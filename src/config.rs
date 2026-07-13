@@ -225,6 +225,34 @@ impl Config {
             ));
         }
 
+        // Advisory only, not a hard error: warn if tunnel.mtu plus our own
+        // framing overhead is likely to exceed a typical 1500-byte
+        // physical link MTU. We can't know the *actual* MTU of every
+        // bonded physical interface from here, so this is a rule-of-thumb
+        // check against the common case (jumbo-frame environments may
+        // legitimately want a higher tunnel.mtu). Getting this wrong
+        // doesn't break the tunnel outright, but it means the outer UDP
+        // datagram gets IP-fragmented -- which is inefficient, and
+        // outright dropped by any firewall/NAT on the path that blocks
+        // fragments, a notoriously hard-to-diagnose failure mode. This
+        // uses eprintln! rather than tracing::warn! because it runs
+        // during config validation, before logging is initialized (see
+        // main.rs) -- stderr is the only channel guaranteed visible here.
+        let outer_overhead = crate::protocol::HEADER_LEN as u32 + crate::crypto::TAG_LEN as u32
+            + 28 /* IPv4(20) + UDP(8); +20 more if the outer transport ends up on IPv6 */;
+        const TYPICAL_PHYSICAL_MTU: u32 = 1500;
+        if self.tunnel.mtu as u32 + outer_overhead > TYPICAL_PHYSICAL_MTU {
+            eprintln!(
+                "warning: tunnel.mtu = {} plus ~{outer_overhead} bytes of tunnel overhead \
+                 exceeds the typical 1500-byte physical link MTU; outer packets may be \
+                 IP-fragmented or silently dropped by firewalls that block fragments. \
+                 Consider tunnel.mtu <= {} unless every bonded link's physical MTU is \
+                 confirmed higher.",
+                self.tunnel.mtu,
+                TYPICAL_PHYSICAL_MTU.saturating_sub(outer_overhead)
+            );
+        }
+
         Ok(())
     }
 }

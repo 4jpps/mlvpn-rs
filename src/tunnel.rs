@@ -6,10 +6,19 @@
 //! - one `tun_reader` task: reads plaintext IP packets from the TUN
 //!   device, encrypts them, asks the `Scheduler` which link to use, and
 //!   sends the resulting datagram out that link's socket.
-//! - one task per link (`link_actor`): owns that link's UDP socket,
+//! - two tasks per link: `link_receiver` owns that link's UDP socket and
 //!   demultiplexes incoming frames by `PacketType` (Data goes to the
 //!   reorder buffer and then the TUN device; Probe/ProbeReply feed the
-//!   latency monitor), and periodically emits its own Probe frames.
+//!   latency monitor); `link_prober` independently emits Probe frames on a
+//!   timer and sweeps timed-out ones into losses. These are deliberately
+//!   *separate* tasks rather than one task `select!`-ing between "receive"
+//!   and "probe timer" branches: under sustained high receive volume, a
+//!   biased or even fairly-randomized `select!` can keep preferring the
+//!   always-ready receive branch and starve the timer branches, which for
+//!   this daemon means probes silently stop firing on the busiest links --
+//!   precisely the ones whose quality most needs fresh measurement. Giving
+//!   the prober its own task with its own timer removes that failure mode
+//!   entirely instead of just making it statistically rare.
 //! - one `reorder_flush` task: releases packets from the reorder buffer
 //!   that have waited past `reorder_window_ms`, so a permanently missing
 //!   packet degrades to out-of-order delivery instead of stalling the
@@ -74,23 +83,56 @@ pub async fn run(tun: AsyncDevice, links: Vec<Link>, params: TunnelParams) -> Re
         params.scheduler_cfg.reorder_window_ms,
     )));
 
-    let n_links = links.lock().await.len();
+    // One ProbeTracker per link, shared between that link's receiver and
+    // prober tasks: the prober records when a probe was sent
+    // (`record_sent`) and the receiver records when its reply comes back
+    // (`record_reply`) -- both need to see the same outstanding-probes
+    // table for RTT to ever be computed at all, which is why this is
+    // built once here and handed to *both* tasks below rather than each
+    // task getting its own independent tracker.
+    let trackers: Vec<Arc<AsyncMutex<ProbeTracker>>> = {
+        let links_guard = links.lock().await;
+        links_guard
+            .iter()
+            .map(|l| {
+                let timeout_ms = l.config.probe_interval_ms.saturating_mul(4).max(500);
+                Arc::new(AsyncMutex::new(ProbeTracker::new(Duration::from_millis(
+                    timeout_ms,
+                ))))
+            })
+            .collect()
+    };
+
+    let n_links = trackers.len();
     let mut handles = Vec::new();
 
     for idx in 0..n_links {
-        let links = links.clone();
-        let session = session.clone();
-        let scheduler = scheduler.clone();
-        let tun = tun.clone();
-        let reorder = reorder.clone();
-        let cfg = params.scheduler_cfg.clone();
-        handles.push(tokio::spawn(async move {
-            if let Err(e) =
-                link_actor(idx, links, session, scheduler, tun, reorder, cfg, session_id).await
-            {
-                tracing::error!(link_index = idx, error = %e, "link actor exited");
-            }
-        }));
+        let tracker = trackers[idx].clone();
+        {
+            let links = links.clone();
+            let session = session.clone();
+            let scheduler = scheduler.clone();
+            let tun = tun.clone();
+            let reorder = reorder.clone();
+            let cfg = params.scheduler_cfg.clone();
+            let tracker = tracker.clone();
+            handles.push(tokio::spawn(async move {
+                if let Err(e) =
+                    link_receiver(idx, links, session, scheduler, tun, reorder, cfg, tracker).await
+                {
+                    tracing::error!(link_index = idx, error = %e, "link receiver exited");
+                }
+            }));
+        }
+        {
+            let links = links.clone();
+            let session = session.clone();
+            let scheduler = scheduler.clone();
+            let cfg = params.scheduler_cfg.clone();
+            handles.push(tokio::spawn(async move {
+                link_prober(idx, links, session, scheduler, cfg, tracker).await;
+            }));
+        }
     }
 
     {
@@ -328,8 +370,12 @@ async fn tun_reader(
     }
 }
 
+/// Owns one link's receive side: read frames off the socket and dispatch
+/// them. Nothing else runs on this task, so a busy link can never delay
+/// its own (or any other link's) probe timer -- see the module doc
+/// comment for why that separation matters.
 #[allow(clippy::too_many_arguments)]
-async fn link_actor(
+async fn link_receiver(
     idx: usize,
     links: Arc<AsyncMutex<Vec<Link>>>,
     session: Arc<AsyncMutex<Session>>,
@@ -337,44 +383,63 @@ async fn link_actor(
     tun: Arc<AsyncDevice>,
     reorder: Arc<AsyncMutex<ReorderBuffer>>,
     cfg: SchedulerConfig,
-    session_id: u32,
+    tracker: Arc<AsyncMutex<ProbeTracker>>,
 ) -> Result<()> {
+    let (socket, link_id) = {
+        let links_guard = links.lock().await;
+        let link = &links_guard[idx];
+        (link.socket.clone(), link.id)
+    };
+
+    let mut buf = vec![0u8; MAX_FRAME];
+    loop {
+        let (n, from) = socket.recv_from(&mut buf).await.map_err(MlvpnError::Io)?;
+        handle_incoming(
+            idx, link_id, &buf[..n], from, &socket, &links, &session, &scheduler, &tun, &reorder,
+            &cfg, &tracker,
+        )
+        .await;
+    }
+}
+
+/// Owns one link's probing side: periodically sends authenticated `Probe`
+/// frames, sweeps ones that never got a reply into recorded losses, and
+/// (for link index 0 only) reports the aggregate all-links-down state.
+/// Runs as a task fully independent of `link_receiver` -- see the module
+/// doc comment. Shares `tracker` with that link's `link_receiver` (see
+/// `run()`, where both tasks are handed the same `Arc`).
+async fn link_prober(
+    idx: usize,
+    links: Arc<AsyncMutex<Vec<Link>>>,
+    session: Arc<AsyncMutex<Session>>,
+    scheduler: Arc<std::sync::Mutex<Scheduler>>,
+    cfg: SchedulerConfig,
+    tracker: Arc<AsyncMutex<ProbeTracker>>,
+) {
     let (socket, link_id, probe_interval_ms) = {
         let links_guard = links.lock().await;
         let link = &links_guard[idx];
         (link.socket.clone(), link.id, link.config.probe_interval_ms)
     };
 
-    let mut tracker = ProbeTracker::new(Duration::from_millis(
-        probe_interval_ms.saturating_mul(4).max(500),
-    ));
     let probe_seq_counter = AtomicU32::new(0);
     let mut probe_tick = interval(Duration::from_millis(probe_interval_ms));
     let mut sweep_tick = interval(Duration::from_millis(probe_interval_ms));
-    // Only meaningful/used by the idx == 0 actor; see the sweep_tick arm
-    // below for why only one actor reports the aggregate down state.
+    // Only meaningful/used by the idx == 0 prober.
     let mut all_down_reported = false;
-
-    let mut buf = vec![0u8; MAX_FRAME];
 
     loop {
         tokio::select! {
-            biased;
-
-            recv_result = socket.recv_from(&mut buf) => {
-                let (n, from) = recv_result.map_err(MlvpnError::Io)?;
-                handle_incoming(
-                    idx, link_id, &buf[..n], from, &socket, &links, &session, &scheduler, &tun,
-                    &reorder, &cfg, &mut tracker,
-                ).await;
-            }
-
             _ = probe_tick.tick() => {
-                send_probe(&socket, link_id, &links, idx, &session, &probe_seq_counter, &mut tracker).await;
+                let mut t = tracker.lock().await;
+                send_probe(&socket, link_id, &links, idx, &session, &probe_seq_counter, &mut t).await;
             }
 
             _ = sweep_tick.tick() => {
-                let misses = tracker.sweep_timeouts();
+                let misses = {
+                    let mut t = tracker.lock().await;
+                    t.sweep_timeouts()
+                };
                 if misses > 0 {
                     let mut links_guard = links.lock().await;
                     for _ in 0..misses {
@@ -385,12 +450,12 @@ async fn link_actor(
                     sched.refresh(&links_guard);
                 }
 
-                // Only one of the N link actors needs to report the
-                // aggregate state, and only on the edge (not every tick
-                // while it stays down), or this would spam the log once
-                // per link per probe interval. Runs every sweep tick
-                // regardless of whether *this* link had a miss, since a
-                // different link's state is what may have changed.
+                // Only one of the N probers needs to report the aggregate
+                // state, and only on the edge (not every tick while it
+                // stays down), or this would spam the log once per link
+                // per probe interval. Runs every sweep tick regardless of
+                // whether *this* link had a miss, since a different
+                // link's state is what may have changed.
                 if idx == 0 {
                     let links_guard = links.lock().await;
                     let sched = scheduler.lock().unwrap();
@@ -407,7 +472,6 @@ async fn link_actor(
                 }
             }
         }
-        let _ = session_id; // reserved for future per-frame session validation (roadmap: rekey)
     }
 }
 
@@ -424,7 +488,7 @@ async fn handle_incoming(
     tun: &Arc<AsyncDevice>,
     reorder: &Arc<AsyncMutex<ReorderBuffer>>,
     cfg: &SchedulerConfig,
-    tracker: &mut ProbeTracker,
+    tracker: &Arc<AsyncMutex<ProbeTracker>>,
 ) {
     let Ok((hdr, ciphertext)) = Header::decode(frame) else {
         return;
@@ -499,14 +563,11 @@ async fn handle_incoming(
             // under our own next sequence number, so the original sender
             // can match it against their outstanding-probe table by
             // `probe_seq` and compute RTT from their own clock.
-            let reply_seq = {
+            let (reply_seq, reply_ct) = {
                 let s = session.lock().await;
-                s.next_send_seq()
-            };
-            let reply_ct = {
-                let s = session.lock().await;
-                match s.encrypt(reply_seq, &plaintext) {
-                    Ok(ct) => ct,
+                let seq = s.next_send_seq();
+                match s.encrypt(seq, &plaintext) {
+                    Ok(ct) => (seq, ct),
                     Err(_) => return,
                 }
             };
@@ -525,7 +586,11 @@ async fn handle_incoming(
             let Ok(probe) = ProbePayload::decode(&plaintext) else {
                 return;
             };
-            if let Some(rtt_ms) = tracker.record_reply(probe.probe_seq) {
+            let rtt_ms = {
+                let mut t = tracker.lock().await;
+                t.record_reply(probe.probe_seq)
+            };
+            if let Some(rtt_ms) = rtt_ms {
                 let mut links_guard = links.lock().await;
                 if let Some(link) = links_guard.get_mut(idx) {
                     link.stats.record_rtt(rtt_ms);
