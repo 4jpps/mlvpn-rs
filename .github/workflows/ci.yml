@@ -9,7 +9,19 @@ on:
 
 jobs:
   build-and-test:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Native arm64 runner (not cross-compiled/emulated), so this
+          # catches real architecture-specific bugs -- pointer-width
+          # assumptions, endianness, unsafe libc calls -- before a
+          # release tag ever reaches release-deb.yml's matrix.
+          - arch: amd64
+            runs-on: ubuntu-latest
+          - arch: arm64
+            runs-on: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runs-on }}
     steps:
       - uses: actions/checkout@v4
 
@@ -20,6 +32,8 @@ jobs:
 
       - name: Cache cargo registry/build
         uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.arch }}
 
       # Debian 13's minimum supported toolchain per Cargo.toml
       # (rust-version = "1.75"); build-essential/pkg-config/libc6-dev

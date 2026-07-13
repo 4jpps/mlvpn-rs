@@ -142,7 +142,7 @@ mod tests {
     /// smoothness property).
     #[test]
     fn swrr_distributes_proportionally() {
-        let mut entries = vec![
+        let mut entries = [
             SwrrEntry {
                 link_index: 0,
                 effective_weight: 3.0,

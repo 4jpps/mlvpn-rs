@@ -1,8 +1,8 @@
 name: Build .deb package
 
 # Runs on version tags (v1.0.0, v0.2.1, ...) to build and publish a
-# release, or manually via workflow_dispatch to just produce a
-# downloadable artifact without cutting a release (handy for testing
+# release, or manually via workflow_dispatch to just produce
+# downloadable artifacts without cutting a release (handy for testing
 # packaging changes on a branch before tagging).
 on:
   push:
@@ -11,19 +11,38 @@ on:
   workflow_dispatch: {}
 
 permissions:
-  contents: write # needed to attach the .deb to a GitHub Release
+  contents: write # needed to attach the .deb(s) to a GitHub Release
 
 jobs:
   build-deb:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # debian/control declares `Architecture: any`, so dpkg-
+          # buildpackage just builds for whatever host it runs on --
+          # no cross-compilation toolchain needed, just a matching
+          # native runner per architecture.
+          - arch: amd64
+            runs-on: ubuntu-latest
+          - arch: arm64
+            runs-on: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runs-on }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      # Keyed per-arch: amd64 and arm64 produce incompatible compiled
+      # artifacts, and rust-cache's default key doesn't distinguish
+      # runner CPU architecture, only OS -- without this, the two
+      # matrix legs would fight over (and potentially corrupt) the
+      # same cache entry.
       - name: Cache cargo registry/build
         uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.arch }}
 
       # debian/rules invokes plain `cargo build`/`cargo test`, which pick
       # up whatever rustc/cargo are first on PATH -- the toolchain from
@@ -56,11 +75,25 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: mlvpn-deb
+          name: mlvpn-deb-${{ matrix.arch }}
           path: dist/*.deb
 
+  # Separate from build-deb so both architectures land in one Release
+  # via a single softprops/action-gh-release call, instead of two
+  # matrix legs racing to create/update the same tag's Release at once.
+  publish:
+    needs: build-deb
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all .deb artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: mlvpn-deb-*
+          path: dist
+          merge-multiple: true
+
       - name: Create/update GitHub Release
-        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*.deb

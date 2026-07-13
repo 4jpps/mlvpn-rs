@@ -27,6 +27,12 @@ include breaking config/wire changes, called out explicitly below.
 - GitHub Actions CI (`build + cargo test` on every push/PR to `main`) and
   a release workflow that builds and publishes a `.deb` via
   `dpkg-buildpackage` on version tags (`v*`), or on manual dispatch.
+- arm64 support: CI and the release workflow now build natively on both
+  amd64 (`ubuntu-latest`) and arm64 (`ubuntu-24.04-arm`) runners --
+  `debian/control` already declared `Architecture: any`, so this is just
+  running the existing build on a second native runner, not
+  cross-compiling. Tagged releases attach a `.deb` for each
+  architecture.
 - `.gitignore` for build artifacts, debian packaging scratch directories,
   and generated key material.
 
@@ -108,6 +114,13 @@ review pass) specifically looking for remotely-triggerable flaws:
   `ProtectSystem=strict` without a broader filesystem exception.
 - A redundant double lock/encrypt of the session in the `Probe` reply
   path in `handle_incoming`, collapsed into one critical section.
+- `debian/compat` conflicted with `debian/control`'s
+  `debhelper-compat (= 13)` Build-Depends -- debhelper refuses to build
+  at all when the compat level is declared both ways, regardless of
+  whether the values agree (`dh: error: debhelper compat level
+  specified both in debian/compat and via build-dependency on
+  debhelper-compat`). Removed `debian/compat`; the Build-Depends entry
+  is the only source of truth now.
 
 ## [0.1.0] - 2026-07-13
 

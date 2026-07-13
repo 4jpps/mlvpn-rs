@@ -34,6 +34,13 @@ mlvpn (0.1.1-1) unstable; urgency=medium
     instead of chmod-ing it after the fact.
   * security: rate-limit pre-session handshake attempts to blunt a
     CPU-exhaustion flood from unauthenticated senders.
+  * Remove debian/compat: it conflicted with the debhelper-compat (= 13)
+    Build-Depends and made every build fail with "debhelper compat
+    level specified both in debian/compat and via build-dependency on
+    debhelper-compat".
+  * Build and publish arm64 .deb packages alongside amd64 (native
+    ubuntu-24.04-arm GitHub Actions runner; no cross-compilation
+    needed since Architecture: any already covers this).
 
  -- Jeff Parrish PC Services <www.jpps.us>  Mon, 13 Jul 2026 00:00:00 +0000
 

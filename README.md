@@ -3,8 +3,9 @@
 Bonds multiple physical network links (fiber, DSL, LTE, ...) into one
 resilient, Noise-encrypted VPN tunnel, load-balancing and failing over
 between them based on continuously measured latency, jitter, loss and
-throughput. A Rust rewrite of MLVPN, targeting Debian 13 and other
-current systemd-based Linux distributions.
+throughput. A Rust rewrite of MLVPN, targeting Debian 13+, Ubuntu 24.04+,
+and other current systemd-based Debian derivatives, on both amd64 and
+arm64.
 
 By [Jeff Parrish PC Services](https://www.jpps.us), vibe-coded with
 [Claude](https://claude.com/claude-code). License: MIT.
@@ -36,7 +37,10 @@ sudo ./target/release/mlvpnd run --config /etc/mlvpn/mlvpn.toml
 
 For a persistent, hardened install, see `systemd/mlvpn.service` (includes
 one-time host setup instructions at the top of the file) and the Debian
-packaging under `debian/` (`dpkg-buildpackage -us -uc -b`).
+packaging under `debian/` (`dpkg-buildpackage -us -uc -b`). `Architecture:
+any` in `debian/control` means this builds natively on both amd64 and
+arm64; prebuilt `.deb`s for both are attached to each
+[GitHub Release](https://github.com/4jpps/mlvpn-rs/releases).
 
 ## Monitoring: mlvpn-tui
 
@@ -75,11 +79,12 @@ cargo clippy --all-targets
 cargo fmt
 ```
 
-GitHub Actions runs the same build+test on every push/PR
-(`.github/workflows/ci.yml`). Pushing a tag like `v0.1.1` triggers
-`.github/workflows/release-deb.yml`, which builds the `.deb` and attaches
-it to a GitHub Release; see [CHANGELOG.md](CHANGELOG.md) before cutting
-one to keep the version notes current.
+GitHub Actions runs the same build+test on every push/PR, on both amd64
+and arm64 runners (`.github/workflows/ci.yml`). Pushing a tag like
+`v0.1.1` triggers `.github/workflows/release-deb.yml`, which builds a
+`.deb` for each architecture and attaches both to a GitHub Release; see
+[CHANGELOG.md](CHANGELOG.md) before cutting one to keep the version notes
+current.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) before opening a PR, and
 [SECURITY.md](SECURITY.md) if you've found a vulnerability rather than a
