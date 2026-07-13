@@ -29,15 +29,22 @@ jobs:
       # up whatever rustc/cargo are first on PATH -- the toolchain from
       # dtolnay/rust-toolchain above -- regardless of the (possibly
       # older) rustc apt would otherwise install to satisfy
-      # debian/control's Build-Depends. `dpkg-buildpackage` run directly
-      # like this doesn't itself enforce Build-Depends (that's what
-      # sbuild/pbuilder are for), so this is just what debhelper +
+      # debian/control's Build-Depends. This is just what debhelper +
       # dpkg-dev need to run the packaging machinery itself.
       - name: Install packaging dependencies
         run: sudo apt-get update && sudo apt-get install -y debhelper dpkg-dev build-essential pkg-config libc6-dev
 
+      # -d skips dpkg-buildpackage's own dpkg-checkbuilddeps step. That
+      # check only knows about *apt-installed* packages, so it can't see
+      # the rustup-installed cargo/rustc from dtolnay/rust-toolchain
+      # above and fails with "Unmet build dependencies: cargo rustc (>=
+      # 1.75)" even though the real toolchain is right there on PATH and
+      # already proven to work by ci.yml's build+test steps. This is
+      # exactly the situation `-d` exists for (see dpkg-buildpackage(1));
+      # a real apt-based build environment (sbuild/pbuilder) would still
+      # enforce Build-Depends normally.
       - name: Build .deb
-        run: dpkg-buildpackage -us -uc -b
+        run: dpkg-buildpackage -us -uc -b -d
 
       - name: Collect build output
         run: |
