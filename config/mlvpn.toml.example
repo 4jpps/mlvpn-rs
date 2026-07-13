@@ -1,0 +1,54 @@
+# mlvpnd example configuration.
+#
+# Copy to /etc/mlvpn/mlvpn.toml, mode 0600, and adjust for your links.
+# mlvpnd refuses to start if this file (or the private key file) is
+# readable by group/other, so ownership matters:
+#   - shipped systemd unit (runs as the `mlvpn` user from the start,
+#     never root): chown mlvpn:mlvpn /etc/mlvpn/mlvpn.toml
+#   - running mlvpnd as root and letting it drop privileges itself: the
+#     config is read while still root, so root:root 0600 also works.
+# See systemd/mlvpn.service for the full one-time setup.
+#
+# Run `mlvpnd genkey --out /etc/mlvpn/private.key` on each end first, then
+# paste the resulting public keys into `peer_public_key` below (client's
+# config gets the server's public key and vice versa).
+
+mode = "client"   # "client" or "server" -- see ARCHITECTURE.md for what differs
+
+[tunnel]
+name = "mlvpn0"
+address = "10.200.0.2/30"   # client and server must use addresses in the same /30
+mtu = 1400                  # keep below the smallest link's MTU minus protocol overhead
+
+[crypto]
+private_key_file = "/etc/mlvpn/private.key"   # must be mode 0600
+peer_public_key = "REPLACE_WITH_PEER_PUBLIC_KEY_BASE64"
+rekey_interval_secs = 120
+
+[scheduler]
+down_threshold = 5       # consecutive missed probes before a link is marked Down
+up_threshold = 3         # consecutive good probes before a Down link is marked Up again
+reorder_window_ms = 50   # max time to hold a gap open in the receive reorder buffer
+ewma_alpha = 0.2         # smoothing factor for latency/jitter/loss/throughput stats
+
+[logging]
+level = "info"           # tracing-subscriber EnvFilter directive, e.g. "info" or "mlvpn=debug"
+
+# One [[links]] block per physical uplink to bond together.
+
+[[links]]
+name = "fiber"
+bind_interface = "eth0"
+remote_addr = "203.0.113.10:51000"   # server's address:port for this link
+local_port = 51000
+weight = 1.0
+probe_interval_ms = 200
+
+[[links]]
+name = "lte"
+bind_interface = "wwan0"
+remote_addr = "203.0.113.10:51001"
+local_port = 51001
+weight = 0.5                # bias away from a metered/slower link
+bandwidth_cap_mbps = 20.0    # optional ceiling until real throughput is measured
+probe_interval_ms = 200

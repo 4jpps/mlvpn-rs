@@ -1,0 +1,42 @@
+# mlvpnd example configuration -- SERVER side.
+#
+# Pairs with config/mlvpn.toml.example (the client side). Each [[links]]
+# entry here just needs to listen on the local_port the matching client
+# link sends to; the server learns the client's actual source address
+# (and therefore survives the client's IP changing, e.g. LTE roaming)
+# from the handshake itself rather than needing remote_addr configured.
+
+mode = "server"
+
+[tunnel]
+name = "mlvpn0"
+address = "10.200.0.1/30"
+mtu = 1400
+
+[crypto]
+private_key_file = "/etc/mlvpn/private.key"
+peer_public_key = "REPLACE_WITH_CLIENT_PUBLIC_KEY_BASE64"
+rekey_interval_secs = 120
+
+[scheduler]
+down_threshold = 5
+up_threshold = 3
+reorder_window_ms = 50
+ewma_alpha = 0.2
+
+[logging]
+level = "info"
+
+[[links]]
+name = "fiber"
+bind_interface = "eth0"
+local_port = 51000
+weight = 1.0
+probe_interval_ms = 200
+
+[[links]]
+name = "lte"
+bind_interface = "eth0"   # server usually has one WAN-facing interface for all links
+local_port = 51001
+weight = 0.5
+probe_interval_ms = 200

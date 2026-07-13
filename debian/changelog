@@ -1,0 +1,5 @@
+mlvpn (0.1.0-1) unstable; urgency=medium
+
+  * Initial packaging of the Rust rewrite.
+
+ -- Jeff Parrish PC Services <www.jpps.us>  Mon, 13 Jul 2026 00:00:00 +0000

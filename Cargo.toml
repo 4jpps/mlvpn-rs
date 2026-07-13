@@ -1,0 +1,46 @@
+[package]
+name = "mlvpn"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+authors = ["Jeff Parrish PC Services <www.jpps.us>"]
+description = "Multi-link VPN bonding daemon: combines several network uplinks into one resilient, Noise-encrypted tunnel with automatic latency/jitter/throughput-aware failover."
+license = "MIT"
+repository = "https://github.com/4jpps/mlvpn-rs"
+homepage = "https://github.com/4jpps/mlvpn-rs"
+default-run = "mlvpnd"
+
+[[bin]]
+name = "mlvpnd"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "signal", "macros", "io-util"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+anyhow = "1"
+thiserror = "1"
+snow = { version = "0.10", features = ["default-resolver"] }
+rand = "0.8"
+socket2 = { version = "0.5", features = ["all"] }
+tun-rs = { version = "2", features = ["async"] }
+nix = { version = "0.27", features = ["user", "process", "net"] }
+caps = "0.5"
+bytes = "1"
+libc = "0.2"
+zeroize = { version = "1", features = ["derive"] }
+base64 = "0.22"
+hex = "0.4"
+
+[dev-dependencies]
+proptest = "1"

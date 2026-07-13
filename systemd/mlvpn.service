@@ -1,0 +1,75 @@
+# Install to /etc/systemd/system/mlvpn.service
+#
+# Hardened by default to run as the unprivileged `mlvpn` user with only the
+# two capabilities the daemon actually needs (CAP_NET_ADMIN for creating
+# the TUN device, CAP_NET_RAW for SO_BINDTODEVICE), granted ambiently so
+# the process is never root at any point -- see src/privilege.rs for the
+# corresponding in-process fallback if you instead run this as root and
+# let it drop privileges itself.
+#
+# Setup (once):
+#   groupadd --system mlvpn
+#   useradd  --system --no-create-home --shell /usr/sbin/nologin -g mlvpn mlvpn
+#   mkdir -p /etc/mlvpn && chmod 750 /etc/mlvpn && chown root:mlvpn /etc/mlvpn
+#   mlvpnd genkey --out /etc/mlvpn/private.key && chown mlvpn:mlvpn /etc/mlvpn/private.key
+#   cp config/mlvpn.toml.example /etc/mlvpn/mlvpn.toml   # edit it
+#   chown mlvpn:mlvpn /etc/mlvpn/mlvpn.toml && chmod 600 /etc/mlvpn/mlvpn.toml
+#   # mlvpnd checks this itself at startup and refuses to run if the config
+#   # or private key file is readable by group/other (see config.rs).
+
+[Unit]
+Description=mlvpn multi-link VPN bonding daemon
+Documentation=https://github.com/4jpps/mlvpn-rs/blob/main/ARCHITECTURE.md
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/mlvpnd run --config /etc/mlvpn/mlvpn.toml
+Restart=on-failure
+RestartSec=2
+
+# --- Identity -------------------------------------------------------
+User=mlvpn
+Group=mlvpn
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+# Device nodes/network namespace handling for TUN creation.
+DeviceAllow=/dev/net/tun rw
+SupplementaryGroups=
+
+# --- Sandboxing (systemd hardening) ----------------------------------
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=no          # TUN needs /dev/net/tun; everything else is still hidden
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+UMask=0077
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @mount @debug @cpu-emulation @obsolete
+SystemCallErrorNumber=EPERM
+ReadOnlyPaths=/etc/mlvpn
+
+# Only the paths mlvpnd actually needs are writable/readable; everything
+# else on the filesystem is unavailable to the process even if the code
+# has a bug that tries to reach it.
+InaccessiblePaths=-/root -/home
+
+[Install]
+WantedBy=multi-user.target

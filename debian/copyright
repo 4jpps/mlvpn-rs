@@ -1,0 +1,7 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: mlvpn-rs
+Source: https://github.com/4jpps/mlvpn-rs
+
+Files: *
+Copyright: 2026 Jeff Parrish PC Services <www.jpps.us>
+License: MIT

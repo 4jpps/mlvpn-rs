@@ -1,0 +1,33 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+  configure)
+    if ! getent group mlvpn >/dev/null; then
+      addgroup --system mlvpn
+    fi
+    if ! getent passwd mlvpn >/dev/null; then
+      adduser --system --ingroup mlvpn --no-create-home \
+        --home /nonexistent --shell /usr/sbin/nologin \
+        --gecos "mlvpn daemon" mlvpn
+    fi
+    chown root:mlvpn /etc/mlvpn
+    chmod 0750 /etc/mlvpn
+    if [ -f /etc/mlvpn/mlvpn.toml ]; then
+      chown mlvpn:mlvpn /etc/mlvpn/mlvpn.toml
+      # 0600, not 0640: mlvpnd runs as the mlvpn user itself (not merely
+      # in the mlvpn group), so it needs no group-read bit at all, and
+      # config.rs's permission check rejects the file outright if one is
+      # set.
+      chmod 0600 /etc/mlvpn/mlvpn.toml
+    fi
+    if [ -f /etc/mlvpn/private.key ]; then
+      chown mlvpn:mlvpn /etc/mlvpn/private.key
+      chmod 0600 /etc/mlvpn/private.key
+    fi
+    ;;
+esac
+
+#DEBHELPER#
+
+exit 0

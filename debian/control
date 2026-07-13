@@ -1,0 +1,22 @@
+Source: mlvpn
+Section: net
+Priority: optional
+Maintainer: Jeff Parrish PC Services <www.jpps.us>
+Build-Depends: debhelper-compat (= 13), cargo, rustc (>= 1.75), libc6-dev, pkg-config
+Standards-Version: 4.6.2
+Rules-Requires-Root: no
+Homepage: https://github.com/4jpps/mlvpn-rs
+Vcs-Git: https://github.com/4jpps/mlvpn-rs.git
+Vcs-Browser: https://github.com/4jpps/mlvpn-rs
+
+Package: mlvpn
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, adduser
+Description: Multi-link VPN bonding daemon
+ mlvpn bonds several physical network uplinks (e.g. fiber + LTE) into a
+ single encrypted tunnel, load-balancing and failing over between them
+ based on continuously measured latency, jitter, loss and throughput.
+ .
+ This is a Rust rewrite built on the Noise Protocol Framework
+ (Noise_IK, the same family WireGuard uses) for a single-round-trip,
+ mutually authenticated, forward-secret handshake.

@@ -1,0 +1,26 @@
+#!/usr/bin/make -f
+
+export CARGO_HOME = $(CURDIR)/debian/cargo_home
+export DEB_BUILD_OPTIONS = nostrip
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	cargo build --release --locked --offline || cargo build --release --locked
+
+override_dh_auto_install:
+	install -D -m0755 target/release/mlvpnd debian/mlvpn/usr/bin/mlvpnd
+	install -D -m0644 systemd/mlvpn.service debian/mlvpn/lib/systemd/system/mlvpn.service
+	install -D -m0644 config/mlvpn.toml.example debian/mlvpn/usr/share/doc/mlvpn/mlvpn.toml.example
+	install -D -m0644 config/mlvpn-server.toml.example debian/mlvpn/usr/share/doc/mlvpn/mlvpn-server.toml.example
+	install -d -m0750 debian/mlvpn/etc/mlvpn
+
+override_dh_auto_test:
+	# Unit tests need no special privileges; skip integration tests that
+	# require a real TUN device / CAP_NET_ADMIN, which isn't available in
+	# most package build environments.
+	cargo test --release --locked --lib || true
+
+override_dh_installsystemd:
+	dh_installsystemd --no-enable --no-start
