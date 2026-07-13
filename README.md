@@ -6,11 +6,12 @@ between them based on continuously measured latency, jitter, loss and
 throughput. A Rust rewrite of MLVPN, targeting Debian 13 and other
 current systemd-based Linux distributions.
 
-By [Jeff Parrish PC Services](https://www.jpps.us). License: MIT.
+By [Jeff Parrish PC Services](https://www.jpps.us), vibe-coded with
+[Claude](https://claude.com/claude-code). License: MIT.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the full design, threat model,
 and known limitations/roadmap -- read that before relying on this for
-anything real.
+anything real. See [CHANGELOG.md](CHANGELOG.md) for release history.
 
 ## Quick start
 
@@ -55,6 +56,35 @@ shows the full picture without cross-referencing logs on both machines.
 Press `q` or `Esc` to quit. See ARCHITECTURE.md's "Monitoring" section for
 the wire/IPC details (`ipc.rs`, `control.rs`, `PacketType::StatsShare`).
 
+## Development
+
+This targets Debian 13 / other current systemd Linux, so on Windows the
+supported setup is [WSL2](https://learn.microsoft.com/windows/wsl/) with
+a Debian distro, plus VS Code's
+[WSL extension](https://marketplace.visualstudio.com/items?itemName=ms-vscode-remote.remote-wsl)
+(`code .` from inside the WSL repo clone) and the
+[rust-analyzer](https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer)
+extension installed *in* that WSL window. Clone into WSL's native
+filesystem (`~/mlvpn-rs`), not `/mnt/c/...` -- NTFS-backed paths break
+`chmod`/git filemode handling that `cargo` and `git` both rely on.
+
+```sh
+cargo build --release
+cargo test --release --lib
+cargo clippy --all-targets
+cargo fmt
+```
+
+GitHub Actions runs the same build+test on every push/PR
+(`.github/workflows/ci.yml`). Pushing a tag like `v0.1.1` triggers
+`.github/workflows/release-deb.yml`, which builds the `.deb` and attaches
+it to a GitHub Release; see [CHANGELOG.md](CHANGELOG.md) before cutting
+one to keep the version notes current.
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) before opening a PR, and
+[SECURITY.md](SECURITY.md) if you've found a vulnerability rather than a
+regular bug -- please don't file those as public issues.
+
 ## Layout
 
 ```
@@ -76,4 +106,6 @@ src/
 config/          Example client/server TOML configs
 systemd/         Hardened systemd unit
 debian/          .deb packaging
+.github/workflows/  CI (build+test) and release (.deb build/publish)
+CHANGELOG.md     Release history
 ```

@@ -1,3 +1,42 @@
+mlvpn (0.1.1-1) unstable; urgency=medium
+
+  * Add mlvpn-tui: a terminal monitoring view showing live per-link
+    state, peer address, and both sides' RTT/jitter/loss/throughput.
+  * Add mlvpnd's local control socket (/run/mlvpn/<tunnel>.sock,
+    [control] in config) that mlvpn-tui and other tools read from.
+  * Add PacketType::StatsShare so peers exchange their self-reported
+    link stats over the authenticated tunnel session.
+  * Restructure the crate into a library plus two binaries (mlvpnd,
+    mlvpn-tui) so they can share the control-socket JSON schema.
+  * Fix systemd unit ExecStart path (/usr/local/bin -> /usr/bin) to
+    match where this package actually installs mlvpnd; add
+    RuntimeDirectory=mlvpn so the control socket has a writable,
+    correctly-owned directory under ProtectSystem=strict.
+  * Fix a redundant double session-lock in the Probe reply path, and
+    split the per-link receive/probe task into two independent tasks
+    to remove a probe-starvation risk under sustained receive load.
+  * Add an advisory warning when tunnel.mtu plus protocol overhead is
+    likely to exceed a typical 1500-byte physical link MTU.
+  * Add GitHub Actions CI (build + unit tests on every push/PR) and a
+    release workflow that builds and publishes this .deb on version
+    tags.
+  * security: fix unauthenticated remote DoS where a single forged
+    handshake reply could crash the client daemon (bypassed the
+    handshake retry loop via `?`, no source-address check).
+  * security: fix replay window being updated before AEAD
+    authentication succeeded, letting an unauthenticated attacker
+    pre-burn sequence numbers and cause legitimate packets to be
+    misclassified as replays and dropped.
+  * security: fail closed (instead of silently skipping) the peer
+    identity pin check on an unexpected missing remote static key.
+  * security: close a permission race on the monitoring control
+    socket by tightening the process umask around its creation
+    instead of chmod-ing it after the fact.
+  * security: rate-limit pre-session handshake attempts to blunt a
+    CPU-exhaustion flood from unauthenticated senders.
+
+ -- Jeff Parrish PC Services <www.jpps.us>  Mon, 13 Jul 2026 00:00:00 +0000
+
 mlvpn (0.1.0-1) unstable; urgency=medium
 
   * Initial packaging of the Rust rewrite.

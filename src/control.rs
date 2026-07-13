@@ -52,6 +52,17 @@ pub async fn serve(
             );
             return;
         }
+        // Defense in depth for manual/non-systemd runs, where this
+        // directory doesn't already exist with a restrictive mode via
+        // `RuntimeDirectory=` (see systemd/mlvpn.service). Harmless
+        // no-op when it does.
+        if let Err(e) = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o750)) {
+            tracing::debug!(
+                error = %e,
+                path = %parent.display(),
+                "could not set control socket directory permissions (likely already correct)"
+            );
+        }
     }
 
     // A stale socket file left behind by an unclean previous shutdown
@@ -59,18 +70,43 @@ pub async fn serve(
     // is actually listening on it anymore.
     let _ = std::fs::remove_file(&path);
 
-    let listener = match UnixListener::bind(&path) {
-        Ok(l) => l,
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                path = %path.display(),
-                "failed to bind control socket; mlvpn-tui will be unavailable"
-            );
-            return;
+    // Create the socket file with a restrictive mode *atomically* at
+    // creation time by tightening the process umask around just this
+    // call, rather than binding first and `chmod`-ing after. The latter
+    // leaves a real (if brief) window where the socket exists at
+    // whatever the ambient umask allows -- group/world-connectable
+    // unless the umask already happens to be restrictive. The shipped
+    // systemd unit sets `UMask=0077` so that window wouldn't matter
+    // there, but `control::serve` is also reachable from a manual,
+    // non-systemd run where nothing else guarantees that.
+    let listener = {
+        // SAFETY: `umask(2)` is an unconditional syscall with no
+        // preconditions beyond "no other thread relies on the umask
+        // being unchanged for the duration" -- there is no such
+        // concurrent dependency here, and we restore the prior value
+        // immediately after `bind()` returns.
+        let previous_umask = unsafe { libc::umask(0o177) };
+        let result = UnixListener::bind(&path);
+        unsafe {
+            libc::umask(previous_umask);
+        }
+        match result {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    path = %path.display(),
+                    "failed to bind control socket; mlvpn-tui will be unavailable"
+                );
+                return;
+            }
         }
     };
 
+    // Belt and suspenders: explicitly (re-)assert 0600 even though the
+    // umask above should already have produced exactly that, in case
+    // some platform/backend doesn't fully honor umask for AF_UNIX socket
+    // creation.
     if let Err(e) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)) {
         tracing::warn!(error = %e, "failed to restrict control socket permissions to 0600");
     }

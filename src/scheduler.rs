@@ -99,7 +99,14 @@ impl Scheduler {
         let winner = self
             .entries
             .iter_mut()
-            .max_by(|a, b| a.current_weight.partial_cmp(&b.current_weight).unwrap())
+            // total_cmp, not partial_cmp().unwrap(): never panics, even
+            // in a hypothetical future where a score computation
+            // produces NaN/infinity. current_weight is a running sum of
+            // monitor::score() outputs, which are already clamped away
+            // from NaN today, but a scheduling hot path is exactly the
+            // kind of code that should be panic-free by construction
+            // rather than "we don't think it's reachable right now."
+            .max_by(|a, b| a.current_weight.total_cmp(&b.current_weight))
             .expect("entries is non-empty (checked by caller)");
         winner.current_weight -= total;
         winner.link_index
@@ -142,7 +149,7 @@ mod tests {
             let (idx, winner) = entries
                 .iter_mut()
                 .enumerate()
-                .max_by(|(_, a), (_, b)| a.current_weight.partial_cmp(&b.current_weight).unwrap())
+                .max_by(|(_, a), (_, b)| a.current_weight.total_cmp(&b.current_weight))
                 .unwrap();
             counts[idx] += 1;
             winner.current_weight -= total;

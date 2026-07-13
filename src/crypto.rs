@@ -268,14 +268,53 @@ impl ReplayWindow {
         }
     }
 
-    /// Returns Ok(()) and marks `seq` seen if it's acceptable; returns
-    /// Err(Replay) if it's a duplicate or too old to track.
-    pub fn check_and_update(&mut self, seq: u64) -> Result<()> {
+    /// Returns `Ok(())` if `seq` would currently be accepted (not a
+    /// duplicate, not too old to track) -- WITHOUT marking it seen.
+    /// Deliberately split from `commit()` rather than one combined
+    /// "check and update" call: frame headers (including `seq`) are
+    /// plaintext and unauthenticated (see this module's doc comment), so
+    /// an attacker who doesn't hold the session key can send an
+    /// arbitrary `seq` with garbage ciphertext that will always fail
+    /// AEAD authentication. If that seq were marked "seen" as a side
+    /// effect of merely checking it -- as an earlier version of this
+    /// code did -- an attacker could pre-burn replay-window slots ahead
+    /// of the legitimate sender's real sequence numbers with no key
+    /// material at all, causing genuine, correctly-authenticated packets
+    /// at those sequence numbers to be misclassified as replays and
+    /// dropped: an unauthenticated denial-of-service with no
+    /// cryptographic break required. Callers MUST call `commit()` if and
+    /// only if the packet subsequently passes AEAD authentication -- see
+    /// `Session::decrypt`.
+    pub fn check(&self, seq: u64) -> Result<()> {
+        if !self.initialized {
+            return Ok(());
+        }
+        if seq > self.last {
+            return Ok(());
+        }
+        let diff = self.last - seq;
+        if diff as usize >= REPLAY_WINDOW_BITS {
+            return Err(MlvpnError::Replay);
+        }
+        if self.test_bit(diff as usize) {
+            return Err(MlvpnError::Replay);
+        }
+        Ok(())
+    }
+
+    /// Marks `seq` as seen, sliding the window forward if it's newer
+    /// than anything seen before. Must only be called after the packet
+    /// carrying `seq` has passed AEAD authentication -- see `check`'s
+    /// doc comment for why. Calling this without a preceding successful
+    /// `check()` (e.g. for a `seq` that `check()` would have rejected)
+    /// does not panic or corrupt state, but callers should not rely on
+    /// that as an excuse to skip `check()` first.
+    pub fn commit(&mut self, seq: u64) {
         if !self.initialized {
             self.initialized = true;
             self.last = seq;
             self.set_bit(0);
-            return Ok(());
+            return;
         }
 
         if seq > self.last {
@@ -287,18 +326,13 @@ impl ReplayWindow {
             }
             self.last = seq;
             self.set_bit(0);
-            return Ok(());
+            return;
         }
 
         let diff = self.last - seq;
-        if diff as usize >= REPLAY_WINDOW_BITS {
-            return Err(MlvpnError::Replay);
+        if (diff as usize) < REPLAY_WINDOW_BITS {
+            self.set_bit(diff as usize);
         }
-        if self.test_bit(diff as usize) {
-            return Err(MlvpnError::Replay);
-        }
-        self.set_bit(diff as usize);
-        Ok(())
     }
 
     fn set_bit(&mut self, i: usize) {
@@ -368,12 +402,15 @@ impl Session {
         Ok(out)
     }
 
-    /// Decrypt and replay-check in one step. `seq` must be the sequence
-    /// number carried in the packet's header (also used as nonce).
+    /// Decrypt and replay-check. `seq` must be the sequence number
+    /// carried in the packet's header (also used as nonce).
     pub fn decrypt(&mut self, seq: u64, ciphertext: &[u8]) -> Result<Vec<u8>> {
-        // Replay-check first: cheaper than a full AEAD open, and avoids
+        // Check-only first: cheaper than a full AEAD open, and avoids
         // doing decrypt work for packets we're going to discard anyway.
-        self.replay.check_and_update(seq)?;
+        // Crucially, this does NOT mark `seq` as seen yet -- see
+        // `ReplayWindow::check`'s doc comment for why the window must
+        // not be mutated until authentication has actually succeeded.
+        self.replay.check(seq)?;
         if ciphertext.len() < TAG_LEN {
             return Err(MlvpnError::AuthFailed);
         }
@@ -383,6 +420,9 @@ impl Session {
             .read_message(seq, ciphertext, &mut out)
             .map_err(|_| MlvpnError::AuthFailed)?;
         out.truncate(n);
+        // Only now, having verified the frame is authentic, commit `seq`
+        // to the replay window.
+        self.replay.commit(seq);
         Ok(out)
     }
 }
@@ -391,4 +431,68 @@ impl Session {
 /// distinguish handshake attempts / sessions on the wire.
 pub fn random_session_id() -> u32 {
     rand::rngs::OsRng.next_u32()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression test for the fixed vulnerability: an unauthenticated
+    /// `check()` (as happens for every packet that fails AEAD auth, e.g.
+    /// forged by an attacker with no key material) must never itself
+    /// mark a sequence number as seen. Only `commit()` may do that.
+    #[test]
+    fn check_alone_does_not_mutate_state() {
+        let mut w = ReplayWindow::new();
+        assert!(w.check(5).is_ok());
+        assert!(w.check(5).is_ok(), "repeated check() must not start rejecting");
+        w.commit(5);
+        assert!(w.check(5).is_err(), "commit() must make the seq rejected afterward");
+    }
+
+    /// Simulates the actual attack this fixes: an attacker "probes" a
+    /// sequence number with a packet that fails authentication (so only
+    /// `check()` runs, never `commit()`), and the legitimate sender's
+    /// real packet at that same sequence number must still be accepted
+    /// afterward.
+    #[test]
+    fn failed_auth_attempt_does_not_poison_future_legitimate_packet() {
+        let mut w = ReplayWindow::new();
+        w.commit(1); // establish a baseline session state
+
+        // Attacker sends garbage at seq=2; caller calls check() (as
+        // Session::decrypt does before AEAD auth), auth then fails, so
+        // commit() is never reached.
+        assert!(w.check(2).is_ok());
+
+        // The legitimate peer's real seq=2 packet must still go through.
+        assert!(w.check(2).is_ok(), "attacker's failed probe must not have blocked the real packet");
+        w.commit(2);
+        assert!(w.check(2).is_err(), "now that it's genuinely been seen, a duplicate is rejected");
+    }
+
+    #[test]
+    fn replay_window_rejects_duplicate_and_too_old() {
+        let mut w = ReplayWindow::new();
+        // Comfortably larger than the window width so `last -
+        // REPLAY_WINDOW_BITS` below can't underflow.
+        let last = REPLAY_WINDOW_BITS as u64 + 1000;
+        w.commit(last);
+        assert!(w.check(last).is_err(), "exact duplicate");
+        assert!(
+            w.check(last - REPLAY_WINDOW_BITS as u64).is_err(),
+            "exactly at the window edge must be rejected as too old"
+        );
+        assert!(w.check(last - 1).is_ok(), "still inside the window and not yet seen");
+    }
+
+    #[test]
+    fn replay_window_slides_forward_on_new_high_seq() {
+        let mut w = ReplayWindow::new();
+        w.commit(100);
+        w.commit(5000); // far beyond REPLAY_WINDOW_BITS ahead
+        // The old seq=100 is now far outside the slid window.
+        assert!(w.check(100).is_err());
+        assert!(w.check(4999).is_ok());
+    }
 }

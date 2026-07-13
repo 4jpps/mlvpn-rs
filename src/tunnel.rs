@@ -246,20 +246,77 @@ async fn establish_session(
 
                 let mut buf = vec![0u8; MAX_FRAME];
                 match tokio::time::timeout(Duration::from_millis(500), socket.recv_from(&mut buf)).await {
-                    Ok(Ok((n, _from))) => {
+                    Ok(Ok((n, from))) => {
+                        // Quick filter, not a security boundary (UDP
+                        // source addresses are trivially spoofable; the
+                        // actual authentication is the Noise handshake
+                        // below) -- just avoids wasting a retry attempt
+                        // processing traffic that obviously isn't from
+                        // our configured peer.
+                        if from != remote {
+                            last_err = Some(MlvpnError::Handshake(format!(
+                                "handshake reply from unexpected source {from} (expected {remote})"
+                            )));
+                            continue;
+                        }
+
                         buf.truncate(n);
-                        if let Ok((hdr, payload)) = Header::decode(&buf) {
-                            if hdr.ptype == PacketType::HandshakeResp {
-                                hs.read_second(payload)?;
-                                if let Some(remote_static) = hs.remote_static() {
-                                    if remote_static != params.peer_public {
-                                        return Err(MlvpnError::AuthFailed);
-                                    }
-                                }
-                                return hs.into_session();
+                        let Ok((hdr, payload)) = Header::decode(&buf) else {
+                            last_err = Some(MlvpnError::Handshake("undecodable reply frame".into()));
+                            continue;
+                        };
+                        if hdr.ptype != PacketType::HandshakeResp {
+                            last_err = Some(MlvpnError::Handshake("unexpected reply frame".into()));
+                            continue;
+                        }
+
+                        // A garbled or forged HandshakeResp -- anyone can
+                        // send a packet tagged with this ptype, header
+                        // fields are plaintext -- must not crash the
+                        // daemon or abort the retry loop via `?`. Treat
+                        // it exactly like a timeout and try again next
+                        // iteration with a fresh `hs`. This was previously
+                        // a real bug: a single unauthenticated garbage
+                        // packet here used to propagate straight out of
+                        // `establish_session` (and from there out of the
+                        // whole process), a one-packet remote DoS against
+                        // the client role.
+                        match hs.read_second(payload) {
+                            Ok(()) => {}
+                            Err(e) => {
+                                tracing::warn!(
+                                    attempt,
+                                    %from,
+                                    error = %e,
+                                    "rejected malformed/invalid handshake reply, retrying"
+                                );
+                                last_err = Some(e);
+                                continue;
                             }
                         }
-                        last_err = Some(MlvpnError::Handshake("unexpected reply frame".into()));
+
+                        match hs.remote_static() {
+                            Some(remote_static) if remote_static == params.peer_public => {
+                                return hs.into_session();
+                            }
+                            Some(_) => {
+                                // Definitively the wrong key: no amount
+                                // of retrying will fix that, so this one
+                                // stays a hard failure rather than
+                                // looping.
+                                return Err(MlvpnError::AuthFailed);
+                            }
+                            None => {
+                                // Fail closed: a Noise_IK handshake that
+                                // completed `read_second` successfully
+                                // must have a remote static key. Treating
+                                // "can't verify the pin" the same as
+                                // "verified and it didn't match" means
+                                // this check can never be silently
+                                // skipped.
+                                return Err(MlvpnError::AuthFailed);
+                            }
+                        }
                     }
                     Ok(Err(e)) => last_err = Some(MlvpnError::Io(e)),
                     Err(_) => {
@@ -282,6 +339,27 @@ async fn establish_session(
                 links_guard.iter().map(|l| (l.socket.clone(), l.id)).collect()
             };
             let mut buf = vec![0u8; MAX_FRAME];
+
+            // Lightweight defense against a pre-session CPU-exhaustion
+            // flood: `hdr.ptype == HandshakeInit` is plaintext, so
+            // anyone can tag arbitrary garbage that way, and each one
+            // that reaches `Handshake::new_responder` +
+            // `read_first_and_reply` below forces real X25519 operations
+            // before it's rejected. This cannot forge a valid session
+            // (the `remote_static()` pin check further down still
+            // requires holding the real peer's private key), but it can
+            // burn CPU cycles for free. Cap how many attempts get that
+            // far per second; the rest are dropped before any crypto
+            // runs. Global rather than per-source-IP deliberately: UDP
+            // source addresses are trivially spoofable, so a per-IP
+            // table would itself be an unbounded-memory attack surface.
+            // This only matters pre-session -- once established, stray
+            // HandshakeInit frames are already ignored elsewhere (see
+            // `handle_incoming`).
+            const MAX_HANDSHAKE_ATTEMPTS_PER_SEC: u32 = 20;
+            let mut rate_window_start = Instant::now();
+            let mut attempts_this_window = 0u32;
+
             loop {
                 let mut hit = None;
                 for (socket, link_id) in &sockets {
@@ -301,6 +379,17 @@ async fn establish_session(
                     continue;
                 };
                 if hdr.ptype != PacketType::HandshakeInit {
+                    buf.resize(MAX_FRAME, 0);
+                    continue;
+                }
+
+                if rate_window_start.elapsed() >= Duration::from_secs(1) {
+                    rate_window_start = Instant::now();
+                    attempts_this_window = 0;
+                }
+                attempts_this_window += 1;
+                if attempts_this_window > MAX_HANDSHAKE_ATTEMPTS_PER_SEC {
+                    tracing::debug!(%from, "dropping HandshakeInit: rate limit exceeded");
                     buf.resize(MAX_FRAME, 0);
                     continue;
                 }
@@ -326,9 +415,20 @@ async fn establish_session(
                         continue;
                     }
                 };
-                if let Some(remote_static) = hs.remote_static() {
-                    if remote_static != params.peer_public {
-                        tracing::warn!(%from, "rejected handshake from unpinned peer key");
+                // Fail closed: treat "couldn't determine the peer's
+                // static key" the same as "determined it and it didn't
+                // match" rather than silently letting a `None` skip the
+                // pin check. For a Noise_IK responder that has just
+                // successfully processed message 1, `remote_static()`
+                // returning `None` shouldn't happen in practice, but the
+                // one line of code that turns "authenticated by Noise"
+                // into "authenticated as the specific pinned peer" is
+                // exactly the wrong place to fail open on an unexpected
+                // case.
+                match hs.remote_static() {
+                    Some(remote_static) if remote_static == params.peer_public => {}
+                    _ => {
+                        tracing::warn!(%from, "rejected handshake from unpinned or unverifiable peer key");
                         buf.resize(MAX_FRAME, 0);
                         continue;
                     }
