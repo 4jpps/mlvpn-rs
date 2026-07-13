@@ -83,8 +83,14 @@ impl Scheduler {
             .iter()
             .enumerate()
             .min_by(|(_, a), (_, b)| {
-                let a_key = (a.stats.consecutive_misses, a.stats.rtt_ms.get().unwrap_or(f64::MAX) as i64);
-                let b_key = (b.stats.consecutive_misses, b.stats.rtt_ms.get().unwrap_or(f64::MAX) as i64);
+                let a_key = (
+                    a.stats.consecutive_misses,
+                    a.stats.rtt_ms.get().unwrap_or(f64::MAX) as i64,
+                );
+                let b_key = (
+                    b.stats.consecutive_misses,
+                    b.stats.rtt_ms.get().unwrap_or(f64::MAX) as i64,
+                );
                 a_key.cmp(&b_key)
             })
             .map(|(i, _)| i)?;
@@ -137,8 +143,16 @@ mod tests {
     #[test]
     fn swrr_distributes_proportionally() {
         let mut entries = vec![
-            SwrrEntry { link_index: 0, effective_weight: 3.0, current_weight: 0.0 },
-            SwrrEntry { link_index: 1, effective_weight: 1.0, current_weight: 0.0 },
+            SwrrEntry {
+                link_index: 0,
+                effective_weight: 3.0,
+                current_weight: 0.0,
+            },
+            SwrrEntry {
+                link_index: 1,
+                effective_weight: 1.0,
+                current_weight: 0.0,
+            },
         ];
         let mut counts = [0usize; 2];
         let total: f64 = entries.iter().map(|e| e.effective_weight).sum();
@@ -157,6 +171,9 @@ mod tests {
         // Expect roughly 3:1 -- allow generous tolerance since this is a
         // deterministic but non-uniform sequence, not a random sample.
         let ratio = counts[0] as f64 / counts[1] as f64;
-        assert!((2.5..3.5).contains(&ratio), "ratio was {ratio}, counts {counts:?}");
+        assert!(
+            (2.5..3.5).contains(&ratio),
+            "ratio was {ratio}, counts {counts:?}"
+        );
     }
 }

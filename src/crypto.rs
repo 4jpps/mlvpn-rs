@@ -139,7 +139,10 @@ pub struct Handshake {
 }
 
 impl Handshake {
-    pub fn new_initiator(local_private: &LocalPrivateKey, remote_public: &[u8; 32]) -> Result<Self> {
+    pub fn new_initiator(
+        local_private: &LocalPrivateKey,
+        remote_public: &[u8; 32],
+    ) -> Result<Self> {
         let params = NOISE_PATTERN
             .parse()
             .map_err(|e| MlvpnError::Handshake(format!("bad noise pattern: {e:?}")))?;
@@ -257,6 +260,12 @@ pub struct ReplayWindow {
     /// (last - i) has been seen.
     bitmap: [u64; REPLAY_WINDOW_WORDS],
     initialized: bool,
+}
+
+impl Default for ReplayWindow {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ReplayWindow {
@@ -445,9 +454,15 @@ mod tests {
     fn check_alone_does_not_mutate_state() {
         let mut w = ReplayWindow::new();
         assert!(w.check(5).is_ok());
-        assert!(w.check(5).is_ok(), "repeated check() must not start rejecting");
+        assert!(
+            w.check(5).is_ok(),
+            "repeated check() must not start rejecting"
+        );
         w.commit(5);
-        assert!(w.check(5).is_err(), "commit() must make the seq rejected afterward");
+        assert!(
+            w.check(5).is_err(),
+            "commit() must make the seq rejected afterward"
+        );
     }
 
     /// Simulates the actual attack this fixes: an attacker "probes" a
@@ -466,9 +481,15 @@ mod tests {
         assert!(w.check(2).is_ok());
 
         // The legitimate peer's real seq=2 packet must still go through.
-        assert!(w.check(2).is_ok(), "attacker's failed probe must not have blocked the real packet");
+        assert!(
+            w.check(2).is_ok(),
+            "attacker's failed probe must not have blocked the real packet"
+        );
         w.commit(2);
-        assert!(w.check(2).is_err(), "now that it's genuinely been seen, a duplicate is rejected");
+        assert!(
+            w.check(2).is_err(),
+            "now that it's genuinely been seen, a duplicate is rejected"
+        );
     }
 
     #[test]
@@ -483,7 +504,10 @@ mod tests {
             w.check(last - REPLAY_WINDOW_BITS as u64).is_err(),
             "exactly at the window edge must be rejected as too old"
         );
-        assert!(w.check(last - 1).is_ok(), "still inside the window and not yet seen");
+        assert!(
+            w.check(last - 1).is_ok(),
+            "still inside the window and not yet seen"
+        );
     }
 
     #[test]
@@ -491,7 +515,7 @@ mod tests {
         let mut w = ReplayWindow::new();
         w.commit(100);
         w.commit(5000); // far beyond REPLAY_WINDOW_BITS ahead
-        // The old seq=100 is now far outside the slid window.
+                        // The old seq=100 is now far outside the slid window.
         assert!(w.check(100).is_err());
         assert!(w.check(4999).is_ok());
     }

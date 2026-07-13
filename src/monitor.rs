@@ -48,7 +48,8 @@ impl ProbeTracker {
     pub fn sweep_timeouts(&mut self) -> usize {
         let timeout = self.timeout;
         let before = self.outstanding.len();
-        self.outstanding.retain(|_, sent_at| sent_at.elapsed() < timeout);
+        self.outstanding
+            .retain(|_, sent_at| sent_at.elapsed() < timeout);
         before - self.outstanding.len()
     }
 }
@@ -63,9 +64,7 @@ pub fn update_link_state(link: &mut Link, cfg: &SchedulerConfig) {
     let was = link.state;
     link.state = match link.state {
         LinkState::Up if link.stats.consecutive_misses >= cfg.down_threshold => LinkState::Down,
-        LinkState::Down | LinkState::Probing
-            if link.stats.consecutive_hits >= cfg.up_threshold =>
-        {
+        LinkState::Down | LinkState::Probing if link.stats.consecutive_hits >= cfg.up_threshold => {
             LinkState::Up
         }
         other => other,

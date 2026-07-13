@@ -135,9 +135,8 @@ impl LinkStats {
         self.bytes_since_last_sample += n;
         let elapsed = self.last_throughput_sample.elapsed();
         if elapsed.as_secs_f64() >= 1.0 {
-            let mbps = (self.bytes_since_last_sample as f64 * 8.0)
-                / elapsed.as_secs_f64()
-                / 1_000_000.0;
+            let mbps =
+                (self.bytes_since_last_sample as f64 * 8.0) / elapsed.as_secs_f64() / 1_000_000.0;
             self.throughput_mbps.update(mbps);
             self.bytes_since_last_sample = 0;
             self.last_throughput_sample = Instant::now();
@@ -168,7 +167,8 @@ impl Link {
     /// which `privilege::drop_to` retains explicitly for this reason).
     pub async fn bind(id: u8, config: LinkConfig, ewma_alpha: f64) -> Result<Self> {
         let domain = Domain::IPV4; // IPv6 links can be added by detecting the parsed addr.
-        let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP)).map_err(MlvpnError::Io)?;
+        let socket =
+            Socket::new(domain, Type::DGRAM, Some(Protocol::UDP)).map_err(MlvpnError::Io)?;
         socket.set_nonblocking(true).map_err(MlvpnError::Io)?;
         socket.set_reuse_address(true).map_err(MlvpnError::Io)?;
 
@@ -197,19 +197,21 @@ impl Link {
             .local_addr
             .clone()
             .unwrap_or_else(|| "0.0.0.0".to_string());
-        let bind_addr: SocketAddr = format!("{bind_ip}:{}", config.local_port)
-            .parse()
-            .map_err(|e| MlvpnError::Config(format!("bad local_addr for link '{}': {e}", config.name)))?;
+        let bind_addr: SocketAddr =
+            format!("{bind_ip}:{}", config.local_port)
+                .parse()
+                .map_err(|e| {
+                    MlvpnError::Config(format!("bad local_addr for link '{}': {e}", config.name))
+                })?;
         socket.bind(&bind_addr.into()).map_err(MlvpnError::Io)?;
 
         let std_socket: StdUdpSocket = socket.into();
         let tokio_socket = UdpSocket::from_std(std_socket).map_err(MlvpnError::Io)?;
 
         let remote = match &config.remote_addr {
-            Some(addr) => Some(
-                addr.parse()
-                    .map_err(|e| MlvpnError::Config(format!("bad remote_addr for link '{}': {e}", config.name)))?,
-            ),
+            Some(addr) => Some(addr.parse().map_err(|e| {
+                MlvpnError::Config(format!("bad remote_addr for link '{}': {e}", config.name))
+            })?),
             None => None,
         };
 

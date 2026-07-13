@@ -126,7 +126,6 @@ impl Header {
             &buf[HEADER_LEN..],
         ))
     }
-
 }
 
 /// Payload of a Probe/ProbeReply frame, used by the latency monitor.
@@ -204,7 +203,11 @@ impl StatsPayload {
     }
 
     pub fn name_str(&self) -> String {
-        let end = self.name.iter().position(|&b| b == 0).unwrap_or(Self::NAME_LEN);
+        let end = self
+            .name
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(Self::NAME_LEN);
         String::from_utf8_lossy(&self.name[..end]).into_owned()
     }
 

@@ -39,7 +39,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 #[derive(Parser)]
-#[command(name = "mlvpn-tui", version, about = "Live monitoring view for an mlvpnd tunnel")]
+#[command(
+    name = "mlvpn-tui",
+    version,
+    about = "Live monitoring view for an mlvpnd tunnel"
+)]
 struct Cli {
     /// Path to the mlvpnd control socket. If omitted, auto-detects a
     /// single `*.sock` file under /run/mlvpn/ and uses that.
@@ -171,7 +175,8 @@ fn run_app(
                     continue;
                 }
                 let quit = matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
-                    || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL));
+                    || (key.code == KeyCode::Char('c')
+                        && key.modifiers.contains(KeyModifiers::CONTROL));
                 if quit {
                     return Ok(());
                 }
@@ -184,7 +189,11 @@ fn draw(f: &mut Frame, state: &SharedState, socket_path: &Path) {
     let area = f.area();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(0), Constraint::Length(1)])
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(0),
+            Constraint::Length(1),
+        ])
         .split(area);
 
     draw_header(f, chunks[0], state, socket_path);
@@ -192,7 +201,12 @@ fn draw(f: &mut Frame, state: &SharedState, socket_path: &Path) {
     draw_footer(f, chunks[2], state);
 }
 
-fn draw_header(f: &mut Frame, area: ratatui::layout::Rect, state: &SharedState, socket_path: &Path) {
+fn draw_header(
+    f: &mut Frame,
+    area: ratatui::layout::Rect,
+    state: &SharedState,
+    socket_path: &Path,
+) {
     let (title, style) = match &state.snapshot {
         Some(snap) => (
             format!(
@@ -201,10 +215,15 @@ fn draw_header(f: &mut Frame, area: ratatui::layout::Rect, state: &SharedState, 
                 snap.mode,
                 socket_path.display()
             ),
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         ),
         None => (
-            format!("mlvpn-tui  --  waiting for data from {}...", socket_path.display()),
+            format!(
+                "mlvpn-tui  --  waiting for data from {}...",
+                socket_path.display()
+            ),
             Style::default().fg(Color::Yellow),
         ),
     };
@@ -296,11 +315,20 @@ fn draw_footer(f: &mut Frame, area: ratatui::layout::Rect, state: &SharedState) 
             Some(t) if t.elapsed() < Duration::from_secs(3) => {
                 Span::styled("connected", Style::default().fg(Color::Green))
             }
-            Some(_) => Span::styled("connected, no recent data", Style::default().fg(Color::Yellow)),
-            None => Span::styled("connected, waiting for first snapshot", Style::default().fg(Color::Yellow)),
+            Some(_) => Span::styled(
+                "connected, no recent data",
+                Style::default().fg(Color::Yellow),
+            ),
+            None => Span::styled(
+                "connected, waiting for first snapshot",
+                Style::default().fg(Color::Yellow),
+            ),
         }
     } else {
-        Span::styled("disconnected -- retrying...", Style::default().fg(Color::Red))
+        Span::styled(
+            "disconnected -- retrying...",
+            Style::default().fg(Color::Red),
+        )
     };
 
     let line = Line::from(vec![
@@ -313,20 +341,25 @@ fn draw_footer(f: &mut Frame, area: ratatui::layout::Rect, state: &SharedState) 
 
 fn state_style(s: &str) -> Style {
     match s {
-        "up" => Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+        "up" => Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD),
         "down" => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         _ => Style::default().fg(Color::Yellow),
     }
 }
 
 fn fmt_ms(v: Option<f64>) -> String {
-    v.map(|v| format!("{v:.1}ms")).unwrap_or_else(|| "-".to_string())
+    v.map(|v| format!("{v:.1}ms"))
+        .unwrap_or_else(|| "-".to_string())
 }
 
 fn fmt_pct(v: Option<f64>) -> String {
-    v.map(|v| format!("{v:.1}%")).unwrap_or_else(|| "-".to_string())
+    v.map(|v| format!("{v:.1}%"))
+        .unwrap_or_else(|| "-".to_string())
 }
 
 fn fmt_mbps(v: Option<f64>) -> String {
-    v.map(|v| format!("{v:.1}Mbps")).unwrap_or_else(|| "-".to_string())
+    v.map(|v| format!("{v:.1}Mbps"))
+        .unwrap_or_else(|| "-".to_string())
 }

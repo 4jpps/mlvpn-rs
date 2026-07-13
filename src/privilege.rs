@@ -62,7 +62,8 @@ pub fn drop_privileges(target: &DropTarget) -> Result<()> {
     // Order matters: clear supplementary groups and set the real/effective
     // gid *before* dropping the uid. Once we're no longer root we lose the
     // ability to change gid at all.
-    setgroups(&[]).map_err(|e| MlvpnError::Privilege(format!("clearing supplementary groups: {e}")))?;
+    setgroups(&[])
+        .map_err(|e| MlvpnError::Privilege(format!("clearing supplementary groups: {e}")))?;
     setgid(group.gid).map_err(|e| MlvpnError::Privilege(format!("setgid: {e}")))?;
     setuid(user.uid).map_err(|e| MlvpnError::Privilege(format!("setuid: {e}")))?;
 

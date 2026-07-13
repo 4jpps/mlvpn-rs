@@ -183,7 +183,9 @@ async fn build_snapshot(
                 peer_jitter_ms: peer.as_ref().map(|p| p.jitter_ms),
                 peer_loss_pct: peer.as_ref().map(|p| p.loss_pct),
                 peer_throughput_mbps: peer.as_ref().map(|p| p.throughput_mbps),
-                peer_stats_age_ms: peer.as_ref().map(|p| p.received_at.elapsed().as_millis() as u64),
+                peer_stats_age_ms: peer
+                    .as_ref()
+                    .map(|p| p.received_at.elapsed().as_millis() as u64),
             }
         })
         .collect();

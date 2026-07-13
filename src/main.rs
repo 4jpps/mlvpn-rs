@@ -89,7 +89,8 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
 
     let mut links = Vec::with_capacity(cfg.links.len());
     for (i, link_cfg) in cfg.links.iter().enumerate() {
-        let id = u8::try_from(i).map_err(|_| MlvpnError::Config("too many links (max 255)".into()))?;
+        let id =
+            u8::try_from(i).map_err(|_| MlvpnError::Config("too many links (max 255)".into()))?;
         let link = link::Link::bind(id, link_cfg.clone(), cfg.scheduler.ewma_alpha).await?;
         tracing::info!(
             link = %link_cfg.name,
@@ -111,9 +112,13 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     // (and anything else that wants to read newline-delimited JSON off a
     // Unix socket -- see `control.rs`). `None` disables it entirely.
     let control_socket = if cfg.control.enabled {
-        Some(cfg.control.socket_path.clone().map(PathBuf::from).unwrap_or_else(|| {
-            PathBuf::from(format!("/run/mlvpn/{}.sock", cfg.tunnel.name))
-        }))
+        Some(
+            cfg.control
+                .socket_path
+                .clone()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(format!("/run/mlvpn/{}.sock", cfg.tunnel.name))),
+        )
     } else {
         None
     };
@@ -154,11 +159,13 @@ fn open_tun(cfg: &config::TunnelConfig) -> Result<tun_rs::AsyncDevice> {
 }
 
 fn parse_cidr(s: &str) -> Result<(String, u8)> {
-    let (addr, prefix) = s
-        .split_once('/')
-        .ok_or_else(|| MlvpnError::Config(format!("tunnel.address '{s}' must be in CIDR form, e.g. 10.0.0.1/30")))?;
-    let prefix: u8 = prefix
-        .parse()
-        .map_err(|_| MlvpnError::Config(format!("invalid prefix length in tunnel.address '{s}'")))?;
+    let (addr, prefix) = s.split_once('/').ok_or_else(|| {
+        MlvpnError::Config(format!(
+            "tunnel.address '{s}' must be in CIDR form, e.g. 10.0.0.1/30"
+        ))
+    })?;
+    let prefix: u8 = prefix.parse().map_err(|_| {
+        MlvpnError::Config(format!("invalid prefix length in tunnel.address '{s}'"))
+    })?;
     Ok((addr.to_string(), prefix))
 }

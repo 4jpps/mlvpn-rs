@@ -131,11 +131,10 @@ pub async fn run(tun: AsyncDevice, links: Vec<Link>, params: TunnelParams) -> Re
     // monitoring client.
     let peer_stats = Arc::new(PeerStatsTable::new());
 
-    let n_links = trackers.len();
     let mut handles = Vec::new();
 
-    for idx in 0..n_links {
-        let tracker = trackers[idx].clone();
+    for (idx, tracker) in trackers.iter().enumerate() {
+        let tracker = tracker.clone();
         {
             let links = links.clone();
             let session = session.clone();
@@ -242,10 +241,15 @@ async fn establish_session(
                 }
                 .encode(&mut frame);
                 frame.extend_from_slice(&msg1);
-                socket.send_to(&frame, remote).await.map_err(MlvpnError::Io)?;
+                socket
+                    .send_to(&frame, remote)
+                    .await
+                    .map_err(MlvpnError::Io)?;
 
                 let mut buf = vec![0u8; MAX_FRAME];
-                match tokio::time::timeout(Duration::from_millis(500), socket.recv_from(&mut buf)).await {
+                match tokio::time::timeout(Duration::from_millis(500), socket.recv_from(&mut buf))
+                    .await
+                {
                     Ok(Ok((n, from))) => {
                         // Quick filter, not a security boundary (UDP
                         // source addresses are trivially spoofable; the
@@ -262,7 +266,8 @@ async fn establish_session(
 
                         buf.truncate(n);
                         let Ok((hdr, payload)) = Header::decode(&buf) else {
-                            last_err = Some(MlvpnError::Handshake("undecodable reply frame".into()));
+                            last_err =
+                                Some(MlvpnError::Handshake("undecodable reply frame".into()));
                             continue;
                         };
                         if hdr.ptype != PacketType::HandshakeResp {
@@ -336,7 +341,10 @@ async fn establish_session(
             // per-socket ownership instead once the session exists.
             let sockets: Vec<(Arc<UdpSocket>, u8)> = {
                 let links_guard = links.lock().await;
-                links_guard.iter().map(|l| (l.socket.clone(), l.id)).collect()
+                links_guard
+                    .iter()
+                    .map(|l| (l.socket.clone(), l.id))
+                    .collect()
             };
             let mut buf = vec![0u8; MAX_FRAME];
 
@@ -364,7 +372,8 @@ async fn establish_session(
                 let mut hit = None;
                 for (socket, link_id) in &sockets {
                     if let Ok(Ok((n, from))) =
-                        tokio::time::timeout(Duration::from_millis(50), socket.recv_from(&mut buf)).await
+                        tokio::time::timeout(Duration::from_millis(50), socket.recv_from(&mut buf))
+                            .await
                     {
                         hit = Some((n, from, *link_id, socket.clone()));
                         break;
@@ -537,8 +546,19 @@ async fn link_receiver(
     loop {
         let (n, from) = socket.recv_from(&mut buf).await.map_err(MlvpnError::Io)?;
         handle_incoming(
-            idx, link_id, &buf[..n], from, &socket, &links, &session, &scheduler, &tun, &reorder,
-            &cfg, &tracker, &peer_stats,
+            idx,
+            link_id,
+            &buf[..n],
+            from,
+            &socket,
+            &links,
+            &session,
+            &scheduler,
+            &tun,
+            &reorder,
+            &cfg,
+            &tracker,
+            &peer_stats,
         )
         .await;
     }
