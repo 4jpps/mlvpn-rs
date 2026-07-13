@@ -16,11 +16,16 @@
 //! +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 //! ```
 //!
-//! `SessionId`, `Type` and `LinkId` are authenticated-but-not-encrypted
-//! associated data (AAD) fed into the AEAD along with the sequence number;
-//! `Payload` is the ciphertext (which includes the AEAD tag at its end) for
-//! Data/Keepalive/Probe frames, or raw Noise handshake bytes for
-//! Handshake frames (Noise protects its own handshake messages).
+//! `SessionId`, `Type` and `LinkId` are plaintext dispatch metadata, *not*
+//! AEAD associated data -- `snow`'s `StatelessTransportState` (see
+//! `crypto.rs`) doesn't expose an AAD parameter, so they aren't
+//! cryptographically bound to the ciphertext. `Payload` is the ciphertext
+//! (which includes the AEAD tag at its end) for Data/Keepalive/Probe/
+//! ProbeReply frames, or raw Noise handshake bytes for Handshake frames
+//! (Noise protects its own handshake messages). See `crypto.rs`'s module
+//! doc comment for why this is an acceptable tradeoff: the sequence
+//! number doubles as the AEAD nonce and is therefore implicitly
+//! authenticated, which is what actually matters here.
 //!
 //! The 64-bit sequence number is global per session (not per-link): it is
 //! what lets the receiver detect replay and reorder packets that arrive
@@ -112,13 +117,6 @@ impl Header {
         ))
     }
 
-    /// Bytes fed to the AEAD as associated data: everything that must be
-    /// authenticated but is not itself encrypted.
-    pub fn aad(&self) -> Vec<u8> {
-        let mut v = Vec::with_capacity(HEADER_LEN);
-        self.encode(&mut v);
-        v
-    }
 }
 
 /// Payload of a Probe/ProbeReply frame, used by the latency monitor.

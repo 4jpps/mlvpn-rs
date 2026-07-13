@@ -29,6 +29,12 @@ pub enum MlvpnError {
     #[error("replayed or out-of-window packet dropped")]
     Replay,
 
+    /// Not constructed by the current scheduler (see `scheduler.rs`:
+    /// `select()` always attempts the least-bad link rather than giving
+    /// up), but kept for a future health/metrics surface that wants to
+    /// report "every link failed its probes" as a distinct condition from
+    /// individual link errors.
+    #[allow(dead_code)]
     #[error("no interfaces are currently usable: link aggregate is down")]
     AllLinksDown,
 
@@ -41,6 +47,10 @@ pub enum MlvpnError {
     #[error("protocol error: {0}")]
     Protocol(String),
 
+    /// Reserved for a future refactor of the actor tasks in `tunnel.rs`
+    /// onto explicit `mpsc` channels; the current design coordinates
+    /// through shared `Mutex` state instead, so this can't yet occur.
+    #[allow(dead_code)]
     #[error("channel closed unexpectedly")]
     ChannelClosed,
 }

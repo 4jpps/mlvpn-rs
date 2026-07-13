@@ -351,6 +351,9 @@ async fn link_actor(
     let probe_seq_counter = AtomicU32::new(0);
     let mut probe_tick = interval(Duration::from_millis(probe_interval_ms));
     let mut sweep_tick = interval(Duration::from_millis(probe_interval_ms));
+    // Only meaningful/used by the idx == 0 actor; see the sweep_tick arm
+    // below for why only one actor reports the aggregate down state.
+    let mut all_down_reported = false;
 
     let mut buf = vec![0u8; MAX_FRAME];
 
@@ -380,6 +383,27 @@ async fn link_actor(
                     monitor::update_link_state(&mut links_guard[idx], &cfg);
                     let mut sched = scheduler.lock().unwrap();
                     sched.refresh(&links_guard);
+                }
+
+                // Only one of the N link actors needs to report the
+                // aggregate state, and only on the edge (not every tick
+                // while it stays down), or this would spam the log once
+                // per link per probe interval. Runs every sweep tick
+                // regardless of whether *this* link had a miss, since a
+                // different link's state is what may have changed.
+                if idx == 0 {
+                    let links_guard = links.lock().await;
+                    let sched = scheduler.lock().unwrap();
+                    let now_all_down = sched.all_down(&links_guard);
+                    if now_all_down && !all_down_reported {
+                        tracing::warn!(
+                            "all links are currently down; still attempting delivery on the \
+                             least-bad link (see scheduler.rs) rather than stalling the tunnel"
+                        );
+                    } else if !now_all_down && all_down_reported {
+                        tracing::info!("at least one link is back up; aggregate no longer down");
+                    }
+                    all_down_reported = now_all_down;
                 }
             }
         }

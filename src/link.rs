@@ -59,8 +59,6 @@ pub struct LinkStats {
     last_rtt_ms: Option<f64>,
     pub consecutive_misses: u32,
     pub consecutive_hits: u32,
-    pub last_probe_sent_ns: Option<u64>,
-    pub next_probe_seq: u32,
     pub bytes_since_last_sample: u64,
     pub last_throughput_sample: Instant,
 }
@@ -75,8 +73,6 @@ impl LinkStats {
             last_rtt_ms: None,
             consecutive_misses: 0,
             consecutive_hits: 0,
-            last_probe_sent_ns: None,
-            next_probe_seq: 0,
             bytes_since_last_sample: 0,
             last_throughput_sample: Instant::now(),
         }
@@ -147,10 +143,19 @@ impl Link {
             socket
                 .bind_device(Some(config.bind_interface.as_bytes()))
                 .map_err(|e| {
-                    MlvpnError::Config(format!(
-                        "binding link '{}' to interface '{}': {e} (does the interface exist? are we running with CAP_NET_RAW?)",
-                        config.name, config.bind_interface
-                    ))
+                    // ENODEV specifically means the named interface doesn't
+                    // exist on this system right now (typo in config, or a
+                    // hot-pluggable interface like wwan0 that hasn't come
+                    // up yet) -- worth its own error variant so operators
+                    // get a precise diagnosis instead of a generic one.
+                    if e.raw_os_error() == Some(libc::ENODEV) {
+                        MlvpnError::InterfaceNotFound(config.bind_interface.clone())
+                    } else {
+                        MlvpnError::Config(format!(
+                            "binding link '{}' to interface '{}': {e} (are we running with CAP_NET_RAW?)",
+                            config.name, config.bind_interface
+                        ))
+                    }
                 })?;
         }
 

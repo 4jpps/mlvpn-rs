@@ -136,7 +136,6 @@ pub fn decode_public_key(b64: &str) -> Result<[u8; 32]> {
 /// (server side of a given link/session).
 pub struct Handshake {
     state: HandshakeState,
-    pub is_initiator: bool,
 }
 
 impl Handshake {
@@ -151,10 +150,7 @@ impl Handshake {
             .map_err(|e| MlvpnError::Handshake(e.to_string()))?
             .build_initiator()
             .map_err(|e| MlvpnError::Handshake(e.to_string()))?;
-        Ok(Self {
-            state,
-            is_initiator: true,
-        })
+        Ok(Self { state })
     }
 
     pub fn new_responder(local_private: &LocalPrivateKey) -> Result<Self> {
@@ -166,10 +162,7 @@ impl Handshake {
             .map_err(|e| MlvpnError::Handshake(e.to_string()))?
             .build_responder()
             .map_err(|e| MlvpnError::Handshake(e.to_string()))?;
-        Ok(Self {
-            state,
-            is_initiator: false,
-        })
+        Ok(Self { state })
     }
 
     /// Produce the initiator's first handshake message (`-> e, es, s, ss`).
@@ -207,6 +200,11 @@ impl Handshake {
         Ok(())
     }
 
+    /// Unused today (the handshake state machine in `tunnel.rs` already
+    /// knows when it's done by which message it just sent/received), but
+    /// kept as public API for the rekey roadmap item in ARCHITECTURE.md,
+    /// where a background task will need to poll handshake progress.
+    #[allow(dead_code)]
     pub fn is_finished(&self) -> bool {
         self.state.is_handshake_finished()
     }
