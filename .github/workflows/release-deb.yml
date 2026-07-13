@@ -1,0 +1,60 @@
+name: Build .deb package
+
+# Runs on version tags (v1.0.0, v0.2.1, ...) to build and publish a
+# release, or manually via workflow_dispatch to just produce a
+# downloadable artifact without cutting a release (handy for testing
+# packaging changes on a branch before tagging).
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write # needed to attach the .deb to a GitHub Release
+
+jobs:
+  build-deb:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry/build
+        uses: Swatinem/rust-cache@v2
+
+      # debian/rules invokes plain `cargo build`/`cargo test`, which pick
+      # up whatever rustc/cargo are first on PATH -- the toolchain from
+      # dtolnay/rust-toolchain above -- regardless of the (possibly
+      # older) rustc apt would otherwise install to satisfy
+      # debian/control's Build-Depends. `dpkg-buildpackage` run directly
+      # like this doesn't itself enforce Build-Depends (that's what
+      # sbuild/pbuilder are for), so this is just what debhelper +
+      # dpkg-dev need to run the packaging machinery itself.
+      - name: Install packaging dependencies
+        run: sudo apt-get update && sudo apt-get install -y debhelper dpkg-dev build-essential pkg-config libc6-dev
+
+      - name: Build .deb
+        run: dpkg-buildpackage -us -uc -b
+
+      - name: Collect build output
+        run: |
+          mkdir -p dist
+          mv ../*.deb dist/
+          mv ../*.changes dist/ || true
+          mv ../*.buildinfo dist/ || true
+          ls -la dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mlvpn-deb
+          path: dist/*.deb
+
+      - name: Create/update GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.deb
+          generate_release_notes: true

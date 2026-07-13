@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry/build
+        uses: Swatinem/rust-cache@v2
+
+      # Debian 13's minimum supported toolchain per Cargo.toml
+      # (rust-version = "1.75"); build-essential/pkg-config/libc6-dev
+      # cover what tun-rs/snow/socket2 need to compile.
+      - name: Install system build dependencies
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config libc6-dev
+
+      - name: cargo build --release
+        run: cargo build --release --locked
+
+      # Unit tests only -- integration tests that need a real TUN device
+      # / CAP_NET_ADMIN aren't runnable in a standard CI container, same
+      # exclusion debian/rules applies for package builds.
+      - name: cargo test --release --lib
+        run: cargo test --release --locked --lib
+
+      # Informational only for now: not gating CI red/green on lint
+      # findings until there's been a full clippy pass over the newer
+      # monitoring code (control.rs, ipc.rs, mlvpn-tui.rs).
+      - name: cargo clippy
+        run: cargo clippy --release --locked --all-targets -- -D warnings
+        continue-on-error: true
+
+      - name: cargo fmt --check
+        run: cargo fmt --check
+        continue-on-error: true
