@@ -16,6 +16,12 @@
 #   chown mlvpn:mlvpn /etc/mlvpn/mlvpn.toml && chmod 600 /etc/mlvpn/mlvpn.toml
 #   # mlvpnd checks this itself at startup and refuses to run if the config
 #   # or private key file is readable by group/other (see config.rs).
+#
+# ExecStart below assumes /usr/bin/mlvpnd, matching where the .deb package
+# installs it (debian/rules). Building and installing manually instead of
+# via the package? Put the binary at /usr/bin/mlvpnd too (e.g. `install -m
+# 0755 target/release/mlvpnd /usr/bin/mlvpnd`) so this file doesn't need
+# editing -- or change ExecStart if you'd rather use /usr/local/bin.
 
 [Unit]
 Description=mlvpn multi-link VPN bonding daemon
@@ -27,7 +33,7 @@ StartLimitBurst=5
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/mlvpnd run --config /etc/mlvpn/mlvpn.toml
+ExecStart=/usr/bin/mlvpnd run --config /etc/mlvpn/mlvpn.toml
 Restart=on-failure
 RestartSec=2
 
@@ -39,6 +45,16 @@ CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
 # Device nodes/network namespace handling for TUN creation.
 DeviceAllow=/dev/net/tun rw
 SupplementaryGroups=
+
+# Creates /run/mlvpn (mode 0750, owned by mlvpn:mlvpn) before ExecStart
+# runs and removes it on stop -- this is what makes mlvpnd's default
+# control-socket path (/run/mlvpn/<tunnel.name>.sock, see config.rs) work
+# under ProtectSystem=strict below without needing a broader filesystem
+# exception. To use mlvpn-tui from another account, add that account to
+# the `mlvpn` group so it can traverse the directory and connect to the
+# 0600 socket -- see README.md.
+RuntimeDirectory=mlvpn
+RuntimeDirectoryMode=0750
 
 # --- Sandboxing (systemd hardening) ----------------------------------
 NoNewPrivileges=yes

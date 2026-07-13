@@ -52,14 +52,23 @@ Steady state (`tunnel.rs`) is a small set of tokio tasks:
 
 - `tun_reader` -- TUN → encrypt → `Scheduler::select()` → chosen link's
   socket.
-- one `link_actor` per physical link -- owns that link's socket; reads
-  incoming frames and dispatches by type (Data → reorder buffer → TUN;
-  Probe → authenticate, reply; ProbeReply → feed `monitor`); on a timer,
-  sends its own `Probe` frames and sweeps timed-out ones into `monitor` as
-  losses.
+- two tasks per physical link -- `link_receiver` owns that link's socket
+  and reads incoming frames, dispatching by type (Data → reorder buffer →
+  TUN; Probe → authenticate, reply; ProbeReply → feed `monitor`; StatsShare
+  → feed `peerstats::PeerStatsTable`); `link_prober` independently sends
+  `Probe` frames on a timer, sweeps timed-out ones into `monitor` as
+  losses, and sends `StatsShare` frames on a slower timer. These are two
+  separate tasks rather than one task `select!`-ing between "receive" and
+  "timer" branches: under sustained receive load, a `select!` can starve
+  the timer branches, silently disabling probing on exactly the busiest
+  links. See the module doc comment at the top of `tunnel.rs` for the full
+  reasoning.
 - `reorder_flush` -- periodically releases anything in the reorder buffer
   that's aged past the configured window, so one missing packet can't
   stall the tunnel indefinitely.
+- `control::serve` (optional, on by default) -- accepts connections on the
+  local monitoring Unix socket and streams live stats to `mlvpn-tui`. See
+  §11.
 
 See the module doc comment at the top of `tunnel.rs` for the locking
 discipline (short summary: the shared `Vec<Link>` mutex guards metadata
@@ -72,14 +81,16 @@ Defined in `protocol.rs`. Every frame after the outer UDP header has a
 16-byte plaintext header (magic, version, packet type, link id, session
 id, 64-bit sequence number) followed by a payload. `HandshakeInit` /
 `HandshakeResp` payloads are raw Noise handshake messages (Noise protects
-those itself); every other type's payload -- `Data`, `Probe`, and
-`ProbeReply` alike -- is AEAD ciphertext produced by the session
+those itself); every other type's payload -- `Data`, `Probe`, `ProbeReply`,
+and `StatsShare` alike -- is AEAD ciphertext produced by the session
 established during the handshake.
 
-Authenticating `Probe`/`ProbeReply`, not just `Data`, was a deliberate
-choice made partway through implementation: an unauthenticated probe
-channel would let an off-path attacker inject forged RTT/loss samples and
-steer scheduling decisions, or falsely flip a healthy link to `Down`. Wire
+Authenticating `Probe`/`ProbeReply` (and `StatsShare`), not just `Data`,
+was a deliberate choice made partway through implementation: an
+unauthenticated probe channel would let an off-path attacker inject forged
+RTT/loss samples and steer scheduling decisions, or falsely flip a healthy
+link to `Down` -- and an unauthenticated stats channel would let one feed
+fabricated numbers straight into the peer's monitoring display. Wire
 format details and the AAD tradeoff (the sequence number is the AEAD
 nonce and is therefore implicitly authenticated; the other header fields
 are not cryptographically bound to the ciphertext because `snow`'s
@@ -244,12 +255,61 @@ Other practices applied throughout:
   discarded; it cannot crash or hang the accept loop (see the comments in
   `tunnel::establish_session`'s `Mode::Server` arm).
 
-## 9. Build and deployment
+## 9. Monitoring: mlvpn-tui and the control socket
+
+Operating a bonding VPN by tailing `journalctl -u mlvpn` on both ends and
+mentally correlating timestamps doesn't scale past "it's obviously
+broken." `mlvpn-tui` exists to make link health visible at a glance, on
+either end, without needing shell access to the other side.
+
+**Wire side** (`protocol.rs`): each link's `link_prober` task sends a
+`PacketType::StatsShare` frame roughly once a second, carrying that link's
+own current `rtt_ms` / `jitter_ms` / `loss_pct` / `throughput_mbps` /
+state and its configured name (`StatsPayload`, fixed 33-byte encoding,
+AEAD-protected like every other post-handshake frame type -- see §3 for
+why authentication matters here specifically). The receiving
+`link_receiver` task decodes it and stores it in
+`peerstats::PeerStatsTable`, keyed by *our own* local link index rather
+than anything the sender includes -- each link is a dedicated
+point-to-point socket pairing, so the local receiving index already
+unambiguously identifies the physical link regardless of how the two
+sides happen to order their own `[[links]]` config.
+
+**IPC side** (`ipc.rs`, `control.rs`): `mlvpnd` optionally (on by default,
+`[control] enabled`) binds a Unix domain socket at
+`/run/mlvpn/<tunnel.name>.sock` (mode 0600) and streams one
+newline-delimited JSON `ipc::Snapshot` per connected client roughly twice
+a second, combining each link's locally-measured stats with whatever
+`peerstats::PeerStatsTable` currently holds for it. There is deliberately
+no write/command side -- a client can only observe. `mlvpn-tui`
+(`src/bin/mlvpn-tui.rs`) is the reference client: a small, tokio-free
+binary that reads the socket on a background OS thread and renders a
+`ratatui` table on the main thread, color-coding link state and dimming
+peer-side stats once they go stale (no `StatsShare` received recently,
+e.g. because the peer is on an older build or the return path is down).
+
+Two access notes:
+
+- Systemd's `RuntimeDirectory=mlvpn` (in `systemd/mlvpn.service`) is what
+  makes `/run/mlvpn` exist, owned by the unprivileged `mlvpn` user, under
+  `ProtectSystem=strict` -- without it the daemon would have nowhere
+  permitted to create the socket file post-privilege-drop.
+- The socket's 0600 permissions mean only the `mlvpn` user (or root) can
+  connect by default; add another account to the `mlvpn` group and loosen
+  `RuntimeDirectoryMode`/the socket's own mode if you want a
+  non-privileged monitoring-only account to run `mlvpn-tui` too.
+
+## 10. Build and deployment
 
 ```
 cargo build --release
-sudo install -m0755 target/release/mlvpnd /usr/local/bin/mlvpnd
+sudo install -m0755 target/release/mlvpnd /usr/bin/mlvpnd
+sudo install -m0755 target/release/mlvpn-tui /usr/bin/mlvpn-tui
 ```
+
+(`/usr/bin`, not `/usr/local/bin`, to match where the shipped systemd unit
+and Debian package expect the binaries -- see `systemd/mlvpn.service`'s
+header comment if you'd rather install elsewhere.)
 
 Or build the `.deb` in `debian/` (targets Debian 13 / any recent
 debhelper-compat 13 system):
@@ -263,19 +323,22 @@ See the top of `systemd/mlvpn.service` for one-time host setup
 `config/mlvpn.toml.example` / `config/mlvpn-server.toml.example` for a
 paired client/server configuration.
 
-**A note on verification**: this codebase was written and reasoned about
-carefully, including verifying the exact API surface of its two riskiest
-dependencies (`snow`'s `StatelessTransportState`, `tun-rs`'s
-`AsyncDevice`) against current published documentation. It has **not**
-been compiled -- the environment this was produced in has no Rust
-toolchain and no network access to install one. Treat this as a thorough
-first draft: run `cargo build`, expect to fix a handful of small type/API
-mismatches (most likely candidates: exact parameter types on
-`tun_rs::DeviceBuilder::mtu`/`ipv4`, and `socket2::Socket::bind_device`'s
-exact signature on your installed `socket2` version), and then move on to
-the roadmap below.
+**A note on verification**: the core tunnel (everything through §8) has
+been built successfully with `cargo build --release` (0 errors) and its
+unit tests pass (`monitor::score`, `scheduler`'s SWRR distribution). The
+monitoring layer in §9 (`StatsShare`, `ipc.rs`, `control.rs`,
+`mlvpn-tui`, and the `lib.rs`/`main.rs` restructuring that split the
+crate into a library plus two binaries so they could share `ipc.rs`) is
+new and has not yet had a `cargo build --release` run against it -- run
+that first after pulling these changes and expect to fix any small
+API-surface mismatches in the `ratatui`/`crossterm` calls in
+`src/bin/mlvpn-tui.rs`, which is the least-verified file in the tree.
+Neither the core tunnel nor the monitoring layer has yet been exercised
+as two real processes exchanging traffic over real network links/veth
+pairs -- see item 6 in the roadmap below for the integration-test gap
+that would close out that remaining uncertainty.
 
-## 10. Known limitations / roadmap
+## 11. Known limitations / roadmap
 
 Deliberately out of scope for this first pass, in rough priority order:
 
@@ -306,3 +369,18 @@ Deliberately out of scope for this first pass, in rough priority order:
 7. **Bandwidth ceiling is operator-declared only** (`bandwidth_cap_mbps`);
    there's no active bandwidth probing to discover it automatically the
    way latency/jitter are discovered.
+8. **The control socket is read-only.** `mlvpn-tui` can observe but not
+   act -- there's no way to, say, temporarily pin traffic off a flapping
+   link from the TUI. Adding a command channel would need its own
+   authorization story (the socket's 0600 permissions are enough for
+   "can observe," not necessarily enough for "can redirect live traffic").
+9. **Bonding is score-proportional only.** `scheduler.rs`'s SWRR already
+   spreads traffic across every `Up` link in proportion to its measured
+   score, which combines their bandwidth rather than just failing over --
+   but there's no explicit per-link bandwidth cap/shaping (beyond the
+   passive `bandwidth_cap_mbps` ceiling on the score itself) or optional
+   redundancy/broadcast mode (duplicating latency-sensitive traffic across
+   multiple links for extra reliability at the cost of bandwidth). Neither
+   was needed for the current use case; both are natural extensions to
+   `scheduler::Scheduler::select()` if a future need justifies the added
+   complexity.

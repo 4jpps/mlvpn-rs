@@ -19,6 +19,40 @@ pub enum LinkState {
     Down,
 }
 
+impl LinkState {
+    /// Wire encoding used by `protocol::StatsPayload` and the JSON
+    /// `ipc::LinkSnapshot` schema.
+    pub fn to_wire(self) -> u8 {
+        match self {
+            LinkState::Probing => 0,
+            LinkState::Up => 1,
+            LinkState::Down => 2,
+        }
+    }
+
+    /// Inverse of `to_wire`. Any unrecognized byte (e.g. a future version
+    /// on the peer) decodes as `Probing` rather than failing outright --
+    /// this only ever feeds a monitoring display, never a security or
+    /// scheduling decision, so "unknown" degrading to the most
+    /// conservative label is preferable to dropping the whole StatsShare
+    /// frame.
+    pub fn from_wire(v: u8) -> Self {
+        match v {
+            1 => LinkState::Up,
+            2 => LinkState::Down,
+            _ => LinkState::Probing,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LinkState::Probing => "probing",
+            LinkState::Up => "up",
+            LinkState::Down => "down",
+        }
+    }
+}
+
 /// Exponentially-weighted moving average, used for latency/jitter/loss so
 /// the scheduler reacts to trends rather than single noisy samples.
 #[derive(Debug, Clone, Copy)]

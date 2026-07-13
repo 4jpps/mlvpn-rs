@@ -11,6 +11,7 @@ override_dh_auto_build:
 
 override_dh_auto_install:
 	install -D -m0755 target/release/mlvpnd debian/mlvpn/usr/bin/mlvpnd
+	install -D -m0755 target/release/mlvpn-tui debian/mlvpn/usr/bin/mlvpn-tui
 	install -D -m0644 systemd/mlvpn.service debian/mlvpn/lib/systemd/system/mlvpn.service
 	install -D -m0644 config/mlvpn.toml.example debian/mlvpn/usr/share/doc/mlvpn/mlvpn.toml.example
 	install -D -m0644 config/mlvpn-server.toml.example debian/mlvpn/usr/share/doc/mlvpn/mlvpn-server.toml.example

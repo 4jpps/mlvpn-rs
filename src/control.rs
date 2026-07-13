@@ -1,0 +1,164 @@
+//! Local monitoring control socket.
+//!
+//! `mlvpnd` listens on a Unix domain socket (path from `[control]` in the
+//! config; default `/run/mlvpn/<tunnel.name>.sock`) and streams one
+//! newline-delimited JSON `ipc::Snapshot` roughly twice a second to every
+//! connected client for as long as that client stays connected.
+//! `mlvpn-tui` is the reference client (`src/bin/mlvpn-tui.rs`), but the
+//! format is plain enough to consume with `socat -u UNIX-CONNECT:<path> -
+//! | jq` for ad-hoc debugging.
+//!
+//! Security: this socket exposes live topology (bind interfaces, learned
+//! peer IP:port per link) and traffic statistics -- never key material,
+//! and there is no write/command side, so a reader can only observe, never
+//! redirect traffic or exfiltrate secrets. Even so, the socket file is
+//! created mode 0600 so only the daemon's own runtime user (or root) can
+//! connect; anyone who can already read it can already read `/proc` for
+//! the same process, so this isn't adding new exposure, just convenience.
+
+use crate::ipc::{LinkSnapshot, Snapshot};
+use crate::link::{Link, LinkState};
+use crate::peerstats::PeerStatsTable;
+use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::io::AsyncWriteExt;
+use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::Mutex as AsyncMutex;
+use tokio::time::interval;
+
+const SNAPSHOT_INTERVAL_MS: u64 = 500;
+
+/// Bind the control socket and serve snapshots to whoever connects until
+/// the process exits. Any setup failure (can't create the runtime
+/// directory, can't bind, path already in use by something else) is
+/// logged and treated as "monitoring unavailable" rather than a fatal
+/// daemon error -- a stats socket is a convenience feature, not something
+/// that should be able to take the tunnel down.
+pub async fn serve(
+    path: PathBuf,
+    links: Arc<AsyncMutex<Vec<Link>>>,
+    peer_stats: Arc<PeerStatsTable>,
+    tunnel_name: String,
+    mode: String,
+) {
+    if let Some(parent) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            tracing::warn!(
+                error = %e,
+                path = %parent.display(),
+                "failed to create control socket directory; mlvpn-tui will be unavailable"
+            );
+            return;
+        }
+    }
+
+    // A stale socket file left behind by an unclean previous shutdown
+    // would otherwise make bind() fail with AddrInUse even though nothing
+    // is actually listening on it anymore.
+    let _ = std::fs::remove_file(&path);
+
+    let listener = match UnixListener::bind(&path) {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                path = %path.display(),
+                "failed to bind control socket; mlvpn-tui will be unavailable"
+            );
+            return;
+        }
+    };
+
+    if let Err(e) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)) {
+        tracing::warn!(error = %e, "failed to restrict control socket permissions to 0600");
+    }
+
+    tracing::info!(path = %path.display(), "control socket listening (for mlvpn-tui)");
+
+    loop {
+        let (stream, _addr) = match listener.accept().await {
+            Ok(x) => x,
+            Err(e) => {
+                tracing::warn!(error = %e, "control socket accept failed");
+                continue;
+            }
+        };
+        let links = links.clone();
+        let peer_stats = peer_stats.clone();
+        let tunnel_name = tunnel_name.clone();
+        let mode = mode.clone();
+        tokio::spawn(async move {
+            serve_client(stream, links, peer_stats, tunnel_name, mode).await;
+        });
+    }
+}
+
+async fn serve_client(
+    mut stream: UnixStream,
+    links: Arc<AsyncMutex<Vec<Link>>>,
+    peer_stats: Arc<PeerStatsTable>,
+    tunnel_name: String,
+    mode: String,
+) {
+    let mut tick = interval(Duration::from_millis(SNAPSHOT_INTERVAL_MS));
+    loop {
+        tick.tick().await;
+        let snapshot = build_snapshot(&links, &peer_stats, &tunnel_name, &mode).await;
+        let Ok(mut line) = serde_json::to_vec(&snapshot) else {
+            continue;
+        };
+        line.push(b'\n');
+        if stream.write_all(&line).await.is_err() {
+            return; // client disconnected
+        }
+    }
+}
+
+async fn build_snapshot(
+    links: &Arc<AsyncMutex<Vec<Link>>>,
+    peer_stats: &Arc<PeerStatsTable>,
+    tunnel_name: &str,
+    mode: &str,
+) -> Snapshot {
+    let links_guard = links.lock().await;
+    let link_snapshots = links_guard
+        .iter()
+        .enumerate()
+        .map(|(idx, link)| {
+            let peer = peer_stats.get(idx as u8);
+            LinkSnapshot {
+                name: link.config.name.clone(),
+                bind_interface: link.config.bind_interface.clone(),
+                local_port: link.config.local_port,
+                remote_addr: link.remote.map(|a| a.to_string()),
+                state: link.state.as_str().to_string(),
+                score: crate::monitor::score(link),
+                local_rtt_ms: link.stats.rtt_ms.get(),
+                local_jitter_ms: link.stats.jitter_ms.get(),
+                local_loss_pct: link.stats.loss_rate.get().map(|v| v * 100.0),
+                local_throughput_mbps: link.stats.throughput_mbps.get(),
+                peer_name: peer.as_ref().map(|p| p.name.clone()),
+                peer_state: peer
+                    .as_ref()
+                    .map(|p| LinkState::from_wire(p.state).as_str().to_string()),
+                peer_rtt_ms: peer.as_ref().map(|p| p.rtt_ms),
+                peer_jitter_ms: peer.as_ref().map(|p| p.jitter_ms),
+                peer_loss_pct: peer.as_ref().map(|p| p.loss_pct),
+                peer_throughput_mbps: peer.as_ref().map(|p| p.throughput_mbps),
+                peer_stats_age_ms: peer.as_ref().map(|p| p.received_at.elapsed().as_millis() as u64),
+            }
+        })
+        .collect();
+
+    Snapshot {
+        tunnel_name: tunnel_name.to_string(),
+        mode: mode.to_string(),
+        unix_ts_ms: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64,
+        links: link_snapshots,
+    }
+}

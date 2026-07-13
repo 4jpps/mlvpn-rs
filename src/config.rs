@@ -31,6 +31,9 @@ pub struct Config {
 
     #[serde(default)]
     pub logging: LoggingConfig,
+
+    #[serde(default)]
+    pub control: ControlConfig,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -38,6 +41,15 @@ pub struct Config {
 pub enum Mode {
     Server,
     Client,
+}
+
+impl Mode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Mode::Server => "server",
+            Mode::Client => "client",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -173,6 +185,40 @@ impl Default for LoggingConfig {
     fn default() -> Self {
         Self {
             level: default_log_level(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ControlConfig {
+    /// Enable the local Unix-socket monitoring interface used by
+    /// `mlvpn-tui`. On by default; the socket exposes no key material and
+    /// is created mode 0600 (see `control.rs`), so there's little reason
+    /// to disable it, but the option exists for minimal/locked-down
+    /// deployments that want to shed anything not strictly required.
+    #[serde(default = "default_control_enabled")]
+    pub enabled: bool,
+    /// Override the Unix socket path. When unset, defaults to
+    /// `/run/mlvpn/<tunnel.name>.sock`, which matches the
+    /// `RuntimeDirectory=mlvpn` directive in the shipped systemd unit
+    /// (that directive is what makes `/run/mlvpn` exist, owned by the
+    /// service's unprivileged runtime user, before mlvpnd ever starts --
+    /// see systemd/mlvpn.service).
+    pub socket_path: Option<String>,
+}
+
+fn default_control_enabled() -> bool {
+    true
+}
+
+impl Default for ControlConfig {
+    // Hand-written for the same reason as `LoggingConfig::default()`
+    // above: this is what serde calls when the whole `[control]` table is
+    // absent from the TOML, and it must still produce `enabled: true`.
+    fn default() -> Self {
+        Self {
+            enabled: default_control_enabled(),
+            socket_path: None,
         }
     }
 }

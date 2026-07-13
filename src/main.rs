@@ -1,16 +1,7 @@
-mod config;
-mod crypto;
-mod error;
-mod link;
-mod monitor;
-mod privilege;
-mod protocol;
-mod scheduler;
-mod tunnel;
-
 use clap::{Parser, Subcommand};
-use config::Config;
-use error::{MlvpnError, Result};
+use mlvpn::config::{self, Config};
+use mlvpn::error::{MlvpnError, Result};
+use mlvpn::{crypto, link, privilege, tunnel};
 use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
 
@@ -116,6 +107,17 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     privilege::drop_privileges(&privilege::DropTarget::default())?;
     privilege::assert_unprivileged()?;
 
+    // The control socket exposes live link/traffic stats to `mlvpn-tui`
+    // (and anything else that wants to read newline-delimited JSON off a
+    // Unix socket -- see `control.rs`). `None` disables it entirely.
+    let control_socket = if cfg.control.enabled {
+        Some(cfg.control.socket_path.clone().map(PathBuf::from).unwrap_or_else(|| {
+            PathBuf::from(format!("/run/mlvpn/{}.sock", cfg.tunnel.name))
+        }))
+    } else {
+        None
+    };
+
     let params = tunnel::TunnelParams {
         mode: cfg.mode,
         mtu: cfg.tunnel.mtu,
@@ -123,6 +125,8 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
         local_private,
         peer_public,
         rekey_interval: std::time::Duration::from_secs(cfg.crypto.rekey_interval_secs),
+        tunnel_name: cfg.tunnel.name.clone(),
+        control_socket,
     };
 
     let shutdown = tokio::signal::ctrl_c();

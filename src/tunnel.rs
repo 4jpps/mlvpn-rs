@@ -9,20 +9,27 @@
 //! - two tasks per link: `link_receiver` owns that link's UDP socket and
 //!   demultiplexes incoming frames by `PacketType` (Data goes to the
 //!   reorder buffer and then the TUN device; Probe/ProbeReply feed the
-//!   latency monitor); `link_prober` independently emits Probe frames on a
-//!   timer and sweeps timed-out ones into losses. These are deliberately
-//!   *separate* tasks rather than one task `select!`-ing between "receive"
-//!   and "probe timer" branches: under sustained high receive volume, a
-//!   biased or even fairly-randomized `select!` can keep preferring the
-//!   always-ready receive branch and starve the timer branches, which for
-//!   this daemon means probes silently stop firing on the busiest links --
-//!   precisely the ones whose quality most needs fresh measurement. Giving
-//!   the prober its own task with its own timer removes that failure mode
-//!   entirely instead of just making it statistically rare.
+//!   latency monitor; StatsShare feeds `peerstats::PeerStatsTable`);
+//!   `link_prober` independently emits Probe frames on a timer, emits
+//!   StatsShare frames on a slower timer, and sweeps timed-out probes into
+//!   losses. These are deliberately *separate* tasks rather than one task
+//!   `select!`-ing between "receive" and "probe timer" branches: under
+//!   sustained high receive volume, a biased or even fairly-randomized
+//!   `select!` can keep preferring the always-ready receive branch and
+//!   starve the timer branches, which for this daemon means probes
+//!   silently stop firing on the busiest links -- precisely the ones whose
+//!   quality most needs fresh measurement. Giving the prober its own task
+//!   with its own timer removes that failure mode entirely instead of
+//!   just making it statistically rare.
 //! - one `reorder_flush` task: releases packets from the reorder buffer
 //!   that have waited past `reorder_window_ms`, so a permanently missing
 //!   packet degrades to out-of-order delivery instead of stalling the
 //!   tunnel forever.
+//! - one optional `control::serve` task: accepts connections on the local
+//!   monitoring Unix socket and streams live link/traffic stats to
+//!   whoever connects (`mlvpn-tui`, or anything else speaking the
+//!   newline-delimited-JSON protocol in `ipc.rs`). Disabled by setting
+//!   `[control] enabled = false` in the config.
 //!
 //! Locking discipline: `links: Arc<AsyncMutex<Vec<Link>>>` guards
 //! *metadata only* (stats, state, the learned remote address). Every task
@@ -40,14 +47,17 @@
 //! and live session migration/rekey scheduling are not yet implemented.
 
 use crate::config::{Mode, SchedulerConfig};
+use crate::control;
 use crate::crypto::{self, Handshake, LocalPrivateKey, Session};
 use crate::error::{MlvpnError, Result};
 use crate::link::Link;
 use crate::monitor::{self, ProbeTracker};
-use crate::protocol::{Header, PacketType, ProbePayload, HEADER_LEN};
+use crate::peerstats::PeerStatsTable;
+use crate::protocol::{Header, PacketType, ProbePayload, StatsPayload, HEADER_LEN};
 use crate::scheduler::Scheduler;
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -58,6 +68,13 @@ use tun_rs::AsyncDevice;
 
 const MAX_FRAME: usize = 2048;
 
+/// How often each link reports its own stats to the peer via a
+/// `StatsShare` frame. Not performance-sensitive (this only feeds a
+/// monitoring display), so a fixed constant rather than another config
+/// knob -- 1s is frequent enough to feel "live" in `mlvpn-tui` without
+/// adding meaningful traffic overhead.
+const STATS_SHARE_INTERVAL_MS: u64 = 1000;
+
 pub struct TunnelParams {
     pub mode: Mode,
     pub mtu: u16,
@@ -66,6 +83,11 @@ pub struct TunnelParams {
     pub peer_public: [u8; 32],
     #[allow(dead_code)] // wired up once rekey scheduling lands (roadmap)
     pub rekey_interval: Duration,
+    /// Used to label snapshots served over the control socket and to
+    /// compute its default path (`/run/mlvpn/<tunnel_name>.sock`).
+    pub tunnel_name: String,
+    /// `None` disables the monitoring control socket entirely.
+    pub control_socket: Option<PathBuf>,
 }
 
 pub async fn run(tun: AsyncDevice, links: Vec<Link>, params: TunnelParams) -> Result<()> {
@@ -103,6 +125,12 @@ pub async fn run(tun: AsyncDevice, links: Vec<Link>, params: TunnelParams) -> Re
             .collect()
     };
 
+    // Most recent StatsShare received from the peer, per local link index.
+    // Written by `handle_incoming` (in every `link_receiver` task), read
+    // by `control::serve` when it builds a snapshot for a connected
+    // monitoring client.
+    let peer_stats = Arc::new(PeerStatsTable::new());
+
     let n_links = trackers.len();
     let mut handles = Vec::new();
 
@@ -116,9 +144,12 @@ pub async fn run(tun: AsyncDevice, links: Vec<Link>, params: TunnelParams) -> Re
             let reorder = reorder.clone();
             let cfg = params.scheduler_cfg.clone();
             let tracker = tracker.clone();
+            let peer_stats = peer_stats.clone();
             handles.push(tokio::spawn(async move {
-                if let Err(e) =
-                    link_receiver(idx, links, session, scheduler, tun, reorder, cfg, tracker).await
+                if let Err(e) = link_receiver(
+                    idx, links, session, scheduler, tun, reorder, cfg, tracker, peer_stats,
+                )
+                .await
                 {
                     tracing::error!(link_index = idx, error = %e, "link receiver exited");
                 }
@@ -133,6 +164,16 @@ pub async fn run(tun: AsyncDevice, links: Vec<Link>, params: TunnelParams) -> Re
                 link_prober(idx, links, session, scheduler, cfg, tracker).await;
             }));
         }
+    }
+
+    if let Some(path) = params.control_socket.clone() {
+        let links = links.clone();
+        let peer_stats = peer_stats.clone();
+        let tunnel_name = params.tunnel_name.clone();
+        let mode = params.mode.as_str().to_string();
+        handles.push(tokio::spawn(async move {
+            control::serve(path, links, peer_stats, tunnel_name, mode).await;
+        }));
     }
 
     {
@@ -384,6 +425,7 @@ async fn link_receiver(
     reorder: Arc<AsyncMutex<ReorderBuffer>>,
     cfg: SchedulerConfig,
     tracker: Arc<AsyncMutex<ProbeTracker>>,
+    peer_stats: Arc<PeerStatsTable>,
 ) -> Result<()> {
     let (socket, link_id) = {
         let links_guard = links.lock().await;
@@ -396,7 +438,7 @@ async fn link_receiver(
         let (n, from) = socket.recv_from(&mut buf).await.map_err(MlvpnError::Io)?;
         handle_incoming(
             idx, link_id, &buf[..n], from, &socket, &links, &session, &scheduler, &tun, &reorder,
-            &cfg, &tracker,
+            &cfg, &tracker, &peer_stats,
         )
         .await;
     }
@@ -425,6 +467,7 @@ async fn link_prober(
     let probe_seq_counter = AtomicU32::new(0);
     let mut probe_tick = interval(Duration::from_millis(probe_interval_ms));
     let mut sweep_tick = interval(Duration::from_millis(probe_interval_ms));
+    let mut stats_tick = interval(Duration::from_millis(STATS_SHARE_INTERVAL_MS));
     // Only meaningful/used by the idx == 0 prober.
     let mut all_down_reported = false;
 
@@ -433,6 +476,15 @@ async fn link_prober(
             _ = probe_tick.tick() => {
                 let mut t = tracker.lock().await;
                 send_probe(&socket, link_id, &links, idx, &session, &probe_seq_counter, &mut t).await;
+            }
+
+            // A third independent timer branch, same rationale as the
+            // probe/sweep split described in the module doc comment: this
+            // only feeds a monitoring display, so it must never be able
+            // to delay (or be delayed by) probing, which is what actually
+            // drives scheduling decisions.
+            _ = stats_tick.tick() => {
+                send_stats_share(&socket, link_id, &links, idx, &session).await;
             }
 
             _ = sweep_tick.tick() => {
@@ -489,6 +541,7 @@ async fn handle_incoming(
     reorder: &Arc<AsyncMutex<ReorderBuffer>>,
     cfg: &SchedulerConfig,
     tracker: &Arc<AsyncMutex<ProbeTracker>>,
+    peer_stats: &Arc<PeerStatsTable>,
 ) {
     let Ok((hdr, ciphertext)) = Header::decode(frame) else {
         return;
@@ -600,6 +653,14 @@ async fn handle_incoming(
                 sched.refresh(&links_guard);
             }
         }
+        PacketType::StatsShare => {
+            if let Ok(payload) = StatsPayload::decode(&plaintext) {
+                // Keyed by our own idx (the link we received this on),
+                // not anything the sender included -- see StatsPayload's
+                // doc comment for why that's the correct choice here.
+                peer_stats.update(idx as u8, &payload);
+            }
+        }
         PacketType::Keepalive | PacketType::Disconnect => {
             // Keepalives need no action beyond having been received (the
             // socket read itself is enough to keep NAT bindings alive);
@@ -660,6 +721,56 @@ async fn send_probe(
     if socket.send_to(&frame, remote).await.is_ok() {
         tracker.record_sent(probe_seq);
     }
+}
+
+/// Send this link's current locally-measured stats to the peer, so their
+/// `mlvpn-tui` can show a full-duplex view instead of only what they
+/// measure themselves. See `PacketType::StatsShare` and `StatsPayload`'s
+/// doc comments in `protocol.rs` for the wire format and design
+/// rationale.
+async fn send_stats_share(
+    socket: &Arc<UdpSocket>,
+    link_id: u8,
+    links: &Arc<AsyncMutex<Vec<Link>>>,
+    idx: usize,
+    session: &Arc<AsyncMutex<Session>>,
+) {
+    let (remote, payload) = {
+        let links_guard = links.lock().await;
+        let link = &links_guard[idx];
+        let Some(remote) = link.remote else { return };
+        let payload = StatsPayload {
+            name: StatsPayload::encode_name(&link.config.name),
+            rtt_ms: link.stats.rtt_ms.get().unwrap_or(0.0) as f32,
+            jitter_ms: link.stats.jitter_ms.get().unwrap_or(0.0) as f32,
+            loss_pct: (link.stats.loss_rate.get().unwrap_or(0.0) * 100.0) as f32,
+            throughput_mbps: link.stats.throughput_mbps.get().unwrap_or(0.0) as f32,
+            state: link.state.to_wire(),
+        };
+        (remote, payload)
+    };
+
+    let plaintext = payload.encode();
+    let (seq, ciphertext) = {
+        let s = session.lock().await;
+        let seq = s.next_send_seq();
+        match s.encrypt(seq, &plaintext) {
+            Ok(ct) => (seq, ct),
+            Err(_) => return,
+        }
+    };
+
+    let mut frame = Vec::with_capacity(HEADER_LEN + ciphertext.len());
+    Header {
+        ptype: PacketType::StatsShare,
+        link_id,
+        session_id: 0,
+        seq,
+    }
+    .encode(&mut frame);
+    frame.extend_from_slice(&ciphertext);
+
+    let _ = socket.send_to(&frame, remote).await;
 }
 
 /// Holds decrypted, still-possibly-out-of-order Data payloads keyed by the

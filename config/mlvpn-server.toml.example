@@ -27,6 +27,10 @@ ewma_alpha = 0.2
 [logging]
 level = "info"
 
+[control]
+enabled = true           # exposes live stats to `mlvpn-tui`; see README.md "Monitoring"
+# socket_path = "/run/mlvpn/mlvpn0.sock"   # default is /run/mlvpn/<tunnel.name>.sock
+
 [[links]]
 name = "fiber"
 bind_interface = "eth0"

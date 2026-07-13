@@ -10,10 +10,7 @@ By [Jeff Parrish PC Services](https://www.jpps.us). License: MIT.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the full design, threat model,
 and known limitations/roadmap -- read that before relying on this for
-anything real. This is a first implementation pass, not yet compiled in
-the environment it was written in (no Rust toolchain was available); see
-ARCHITECTURE.md §9 for details and what to expect when you first run
-`cargo build`.
+anything real.
 
 ## Quick start
 
@@ -40,21 +37,43 @@ For a persistent, hardened install, see `systemd/mlvpn.service` (includes
 one-time host setup instructions at the top of the file) and the Debian
 packaging under `debian/` (`dpkg-buildpackage -us -uc -b`).
 
+## Monitoring: mlvpn-tui
+
+`mlvpnd` exposes live per-link stats over a local Unix socket (on by
+default; see `[control]` in the example configs). `mlvpn-tui` connects to
+it and renders a continuously-updating table with, for every bonded link:
+state, the peer address it's talking to, this side's own measured RTT/
+jitter/loss/throughput, *and* the peer's self-reported view of the same
+link -- received over the tunnel itself, so one terminal on either end
+shows the full picture without cross-referencing logs on both machines.
+
+```sh
+./target/release/mlvpn-tui                    # auto-detects the socket under /run/mlvpn
+./target/release/mlvpn-tui --socket /run/mlvpn/mlvpn0.sock
+```
+
+Press `q` or `Esc` to quit. See ARCHITECTURE.md's "Monitoring" section for
+the wire/IPC details (`ipc.rs`, `control.rs`, `PacketType::StatsShare`).
+
 ## Layout
 
 ```
 src/
   main.rs        CLI (run / genkey), startup sequencing, privilege drop
+  lib.rs          Library crate shared by mlvpnd and mlvpn-tui
   config.rs       TOML config + validation + permission checks
   crypto.rs       Noise_IK handshake, AEAD session, replay window
-  protocol.rs     Wire frame header + probe payload encoding
+  protocol.rs     Wire frame header, probe payload, stats-share payload
   link.rs         Per-interface UDP socket + running stats (EWMA)
   monitor.rs      Probe RTT bookkeeping, up/down hysteresis, scoring
   scheduler.rs    Smooth weighted round robin link selection
   tunnel.rs       Ties it together: TUN <-> links, per-link actor tasks
   privilege.rs    Drop root -> unprivileged user, clear capabilities
+  peerstats.rs    Table of the peer's most recently reported link stats
+  ipc.rs          JSON schema for the monitoring control socket
+  control.rs      Unix-socket server that streams ipc::Snapshot to mlvpn-tui
+  bin/mlvpn-tui.rs  Terminal monitoring view (see "Monitoring" above)
 config/          Example client/server TOML configs
 systemd/         Hardened systemd unit
 debian/          .deb packaging
 ```
-# mlvpn-rs

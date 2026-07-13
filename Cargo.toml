@@ -10,9 +10,16 @@ repository = "https://github.com/4jpps/mlvpn-rs"
 homepage = "https://github.com/4jpps/mlvpn-rs"
 default-run = "mlvpnd"
 
+[lib]
+name = "mlvpn"
+path = "src/lib.rs"
+
 [[bin]]
 name = "mlvpnd"
 path = "src/main.rs"
+
+# src/bin/mlvpn-tui.rs is picked up automatically by cargo's default
+# `autobins` discovery -- no explicit [[bin]] section needed for it.
 
 [profile.release]
 opt-level = 3
@@ -24,6 +31,7 @@ strip = true
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "signal", "macros", "io-util"] }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 toml = "0.8"
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
@@ -41,6 +49,10 @@ libc = "0.2"
 zeroize = { version = "1", features = ["derive"] }
 base64 = "0.22"
 hex = "0.4"
+# Monitoring TUI (src/bin/mlvpn-tui.rs) only -- not used by mlvpnd itself,
+# but cargo builds both binaries from one dependency set regardless.
+ratatui = "0.29"
+crossterm = "0.28"
 
 [dev-dependencies]
 proptest = "1"

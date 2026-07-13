@@ -34,7 +34,16 @@ ewma_alpha = 0.2         # smoothing factor for latency/jitter/loss/throughput s
 [logging]
 level = "info"           # tracing-subscriber EnvFilter directive, e.g. "info" or "mlvpn=debug"
 
-# One [[links]] block per physical uplink to bond together.
+[control]
+enabled = true           # exposes live stats to `mlvpn-tui`; see README.md "Monitoring"
+# socket_path = "/run/mlvpn/mlvpn0.sock"   # default is /run/mlvpn/<tunnel.name>.sock
+
+# One [[links]] block per physical uplink to bond together. Traffic is
+# split across every link currently marked Up in proportion to its
+# measured score (latency/jitter/loss/throughput, see monitor.rs) -- this
+# combines their bandwidth rather than just failing over to a single
+# "best" link. `weight` biases that split; `mlvpn-tui` shows the live
+# result.
 
 [[links]]
 name = "fiber"

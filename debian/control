@@ -20,3 +20,8 @@ Description: Multi-link VPN bonding daemon
  This is a Rust rewrite built on the Noise Protocol Framework
  (Noise_IK, the same family WireGuard uses) for a single-round-trip,
  mutually authenticated, forward-secret handshake.
+ .
+ Includes mlvpn-tui, a terminal monitoring view that shows every bonded
+ link's state, peer address, and both sides' measured RTT/jitter/loss/
+ throughput side by side, without needing to compare logs on both ends
+ by hand.
