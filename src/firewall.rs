@@ -378,9 +378,8 @@ fn plan_nftables(ports: &BTreeSet<u16>, action: Action) -> Result<Vec<PlannedCom
             String::from_utf8_lossy(&output.stderr)
         )));
     }
-    let json: Value = serde_json::from_slice(&output.stdout).map_err(|e| {
-        MlvpnError::Config(format!("parsing `nft -j list ruleset` output: {e}"))
-    })?;
+    let json: Value = serde_json::from_slice(&output.stdout)
+        .map_err(|e| MlvpnError::Config(format!("parsing `nft -j list ruleset` output: {e}")))?;
 
     let chains = find_input_filter_chains(&json);
     if chains.is_empty() {
@@ -480,7 +479,14 @@ fn find_rule_handle(
 ) -> Option<u32> {
     let items = ruleset.get("nftables")?.as_array()?;
     for item in items {
-        let rule = item.get("rule")?;
+        // Not every array entry is a rule (metainfo/table/chain entries
+        // interleave with rule entries in `nft -j list ruleset` output)
+        // -- skip those rather than using `?`, which would abort this
+        // whole function on the first non-rule entry instead of just
+        // moving on to check the next one.
+        let Some(rule) = item.get("rule") else {
+            continue;
+        };
         if rule.get("family").and_then(Value::as_str) != Some(family)
             || rule.get("table").and_then(Value::as_str) != Some(table)
             || rule.get("chain").and_then(Value::as_str) != Some(chain)
@@ -580,7 +586,10 @@ mod tests {
     fn backend_parse_accepts_common_aliases() {
         assert_eq!(Backend::parse("nft"), Some(Backend::Nftables));
         assert_eq!(Backend::parse("Nftables"), Some(Backend::Nftables));
-        assert_eq!(Backend::parse("iptables-legacy"), Some(Backend::IptablesLegacy));
+        assert_eq!(
+            Backend::parse("iptables-legacy"),
+            Some(Backend::IptablesLegacy)
+        );
         assert_eq!(Backend::parse("bogus"), None);
     }
 
@@ -629,7 +638,11 @@ mod tests {
         let chains = find_input_filter_chains(&json);
         assert_eq!(
             chains,
-            vec![("inet".to_string(), "filter".to_string(), "input".to_string())]
+            vec![(
+                "inet".to_string(),
+                "filter".to_string(),
+                "input".to_string()
+            )]
         );
     }
 
