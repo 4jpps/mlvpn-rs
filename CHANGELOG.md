@@ -6,6 +6,68 @@ versioning follows [Semantic Versioning](https://semver.org/) once this
 project has a stable public release -- pre-1.0, minor bumps may still
 include breaking config/wire changes, called out explicitly below.
 
+## [0.1.2] - 2026-07-13
+
+### Security
+
+- **`lru` IterMut soundness advisory (RUSTSEC, affects `lru` >= 0.9.0,
+  < 0.16.3, fixed in 0.16.3).** `lru` entered the dependency tree only
+  transitively, via `ratatui` 0.29.0 (which pins `lru = "0.12.0"`,
+  resolving to the vulnerable 0.12.5) -- reachable only through
+  `mlvpn-tui`, the terminal monitoring binary; `mlvpnd`'s core/data-path
+  code never depends on it. A Cargo `[patch]` override can't fix this
+  while staying on `ratatui` 0.29: patched versions must still satisfy
+  the original dependency's semver requirement, and 0.12.x/0.16.x are
+  incompatible pre-1.0 minors. Fixed by bumping `ratatui` to 0.30 (its
+  latest release, and the version whose own dependency graph requires
+  `lru` >= 0.16). Reviewed ratatui's published 0.30 breaking-changes
+  list line by line against `src/bin/mlvpn-tui.rs`'s actual usage
+  (removed `block::Title`, the `Style`/`Stylize` split, the
+  `Alignment` rename, `Marker`, `Flex::SpaceAround`, and the `Backend`
+  trait's new associated `Error`/`clear_region` requirement) -- none of
+  it is exercised by this codebase, so no source changes were needed
+  beyond the dependency bump itself. `Cargo.toml`'s `ratatui` feature
+  list is now explicit (`default-features = false` plus `crossterm`,
+  `underline-color`, `layout-cache`) to keep the same footprint as
+  0.29, since 0.30's new defaults would otherwise pull in an unused
+  `time` dependency for a calendar widget this project doesn't use.
+
+- Full dependency audit against the RustSec advisory database (every
+  crate in `Cargo.lock` with a published advisory, checked against our
+  actual locked version): `tokio` 1.52.3 (patched for RUSTSEC-2025-0023
+  since >=1.44.2), `bytes` 1.12.1 (patched for RUSTSEC-2026-0007 since
+  >=1.11.1), `rand` 0.8.7/0.9.5 (patched for RUSTSEC-2026-0097),
+  `tracing-subscriber` 0.3.23 (patched for RUSTSEC-2025-0055 since
+  >=0.3.20), `ring` 0.17.14 (patched for RUSTSEC-2025-0009 since
+  >=0.17.12), `time` 0.3.53 (patched for RUSTSEC-2026-0009 since
+  >=0.3.47), `snow` 0.10.0 (patched for RUSTSEC-2024-0011 since
+  >=0.9.5 -- our core Noise implementation), `curve25519-dalek` 4.1.3
+  and `aes-gcm` 0.10.3 (each exactly at their patched floor), `nix`
+  0.27.1/0.29-0.31 (patched for RUSTSEC-2021-0119 since >=0.23.0),
+  `zerocopy` 0.8.54 and `hashbrown` 0.16.1/0.17.1 (both well past their
+  patched floors). Every one of them already resolves to a
+  non-vulnerable version under the existing `Cargo.toml` semver ranges
+  -- no further pins or `[patch]` entries needed beyond the `lru` fix
+  above.
+
+### Changed
+
+- Minimum supported Rust version raised from 1.75 to 1.86, which
+  `ratatui` 0.30 itself requires. Updated everywhere it's declared:
+  `Cargo.toml`, `debian/control`, `packaging/rpm/mlvpn.spec`, and the
+  CI/release workflow comments referencing it.
+
+### Fixed
+
+- `.github/workflows/release.yml`'s RPM build failed on the
+  RHEL-family leg (`rockylinux:9`) with `cargo/rust >= 1.75 is needed`
+  regardless of the actual toolchain version, because Rust is installed
+  there via `dtolnay/rust-toolchain` (rustup), which `rpmbuild`'s
+  internal `BuildRequires` check can't see -- it only knows about
+  dnf-tracked packages. Same root cause as the `.deb` build's
+  `dpkg-buildpackage -d` flag exists for. Added the equivalent
+  `rpmbuild -ba --nodeps`.
+
 ## [0.1.1] - 2026-07-13
 
 ### Added
@@ -207,5 +269,6 @@ Initial implementation and first successful build.
   (`debian/`) targeting Debian 13.
 - `ARCHITECTURE.md` design document and example client/server configs.
 
+[0.1.2]: https://github.com/4jpps/mlvpn-rs/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/4jpps/mlvpn-rs/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/4jpps/mlvpn-rs/releases/tag/v0.1.0

@@ -1,3 +1,34 @@
+mlvpn (0.1.2-1) unstable; urgency=medium
+
+  * security: bump ratatui 0.29 -> 0.30, pulling in a patched lru
+    (>= 0.16.3) that fixes a soundness issue in lru's IterMut affecting
+    versions >= 0.9.0, < 0.16.3 (RUSTSEC advisory). ratatui 0.29 pins
+    lru = "0.12.0", which cargo resolved to the vulnerable 0.12.5; a
+    Cargo [patch] can't bridge that semver-incompatible pre-1.0 gap, so
+    following ratatui's own dependency bump was the only real fix.
+    lru is only ever reachable via mlvpn-tui (the monitoring binary);
+    mlvpnd's core/data-path code doesn't depend on it. Reviewed
+    ratatui's 0.30 breaking changes against src/bin/mlvpn-tui.rs's
+    actual usage (no block::Title, Style/Stylize, Alignment, Marker, or
+    generic Backend exposure) -- no source changes needed there, but
+    default-features trimmed in Cargo.toml to avoid pulling in an
+    unused `time` dependency from 0.30's new all-widgets default.
+  * Raise minimum supported Rust toolchain to 1.86 (from 1.75), which
+    ratatui 0.30 itself requires.
+  * Audited every crate in Cargo.lock with a published RustSec
+    advisory against our actual locked version (tokio, bytes, rand,
+    tracing-subscriber, ring, time, snow, curve25519-dalek, aes-gcm,
+    nix, zerocopy, hashbrown); all already resolve to patched versions
+    under the existing Cargo.toml semver ranges, no further pins
+    needed beyond the lru fix above.
+  * Fix release.yml's RPM build (rockylinux9 leg): rpmbuild's internal
+    BuildRequires check can't see the rustup-installed toolchain and
+    failed with "cargo/rust >= 1.75 is needed" regardless of version;
+    added rpmbuild -ba --nodeps, same reasoning as the .deb build's
+    dpkg-buildpackage -d.
+
+ -- Jeff Parrish PC Services <www.jpps.us>  Mon, 13 Jul 2026 00:00:00 +0000
+
 mlvpn (0.1.1-1) unstable; urgency=medium
 
   * Add mlvpn-tui: a terminal monitoring view showing live per-link

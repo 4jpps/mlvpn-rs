@@ -35,8 +35,9 @@ jobs:
         with:
           key: ${{ matrix.arch }}
 
-      # Debian 13's minimum supported toolchain per Cargo.toml
-      # (rust-version = "1.75"); build-essential/pkg-config/libc6-dev
+      # Minimum supported toolchain per Cargo.toml (rust-version =
+      # "1.86", raised from 1.75 by the ratatui 0.29->0.30 bump in
+      # v0.1.2 -- see CHANGELOG.md); build-essential/pkg-config/libc6-dev
       # cover what tun-rs/snow/socket2 need to compile.
       - name: Install system build dependencies
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config libc6-dev

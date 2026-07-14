@@ -1,8 +1,8 @@
 [package]
 name = "mlvpn"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.86"
 authors = ["Jeff Parrish PC Services <www.jpps.us>"]
 description = "Multi-link VPN bonding daemon: combines several network uplinks into one resilient, Noise-encrypted tunnel with automatic latency/jitter/throughput-aware failover."
 license = "AGPL-3.0-only"
@@ -51,7 +51,32 @@ base64 = "0.22"
 hex = "0.4"
 # Monitoring TUI (src/bin/mlvpn-tui.rs) only -- not used by mlvpnd itself,
 # but cargo builds both binaries from one dependency set regardless.
-ratatui = "0.29"
+#
+# 0.30 (not 0.29): 0.29 pins its internal `lru` dependency to "0.12.0",
+# which resolves to 0.12.5 -- affected by RUSTSEC's lru IterMut
+# soundness advisory (fixed in 0.16.3). `[patch]` can't bridge that gap
+# (0.12.x and 0.16.x are semver-incompatible pre-1.0 minors, and Cargo
+# patches must stay within the original requirement's range), so the
+# only real fix is following ratatui's own dependency bump. Checked
+# ratatui's BREAKING-CHANGES.md for 0.30 against this file's actual
+# usage: none of it touches removed `block::Title`, the `Style`/
+# `Stylize` split, or the `Alignment` rename, so this should be a
+# behavior-neutral bump -- but see docs/development.md and verify with
+# a real `cargo build`/`test` regardless, this wasn't compiled here.
+# default-features trimmed against ratatui 0.30.2's actual
+# [features]/[dependencies] tables (checked via docs.rs source, not
+# assumed): default = ["all-widgets", "crossterm", "layout-cache",
+# "macros", "underline-color"]. `ratatui-crossterm`/`-termina`/
+# `-termwiz`/`-termion`/`-macros` are each `optional = true`, gated by
+# their like-named feature -- we only enable "crossterm", so those
+# other backend/macro crates should be excluded. `all-widgets` (not
+# enabled here) is what pulls in the calendar widget's `time`
+# dependency via `ratatui-widgets/calendar`; without it, `time`
+# shouldn't enter the graph via ratatui at all. `layout-cache` kept
+# since 0.30's breaking-changes notes recommend it for performance.
+# Confirmed via `cargo tree -p ratatui` against a real build: no
+# ratatui-termina, ratatui-termwiz, or time in the resolved graph.
+ratatui = { version = "0.30", default-features = false, features = ["crossterm", "underline-color", "layout-cache"] }
 crossterm = "0.28"
 
 [dev-dependencies]

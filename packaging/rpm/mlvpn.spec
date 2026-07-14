@@ -10,7 +10,7 @@
 # mlvpn-0.1.1-1.el9.x86_64.rpm on RHEL/Rocky/Alma from one source tree.
 
 Name:           mlvpn
-Version:        0.1.1
+Version:        0.1.2
 Release:        1%{?dist}
 Summary:        Multi-link VPN bonding daemon
 
@@ -18,8 +18,8 @@ License:        AGPL-3.0-only
 URL:            https://github.com/4jpps/mlvpn-rs
 Source0:        %{name}-%{version}.tar.gz
 
-BuildRequires:  cargo >= 1.75
-BuildRequires:  rust >= 1.75
+BuildRequires:  cargo >= 1.86
+BuildRequires:  rust >= 1.86
 BuildRequires:  gcc
 BuildRequires:  pkgconf-pkg-config
 BuildRequires:  systemd-rpm-macros
@@ -91,6 +91,12 @@ chmod 0750 %{_sysconfdir}/mlvpn
 %dir %attr(0750, root, mlvpn) %{_sysconfdir}/mlvpn
 
 %changelog
+* Mon Jul 13 2026 Jeff Parrish PC Services <www.jpps.us> - 0.1.2-1
+- Security: bump ratatui 0.29 -> 0.30 to pull in lru >= 0.16.3, fixing
+  a soundness advisory in lru's IterMut (RUSTSEC, affects >= 0.9.0,
+  < 0.16.3). Only reachable via mlvpn-tui, never mlvpnd itself.
+  Raises the minimum toolchain to rust >= 1.86 accordingly.
+
 * Mon Jul 13 2026 Jeff Parrish PC Services <www.jpps.us> - 0.1.1-1
 - Initial RPM packaging, mirroring the existing .deb: firewalld-aware
   mlvpnd firewall-setup, systemd unit, unprivileged mlvpn user/group
