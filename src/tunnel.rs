@@ -78,6 +78,9 @@ const STATS_SHARE_INTERVAL_MS: u64 = 1000;
 pub struct TunnelParams {
     pub mode: Mode,
     pub mtu: u16,
+    /// Whether to rewrite the MSS option of TCP SYN/SYN-ACK segments
+    /// read off the TUN device so they fit `mtu`. See `mss.rs`.
+    pub clamp_mss: bool,
     pub scheduler_cfg: SchedulerConfig,
     pub local_private: LocalPrivateKey,
     pub peer_public: [u8; 32],
@@ -181,8 +184,11 @@ pub async fn run(tun: AsyncDevice, links: Vec<Link>, params: TunnelParams) -> Re
         let scheduler = scheduler.clone();
         let tun = tun.clone();
         let mtu = params.mtu as usize;
+        let clamp_mss = params.clamp_mss;
         handles.push(tokio::spawn(async move {
-            if let Err(e) = tun_reader(tun, links, session, scheduler, mtu, session_id).await {
+            if let Err(e) =
+                tun_reader(tun, links, session, scheduler, mtu, clamp_mss, session_id).await
+            {
                 tracing::error!(error = %e, "tun reader exited");
             }
         }));
@@ -468,18 +474,28 @@ async fn establish_session(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn tun_reader(
     tun: Arc<AsyncDevice>,
     links: Arc<AsyncMutex<Vec<Link>>>,
     session: Arc<AsyncMutex<Session>>,
     scheduler: Arc<std::sync::Mutex<Scheduler>>,
     mtu: usize,
+    clamp_mss: bool,
     session_id: u32,
 ) -> Result<()> {
     let mut buf = vec![0u8; mtu + 64];
     loop {
         let n = tun.recv(&mut buf).await.map_err(MlvpnError::Io)?;
-        let plaintext = buf[..n].to_vec();
+        let mut plaintext = buf[..n].to_vec();
+
+        // Only touches TCP SYN/SYN-ACK segments carrying an MSS option
+        // larger than what `mtu` can carry -- see mss.rs for why this
+        // matters more than relying on Path MTU Discovery alone, and for
+        // the IPv4/IPv6 parsing and checksum recompute this performs.
+        if clamp_mss {
+            crate::mss::clamp_if_tcp_syn(&mut plaintext, mtu as u16);
+        }
 
         let (seq, ciphertext) = {
             let s = session.lock().await;

@@ -1,3 +1,34 @@
+mlvpn (0.2.0-1) unstable; urgency=medium
+
+  * Add IPv6 support to the mlvpn0 TUN interface: tunnel.address6 (an
+    optional IPv6 CIDR) assigns a second address family to the same
+    device alongside the existing IPv4 tunnel.address, sharing the same
+    encrypted session and bonded links. The underlying UDP transport
+    between mlvpnd instances is still IPv4-only (see ARCHITECTURE.md
+    §11 item 4); this is dual-stack payload, not dual-stack transport.
+  * Add adaptive tunnel MTU: each bonded link's real physical interface
+    MTU is queried via SIOCGIFMTU at bind time (link.rs), and
+    tunnel.mtu is now treated as an upper bound rather than a fixed
+    value -- main.rs's effective_tunnel_mtu() auto-clamps it down (with
+    a logged warning) if it would fragment against the smallest
+    detected physical MTU, turning the previous startup-only advisory
+    warning into a real, self-correcting default.
+  * Add TCP MSS clamping (mss.rs), on by default via the new
+    tunnel.clamp_mss config option: rewrites the MSS option of TCP
+    SYN/SYN-ACK segments (IPv4 and IPv6) transiting the tunnel to fit
+    the effective tunnel MTU, avoiding the "PMTUD black hole" failure
+    mode where a network silently drops the ICMP messages TCP would
+    otherwise use to discover the right segment size on its own.
+  * Add ARCHITECTURE.md's "Relationship to the original MLVPN" section:
+    credits zehome/MLVPN (Laurent Coustet) for the bonding/monitoring/
+    failover concept this project is a from-scratch Rust rewrite of,
+    and documents the specific reasons for the rewrite (binds to a
+    network interface rather than an IP address so it survives DHCP/
+    roaming changes, memory-safe implementation, Noise_IK handshake
+    with forward secrecy instead of a shared password, and more).
+
+ -- Jeff Parrish PC Services <www.jpps.us>  Mon, 13 Jul 2026 00:00:00 +0000
+
 mlvpn (0.1.2-1) unstable; urgency=medium
 
   * security: bump ratatui 0.29 -> 0.30, pulling in a patched lru

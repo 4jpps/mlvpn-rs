@@ -17,6 +17,7 @@ pub mod firewall;
 pub mod ipc;
 pub mod link;
 pub mod monitor;
+pub mod mss;
 pub mod peerstats;
 pub mod privilege;
 pub mod protocol;

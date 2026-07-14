@@ -6,8 +6,8 @@
 # equivalent of the user/group creation below.
 #
 # Note on %{?dist}: left in place (standard Fedora/RHEL convention) so
-# the same spec produces e.g. mlvpn-0.1.2-1.fc41.x86_64.rpm on Fedora and
-# mlvpn-0.1.2-1.el9.x86_64.rpm on RHEL/Rocky/Alma from one source tree.
+# the same spec produces e.g. mlvpn-0.2.0-1.fc41.x86_64.rpm on Fedora and
+# mlvpn-0.2.0-1.el9.x86_64.rpm on RHEL/Rocky/Alma from one source tree.
 #
 # debug_package disabled: [profile.release] in Cargo.toml sets
 # strip = true, so the compiled mlvpnd/mlvpn-tui binaries carry no
@@ -19,7 +19,7 @@
 %global debug_package %{nil}
 
 Name:           mlvpn
-Version:        0.1.2
+Version:        0.2.0
 Release:        1%{?dist}
 Summary:        Multi-link VPN bonding daemon
 
@@ -100,6 +100,17 @@ chmod 0750 %{_sysconfdir}/mlvpn
 %dir %attr(0750, root, mlvpn) %{_sysconfdir}/mlvpn
 
 %changelog
+* Mon Jul 13 2026 Jeff Parrish PC Services <www.jpps.us> - 0.2.0-1
+- Add IPv6 dual-stack support to the TUN interface (tunnel.address6).
+- Add adaptive tunnel MTU: detects each bonded link's real physical
+  interface MTU (SIOCGIFMTU) and auto-clamps tunnel.mtu down if it
+  would fragment, instead of just warning.
+- Add TCP MSS clamping (tunnel.clamp_mss, on by default) for IPv4 and
+  IPv6 TCP SYN/SYN-ACK segments transiting the tunnel.
+- Fix RPM debuginfo packaging: disable debug_package, since
+  Cargo.toml's strip = true leaves nothing for find-debuginfo to
+  extract.
+
 * Mon Jul 13 2026 Jeff Parrish PC Services <www.jpps.us> - 0.1.2-1
 - Security: bump ratatui 0.29 -> 0.30 to pull in lru >= 0.16.3, fixing
   a soundness advisory in lru's IterMut (RUSTSEC, affects >= 0.9.0,

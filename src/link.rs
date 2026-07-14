@@ -7,6 +7,8 @@ use crate::config::LinkConfig;
 use crate::error::{MlvpnError, Result};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::net::{SocketAddr, UdpSocket as StdUdpSocket};
+#[cfg(target_os = "linux")]
+use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::net::UdpSocket;
@@ -157,6 +159,14 @@ pub struct Link {
     pub remote: Option<SocketAddr>,
     pub state: LinkState,
     pub stats: LinkStats,
+    /// The `bind_interface`'s actual kernel-reported MTU at bind time
+    /// (via `SIOCGIFMTU`), if we could determine it. `None` on non-Linux
+    /// targets, or if the ioctl failed for any reason (missing
+    /// permissions, interface renamed/removed between config load and
+    /// bind, etc.) -- this is a best-effort input to MTU auto-tuning
+    /// (see `main.rs`'s `effective_tunnel_mtu()`), never a hard
+    /// requirement for the link to come up.
+    pub physical_mtu: Option<u32>,
 }
 
 impl Link {
@@ -193,6 +203,10 @@ impl Link {
                 })?;
         }
 
+        // Best-effort: feeds MTU auto-tuning (main.rs's
+        // effective_tunnel_mtu()), never blocks link setup on failure.
+        let physical_mtu = query_interface_mtu(&config.bind_interface);
+
         let bind_ip = config
             .local_addr
             .clone()
@@ -222,6 +236,76 @@ impl Link {
             remote,
             state: LinkState::Probing,
             stats: LinkStats::new(ewma_alpha),
+            physical_mtu,
         })
+    }
+}
+
+/// Query a network interface's current kernel-reported MTU via the
+/// `SIOCGIFMTU` ioctl. `None` on any failure (unknown/renamed interface,
+/// insufficient permissions, or simply "not Linux") -- this is an
+/// optimization input, not a correctness requirement, so callers must
+/// always have a sane fallback rather than treating `None` as fatal.
+#[cfg(target_os = "linux")]
+fn query_interface_mtu(ifname: &str) -> Option<u32> {
+    // Any datagram socket works as the ioctl handle -- it's never bound,
+    // connected, or used for actual I/O, just as a file descriptor the
+    // kernel will accept SIOCGIFMTU on. AF_INET is used here purely by
+    // convention (this ioctl is address-family-agnostic; it queries the
+    // interface's link-level MTU, not anything IPv4-specific).
+    let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).ok()?;
+
+    let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
+    let name_bytes = ifname.as_bytes();
+    // ifr_name is a fixed IFNAMSIZ(16)-byte buffer that must stay
+    // NUL-terminated (guaranteed here by the zeroed() above, since we
+    // only fill in name_bytes.len() < ifr.ifr_name.len() bytes and leave
+    // the rest zero). Reject anything that wouldn't leave room for that
+    // terminator rather than silently truncating into a different,
+    // valid-looking interface name.
+    if name_bytes.len() >= ifr.ifr_name.len() {
+        return None;
+    }
+    for (dst, src) in ifr.ifr_name.iter_mut().zip(name_bytes.iter()) {
+        *dst = *src as libc::c_char;
+    }
+
+    // SAFETY: `ifr` is a valid, zero-initialized `ifreq` with `ifr_name`
+    // populated above and within bounds; SIOCGIFMTU reads only
+    // `ifr_name` and writes only the `ifru_mtu` member of the
+    // `ifr_ifru` union on success (see netdevice(7)), both inside the
+    // struct's allocation. `sock`'s file descriptor is valid for the
+    // duration of this call (it isn't dropped until this function
+    // returns).
+    let ret = unsafe { libc::ioctl(sock.as_raw_fd(), libc::SIOCGIFMTU, &mut ifr) };
+    if ret != 0 {
+        return None;
+    }
+    // SAFETY: a successful SIOCGIFMTU call specifically populates the
+    // `ifru_mtu` union member (a plain `c_int`), per netdevice(7).
+    let mtu = unsafe { ifr.ifr_ifru.ifru_mtu };
+    u32::try_from(mtu).ok()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn query_interface_mtu(_ifname: &str) -> Option<u32> {
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // query_interface_mtu itself needs a real interface and isn't
+    // meaningfully unit-testable without one (see integration/manual
+    // testing notes in docs/development.md); this covers the pure
+    // logic every caller actually depends on instead.
+
+    #[test]
+    fn nonexistent_interface_returns_none_not_panic() {
+        // "lo" always exists, so pick a name that (almost certainly)
+        // doesn't, to exercise the ioctl-failure path without requiring
+        // any particular network configuration in CI.
+        assert_eq!(query_interface_mtu("mlvpn-test-nonexistent-if0"), None);
     }
 }

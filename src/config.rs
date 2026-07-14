@@ -58,12 +58,44 @@ pub struct TunnelConfig {
     pub name: String,
     /// CIDR address to assign the local tunnel endpoint, e.g. "10.200.0.1/30".
     pub address: String,
+    /// Optional IPv6 CIDR to *also* assign to the same TUN device, e.g.
+    /// "fd00:200::1/64", so the interface carries both address families
+    /// at once instead of picking one. Unset by default: existing
+    /// configs are unaffected and the device stays IPv4-only exactly as
+    /// before. When present, both stacks share the same encrypted
+    /// session and bonded links -- there is no separate "IPv6 tunnel";
+    /// it's the same tun_reader path in tunnel.rs handling whichever
+    /// address family the kernel happens to hand it a packet for.
+    pub address6: Option<String>,
+    /// Requested tunnel MTU. Treated as an upper bound, not a fixed
+    /// value: at startup this is automatically clamped down (with a
+    /// warning) if it would exceed what the bonded links' actual
+    /// physical interface MTUs can carry without fragmentation -- see
+    /// `main.rs`'s `effective_tunnel_mtu()`. The static warning below
+    /// in `validate()` is a config-time-only sanity check against a
+    /// generic 1500-byte assumption; the real, link-aware clamp happens
+    /// later once links are bound and their true MTUs are known.
     #[serde(default = "default_mtu")]
     pub mtu: u16,
+    /// Rewrite the MSS option of TCP SYN/SYN-ACK segments passing
+    /// through the tunnel so TCP flows negotiate a segment size that
+    /// already fits the effective tunnel MTU, rather than relying on
+    /// Path MTU Discovery -- which many networks silently break by
+    /// dropping the ICMP "fragmentation needed"/"packet too big"
+    /// replies it depends on, leaving affected TCP connections to stall
+    /// instead of just running slightly slower. See `mss.rs`. On by
+    /// default; only worth disabling if something downstream is already
+    /// doing MSS clamping and doing it twice would be redundant.
+    #[serde(default = "default_clamp_mss")]
+    pub clamp_mss: bool,
 }
 
 fn default_mtu() -> u16 {
     1400
+}
+
+fn default_clamp_mss() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Deserialize)]

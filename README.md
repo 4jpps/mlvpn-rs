@@ -3,9 +3,20 @@
 Bonds multiple physical network links (fiber, DSL, LTE, ...) into one
 resilient, Noise-encrypted VPN tunnel, load-balancing and failing over
 between them based on continuously measured latency, jitter, loss and
-throughput. A Rust rewrite of MLVPN, targeting current Debian/Ubuntu
+throughput. Dual-stack (IPv4 + IPv6) tunnel interface, with adaptive
+MTU detection and TCP MSS clamping so real link hardware -- not a
+hand-tuned config value -- decides sizing. Targets current Debian/Ubuntu
 (13+/24.04+) and Fedora/RHEL-family (Fedora, RHEL, Rocky, Alma 9+)
 systemd-based distributions, on both amd64 and arm64.
+
+A Rust rewrite of [MLVPN](https://github.com/zehome/MLVPN) by Laurent
+Coustet, which the core bonding/monitoring/failover idea is credited
+to -- no code is shared between the two. See
+[ARCHITECTURE.md](ARCHITECTURE.md#relationship-to-the-original-mlvpn)
+for what specifically changed and why (binds to a network interface
+instead of an IP address so it survives DHCP/roaming changes, a
+memory-safe implementation, a modern authenticated-key-exchange
+handshake instead of a shared password, and more).
 
 By [Jeff Parrish PC Services](https://www.jpps.us), vibe-coded with
 [Claude](https://claude.com/claude-code). License:
@@ -22,10 +33,10 @@ anything real. See [CHANGELOG.md](CHANGELOG.md) for release history.
 
 ```sh
 # Debian/Ubuntu
-sudo apt install ./mlvpn_0.1.2-1_amd64.deb
+sudo apt install ./mlvpn_0.2.0-1_amd64.deb
 
 # Fedora/RHEL/Rocky/Alma
-sudo dnf install ./mlvpn-0.1.2-1.fc41.x86_64.rpm
+sudo dnf install ./mlvpn-0.2.0-1.fc41.x86_64.rpm
 ```
 
 Grab the package matching your distro/architecture from the
@@ -61,6 +72,7 @@ src/
   crypto.rs       Noise_IK handshake, AEAD session, replay window
   protocol.rs     Wire frame header, probe payload, stats-share payload
   link.rs         Per-interface UDP socket + running stats (EWMA)
+  mss.rs          TCP MSS clamping for packets transiting the TUN device
   monitor.rs      Probe RTT bookkeeping, up/down hysteresis, scoring
   scheduler.rs    Smooth weighted round robin link selection
   tunnel.rs       Ties it together: TUN <-> links, per-link actor tasks

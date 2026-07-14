@@ -119,8 +119,13 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     tracing::info!(mode = ?cfg.mode, tunnel = %cfg.tunnel.name, "starting mlvpnd");
 
     // --- Privileged setup phase -------------------------------------
-    let tun = open_tun(&cfg.tunnel)?;
-
+    // Links are bound *before* the TUN device is created (deliberately
+    // reversed from the more obvious ordering) so we can query each
+    // bind_interface's real kernel MTU first and pick a safe effective
+    // tunnel MTU -- see effective_tunnel_mtu() below -- before the TUN
+    // device is ever built with a fixed value. Both still happen before
+    // privileges are dropped, since both need CAP_NET_RAW/root-level
+    // access on the systems that require it.
     let mut links = Vec::with_capacity(cfg.links.len());
     for (i, link_cfg) in cfg.links.iter().enumerate() {
         let id =
@@ -130,10 +135,14 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
             link = %link_cfg.name,
             interface = %link_cfg.bind_interface,
             port = link_cfg.local_port,
+            physical_mtu = ?link.physical_mtu,
             "link bound"
         );
         links.push(link);
     }
+
+    let effective_mtu = effective_tunnel_mtu(&cfg.tunnel, &links);
+    let tun = open_tun(&cfg.tunnel, effective_mtu)?;
 
     let local_private = crypto::StaticKeypair::load_private(&cfg.crypto.private_key_file)?;
     let peer_public = crypto::decode_public_key(&cfg.crypto.peer_public_key)?;
@@ -159,7 +168,8 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
 
     let params = tunnel::TunnelParams {
         mode: cfg.mode,
-        mtu: cfg.tunnel.mtu,
+        mtu: effective_mtu,
+        clamp_mss: cfg.tunnel.clamp_mss,
         scheduler_cfg: cfg.scheduler.clone(),
         local_private,
         peer_public,
@@ -180,15 +190,88 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     }
 }
 
-fn open_tun(cfg: &config::TunnelConfig) -> Result<tun_rs::AsyncDevice> {
+/// Picks the MTU actually used for the TUN device and outgoing packet
+/// sizing: the smaller of the configured `tunnel.mtu` and a safe value
+/// derived from every bonded link's real physical interface MTU (see
+/// `link::Link::physical_mtu`, populated via `SIOCGIFMTU` at bind time).
+/// This turns the previously advisory-only startup warning (still in
+/// `config.rs`'s `validate()`, checked against a generic 1500-byte
+/// assumption before any link exists to ask) into a real, self-correcting
+/// default: a configured `tunnel.mtu` that would actually fragment
+/// against this deployment's hardware gets clamped down automatically
+/// instead of just logging a warning and fragmenting anyway. Links
+/// whose physical MTU couldn't be determined (non-Linux, insufficient
+/// permissions, a transient ioctl failure) simply don't participate in
+/// the minimum -- if *no* link's MTU is known, this falls back to
+/// trusting the configured value outright rather than refusing to
+/// start.
+///
+/// `outer_overhead` deliberately assumes the *larger* of the two
+/// possible outer-transport combinations (IPv6/UDP, 48 bytes) rather
+/// than IPv4/UDP (28 bytes): which one a given link actually dials over
+/// depends on `remote_addr`'s address family per-link, and this
+/// function has no per-link visibility into that -- one tunnel-wide MTU
+/// is picked for all of them. Assuming the larger overhead errs toward
+/// "possibly slightly conservative" rather than "possibly still
+/// fragments on an IPv6 link," which is the correct direction to be
+/// wrong in given the user asked for this to auto-adjust for
+/// *throughput*, not just raw MTU size: a black-holed PMTUD stall costs
+/// far more throughput than a few bytes of headroom ever would.
+fn effective_tunnel_mtu(cfg: &config::TunnelConfig, links: &[link::Link]) -> u16 {
+    let outer_overhead = mlvpn::protocol::HEADER_LEN as u32 + mlvpn::crypto::TAG_LEN as u32 + 48;
+
+    let Some(detected_min) = links.iter().filter_map(|l| l.physical_mtu).min() else {
+        return cfg.mtu;
+    };
+
+    let safe_mtu = detected_min
+        .saturating_sub(outer_overhead)
+        .min(u16::MAX as u32) as u16;
+
+    if cfg.mtu > safe_mtu {
+        // Never clamp below the config-time floor already enforced in
+        // config.rs's validate() (>= 576, the IPv6 minimum-MTU
+        // guarantee) -- an unusually small detected physical MTU should
+        // surface as a visible problem, not silently produce a tunnel
+        // MTU so small it can't carry a minimum-size IPv6 packet at
+        // all.
+        let clamped = safe_mtu.max(576);
+        tracing::warn!(
+            configured = cfg.mtu,
+            detected_min_physical_mtu = detected_min,
+            clamped_to = clamped,
+            "tunnel.mtu exceeds what the bonded links' physical interfaces can carry \
+             without fragmentation; auto-clamping down for this run (edit tunnel.mtu \
+             in the config to make this permanent and silence this warning)"
+        );
+        clamped
+    } else {
+        cfg.mtu
+    }
+}
+
+fn open_tun(cfg: &config::TunnelConfig, mtu: u16) -> Result<tun_rs::AsyncDevice> {
     let (addr, prefix) = parse_cidr(&cfg.address)?;
-    let dev = tun_rs::DeviceBuilder::new()
+    let mut builder = tun_rs::DeviceBuilder::new()
         .name(cfg.name.as_str())
         .ipv4(addr.as_str(), prefix, None)
-        .mtu(cfg.mtu)
+        .mtu(mtu);
+
+    if let Some(address6) = &cfg.address6 {
+        let (addr6, prefix6) = parse_cidr(address6)?;
+        builder = builder.ipv6(addr6.as_str(), prefix6);
+    }
+
+    let dev = builder
         .build_async()
         .map_err(|e| MlvpnError::Tun(format!("creating device '{}': {e}", cfg.name)))?;
-    tracing::info!(name = %cfg.name, address = %cfg.address, mtu = cfg.mtu, "tun device created");
+    tracing::info!(
+        name = %cfg.name,
+        address = %cfg.address,
+        address6 = ?cfg.address6,
+        mtu,
+        "tun device created"
+    );
     Ok(dev)
 }
 

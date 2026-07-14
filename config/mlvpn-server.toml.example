@@ -11,7 +11,11 @@ mode = "server"
 [tunnel]
 name = "mlvpn0"
 address = "10.200.0.1/30"
-mtu = 1400
+# address6 = "fd00:200::1/64"   # optional dual-stack address; see
+                                 # config/mlvpn.toml.example for details
+mtu = 1400                      # upper bound, auto-clamped to the bonded links'
+                                 # real detected MTU if needed -- see ARCHITECTURE.md
+clamp_mss = true                # TCP MSS clamping to the effective tunnel MTU
 
 [crypto]
 private_key_file = "/etc/mlvpn/private.key"

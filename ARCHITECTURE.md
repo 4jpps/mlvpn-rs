@@ -12,6 +12,93 @@ later work. It's meant to be read alongside the source -- most modules
 carry their own design-rationale doc comments; this file is the map that
 ties them together.
 
+## Relationship to the original MLVPN
+
+This project's name and core idea -- bond several physical uplinks into
+one encrypted, monitored, auto-failing-over tunnel -- come from
+[MLVPN](https://github.com/zehome/MLVPN) by Laurent Coustet
+(`zehome`), first released around 2013 and still the reference
+implementation the concept is best known by. Credit for the idea
+belongs there; this is not a fork and shares no code with it (it's
+written from scratch in a different language), but it would not exist
+without it.
+
+The original is written in C, built on `libev` for its event loop and
+`libsodium` (Salsa20 stream cipher + Poly1305 MAC) for encryption, and
+is licensed BSD-2-Clause. Its most recent tagged release was 2.3.5 in
+March 2020. This project makes several deliberate departures from that
+design, made explicit here rather than left implicit:
+
+- **Binds to a network interface, not an IP address.** MLVPN's
+  per-tunnel `bindhost` setting is documented as "Bind on a specific
+  address (IPv4 only)" -- if that address changes (DHCP renewal, an LTE
+  modem reconnecting and getting reassigned a new address, IP
+  renumbering), the bound socket is now bound to an address that no
+  longer exists on the host, and that link breaks until reconfigured.
+  `link::Link::bind` here binds via `SO_BINDTODEVICE` to an interface
+  *name* (`eth0`, `wwan0`, ...) instead: as long as the named interface
+  still exists, traffic keeps egressing it correctly regardless of what
+  IP address the kernel currently has assigned there. This is the
+  single biggest practical reason this rewrite exists -- it's the
+  difference between a mobile/LTE link that self-heals across an IP
+  change and one that silently goes stale until someone notices and
+  restarts the daemon.
+- **Memory-safe implementation.** C requires manual memory management
+  and pointer discipline; a bonding VPN daemon parses attacker-reachable
+  network input by definition (see `protocol.rs`, `crypto.rs`), which is
+  exactly the kind of code where a single memory-safety bug (buffer
+  overrun, use-after-free, double-free) can become a remote code
+  execution vulnerability. Rust's ownership/borrow-checker model rules
+  out that entire bug class at compile time for all safe code -- and the
+  small amount of genuinely necessary `unsafe` in this codebase (raw
+  FFI for `SIOCGIFMTU` in `link.rs`; nothing else) is isolated,
+  narrowly scoped, and documented inline with the specific invariant it
+  relies on.
+- **Modern authenticated-key-exchange cryptography, not a shared
+  password.** MLVPN derives its Salsa20/Poly1305 key from a configured
+  password string (per its `mlvpn.conf.5` documentation); there's no
+  described handshake, ephemeral key exchange, or forward secrecy --
+  compromise of that one password compromises every session, past and
+  future, that used it. This project instead runs a full
+  `Noise_IK_25519_ChaChaPoly_BLAKE2s` handshake (via the `snow` crate) --
+  the same protocol family WireGuard is built on -- giving mutual
+  authentication via long-term Curve25519 keys *and* forward secrecy via
+  fresh ephemeral keys each session, plus an explicit peer-identity pin
+  check (see §4). See `SECURITY.md` and `CHANGELOG.md`'s `[0.1.1]`
+  "Security" section for the specific hardening passes this went
+  through.
+- **`async`/tokio concurrency instead of a single-threaded event loop.**
+  MLVPN is built on `libev`; this project runs on tokio's multi-threaded
+  runtime, with the task-per-concern layout described in §2 (a busy
+  link's receive task can never starve another link's probe timer, for
+  example -- see the `tunnel.rs` module doc comment for why that
+  specific separation matters).
+- **Privilege *dropping*, not privilege *separation*.** MLVPN's README
+  describes a privilege-separation model (a minimal, "highly readable"
+  privileged component alongside an unprivileged one, as separate
+  processes). This project uses a single process that either drops from
+  root to an unprivileged user after completing its privileged setup, or
+  -- the stronger, preferred posture -- never runs as root at all via
+  pre-granted `CAP_NET_ADMIN`/`CAP_NET_RAW` (see §8). Worth stating
+  plainly: this is a related but distinct security model, not a strict
+  improvement on privilege separation's own guarantees -- it was chosen
+  because it maps cleanly onto systemd's `AmbientCapabilities=`, not
+  because multi-process separation was found lacking.
+- **IPv4/IPv6 dual-stack tunnel interface, adaptive MTU, and TCP MSS
+  clamping.** Covered in detail at the end of this document -- these are
+  additions with no direct analog described in MLVPN's own
+  documentation.
+- **Packaged and CI-built for current distributions**, with automatic
+  firewall configuration (`mlvpnd firewall-setup`) across
+  firewalld/ufw/nftables/iptables -- see `docs/firewall.md`.
+
+One more thing worth being upfront about: this project is licensed
+[AGPL-3.0-only](LICENSE), a copyleft license, in contrast to MLVPN's
+permissive BSD-2-Clause. That choice is about this codebase specifically
+(see `CONTRIBUTING.md`'s "Licensing" section for the reasoning) and has
+no bearing on MLVPN's own licensing or how its code may be used --
+again, no code is shared between the two projects.
+
 ## 1. Goals, restated precisely
 
 The request this implements: automatic tunnel latency measurement, correct
@@ -354,9 +441,15 @@ Deliberately out of scope for this first pass, in rough priority order:
 3. **No session migration/multi-session overlap.** During a rekey, there
    should be a brief window where both old and new session keys accept
    traffic so nothing is dropped mid-transition.
-4. **IPv6 links.** `link::Link::bind` hardcodes `Domain::IPV4`; extending
-   to IPv6 is mechanical (detect the parsed address family) but untested
-   here.
+4. **IPv6 on the bonded links themselves.** The TUN interface is
+   dual-stack (see below) -- `link::Link::bind`'s *transport* sockets
+   still hardcode `Domain::IPV4`, though, so the encrypted UDP session
+   between two `mlvpnd` instances is always carried over IPv4 even when
+   the tunnel is carrying IPv6 payload traffic. Extending the links
+   themselves to dial over IPv6 is mechanical (detect the parsed
+   `remote_addr`'s address family) but untested here, and would also
+   need `firewall.rs`'s rule generation and `socket2`'s bind-device
+   handling reviewed for IPv6-specific behavior.
 5. **`PacketType::Disconnect` is parsed but unhandled** -- there's no
    graceful teardown signal yet; the tunnel only ever ends via process
    shutdown.
@@ -384,3 +477,81 @@ Deliberately out of scope for this first pass, in rough priority order:
    was needed for the current use case; both are natural extensions to
    `scheduler::Scheduler::select()` if a future need justifies the added
    complexity.
+
+## 12. Dual-stack addressing, adaptive MTU, and TCP MSS clamping
+
+**IPv4/IPv6 dual-stack TUN interface.** `tunnel.address` (IPv4, required)
+and the optional `tunnel.address6` (IPv6) are both assigned to the same
+`mlvpn0` device by `main.rs::open_tun` when `address6` is configured --
+there is no separate "IPv6 tunnel" or second session. Both address
+families share the one encrypted Noise session and the one set of
+bonded links: `tunnel::tun_reader` reads whatever the kernel hands it
+off the TUN device, encrypts it, and sends it out over whichever link
+the scheduler currently picks, entirely independent of whether that
+particular packet happened to be IPv4 or IPv6. This is why item 4 above
+(IPv6 on the *links themselves*) is a separate, still-open limitation --
+dual-stack here means the tunnel can carry both address families as
+payload, not that the underlying transport dials out over both.
+
+**Adaptive MTU.** Previously (`v0.1.x`), `tunnel.mtu` was a fixed value
+with only a config-time advisory warning (`config::Config::validate`)
+if it looked likely to exceed a generic 1500-byte assumption -- correct
+sizing was entirely the operator's responsibility, and wrong in either
+direction (too high: silent IP fragmentation or firewall-dropped
+fragments; too low: needlessly small segments, leaving throughput on
+the table). `main.rs::effective_tunnel_mtu` now treats `tunnel.mtu` as
+an upper bound rather than a fixed value:
+
+1. Before the TUN device is created, every configured link is bound
+   first (see the reordering note at the top of `main.rs::run`), and
+   each bound link's `bind_interface` is queried for its real kernel
+   MTU via the `SIOCGIFMTU` ioctl (`link::query_interface_mtu`, Linux
+   only; `None` on any failure, which simply excludes that link from
+   the calculation rather than blocking startup).
+2. The smallest of those detected physical MTUs, minus this protocol's
+   own overhead (frame header + AEAD tag + outer UDP/IP, sized against
+   the larger IPv6/UDP combination to stay safe regardless of which
+   address family a given link ends up dialing over), becomes the
+   ceiling for the actual tunnel MTU used.
+3. If the configured `tunnel.mtu` exceeds that ceiling, it's clamped
+   down to it (never below the 576-byte IPv6-minimum-MTU floor already
+   enforced in `validate()`) and a warning is logged explaining why and
+   what value was used instead. If it's already within the ceiling (or
+   no link's physical MTU could be determined at all), the configured
+   value is used unchanged.
+
+This is deliberately a one-shot decision made at startup from real,
+per-link measurements, not a continuously-adjusting control loop: link
+physical MTUs essentially never change while an interface stays up, so
+there is no ongoing "adjustment" to make -- the previous static-warning
+behavior just never went and looked at the actual hardware to begin
+with.
+
+**TCP MSS clamping** (`mss.rs`, `tunnel.rs::tun_reader`, gated by
+`tunnel.clamp_mss`, on by default). Adaptive MTU alone only helps
+traffic that actually respects the tunnel's own outer size limits --
+individual TCP connections *through* the tunnel still negotiate their
+own segment size independently via Path MTU Discovery, which is exactly
+the mechanism that's unreliable across the open internet (see `mss.rs`'s
+module doc comment for the "PMTUD black hole" failure mode this avoids).
+`tun_reader` inspects every plaintext packet read off the TUN device
+before encryption; if (and only if) it parses as a TCP SYN or SYN-ACK
+segment (IPv4 or IPv6) carrying an MSS option larger than what the
+effective tunnel MTU can carry, that option's value is rewritten in
+place to fit, and the TCP checksum is recomputed over the modified
+segment. Everything else -- non-TCP packets, non-SYN TCP segments,
+already-small-enough MSS values, anything that fails to parse as a
+well-formed TCP header -- passes through completely untouched; see the
+module doc comment for why every parsing step there is written to fail
+closed into "don't touch it" rather than risk mangling a packet it
+doesn't fully understand. IPv6 extension headers are not walked (a TCP
+SYN preceded by one is rare in practice); a next-header value other
+than TCP is left alone rather than guessed at.
+
+Both features exist for the same underlying reason: they turn "the
+operator has to get `tunnel.mtu` exactly right by hand, and TCP flows
+degrade unpredictably if they don't" into "the daemon measures what it
+can and corrects for what it can't," which is a straightforward
+throughput and reliability win with no real downside -- worst case (no
+link MTU detectable, or a packet mss.rs declines to touch), behavior is
+identical to before either feature existed.

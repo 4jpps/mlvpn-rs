@@ -18,7 +18,17 @@ mode = "client"   # "client" or "server" -- see ARCHITECTURE.md for what differs
 [tunnel]
 name = "mlvpn0"
 address = "10.200.0.2/30"   # client and server must use addresses in the same /30
-mtu = 1400                  # keep below the smallest link's MTU minus protocol overhead
+# address6 = "fd00:200::2/64"   # optional: also assign an IPv6 address to
+                                 # mlvpn0, so it carries v4 and v6 traffic
+                                 # at once. Uncomment on both ends with
+                                 # addresses in the same /64.
+mtu = 1400                  # upper bound, not a fixed value: auto-clamped down at
+                             # startup if it would fragment against the bonded
+                             # links' actual detected physical MTUs (see
+                             # ARCHITECTURE.md's "MTU and MSS" section)
+clamp_mss = true            # rewrite TCP SYN/SYN-ACK MSS options to fit the
+                             # effective tunnel MTU instead of relying on PMTUD,
+                             # which many networks silently black-hole
 
 [crypto]
 private_key_file = "/etc/mlvpn/private.key"   # must be mode 0600

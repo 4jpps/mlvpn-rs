@@ -6,6 +6,73 @@ versioning follows [Semantic Versioning](https://semver.org/) once this
 project has a stable public release -- pre-1.0, minor bumps may still
 include breaking config/wire changes, called out explicitly below.
 
+## [0.2.0] - 2026-07-13
+
+### Added
+
+- **IPv6 dual-stack support on the TUN interface.** New optional
+  `tunnel.address6` config field (an IPv6 CIDR, e.g. `fd00:200::1/64`)
+  assigns a second address family to the same `mlvpn0` device alongside
+  the existing IPv4 `tunnel.address` -- both share the same encrypted
+  Noise session and bonded links; there is no separate "IPv6 tunnel."
+  Backward compatible: omitting `address6` leaves the interface exactly
+  as IPv4-only as before. The underlying UDP transport between `mlvpnd`
+  instances is still IPv4-only (see `ARCHITECTURE.md` §11 item 4) --
+  this is dual-stack *payload*, not dual-stack transport; scoped that
+  way deliberately rather than also touching `link.rs`'s socket
+  binding, `firewall.rs`'s rule generation, and everything downstream
+  of them in the same change.
+- **Adaptive tunnel MTU.** `tunnel.mtu` is now an upper bound, not a
+  fixed value. At startup, each bonded link's real physical interface
+  MTU is queried via the `SIOCGIFMTU` ioctl (`link::query_interface_mtu`,
+  Linux-only, best-effort -- a link whose MTU can't be determined
+  simply doesn't participate, it never blocks startup). `main.rs`'s new
+  `effective_tunnel_mtu()` auto-clamps the configured value down (with
+  a logged warning explaining why and to what) if it would exceed what
+  the smallest detected physical MTU can carry without fragmentation.
+  This replaces relying solely on the previous config-time-only
+  advisory warning (still present in `config.rs`'s `validate()` as a
+  generic pre-flight sanity check, since it runs before any link
+  exists to ask) with a real, self-correcting default that reflects
+  each deployment's actual hardware.
+- **TCP MSS clamping** (`mss.rs`), on by default via the new
+  `tunnel.clamp_mss` config option. Adaptive MTU alone only bounds the
+  tunnel's own outer packet size; individual TCP connections passing
+  *through* the tunnel still negotiate their own segment size via Path
+  MTU Discovery, which many networks silently break by dropping the
+  ICMP messages it depends on (the "PMTUD black hole" -- affected
+  connections don't run slower, they stall). `tunnel::tun_reader` now
+  inspects plaintext packets read off the TUN device before encryption
+  and, for TCP SYN/SYN-ACK segments (IPv4 or IPv6) whose advertised MSS
+  exceeds what the effective tunnel MTU can carry, rewrites that option
+  in place and recomputes the TCP checksum -- the same technique
+  `iptables --clamp-mss-to-pmtu` and most consumer VPN/router firmware
+  use. Deliberately conservative: anything that doesn't cleanly parse
+  as a well-formed TCP SYN (wrong protocol, truncated packet, IPv6
+  extension headers, a malformed option list) is left completely
+  untouched rather than risk corrupting it. Covered by unit tests that
+  build synthetic IPv4/IPv6 SYN packets and self-verify the recomputed
+  checksum (summing pseudo-header + segment including the written
+  checksum folds to exactly 0, the standard property of the algorithm)
+  in addition to checking the clamped MSS value itself.
+- **`ARCHITECTURE.md`: "Relationship to the original MLVPN" section.**
+  Credits [MLVPN](https://github.com/zehome/MLVPN) (Laurent Coustet,
+  `zehome`, BSD-2-Clause, C/libev/libsodium) for the bonding/monitoring/
+  failover concept this project is a from-scratch Rust rewrite of --
+  no code is shared between the two -- and documents the specific,
+  deliberate departures from that design and why: binding to a network
+  interface (`SO_BINDTODEVICE`) rather than a specific IP address (the
+  original's `bindhost` is documented as "IPv4 only," and breaks when
+  that address changes, e.g. DHCP renewal or LTE roaming, until
+  manually reconfigured), a memory-safe implementation, a
+  `Noise_IK_25519_ChaChaPoly_BLAKE2s` handshake with mutual
+  authentication and forward secrecy instead of a shared
+  password-derived key, `async`/tokio concurrency instead of a
+  single-threaded event loop, privilege *dropping* rather than
+  multi-process privilege *separation*, and this release's IPv6/MTU/
+  MSS additions. Verified against the original project's actual README
+  and `mlvpn.conf.5` man page rather than assumed.
+
 ## [0.1.2] - 2026-07-13
 
 ### Security
@@ -277,6 +344,7 @@ Initial implementation and first successful build.
   (`debian/`) targeting Debian 13.
 - `ARCHITECTURE.md` design document and example client/server configs.
 
+[0.2.0]: https://github.com/4jpps/mlvpn-rs/compare/v0.1.2...v0.2.0
 [0.1.2]: https://github.com/4jpps/mlvpn-rs/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/4jpps/mlvpn-rs/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/4jpps/mlvpn-rs/releases/tag/v0.1.0
