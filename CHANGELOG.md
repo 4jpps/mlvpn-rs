@@ -55,6 +55,21 @@ include breaking config/wire changes, called out explicitly below.
   the RPM legs built inside `fedora:latest`/`rockylinux:9` containers on
   the same native arm64 runners used for the `.deb`) and publishes all
   of them to one GitHub Release. Replaces `release-deb.yml`.
+- `docs/` -- full documentation, split out of the README (installation,
+  getting started, firewall, monitoring, troubleshooting, development/
+  releases) so the README can stay a short overview with links. See
+  `docs/README.md` for the index.
+- `docs/platforms/opnsense-pfsense.md`: a scoping/TODO document for a
+  future FreeBSD-based port to OPNsense and pfSense CE (current stable
+  series as of writing: OPNsense 26.1/FreeBSD 14.x, pfSense CE 2.8.1/
+  FreeBSD 14.x). Gap analysis only -- no code changed. Identifies that
+  `tun-rs` (already a dependency) claims FreeBSD support so TUN
+  creation is likely fine as-is, but `SO_BINDTODEVICE`-based interface
+  binding (`link.rs`) and Linux-capability clearing (`privilege.rs`'s
+  use of the `caps` crate) have no FreeBSD equivalent and need real
+  redesign, not just a recompile; `mlvpnd firewall-setup` is Linux-only
+  by design and out of scope for either platform (both are pf-based,
+  configured through their own GUI/plugin frameworks).
 
 ### Changed
 
