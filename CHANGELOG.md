@@ -35,6 +35,26 @@ include breaking config/wire changes, called out explicitly below.
   architecture.
 - `.gitignore` for build artifacts, debian packaging scratch directories,
   and generated key material.
+- `mlvpnd firewall-setup` subcommand (`src/firewall.rs`): detects which
+  of `firewalld`, `ufw`, `nftables`, or `iptables` (legacy) is actively
+  managing the host and opens inbound UDP access for every configured
+  `[[links]]` port, on either end regardless of `client`/`server` mode.
+  Supports `--dry-run` (prints the exact commands without running them),
+  `--remove` (closes the same ports), and `--backend` (skip
+  auto-detection). Deliberately a separate one-shot admin command, not
+  something `mlvpnd run` does on every startup -- mutating firewall
+  state is a different trust boundary than anything else this daemon
+  touches. Every command runs as an argv vector, never through a shell.
+- RPM packaging (`packaging/rpm/mlvpn.spec`) targeting current Fedora
+  and RHEL/Rocky/Alma 9+, alongside the existing `.deb`. Creates the
+  `mlvpn` user/group and `/etc/mlvpn` via `%pre`/`%post` scriptlets,
+  mirroring `debian/mlvpn.postinst` -- except it does not remove the
+  user/group on uninstall, per Fedora packaging convention (the Debian
+  package's `postrm` does, on explicit `purge`). CI now builds both
+  package formats across amd64/arm64 (`.github/workflows/release.yml`,
+  the RPM legs built inside `fedora:latest`/`rockylinux:9` containers on
+  the same native arm64 runners used for the `.deb`) and publishes all
+  of them to one GitHub Release. Replaces `release-deb.yml`.
 
 ### Changed
 
@@ -121,6 +141,16 @@ review pass) specifically looking for remotely-triggerable flaws:
   specified both in debian/compat and via build-dependency on
   debhelper-compat`). Removed `debian/compat`; the Build-Depends entry
   is the only source of truth now.
+- README's Quick Start ran `mlvpnd genkey --out /etc/mlvpn/private.key`
+  before `/etc/mlvpn` existed and without `sudo`, so it would fail on a
+  clean host; and it never created the `mlvpn` system user/group that
+  `privilege::drop_privileges()` requires, so a from-source install
+  following those steps literally would get through all privileged
+  setup and then exit with `privilege drop failed: user 'mlvpn' does
+  not exist`. Rewrote the README's setup instructions (found via a
+  full walkthrough simulating a real two-node deployment) to fix both
+  and cover the `.deb`/systemd path, firewall rules, verification, and
+  troubleshooting end to end.
 
 ## [0.1.0] - 2026-07-13
 

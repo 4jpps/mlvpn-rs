@@ -41,6 +41,16 @@ mlvpn (0.1.1-1) unstable; urgency=medium
   * Build and publish arm64 .deb packages alongside amd64 (native
     ubuntu-24.04-arm GitHub Actions runner; no cross-compilation
     needed since Architecture: any already covers this).
+  * Fix README setup instructions: wrong genkey/mkdir ordering and a
+    missing mlvpn system user/group creation step meant following them
+    as written would fail; rewrote with a full install/config/verify
+    walkthrough for the .deb + systemd path.
+  * Add mlvpnd firewall-setup: detects firewalld/ufw/nftables/iptables
+    and opens the UDP ports a config's [[links]] need, with --dry-run
+    and --remove. Ships in this package automatically (same binary).
+  * CI: replace release-deb.yml with release.yml, which builds this
+    .deb alongside a new RPM (packaging/rpm/mlvpn.spec, for current
+    Fedora and RHEL/Rocky/Alma) and publishes both to one Release.
 
  -- Jeff Parrish PC Services <www.jpps.us>  Mon, 13 Jul 2026 00:00:00 +0000
 

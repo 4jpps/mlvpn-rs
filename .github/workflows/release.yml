@@ -1,0 +1,179 @@
+name: Build release packages
+
+# Runs on version tags (v1.0.0, v0.2.1, ...) to build and publish a
+# release, or manually via workflow_dispatch to just produce
+# downloadable artifacts without cutting a release (handy for testing
+# packaging changes on a branch before tagging).
+#
+# Replaces the old release-deb.yml (.deb only) -- this builds both .deb
+# and .rpm packages and publishes them together in one GitHub Release,
+# rather than two workflow files racing to create/update the same
+# release. Delete .github/workflows/release-deb.yml; it's superseded by
+# this file.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write # needed to attach packages to a GitHub Release
+
+jobs:
+  build-deb:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # debian/control declares `Architecture: any`, so dpkg-
+          # buildpackage just builds for whatever host it runs on --
+          # no cross-compilation toolchain needed, just a matching
+          # native runner per architecture.
+          - arch: amd64
+            runs-on: ubuntu-latest
+          - arch: arm64
+            runs-on: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runs-on }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # Keyed per-arch: amd64 and arm64 produce incompatible compiled
+      # artifacts, and rust-cache's default key doesn't distinguish
+      # runner CPU architecture, only OS.
+      - name: Cache cargo registry/build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: deb-${{ matrix.arch }}
+
+      # debian/rules invokes plain `cargo build`/`cargo test`, which pick
+      # up whatever rustc/cargo are first on PATH -- the toolchain from
+      # dtolnay/rust-toolchain above -- regardless of the (possibly
+      # older) rustc apt would otherwise install to satisfy
+      # debian/control's Build-Depends. This is just what debhelper +
+      # dpkg-dev need to run the packaging machinery itself.
+      - name: Install packaging dependencies
+        run: sudo apt-get update && sudo apt-get install -y debhelper dpkg-dev build-essential pkg-config libc6-dev
+
+      # -d skips dpkg-buildpackage's own dpkg-checkbuilddeps step. That
+      # check only knows about *apt-installed* packages, so it can't see
+      # the rustup-installed cargo/rustc from dtolnay/rust-toolchain
+      # above and fails with "Unmet build dependencies: cargo rustc (>=
+      # 1.75)" even though the real toolchain is right there on PATH and
+      # already proven to work by ci.yml's build+test steps.
+      - name: Build .deb
+        run: dpkg-buildpackage -us -uc -b -d
+
+      - name: Collect build output
+        run: |
+          mkdir -p dist
+          mv ../*.deb dist/
+          mv ../*.changes dist/ || true
+          mv ../*.buildinfo dist/ || true
+          ls -la dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mlvpn-deb-${{ matrix.arch }}
+          path: dist/*.deb
+
+  build-rpm:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Fedora tracks current upstream Rust in its own repos, so no
+          # rustup step needed there. RHEL/Rocky/Alma 9's base repos
+          # usually lag the project's rust-version MSRV, so those use
+          # dtolnay/rust-toolchain@stable instead, same as the .deb
+          # build above -- see the "Install Rust" step's condition.
+          - distro: fedora
+            image: fedora:latest
+            arch: amd64
+            runs-on: ubuntu-latest
+          - distro: fedora
+            image: fedora:latest
+            arch: arm64
+            runs-on: ubuntu-24.04-arm
+          - distro: rockylinux9
+            image: rockylinux:9
+            arch: amd64
+            runs-on: ubuntu-latest
+          - distro: rockylinux9
+            image: rockylinux:9
+            arch: arm64
+            runs-on: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runs-on }}
+    container:
+      image: ${{ matrix.image }}
+    steps:
+      - name: Install git (needed before actions/checkout can run)
+        run: dnf -y install git tar
+
+      - uses: actions/checkout@v4
+
+      - name: Install Fedora's packaged Rust toolchain
+        if: matrix.distro == 'fedora'
+        run: dnf -y install rust cargo gcc pkgconf-pkg-config systemd-rpm-macros rpm-build rpmdevtools
+
+      - name: Install RHEL-family packaging deps
+        if: matrix.distro != 'fedora'
+        run: dnf -y install gcc pkgconf-pkg-config systemd-rpm-macros rpm-build rpmdevtools
+
+      - name: Install Rust toolchain (RHEL-family, rustup)
+        if: matrix.distro != 'fedora'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry/build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: rpm-${{ matrix.distro }}-${{ matrix.arch }}
+
+      - name: Build source tarball
+        run: |
+          mkdir -p ~/rpmbuild/SOURCES
+          git config --global --add safe.directory "$PWD"
+          git archive --prefix=mlvpn-0.1.1/ -o ~/rpmbuild/SOURCES/mlvpn-0.1.1.tar.gz HEAD
+
+      - name: rpmbuild
+        run: |
+          rpmdev-setuptree
+          cp packaging/rpm/mlvpn.spec ~/rpmbuild/SPECS/
+          rpmbuild -ba ~/rpmbuild/SPECS/mlvpn.spec
+
+      - name: Collect build output
+        run: |
+          mkdir -p dist
+          find ~/rpmbuild/RPMS -name '*.rpm' -exec cp {} dist/ \;
+          ls -la dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mlvpn-rpm-${{ matrix.distro }}-${{ matrix.arch }}
+          path: dist/*.rpm
+
+  # Separate from the build jobs so every package format/architecture
+  # lands in one Release via a single softprops/action-gh-release call,
+  # instead of several jobs racing to create/update the same tag's
+  # Release at once.
+  publish:
+    needs: [build-deb, build-rpm]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all packages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: mlvpn-*
+          path: dist
+          merge-multiple: true
+
+      - name: Create/update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.deb
+            dist/*.rpm
+          generate_release_notes: true

@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 use mlvpn::config::{self, Config};
 use mlvpn::error::{MlvpnError, Result};
+use mlvpn::firewall;
 use mlvpn::{crypto, link, privilege, tunnel};
 use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
@@ -29,6 +30,24 @@ enum Command {
         #[arg(short, long)]
         out: Option<PathBuf>,
     },
+    /// Detect the active firewall backend (firewalld, ufw, nftables, or
+    /// iptables) and open inbound UDP access for every [[links]] port in
+    /// the given config. Always try --dry-run first: this inspects and
+    /// modifies live firewall state, unlike every other subcommand here.
+    FirewallSetup {
+        #[arg(short, long, default_value = "/etc/mlvpn/mlvpn.toml")]
+        config: PathBuf,
+        /// Print the commands this would run without executing them.
+        #[arg(long)]
+        dry_run: bool,
+        /// Close the ports instead of opening them.
+        #[arg(long)]
+        remove: bool,
+        /// Skip auto-detection and use this backend instead: firewalld,
+        /// ufw, nftables, or iptables.
+        #[arg(long)]
+        backend: Option<String>,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -43,6 +62,21 @@ fn main() -> anyhow::Result<()> {
                 .enable_all()
                 .build()?;
             rt.block_on(run(cfg))
+        }
+        Command::FirewallSetup {
+            config,
+            dry_run,
+            remove,
+            backend,
+        } => {
+            let cfg = Config::load(&config)?;
+            let action = if remove {
+                firewall::Action::Remove
+            } else {
+                firewall::Action::Add
+            };
+            firewall::run(&cfg, dry_run, action, backend.as_deref())?;
+            Ok(())
         }
     }
 }
