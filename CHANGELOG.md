@@ -67,6 +67,14 @@ include breaking config/wire changes, called out explicitly below.
   dnf-tracked packages. Same root cause as the `.deb` build's
   `dpkg-buildpackage -d` flag exists for. Added the equivalent
   `rpmbuild -ba --nodeps`.
+- With that fixed, the RPM build then failed at packaging time with
+  `Empty %files file .../debugsourcefiles.list`: `[profile.release]`
+  in `Cargo.toml` sets `strip = true`, so the compiled binaries carry
+  no debug symbols for `rpmbuild`'s automatic `find-debuginfo` pass to
+  extract, and it errors out rather than silently producing an empty
+  `mlvpn-debugsource` subpackage. Added `%global debug_package %{nil}`
+  to `packaging/rpm/mlvpn.spec` to disable debuginfo package
+  generation entirely, the standard fix for pre-stripped binaries.
 
 ## [0.1.1] - 2026-07-13
 

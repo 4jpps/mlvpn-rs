@@ -26,6 +26,10 @@ mlvpn (0.1.2-1) unstable; urgency=medium
     failed with "cargo/rust >= 1.75 is needed" regardless of version;
     added rpmbuild -ba --nodeps, same reasoning as the .deb build's
     dpkg-buildpackage -d.
+  * Fix RPM packaging failing with "Empty %files file
+    debugsourcefiles.list": Cargo.toml's strip = true leaves no debug
+    symbols for rpmbuild's find-debuginfo to extract. Added
+    %global debug_package %{nil} to packaging/rpm/mlvpn.spec.
 
  -- Jeff Parrish PC Services <www.jpps.us>  Mon, 13 Jul 2026 00:00:00 +0000
 

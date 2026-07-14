@@ -6,8 +6,17 @@
 # equivalent of the user/group creation below.
 #
 # Note on %{?dist}: left in place (standard Fedora/RHEL convention) so
-# the same spec produces e.g. mlvpn-0.1.1-1.fc41.x86_64.rpm on Fedora and
-# mlvpn-0.1.1-1.el9.x86_64.rpm on RHEL/Rocky/Alma from one source tree.
+# the same spec produces e.g. mlvpn-0.1.2-1.fc41.x86_64.rpm on Fedora and
+# mlvpn-0.1.2-1.el9.x86_64.rpm on RHEL/Rocky/Alma from one source tree.
+#
+# debug_package disabled: [profile.release] in Cargo.toml sets
+# strip = true, so the compiled mlvpnd/mlvpn-tui binaries carry no
+# debug symbols for rpmbuild's automatic find-debuginfo pass to
+# extract. Without this, rpmbuild still tries to generate a
+# mlvpn-debugsource subpackage, finds nothing, and fails the whole
+# build with "Empty %files file .../debugsourcefiles.list" -- this is
+# the standard fix for Rust (and other pre-stripped-binary) packages.
+%global debug_package %{nil}
 
 Name:           mlvpn
 Version:        0.1.2
