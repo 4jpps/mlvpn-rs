@@ -8,7 +8,11 @@ throughput. A Rust rewrite of MLVPN, targeting current Debian/Ubuntu
 systemd-based distributions, on both amd64 and arm64.
 
 By [Jeff Parrish PC Services](https://www.jpps.us), vibe-coded with
-[Claude](https://claude.com/claude-code). License: MIT.
+[Claude](https://claude.com/claude-code). License:
+[AGPL-3.0-only](LICENSE) -- if you run a modified version as a network
+service, you must make your changes' source available to its users; see
+`LICENSE` and [CONTRIBUTING.md](CONTRIBUTING.md#licensing) for why this
+version specifically.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the full design, threat model,
 and known limitations/roadmap -- read that before relying on this for

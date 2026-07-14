@@ -14,7 +14,7 @@ Version:        0.1.1
 Release:        1%{?dist}
 Summary:        Multi-link VPN bonding daemon
 
-License:        MIT
+License:        AGPL-3.0-only
 URL:            https://github.com/4jpps/mlvpn-rs
 Source0:        %{name}-%{version}.tar.gz
 
@@ -95,3 +95,4 @@ chmod 0750 %{_sysconfdir}/mlvpn
 - Initial RPM packaging, mirroring the existing .deb: firewalld-aware
   mlvpnd firewall-setup, systemd unit, unprivileged mlvpn user/group
   created automatically on install.
+- Relicensed from MIT to AGPL-3.0-only.

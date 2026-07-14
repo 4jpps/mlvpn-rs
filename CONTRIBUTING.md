@@ -16,8 +16,8 @@ with a Debian distro; this has Linux-only dependencies (`SO_BINDTODEVICE`,
 TUN devices, Linux capabilities) so there is no native Windows build.
 Clone into WSL's native filesystem (`~/mlvpn-rs`), not `/mnt/c/...` --
 NTFS-backed paths break `chmod`/git filemode handling that `cargo` and
-`git` both rely on. See the README's "Development" section for the full
-VS Code + WSL + rust-analyzer setup.
+`git` both rely on. See [docs/development.md](docs/development.md) for
+the full VS Code + WSL + rust-analyzer setup.
 
 ```sh
 git clone https://github.com/4jpps/mlvpn-rs.git
@@ -74,3 +74,15 @@ values).
 Regular bugs: open a GitHub issue using the bug report template.
 Suspected security vulnerabilities: do **not** open a public issue --
 see `SECURITY.md` for private reporting channels.
+
+## Licensing
+
+This project is licensed under **AGPL-3.0-only** -- deliberately
+pinned to that exact version rather than "or any later version": the
+copyright holder decides if/when to adopt a future AGPL revision,
+rather than that happening automatically the moment the FSF publishes
+one. See `LICENSE` for the full text.
+
+By submitting a pull request, you agree your contribution is licensed
+under those same terms (standard inbound=outbound; there's no separate
+CLA to sign at this time).

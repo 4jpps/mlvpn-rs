@@ -73,6 +73,13 @@ include breaking config/wire changes, called out explicitly below.
 
 ### Changed
 
+- **License changed from MIT to AGPL-3.0-only.** Deliberately pinned to
+  that exact version, not "or any later version" -- see
+  `CONTRIBUTING.md`'s "Licensing" section for why, and `LICENSE` for
+  the full text. The `v0.1.1` tag was re-cut after this change, and any
+  release/artifacts previously published under the old tag while it
+  was still MIT-licensed were deleted rather than left alongside the
+  relicensed build.
 - Crate restructured into a library (`src/lib.rs`) plus two binaries
   (`mlvpnd`, `mlvpn-tui`) so both can share the control-socket JSON
   schema (`ipc.rs`) without duplicating type definitions.

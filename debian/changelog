@@ -51,6 +51,7 @@ mlvpn (0.1.1-1) unstable; urgency=medium
   * CI: replace release-deb.yml with release.yml, which builds this
     .deb alongside a new RPM (packaging/rpm/mlvpn.spec, for current
     Fedora and RHEL/Rocky/Alma) and publishes both to one Release.
+  * Relicense from MIT to AGPL-3.0-only.
 
  -- Jeff Parrish PC Services <www.jpps.us>  Mon, 13 Jul 2026 00:00:00 +0000
 
