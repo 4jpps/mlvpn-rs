@@ -7,6 +7,18 @@
 # corresponding in-process fallback if you instead run this as root and
 # let it drop privileges itself.
 #
+# This also matters beyond startup: self-healing link reconnection
+# (link.rs's LinkHandle::reconnect, used when a bonded link's interface
+# is fully removed and recreated, e.g. a USB LTE modem being unplugged
+# and replugged) needs CAP_NET_RAW to still be held at the moment it
+# runs, which is long after startup. AmbientCapabilities= below keeps it
+# held for the process's entire life, so reconnection keeps working for
+# as long as the daemon runs. The privilege.rs fallback (start as root,
+# then drop) explicitly clears every capability right after the
+# privileged setup phase as defense in depth -- which also means a link
+# that later needs to reconnect under that model can't, and will log
+# why instead of silently failing. See ARCHITECTURE.md sec 6 and 8.
+#
 # Setup (once):
 #   groupadd --system mlvpn
 #   useradd  --system --no-create-home --shell /usr/sbin/nologin -g mlvpn mlvpn

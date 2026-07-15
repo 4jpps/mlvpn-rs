@@ -91,16 +91,23 @@ pub fn update_link_state(link: &mut Link, cfg: &SchedulerConfig) {
 /// link that's fast but flaky doesn't outscore one that's slower but
 /// reliable.
 pub fn score(link: &Link) -> f64 {
-    if link.state != LinkState::Up {
+    if link.state != LinkState::Up || link.admin_disabled {
         return 0.0;
     }
     let rtt = link.stats.rtt_ms.get().unwrap_or(200.0).max(0.1);
     let jitter = link.stats.jitter_ms.get().unwrap_or(20.0).max(0.0);
     let loss = link.stats.loss_rate.get().unwrap_or(0.0).clamp(0.0, 1.0);
+    // Prefer the active-probe measurement (a deliberate, MTU-sized burst
+    // sent purely to measure capacity) over the passive one (bytes
+    // actually carried by real traffic) when we have it: a link that's
+    // currently under-used by real traffic still gets scored on its true
+    // capacity instead of looking artificially slow. See
+    // `LinkStats::active_bandwidth_mbps`'s doc comment.
     let throughput = link
         .stats
-        .throughput_mbps
+        .active_bandwidth_mbps
         .get()
+        .or_else(|| link.stats.throughput_mbps.get())
         .unwrap_or(1.0)
         .max(0.1)
         .min(link.config.bandwidth_cap_mbps.unwrap_or(f64::MAX));

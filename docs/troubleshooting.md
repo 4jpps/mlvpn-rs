@@ -10,10 +10,14 @@
 - **`config file ... has insecure permissions`** -- `chmod 600` the
   config and/or private key file; `mlvpnd` refuses to start otherwise.
 - **Tunnel never establishes / stuck retrying the handshake** -- the
-  client only dials the *first* `[[links]]` entry initially (see
-  [Getting started](getting-started.md)); confirm that specific link is
-  actually up and the hub's firewall allows its port, or reorder the
-  config so a reliably-up link is first.
+  client broadcasts its initial handshake attempt on *every* configured
+  link with a `remote_addr` and races them (see
+  [Getting started](getting-started.md)), so this now means none of
+  them got a reply: check the hub is reachable and its firewall allows
+  each link's port, and check `mlvpnd`'s own log for
+  `handshake attempt failed` to see which link(s), if any, are at least
+  getting a malformed or unexpected reply back (as opposed to nothing at
+  all).
 - **`mlvpn-tui: connection refused` / permission denied on the socket**
   -- see [Monitoring](monitoring.md) -- the control socket is mode 0600
   under `/run/mlvpn` (mode 0750), both owned by `mlvpn`. Run
@@ -32,3 +36,16 @@
   to inspect and modify live firewall state, which every backend it
   supports requires root for, regardless of how `mlvpnd run` itself
   drops privileges.
+- **A link goes down after its interface is unplugged/replugged (a USB
+  LTE modem, typically) and never comes back, logging "cannot
+  reconnect this link's socket: ... missing required capability"
+  repeatedly** -- expected under the "start as root, drop after setup"
+  privilege model (see `privilege.rs`): it explicitly clears every
+  capability after startup, so the daemon can no longer re-bind that
+  link's socket once the interface reappears with a new ifindex. Switch
+  to the "never be root" model instead (the shipped
+  `systemd/mlvpn.service` default: `AmbientCapabilities=CAP_NET_ADMIN
+  CAP_NET_RAW`), which keeps `CAP_NET_RAW` for the process's whole
+  life and lets this self-heal on its own -- see `ARCHITECTURE.md` §6
+  and §8. A link recovering successfully logs "link socket
+  reconnected" instead.

@@ -1,5 +1,12 @@
 # Getting started: bonding two ISPs to a single-uplink hub
 
+New to VPN bonding? The short version: you're setting up two machines
+that talk to each other over an encrypted tunnel, and one of them
+(`branch` below) sends its traffic out over *two* physical internet
+connections at once instead of just one -- mlvpn-rs handles splitting
+traffic between them and automatically favoring whichever is working
+best at any given moment.
+
 A concrete example most deployments map onto: a branch site with two
 WAN links on different carriers (`branch`), bonded into one tunnel back
 to a single-uplink hub (`hub`) -- a cloud VPS, colo box, or anything with
@@ -85,12 +92,9 @@ weight = 1.0
 `config/mlvpn.toml.example` and `config/mlvpn-server.toml.example`
 (installed to `/usr/share/doc/mlvpn/` by the `.deb`) are the same
 templates with `[scheduler]`/`[logging]`/`[control]` defaults spelled
-out. Both example templates above put the *most reliable* link first --
-`establish_session` only attempts the initial handshake over the first
-`[[links]]` entry (see `tunnel.rs`'s module doc comment; racing the
-handshake over every link is a roadmap item), so ordering matters at
-startup even though all configured links carry data once the tunnel is
-up.
+out. `[[links]]` order doesn't matter for initial connection setup -- the
+client tries every configured link at once and completes on whichever
+replies first, so a down or slow entry no longer stalls startup.
 
 Then, on **both** ends:
 

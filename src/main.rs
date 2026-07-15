@@ -1,9 +1,12 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use mlvpn::config::{self, Config};
 use mlvpn::error::{MlvpnError, Result};
 use mlvpn::firewall;
+use mlvpn::ipc::{Command as SocketCommand, CommandResult};
 use mlvpn::{crypto, link, privilege, tunnel};
-use std::path::PathBuf;
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -48,6 +51,28 @@ enum Command {
         #[arg(long)]
         backend: Option<String>,
     },
+    /// Pin a link enabled or disabled on a *running* mlvpnd, without
+    /// editing the config and restarting. Talks to the command socket
+    /// (`[command]` in the config -- must have `enabled = true` there
+    /// first; off by default, see `mlvpn.toml.example`).
+    SetLink {
+        #[arg(short, long, default_value = "/etc/mlvpn/mlvpn.toml")]
+        config: PathBuf,
+        /// Link name, matching a [[links]] `name` in the config.
+        link: String,
+        /// Enable or disable the link for scheduling. A disabled link's
+        /// real quality stats keep updating (visible via the control
+        /// socket) -- it's just excluded from picking, same as if it
+        /// were probe-Down, until re-enabled.
+        #[arg(value_enum)]
+        state: LinkEnableState,
+    },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum LinkEnableState {
+    Enable,
+    Disable,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -78,12 +103,101 @@ fn main() -> anyhow::Result<()> {
             firewall::run(&cfg, dry_run, action, backend.as_deref())?;
             Ok(())
         }
+        Command::SetLink {
+            config,
+            link,
+            state,
+        } => set_link(&config, &link, matches!(state, LinkEnableState::Enable)),
+    }
+}
+
+/// Send a `SetLinkEnabled` command to a running daemon's command socket
+/// and print the result. Plain blocking `std` I/O rather than spinning
+/// up a tokio runtime for it -- this is a one-shot request/reply over
+/// an already-local Unix socket, not something that benefits from
+/// async.
+fn set_link(config_path: &Path, link: &str, enabled: bool) -> anyhow::Result<()> {
+    let cfg = Config::load(config_path)?;
+    if !cfg.command.enabled {
+        anyhow::bail!(
+            "[command] is not enabled in {}; set `[command] enabled = true` in the config and \
+             restart mlvpnd before this will work",
+            config_path.display()
+        );
+    }
+    let path = cfg
+        .command
+        .socket_path
+        .clone()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(format!("/run/mlvpn/{}.command.sock", cfg.tunnel.name)));
+
+    let mut stream = UnixStream::connect(&path).map_err(|e| {
+        anyhow::anyhow!(
+            "connecting to command socket {}: {e} (is mlvpnd running with [command] enabled?)",
+            path.display()
+        )
+    })?;
+
+    let cmd = SocketCommand::SetLinkEnabled {
+        link: link.to_string(),
+        enabled,
+    };
+    let mut line = serde_json::to_vec(&cmd)?;
+    line.push(b'\n');
+    stream.write_all(&line)?;
+    // Half-close our write side so the server's read loop sees EOF after
+    // this one line instead of waiting on a second line that never
+    // comes -- matches `serve_command_client`'s "read exactly one line"
+    // contract.
+    stream.shutdown(std::net::Shutdown::Write)?;
+
+    let mut reply = String::new();
+    BufReader::new(&stream).read_line(&mut reply)?;
+    let result: CommandResult = serde_json::from_str(reply.trim_end())?;
+
+    if result.ok {
+        println!(
+            "ok: link '{link}' {}",
+            if enabled { "enabled" } else { "disabled" }
+        );
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "mlvpnd rejected the command: {}",
+            result
+                .error
+                .unwrap_or_else(|| "(no error detail)".to_string())
+        );
     }
 }
 
 fn init_logging(level: &str) {
     let filter = EnvFilter::try_new(level).unwrap_or_else(|_| EnvFilter::new("info"));
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    // `with_ansi(false)`: mlvpnd is a background daemon whose stdout/stderr
+    // normally lands in journald or a log file, not an interactive
+    // terminal -- `tracing_subscriber::fmt()`'s ANSI color coding defaults
+    // to *on* unconditionally (it doesn't auto-detect a non-tty writer),
+    // so without this every log line carries embedded color escape codes
+    // that pollute journal/file output invisibly (a real terminal renders
+    // them away, so this goes unnoticed until something reads the raw
+    // bytes). Concretely surfaced by `tests/support/mod.rs`'s
+    // `LogCapture`: it re-prints each captured line via `println!` (which
+    // renders the escapes away again under `--nocapture`, so the test's
+    // own terminal output looks completely normal), but stores the *raw*
+    // string -- including the invisible escape sequences -- for
+    // `wait_for_line_containing`/`find_line_containing` to search.
+    // tracing_subscriber colors field keys/values distinctly from the
+    // message text, so a needle spanning a `key=value` pair (as
+    // `tests/veth_active_bandwidth_probing.rs`'s does) can straddle an
+    // embedded escape sequence and silently never match, even though the
+    // exact same text is plainly visible on screen. Existing log-based
+    // tests happened to only search the plain message text and never hit
+    // this.
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_ansi(false)
+        .init();
 }
 
 fn genkey(out: Option<PathBuf>) -> anyhow::Result<()> {
@@ -166,6 +280,25 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
         None
     };
 
+    // Off by default -- see `config::CommandConfig::enabled`'s doc
+    // comment for why this one doesn't default on the way
+    // `control_socket` above does. Default path deliberately uses a
+    // different filename (`.command.sock` vs `.sock`) so the two are
+    // never confusable at a glance even though they share a directory.
+    let command_socket = if cfg.command.enabled {
+        Some(
+            cfg.command
+                .socket_path
+                .clone()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| {
+                    PathBuf::from(format!("/run/mlvpn/{}.command.sock", cfg.tunnel.name))
+                }),
+        )
+    } else {
+        None
+    };
+
     let params = tunnel::TunnelParams {
         mode: cfg.mode,
         mtu: effective_mtu,
@@ -176,18 +309,18 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
         rekey_interval: std::time::Duration::from_secs(cfg.crypto.rekey_interval_secs),
         tunnel_name: cfg.tunnel.name.clone(),
         control_socket,
+        command_socket,
     };
 
-    let shutdown = tokio::signal::ctrl_c();
-    tokio::select! {
-        result = tunnel::run(tun, links, params) => {
-            result.map_err(anyhow::Error::from)
-        }
-        _ = shutdown => {
-            tracing::info!("received shutdown signal, exiting");
-            Ok(())
-        }
-    }
+    // `tunnel::run` races SIGINT/SIGTERM against the tunnel's own tasks
+    // internally (rather than this caller racing a bare `ctrl_c()`
+    // against it from outside), specifically so it can send a
+    // best-effort `Disconnect` frame to the peer before exiting -- that
+    // needs access to the live links/session, which only exists inside
+    // `tunnel::run` itself. See `tunnel.rs`'s `Shutdown` doc comment.
+    tunnel::run(tun, links, params)
+        .await
+        .map_err(anyhow::Error::from)
 }
 
 /// Picks the MTU actually used for the TUN device and outgoing packet

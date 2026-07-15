@@ -1,13 +1,24 @@
 # mlvpn-rs
 
-Bonds multiple physical network links (fiber, DSL, LTE, ...) into one
-resilient, Noise-encrypted VPN tunnel, load-balancing and failing over
-between them based on continuously measured latency, jitter, loss and
-throughput. Dual-stack (IPv4 + IPv6) tunnel interface, with adaptive
-MTU detection and TCP MSS clamping so real link hardware -- not a
-hand-tuned config value -- decides sizing. Targets current Debian/Ubuntu
-(13+/24.04+) and Fedora/RHEL-family (Fedora, RHEL, Rocky, Alma 9+)
-systemd-based distributions, on both amd64 and arm64.
+**In plain terms:** if a site has two or more separate internet
+connections -- a fiber line plus a cellular modem, two different ISPs,
+whatever -- mlvpn-rs combines them into one connection that's both
+faster (it uses all of them at once, not just one as backup) and more
+reliable (if one connection slows down or drops out, traffic
+automatically shifts to the others, with no manual intervention and
+no dropped sessions). It runs as a background service on two Linux
+machines, one at each end of the link you want to bond, and everything
+in between is encrypted.
+
+More precisely: mlvpn-rs bonds multiple physical network links
+(fiber, DSL, LTE, ...) into one resilient, Noise-encrypted VPN tunnel,
+load-balancing and failing over between them based on continuously
+measured latency, jitter, loss and throughput. Dual-stack (IPv4 +
+IPv6) tunnel interface, with adaptive MTU detection and TCP MSS
+clamping so real link hardware -- not a hand-tuned config value --
+decides sizing. Targets current Debian/Ubuntu (13+/24.04+) and
+Fedora/RHEL-family (Fedora, RHEL, Rocky, Alma 9+) systemd-based
+distributions, on both amd64 and arm64.
 
 A Rust rewrite of [MLVPN](https://github.com/zehome/MLVPN) by Laurent
 Coustet, which the core bonding/monitoring/failover idea is credited
@@ -33,10 +44,10 @@ anything real. See [CHANGELOG.md](CHANGELOG.md) for release history.
 
 ```sh
 # Debian/Ubuntu
-sudo apt install ./mlvpn_0.2.0-1_amd64.deb
+sudo apt install ./mlvpn_0.3.0-1_amd64.deb
 
 # Fedora/RHEL/Rocky/Alma
-sudo dnf install ./mlvpn-0.2.0-1.fc41.x86_64.rpm
+sudo dnf install ./mlvpn-0.3.0-1.fc41.x86_64.rpm
 ```
 
 Grab the package matching your distro/architecture from the
@@ -57,6 +68,8 @@ Full setup lives in **[docs/](docs/)**, not this README:
 - [Development](docs/development.md) -- build/test/lint, CI, releases
 - [Platform roadmap: OPNsense / pfSense](docs/platforms/opnsense-pfsense.md)
   -- scoping notes for a future FreeBSD-based port (not implemented)
+- [Platform roadmap: OpenWrt](docs/platforms/openwrt.md) -- scoping
+  notes for a future embedded-router port (not implemented)
 
 See also [CONTRIBUTING.md](CONTRIBUTING.md) before opening a PR, and
 [SECURITY.md](SECURITY.md) if you've found a vulnerability rather than a
@@ -66,7 +79,7 @@ regular bug -- please don't file those as public issues.
 
 ```
 src/
-  main.rs        CLI (run / genkey), startup sequencing, privilege drop
+  main.rs        CLI (run / genkey / set-link), startup sequencing, privilege drop
   lib.rs          Library crate shared by mlvpnd and mlvpn-tui
   config.rs       TOML config + validation + permission checks
   crypto.rs       Noise_IK handshake, AEAD session, replay window
@@ -78,8 +91,9 @@ src/
   tunnel.rs       Ties it together: TUN <-> links, per-link actor tasks
   privilege.rs    Drop root -> unprivileged user, clear capabilities
   peerstats.rs    Table of the peer's most recently reported link stats
-  ipc.rs          JSON schema for the monitoring control socket
-  control.rs      Unix-socket server that streams ipc::Snapshot to mlvpn-tui
+  ipc.rs          JSON schema for the monitoring/command sockets
+  control.rs      Unix-socket servers: streams ipc::Snapshot to mlvpn-tui,
+                  and (opt-in) accepts runtime link-control commands
   firewall.rs     mlvpnd firewall-setup: detects/drives firewalld, ufw,
                   nftables, iptables
   bin/mlvpn-tui.rs  Terminal monitoring view (see docs/monitoring.md)

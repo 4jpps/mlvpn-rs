@@ -28,8 +28,14 @@
 //!   is implicitly authenticated: an attacker cannot replay a ciphertext
 //!   under a different sequence number and have it verify.
 //! - Sessions are rekeyed periodically (see `CryptoConfig::rekey_interval_secs`)
-//!   by tearing down and re-running the handshake, bounding the amount of
-//!   data ever protected by one set of transport keys.
+//!   by running a brand new handshake while the current session keeps
+//!   serving traffic, bounding the amount of data ever protected by one
+//!   set of transport keys. `SessionState` (below) is what makes that
+//!   swap safe: it holds the active session plus, briefly, the one it
+//!   replaced, so packets already in flight under the old keys at the
+//!   moment of the swap aren't dropped. See `tunnel.rs`'s module doc
+//!   comment for the task-level design (`rekey_loop`, the server's
+//!   steady-state `HandshakeInit` handling).
 
 use crate::error::{MlvpnError, Result};
 use rand::RngCore;
@@ -37,6 +43,7 @@ use snow::{Builder, HandshakeState, StatelessTransportState};
 use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 use zeroize::Zeroize;
 
 pub const NOISE_PATTERN: &str = "Noise_IK_25519_ChaChaPoly_BLAKE2s";
@@ -115,6 +122,21 @@ pub struct LocalPrivateKey(pub [u8; 32]);
 impl Drop for LocalPrivateKey {
     fn drop(&mut self) {
         self.0.zeroize();
+    }
+}
+
+impl Clone for LocalPrivateKey {
+    // Hand-written rather than `#[derive(Clone)]` purely so this stays
+    // next to the `Drop` impl it pairs with: each clone zeroizes its own
+    // copy independently on drop, which is exactly what we want (no
+    // aliasing -- `[u8; 32]` is `Copy`, so this is a real, independent
+    // copy of the key material, not a shared reference). Needed so
+    // `tunnel.rs` can hand a copy to the steady-state rekey-acceptance
+    // path (`RekeyContext`, shared across every `link_receiver` task)
+    // while `TunnelParams` keeps its own for the client-initiated rekey
+    // loop and the initial handshake.
+    fn clone(&self) -> Self {
+        LocalPrivateKey(self.0)
     }
 }
 
@@ -440,6 +462,141 @@ impl Session {
 /// distinguish handshake attempts / sessions on the wire.
 pub fn random_session_id() -> u32 {
     rand::rngs::OsRng.next_u32()
+}
+
+/// One established session plus the session id (a random `u32` chosen
+/// by the client at handshake time -- initial or rekey -- and echoed
+/// back by the server, so both sides settle on the same value) that
+/// tags every frame protected under it on the wire. See
+/// `SessionState`'s doc comment for how this and a possible `previous`
+/// slot work together across a rekey.
+struct SessionSlot {
+    id: u32,
+    session: Session,
+}
+
+/// Holds the tunnel's current cryptographic session plus, briefly after
+/// a rekey, the one it replaced.
+///
+/// Rekeying tears down and re-establishes the Noise session
+/// periodically (bounding how much traffic is ever protected by one set
+/// of keys) by running a brand new handshake *while the old session
+/// keeps serving traffic* -- see `tunnel.rs`'s `rekey_loop` (client
+/// side) and its steady-state `HandshakeInit` handling in
+/// `handle_incoming` (server side) -- and only then swapping which
+/// session new outgoing packets use (`install`). Packets already in
+/// flight when that swap happens, encrypted under the old session,
+/// would otherwise be dropped as undecryptable the instant it happens;
+/// `previous` exists specifically to keep those decryptable for a
+/// short, bounded overlap window (`expire_previous`) afterward, without
+/// extending that leniency forever. `decrypt` picks which session's
+/// keys to try by the incoming frame's own header `session_id` --
+/// active first (the overwhelmingly common case), falling back to
+/// `previous` only if it matches that instead.
+///
+/// Each side's `active`/`previous` are its own local bookkeeping, not
+/// synchronized with the peer's -- there is no need for them to be: a
+/// rekey's initiator and responder each independently retire their own
+/// prior session into their own `previous` slot the moment *they*
+/// finish their half of the handshake, which is inherently slightly
+/// staggered (the responder installs first, then replies; the
+/// initiator installs only once it receives and verifies that reply).
+/// A handful of packets sent in that narrow gap, tagged with a session
+/// id the receiver doesn't recognize *yet*, are simply dropped and
+/// naturally recovered by this project's existing loss tolerance
+/// (`ReorderBuffer`, the up/down hysteresis) -- exactly like any other
+/// transient loss, not a correctness problem needing its own handling.
+pub struct SessionState {
+    active: SessionSlot,
+    previous: Option<(SessionSlot, Instant)>,
+}
+
+impl SessionState {
+    pub fn new(id: u32, session: Session) -> Self {
+        Self {
+            active: SessionSlot { id, session },
+            previous: None,
+        }
+    }
+
+    /// Encrypt under the active session, returning the session id to
+    /// stamp into the frame header alongside the sequence number and
+    /// ciphertext. Every caller that used to carry a `session_id`
+    /// captured once at tunnel startup now gets it from here instead,
+    /// so a frame sent right after a rekey automatically carries the
+    /// *new* session's id without any caller needing to know a rekey
+    /// just happened.
+    pub fn encrypt(&self, plaintext: &[u8]) -> Result<(u32, u64, Vec<u8>)> {
+        let seq = self.active.session.next_send_seq();
+        let ct = self.active.session.encrypt(seq, plaintext)?;
+        Ok((self.active.id, seq, ct))
+    }
+
+    /// Decrypt an incoming frame using whichever session its header
+    /// `session_id` names. An id matching neither `active` nor
+    /// `previous` is rejected outright (mapped to `MlvpnError::AuthFailed`,
+    /// the same as any other authentication failure, so a probing
+    /// attacker can't distinguish "wrong session id" from "wrong key"
+    /// from the response) rather than, say, falling back to the active
+    /// session anyway -- accepting an unrecognized session id would
+    /// silently defeat the whole point of tagging frames with one.
+    pub fn decrypt(&mut self, session_id: u32, seq: u64, ciphertext: &[u8]) -> Result<Vec<u8>> {
+        if session_id == self.active.id {
+            return self.active.session.decrypt(seq, ciphertext);
+        }
+        if let Some((prev, _)) = &mut self.previous {
+            if session_id == prev.id {
+                return prev.session.decrypt(seq, ciphertext);
+            }
+        }
+        Err(MlvpnError::AuthFailed)
+    }
+
+    /// Install a freshly completed handshake's session as the new
+    /// active one, retiring the current active session into `previous`
+    /// so trailing in-flight traffic encrypted under it still decrypts
+    /// during the overlap window. Called once a rekey handshake
+    /// completes and is verified -- both a client's own rekey attempt
+    /// succeeding and a server accepting a peer-initiated one (see
+    /// `tunnel.rs`).
+    pub fn install(&mut self, id: u32, session: Session) {
+        let old = std::mem::replace(&mut self.active, SessionSlot { id, session });
+        self.previous = Some((old, Instant::now()));
+    }
+
+    /// Whether `id` names a session this side has already installed --
+    /// either the current `active` one or the just-retired `previous`
+    /// one. Used by `tunnel.rs`'s steady-state `HandshakeInit` handling
+    /// to recognize a stale duplicate of an already-completed handshake
+    /// (see that call site's doc comment) before spending real Noise/DH
+    /// work re-processing it: a *genuinely new* rekey attempt always
+    /// carries a freshly generated random session id
+    /// (`crypto::random_session_id`, drawn once per attempt), so by
+    /// construction it can only ever collide with an id already known
+    /// here in the astronomically unlikely case of a true 32-bit random
+    /// collision -- never as a matter of course the way a resent copy of
+    /// an already-processed handshake would.
+    pub fn is_known_session_id(&self, id: u32) -> bool {
+        self.active.id == id || self.previous.as_ref().is_some_and(|(p, _)| p.id == id)
+    }
+
+    /// Drop `previous` once it's older than `overlap_window`, so a
+    /// retired session's keys don't remain able to decrypt anything
+    /// indefinitely. Called periodically by `tunnel.rs`'s
+    /// `session_expiry_loop`, independent of (and much more frequent
+    /// than) the rekey interval itself -- the overlap window only needs
+    /// to be long enough to cover realistic in-flight delay across
+    /// multiple physical links, not anywhere near as long as the
+    /// interval between rekeys.
+    pub fn expire_previous(&mut self, overlap_window: Duration) {
+        let expired = self
+            .previous
+            .as_ref()
+            .is_some_and(|(_, at)| at.elapsed() >= overlap_window);
+        if expired {
+            self.previous = None;
+        }
+    }
 }
 
 #[cfg(test)]

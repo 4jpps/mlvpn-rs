@@ -44,6 +44,20 @@ pub enum MlvpnError {
     #[error("privilege drop failed: {0}")]
     Privilege(String),
 
+    /// Distinct from `Privilege` above (which is specifically about
+    /// `privilege::drop_privileges` itself failing): this is a
+    /// privileged *operation* -- currently only `SO_BINDTODEVICE` via
+    /// `link::bind_socket` -- failing because the calling process no
+    /// longer holds the capability it needs (`CAP_NET_RAW`). Notably
+    /// raised by `link::LinkHandle::reconnect`, called long after
+    /// startup, when privileges were already dropped under the "start
+    /// as root, drop after setup" model (see `privilege.rs`) -- a
+    /// separate error type so callers (see `tunnel.rs`'s reconnect
+    /// loop) can match on it specifically rather than parsing a
+    /// generic message.
+    #[error("missing required capability: {0}")]
+    CapabilityMissing(String),
+
     #[error("protocol error: {0}")]
     Protocol(String),
 

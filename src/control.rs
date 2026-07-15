@@ -15,15 +15,29 @@
 //! created mode 0600 so only the daemon's own runtime user (or root) can
 //! connect; anyone who can already read it can already read `/proc` for
 //! the same process, so this isn't adding new exposure, just convenience.
+//!
+//! **Command socket.** `serve_commands` (below) is a second, separate
+//! Unix socket -- different path, off by default (`[command].enabled`)
+//! -- for runtime link control (currently: pin a link enabled/disabled,
+//! see `ipc::Command`). Kept as its own socket rather than a write mode
+//! bolted onto the one above specifically so a client authorized only to
+//! *read* the monitoring socket (e.g. a `mlvpn-tui` running under a
+//! monitoring-only account) never incidentally gains the ability to
+//! redirect live traffic. Same 0600-via-umask creation as `serve`: mode
+//! 0600 is a real boundary here, not security-by-obscurity -- the kernel
+//! checks it (effectively `SO_PEERCRED`-equivalent: only the owning
+//! uid/root can `connect()` at all) before a client ever gets a byte in
+//! or out, the same guarantee any other 0600 Unix socket or file
+//! provides.
 
-use crate::ipc::{LinkSnapshot, Snapshot};
+use crate::ipc::{Command, CommandResult, LinkSnapshot, Snapshot};
 use crate::link::{Link, LinkState};
 use crate::peerstats::PeerStatsTable;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::interval;
@@ -198,5 +212,141 @@ async fn build_snapshot(
             .unwrap_or_default()
             .as_millis() as u64,
         links: link_snapshots,
+    }
+}
+
+/// Bind the command socket and serve `ipc::Command` requests until the
+/// process exits. Setup (directory creation, umask-tightened bind,
+/// belt-and-suspenders 0600 re-assertion) exactly mirrors `serve` above
+/// -- see its comments for why each step exists. The protocol differs:
+/// this is request/reply rather than a streaming push, so each
+/// connection is expected to send exactly one JSON `Command` line and
+/// gets exactly one JSON `CommandResult` line back before the
+/// connection closes. As with `serve`, any setup failure is logged and
+/// treated as "runtime link control unavailable" rather than a fatal
+/// daemon error -- this is an operator convenience, not something that
+/// should be able to take the tunnel down.
+pub async fn serve_commands(path: PathBuf, links: Arc<AsyncMutex<Vec<Link>>>) {
+    if let Some(parent) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            tracing::warn!(
+                error = %e,
+                path = %parent.display(),
+                "failed to create command socket directory; runtime link control will be unavailable"
+            );
+            return;
+        }
+        if let Err(e) = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o750)) {
+            tracing::debug!(
+                error = %e,
+                path = %parent.display(),
+                "could not set command socket directory permissions (likely already correct)"
+            );
+        }
+    }
+
+    let _ = std::fs::remove_file(&path);
+
+    let listener = {
+        // SAFETY: same reasoning as the umask block in `serve` above.
+        let previous_umask = unsafe { libc::umask(0o177) };
+        let result = UnixListener::bind(&path);
+        unsafe {
+            libc::umask(previous_umask);
+        }
+        match result {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    path = %path.display(),
+                    "failed to bind command socket; runtime link control will be unavailable"
+                );
+                return;
+            }
+        }
+    };
+
+    if let Err(e) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)) {
+        tracing::warn!(error = %e, "failed to restrict command socket permissions to 0600");
+    }
+
+    tracing::info!(path = %path.display(), "command socket listening (runtime link control)");
+
+    loop {
+        let (stream, _addr) = match listener.accept().await {
+            Ok(x) => x,
+            Err(e) => {
+                tracing::warn!(error = %e, "command socket accept failed");
+                continue;
+            }
+        };
+        let links = links.clone();
+        tokio::spawn(async move {
+            serve_command_client(stream, links).await;
+        });
+    }
+}
+
+/// Handle one command-socket connection: read exactly one JSON line,
+/// apply it, write exactly one JSON `CommandResult` line back. Silently
+/// returns (rather than logging) on a client that connects and
+/// disconnects without sending anything, or one that disappears before
+/// the reply is written -- a raced/impatient client is not a server-side
+/// problem worth a warning.
+async fn serve_command_client(stream: UnixStream, links: Arc<AsyncMutex<Vec<Link>>>) {
+    let (reader, mut writer) = stream.into_split();
+    let mut lines = BufReader::new(reader).lines();
+
+    let line = match lines.next_line().await {
+        Ok(Some(l)) => l,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!(error = %e, "command socket read failed");
+            return;
+        }
+    };
+
+    let result = match serde_json::from_str::<Command>(&line) {
+        Ok(cmd) => apply_command(cmd, &links).await,
+        Err(e) => CommandResult {
+            ok: false,
+            error: Some(format!("invalid command: {e}")),
+        },
+    };
+
+    let Ok(mut out) = serde_json::to_vec(&result) else {
+        return;
+    };
+    out.push(b'\n');
+    let _ = writer.write_all(&out).await;
+}
+
+/// Apply one already-parsed `Command` and report the outcome. Split out
+/// from `serve_command_client` so the actual link-mutation logic is
+/// testable/readable independent of the socket I/O around it.
+async fn apply_command(cmd: Command, links: &Arc<AsyncMutex<Vec<Link>>>) -> CommandResult {
+    match cmd {
+        Command::SetLinkEnabled { link, enabled } => {
+            let mut links_guard = links.lock().await;
+            match links_guard.iter_mut().find(|l| l.config.name == link) {
+                Some(l) => {
+                    l.admin_disabled = !enabled;
+                    tracing::info!(
+                        link = %link,
+                        enabled,
+                        "link admin_disabled set via command socket"
+                    );
+                    CommandResult {
+                        ok: true,
+                        error: None,
+                    }
+                }
+                None => CommandResult {
+                    ok: false,
+                    error: Some(format!("no such link '{link}'")),
+                },
+            }
+        }
     }
 }

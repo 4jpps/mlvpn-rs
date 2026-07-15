@@ -23,17 +23,72 @@ peer_public_key = "REPLACE_WITH_CLIENT_PUBLIC_KEY_BASE64"
 rekey_interval_secs = 120
 
 [scheduler]
-down_threshold = 5
-up_threshold = 3
-reorder_window_ms = 50
-ewma_alpha = 0.2
+down_threshold = 5       # consecutive missed probes before a link is marked Down
+up_threshold = 3         # consecutive good probes before a Down link is marked Up again
+reorder_window_ms = 50   # max time to hold a gap open in the receive reorder buffer
+ewma_alpha = 0.2         # smoothing factor for latency/jitter/loss/throughput stats
+# redundant_mode = false   # opt-in: send every packet on *every* Up link instead
+                           # of picking one, trading bandwidth for reliability.
+                           # Only worth it for a small, latency-critical tunnel --
+                           # leave off for a normal bonded/bulk-transfer tunnel.
+# auto_tune_reorder_window = false   # opt-in: periodically re-tune
+                           # reorder_window_ms itself from the live RTT spread
+                           # across bonded links, instead of leaving it fixed.
+                           # Useful when bonding links with very different
+                           # latency (e.g. fiber + a high-latency LTE link).
+# reorder_window_min_ms = 10    # bounds the auto-tuner above; only consulted
+# reorder_window_max_ms = 500   # when auto_tune_reorder_window is true
+# auto_tune_probe_interval = false   # opt-in: let a link's probe interval
+                           # back off above its own [[links]] probe_interval_ms
+                           # floor after a long clean streak (less overhead
+                           # on a stable link), snapping straight back to the
+                           # floor the instant there's any miss at all.
+# probe_interval_max_ms = 2000   # ceiling for the auto-tuner above; only
+                           # consulted when auto_tune_probe_interval is true
+# auto_tune_ewma_alpha = false   # opt-in: let a link's latency/jitter/loss/
+                           # throughput smoothing factor move within
+                           # [ewma_alpha_min, ewma_alpha_max] -- any miss
+                           # jumps it to the max (fastest reaction), a long
+                           # clean streak smooths it back toward the min.
+# ewma_alpha_min = 0.05     # bounds the auto-tuner above; only consulted
+# ewma_alpha_max = 0.5      # when auto_tune_ewma_alpha is true
+# active_bandwidth_probing = false   # opt-in: periodically send a short,
+                           # rate-limited burst of MTU-sized dummy packets on
+                           # each link purely to measure achieved throughput,
+                           # instead of only inferring it from real traffic
+                           # that happens to be flowing. Injects real (if
+                           # small and infrequent) extra traffic onto the
+                           # wire, so this needs a stronger opt-in than the
+                           # other auto-tuning knobs above -- leave off on a
+                           # metered/bandwidth-constrained link.
+# active_bandwidth_probe_interval_secs = 300   # how often each link runs one
+                           # burst; validated to be >= 30s (this is an
+                           # injected burst, not a single latency probe).
+# active_bandwidth_probe_packets = 20   # packets per burst; validated to be
+                           # between 2 and 100.
 
 [logging]
-level = "info"
+level = "info"           # tracing-subscriber EnvFilter directive, e.g. "info" or "mlvpn=debug"
 
 [control]
-enabled = true           # exposes live stats to `mlvpn-tui`; see README.md "Monitoring"
+enabled = true           # exposes live stats to `mlvpn-tui`; see docs/monitoring.md
 # socket_path = "/run/mlvpn/mlvpn0.sock"   # default is /run/mlvpn/<tunnel.name>.sock
+
+[command]
+# enabled = false          # off by default: lets `mlvpnd set-link <link>
+                           # <enable|disable>` pin a link out of scheduling at
+                           # runtime, without editing this file and restarting.
+                           # A separate socket from [control] above (different
+                           # path, same 0600 permissions) so a client only
+                           # authorized to read stats never gains the ability
+                           # to redirect traffic. See ARCHITECTURE.md §9.
+# socket_path = "/run/mlvpn/mlvpn0.command.sock"   # default is
+                           # /run/mlvpn/<tunnel.name>.command.sock
+
+# Each link is independently IPv4 or IPv6, inferred from local_addr (e.g.
+# "::" for "any IPv6") since a server-side link normally has no
+# remote_addr -- it learns the client's address from the handshake
+# itself. See config/mlvpn.toml.example and ARCHITECTURE.md §6.
 
 [[links]]
 name = "fiber"
@@ -46,5 +101,8 @@ probe_interval_ms = 200
 name = "lte"
 bind_interface = "eth0"   # server usually has one WAN-facing interface for all links
 local_port = 51001
-weight = 0.5
+weight = 0.5                # bias away from a metered/slower link
+bandwidth_cap_mbps = 20.0    # optional hard ceiling: the scheduler stops sending
+                             # more to this link once it's hit this rate in the
+                             # current second, picking another link instead
 probe_interval_ms = 200

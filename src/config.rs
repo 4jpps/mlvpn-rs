@@ -34,6 +34,9 @@ pub struct Config {
 
     #[serde(default)]
     pub control: ControlConfig,
+
+    #[serde(default)]
+    pub command: CommandConfig,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -131,6 +134,121 @@ pub struct SchedulerConfig {
     /// more reactive to recent samples, lower = smoother/slower to change.
     #[serde(default = "default_ewma_alpha")]
     pub ewma_alpha: f64,
+    /// Opt-in redundancy mode: send every outgoing Data frame on *every*
+    /// currently-Up link simultaneously, instead of the normal SWRR pick
+    /// of just one. Trades bandwidth (an N-link tunnel with this on uses
+    /// up to N times the bandwidth of a single copy) for the lowest
+    /// possible chance of losing an individual packet -- worth it for a
+    /// small, latency-critical tunnel (e.g. VoIP/control traffic over a
+    /// couple of links), not for a bulk-transfer bonded tunnel. This is
+    /// a blunt, whole-tunnel toggle rather than per-flow classification
+    /// (no DSCP/traffic-class inspection) -- see `tunnel::tun_reader`'s
+    /// doc comment for why that scoping was chosen. The receiving side
+    /// needs no special handling: the existing replay window already
+    /// rejects the second and later copies of the same sequence number
+    /// as duplicates, the same protection it already provides against a
+    /// genuine replay attack.
+    #[serde(default)]
+    pub redundant_mode: bool,
+    /// Opt-in: periodically re-tune `reorder_window_ms` at runtime based
+    /// on the live RTT spread across currently-Up links
+    /// (`tunnel::reorder_tuning_loop`), instead of using the fixed value
+    /// above for the tunnel's whole lifetime. A tunnel bonding two
+    /// similar links wants a tight window; one bonding a fast link with
+    /// a slow one needs more slack, and that spread can drift as links
+    /// come and go or a cellular link's radio conditions shift over the
+    /// life of a long-running tunnel. Off by default -- this changes
+    /// runtime behavior beyond what `reorder_window_ms` alone describes,
+    /// so an operator has to opt in rather than getting new dynamics
+    /// unannounced on upgrade. See `ARCHITECTURE.md` §7 for the full
+    /// design.
+    #[serde(default)]
+    pub auto_tune_reorder_window: bool,
+    /// Lower bound the auto-tuner (above) will ever set
+    /// `reorder_window_ms` to. Only consulted when
+    /// `auto_tune_reorder_window` is true.
+    #[serde(default = "default_reorder_window_min_ms")]
+    pub reorder_window_min_ms: u64,
+    /// Upper bound, same conditions as the min above.
+    #[serde(default = "default_reorder_window_max_ms")]
+    pub reorder_window_max_ms: u64,
+    /// Opt-in: let each link's *effective* probe interval back off above
+    /// its configured `[[links]] probe_interval_ms` floor after a long
+    /// clean streak of successful probes (less overhead on a link
+    /// that's been rock-stable for a while), snapping straight back to
+    /// the floor the instant there's any miss at all (fast reaction the
+    /// moment a link looks even slightly less reliable). `probe_interval_ms`
+    /// itself is never lowered by this -- only ever a floor, same as
+    /// before this existed. Off by default: this changes runtime probing
+    /// cadence, and touches the timing hysteresis-based Up/Down
+    /// decisions (§6) depend on, so it needs a deliberate opt-in same as
+    /// `auto_tune_reorder_window` above. See
+    /// `tunnel::suggest_probe_interval_ms` for the exact backoff math.
+    #[serde(default)]
+    pub auto_tune_probe_interval: bool,
+    /// Ceiling the auto-tuner (above) will ever back a link's effective
+    /// probe interval off to. Only consulted when
+    /// `auto_tune_probe_interval` is true; every configured
+    /// `[[links]] probe_interval_ms` must be `<=` this (checked in
+    /// `Config::validate`), so the floor can never exceed the ceiling.
+    #[serde(default = "default_probe_interval_max_ms")]
+    pub probe_interval_max_ms: u64,
+    /// Opt-in: let each link's own EWMA smoothing factor (shared by its
+    /// latency/jitter/loss/throughput estimates, see `link::LinkStats::set_alpha`)
+    /// move within `[ewma_alpha_min, ewma_alpha_max]` based on how
+    /// stable that link's probes have looked recently, instead of
+    /// staying fixed at `ewma_alpha` above for the tunnel's whole life.
+    /// Any miss at all jumps a link's alpha straight to `ewma_alpha_max`
+    /// (fastest possible reaction the moment there's trouble); a long
+    /// clean streak gradually smooths it back down toward
+    /// `ewma_alpha_min` instead. Off by default -- of this project's
+    /// four auto-tuning knobs, this was originally judged the most
+    /// speculative one (real production data, not just design
+    /// reasoning, is what would actually justify it -- see
+    /// `CHANGELOG.md`), so it gets the most deliberate opt-in of the
+    /// four.
+    #[serde(default)]
+    pub auto_tune_ewma_alpha: bool,
+    /// Lower bound (smoothest, slowest-reacting) the auto-tuner above
+    /// will ever move a link's alpha to. Only consulted when
+    /// `auto_tune_ewma_alpha` is true.
+    #[serde(default = "default_ewma_alpha_min")]
+    pub ewma_alpha_min: f64,
+    /// Upper bound (most reactive, least smooth), same conditions as
+    /// the min above.
+    #[serde(default = "default_ewma_alpha_max")]
+    pub ewma_alpha_max: f64,
+    /// Opt-in: periodically send a short, rate-limited burst of MTU-sized
+    /// dummy packets on each link purely to measure achieved throughput
+    /// (`tunnel::active_bandwidth_prober`), feeding
+    /// `link::LinkStats::active_bandwidth_mbps` -- see that field's doc
+    /// comment and `monitor::score`. Unlike the other three auto-tuning
+    /// knobs, this one injects extra traffic onto the wire rather than
+    /// just changing how existing measurements are interpreted, so it
+    /// gets the same deliberate off-by-default treatment for a stronger
+    /// reason: an operator on a metered or bandwidth-constrained link may
+    /// not want *any* synthetic traffic on it, however small. Existing
+    /// deployments are unaffected either way.
+    #[serde(default)]
+    pub active_bandwidth_probing: bool,
+    /// How often each link runs one probe burst, in seconds. Only
+    /// consulted when `active_bandwidth_probing` is true. Validated
+    /// (`Config::validate`) to be at least 30 seconds: this is a
+    /// deliberate, injected burst of traffic rather than the tiny
+    /// single-packet Probe/ProbeReply exchange used for latency, so a
+    /// too-short interval would start to look like a self-inflicted
+    /// bandwidth-flood/DoS pattern rather than an occasional
+    /// measurement.
+    #[serde(default = "default_active_bandwidth_probe_interval_secs")]
+    pub active_bandwidth_probe_interval_secs: u64,
+    /// How many MTU-sized packets make up one probe burst. Only
+    /// consulted when `active_bandwidth_probing` is true. Validated to be
+    /// between 2 (need at least a first and last packet to time an
+    /// interval) and 100 (an upper sanity bound, so a misconfigured
+    /// value can't turn "an occasional measurement" into a sustained
+    /// flood every interval).
+    #[serde(default = "default_active_bandwidth_probe_packets")]
+    pub active_bandwidth_probe_packets: u32,
 }
 
 fn default_down_threshold() -> u32 {
@@ -145,6 +263,27 @@ fn default_reorder_ms() -> u64 {
 fn default_ewma_alpha() -> f64 {
     0.2
 }
+fn default_reorder_window_min_ms() -> u64 {
+    10
+}
+fn default_reorder_window_max_ms() -> u64 {
+    500
+}
+fn default_probe_interval_max_ms() -> u64 {
+    2000
+}
+fn default_ewma_alpha_min() -> f64 {
+    0.05
+}
+fn default_ewma_alpha_max() -> f64 {
+    0.5
+}
+fn default_active_bandwidth_probe_interval_secs() -> u64 {
+    300
+}
+fn default_active_bandwidth_probe_packets() -> u32 {
+    20
+}
 
 impl Default for SchedulerConfig {
     fn default() -> Self {
@@ -153,6 +292,18 @@ impl Default for SchedulerConfig {
             up_threshold: default_up_threshold(),
             reorder_window_ms: default_reorder_ms(),
             ewma_alpha: default_ewma_alpha(),
+            redundant_mode: false,
+            auto_tune_reorder_window: false,
+            reorder_window_min_ms: default_reorder_window_min_ms(),
+            reorder_window_max_ms: default_reorder_window_max_ms(),
+            auto_tune_probe_interval: false,
+            probe_interval_max_ms: default_probe_interval_max_ms(),
+            auto_tune_ewma_alpha: false,
+            ewma_alpha_min: default_ewma_alpha_min(),
+            ewma_alpha_max: default_ewma_alpha_max(),
+            active_bandwidth_probing: false,
+            active_bandwidth_probe_interval_secs: default_active_bandwidth_probe_interval_secs(),
+            active_bandwidth_probe_packets: default_active_bandwidth_probe_packets(),
         }
     }
 }
@@ -168,10 +319,18 @@ pub struct LinkConfig {
     pub bind_interface: String,
     /// Optional specific local IP to bind the socket to, in addition to
     /// SO_BINDTODEVICE. Useful when an interface has multiple addresses.
+    /// Also what selects IPv6 for a server-side link that has no
+    /// `remote_addr` to infer it from (e.g. `"::"` to bind any local
+    /// IPv6 address) -- see `link::socket_domain`'s doc comment. A bare
+    /// IP, no port and no brackets even for IPv6 (unlike `remote_addr`
+    /// below).
     pub local_addr: Option<String>,
     /// Remote host:port of the peer for this link (client mode: where we
     /// connect; server mode: not used for binding, only for source
-    /// validation once the peer's address is learned).
+    /// validation once the peer's address is learned). Also what
+    /// selects this link's socket address family (IPv4 or IPv6) --
+    /// bracket the host for IPv6, e.g. `"[2001:db8::1]:51000"`, the
+    /// standard `SocketAddr` string form.
     pub remote_addr: Option<String>,
     /// Local UDP port to bind/listen on for this link.
     pub local_port: u16,
@@ -255,6 +414,37 @@ impl Default for ControlConfig {
     }
 }
 
+// Unlike `ControlConfig` above, a plain `#[derive(Default)]` is correct
+// here and clippy (rightly) flags a hand-written impl as redundant:
+// `bool::default()` is already `false`, which is exactly the "off by
+// default" behavior this type needs, for both the field-level
+// `#[serde(default)]` (used when `[command]` is present but `enabled`
+// isn't) and the whole-table-absent case (`#[serde(default)]` on
+// `Config::command`, which calls this `Default` impl).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct CommandConfig {
+    /// Enable the command socket (`control.rs::serve_commands`), which
+    /// lets an authorized local client pin a link enabled/disabled at
+    /// runtime -- see `ipc::Command`. Off by default, unlike the
+    /// read-only control socket: this one can affect live traffic, so an
+    /// operator has to opt in deliberately rather than getting a
+    /// mutation-capable socket "for free" just by upgrading. This is a
+    /// *separate* socket rather than an in-place upgrade of the
+    /// existing one: a client authorized only to read `[control]`'s
+    /// socket -- e.g. a monitoring-only account -- should not gain the
+    /// ability to redirect traffic just because both sockets happened
+    /// to share a path. See `ARCHITECTURE.md` §9.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Override the command socket path. When unset, defaults to
+    /// `/run/mlvpn/<tunnel.name>.command.sock` -- deliberately a
+    /// different filename from the read-only socket's default
+    /// (`<tunnel.name>.sock`), even though both live in the same
+    /// directory, so the two are never confusable at a glance in `ls`
+    /// output or a firewall/AppArmor rule.
+    pub socket_path: Option<String>,
+}
+
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         check_permissions(path)?;
@@ -293,6 +483,18 @@ impl Config {
                     link.name
                 )));
             }
+            // Checked unconditionally, not only when
+            // auto_tune_probe_interval is on: this keeps the invariant
+            // true even if it's enabled later without the config being
+            // revisited, and `suggest_probe_interval_ms`'s `u64::clamp`
+            // call would otherwise panic (clamp requires min <= max) the
+            // first time this link ever backs off.
+            if link.probe_interval_ms > self.scheduler.probe_interval_max_ms {
+                return Err(MlvpnError::Config(format!(
+                    "link '{}' probe_interval_ms ({}) must be <= scheduler.probe_interval_max_ms ({})",
+                    link.name, link.probe_interval_ms, self.scheduler.probe_interval_max_ms
+                )));
+            }
         }
 
         check_permissions(&self.crypto.private_key_file)?;
@@ -301,6 +503,46 @@ impl Config {
             return Err(MlvpnError::Config(
                 "tunnel MTU must be at least 576 bytes".into(),
             ));
+        }
+
+        if self.crypto.rekey_interval_secs == 0 {
+            return Err(MlvpnError::Config(
+                "crypto.rekey_interval_secs must be non-zero (tokio::time::interval panics on \
+                 a zero duration, and rekey_loop now actually runs this on the client)"
+                    .into(),
+            ));
+        }
+
+        if self.scheduler.reorder_window_min_ms > self.scheduler.reorder_window_max_ms {
+            return Err(MlvpnError::Config(format!(
+                "scheduler.reorder_window_min_ms ({}) must be <= reorder_window_max_ms ({})",
+                self.scheduler.reorder_window_min_ms, self.scheduler.reorder_window_max_ms
+            )));
+        }
+
+        if self.scheduler.ewma_alpha_min > self.scheduler.ewma_alpha_max {
+            return Err(MlvpnError::Config(format!(
+                "scheduler.ewma_alpha_min ({}) must be <= ewma_alpha_max ({})",
+                self.scheduler.ewma_alpha_min, self.scheduler.ewma_alpha_max
+            )));
+        }
+
+        // Checked unconditionally (not only when active_bandwidth_probing
+        // is on) for the same "stays true if enabled later" reasoning as
+        // the probe_interval_ms check above.
+        if self.scheduler.active_bandwidth_probe_interval_secs < 30 {
+            return Err(MlvpnError::Config(format!(
+                "scheduler.active_bandwidth_probe_interval_secs ({}) must be >= 30 -- this is \
+                 an injected traffic burst, not a single latency probe, so too-frequent bursts \
+                 look like a self-inflicted flood",
+                self.scheduler.active_bandwidth_probe_interval_secs
+            )));
+        }
+        if !(2..=100).contains(&self.scheduler.active_bandwidth_probe_packets) {
+            return Err(MlvpnError::Config(format!(
+                "scheduler.active_bandwidth_probe_packets ({}) must be between 2 and 100",
+                self.scheduler.active_bandwidth_probe_packets
+            )));
         }
 
         // Advisory only, not a hard error: warn if tunnel.mtu plus our own

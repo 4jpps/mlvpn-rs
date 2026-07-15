@@ -3,7 +3,11 @@
 **Status: scoping only -- nothing in this document is implemented.** No
 code has changed for this yet; this is a gap analysis and a proposed
 plan, written so a future session (or contributor) can pick it up
-without re-deriving all of this from scratch.
+without re-deriving all of this from scratch. See
+[`openwrt.md`](openwrt.md) for the equivalent scoping document covering
+that platform -- together, these three are the major router/firewall
+platforms this project is likely to target beyond generic
+Debian/Fedora-family Linux.
 
 ## Why this is a different kind of port than the Linux packaging work
 

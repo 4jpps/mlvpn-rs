@@ -6,8 +6,8 @@
 # equivalent of the user/group creation below.
 #
 # Note on %{?dist}: left in place (standard Fedora/RHEL convention) so
-# the same spec produces e.g. mlvpn-0.2.0-1.fc41.x86_64.rpm on Fedora and
-# mlvpn-0.2.0-1.el9.x86_64.rpm on RHEL/Rocky/Alma from one source tree.
+# the same spec produces e.g. mlvpn-0.3.0-1.fc41.x86_64.rpm on Fedora and
+# mlvpn-0.3.0-1.el9.x86_64.rpm on RHEL/Rocky/Alma from one source tree.
 #
 # debug_package disabled: [profile.release] in Cargo.toml sets
 # strip = true, so the compiled mlvpnd/mlvpn-tui binaries carry no
@@ -19,7 +19,7 @@
 %global debug_package %{nil}
 
 Name:           mlvpn
-Version:        0.2.0
+Version:        0.3.0
 Release:        1%{?dist}
 Summary:        Multi-link VPN bonding daemon
 
@@ -100,6 +100,27 @@ chmod 0750 %{_sysconfdir}/mlvpn
 %dir %attr(0750, root, mlvpn) %{_sysconfdir}/mlvpn
 
 %changelog
+* Tue Jul 14 2026 Jeff Parrish PC Services <www.jpps.us> - 0.3.0-1
+- Add self-healing link reconnection, handshake racing across every
+  configured link, rekeying with session migration, and graceful
+  shutdown on SIGINT/SIGTERM.
+- Add per-link bandwidth cap enforcement and an opt-in redundancy mode
+  (scheduler.redundant_mode).
+- Add a runtime link-control command socket ([command] enabled, off by
+  default): mlvpnd set-link <link> <enable|disable>.
+- Add IPv6 support to the bonded links themselves (independent of the
+  IPv4 tunnel address), inferred from remote_addr/local_addr.
+- Add periodic tunnel auto-tuning, all opt-in: reorder_window_ms,
+  probe_interval_ms, EWMA alpha, and active bandwidth probing can each
+  re-tune themselves from live link conditions.
+- New integration test harness (tests/veth_*.rs) covering all of the
+  above against two real mlvpnd processes in Linux network namespaces.
+- Fix log output carrying embedded ANSI color escape codes even when
+  not writing to an interactive terminal; now explicitly disabled.
+- Fix a race in the initial handshake's retry loop where a late reply
+  could poison every remaining retry attempt; each attempt now uses
+  its own session id (rekeying is unaffected).
+
 * Mon Jul 13 2026 Jeff Parrish PC Services <www.jpps.us> - 0.2.0-1
 - Add IPv6 dual-stack support to the TUN interface (tunnel.address6).
 - Add adaptive tunnel MTU: detects each bonded link's real physical

@@ -1,3 +1,56 @@
+mlvpn (0.3.0-1) unstable; urgency=medium
+
+  * Add self-healing link reconnection: a link whose interface is fully
+    removed and recreated (e.g. a USB LTE modem replugged) now gets its
+    socket automatically rebound instead of staying dead until the
+    daemon restarts.
+  * Add handshake racing across every configured link: the client tries
+    the initial handshake on all configured links at once instead of
+    only the first one, so a single down link at startup no longer
+    blocks the tunnel from coming up.
+  * Add rekeying and session migration: sessions are now periodically
+    rekeyed (crypto.rekey_interval_secs, default 120s) with a brief
+    overlap window so in-flight packets aren't dropped during the swap.
+  * Add graceful shutdown: mlvpnd now handles SIGINT/SIGTERM
+    (systemctl stop sends SIGTERM, which wasn't previously handled at
+    all) by notifying its peer and exiting cleanly.
+  * Add per-link bandwidth cap enforcement (a real, enforced ceiling
+    rather than just a scoring bias) and an opt-in
+    scheduler.redundant_mode that sends every packet on every
+    currently-up link at once, trading bandwidth for reliability on
+    small, latency-critical tunnels.
+  * Add a runtime link-control command socket ([command] enabled, off
+    by default): mlvpnd set-link <link> <enable|disable> pins a link
+    out of scheduling without editing the config and restarting.
+  * Add IPv6 support to the bonded links themselves: each [[links]]
+    entry is now independently IPv4 or IPv6, inferred from
+    remote_addr/local_addr, so a tunnel can mix address families
+    across its links. Existing IPv4-only configs are unaffected.
+  * Add periodic tunnel auto-tuning, all opt-in and off by default:
+    reorder_window_ms, probe_interval_ms, and EWMA alpha can each
+    re-tune themselves from live link conditions instead of staying
+    fixed at their configured value for the tunnel's whole life.
+  * Add active bandwidth probing (scheduler.active_bandwidth_probing,
+    opt-in): periodically measures a link's real achieved throughput
+    with a small, rate-limited packet burst instead of only ever
+    inferring it from real traffic that happens to be flowing.
+  * New integration test harness (tests/veth_*.rs) exercising all of
+    the above against two real mlvpnd processes in Linux network
+    namespaces connected by real veth pairs.
+  * Fix log output carrying embedded ANSI color escape codes even when
+    not writing to an interactive terminal (e.g. journald, a log
+    file): tracing_subscriber's color coding defaulted to on
+    unconditionally; now explicitly disabled.
+  * Fix a race in the initial handshake's retry loop: a late reply
+    arriving just after one attempt's timeout but during a later
+    attempt's window would fail to decrypt (wrong ephemeral) and then
+    poison every remaining retry via the existing stale-duplicate
+    protection, dooming the whole handshake even though the peer had a
+    valid session waiting. Each initial-handshake attempt now uses its
+    own session id; rekeying is unaffected.
+
+ -- Jeff Parrish PC Services <www.jpps.us>  Wed, 15 Jul 2026 00:00:00 -0500
+
 mlvpn (0.2.0-1) unstable; urgency=medium
 
   * Add IPv6 support to the mlvpn0 TUN interface: tunnel.address6 (an

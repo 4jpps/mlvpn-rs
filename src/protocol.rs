@@ -56,6 +56,23 @@ pub enum PacketType {
     /// unauthenticated stats channel would let an off-path attacker feed
     /// fabricated numbers into the peer's monitoring display.
     StatsShare = 8,
+    /// One packet of an active bandwidth-probing burst
+    /// (`scheduler.active_bandwidth_probing`, off by default) -- see
+    /// `BandwidthProbeBurstPayload`. Unlike `Probe`/`ProbeReply`, this
+    /// measures achieved throughput rather than latency: the sender
+    /// transmits a short, rate-limited burst of these on a slow timer
+    /// (minutes, not seconds), the receiver times how long the whole
+    /// burst took to arrive and reports the achieved rate back via
+    /// `BandwidthProbeResult`. This is what lets `monitor::score()`
+    /// learn a link's true capacity even when it's currently too
+    /// low-scored to ever get saturated by real traffic -- passive
+    /// `LinkStats::record_bytes` alone only reflects bandwidth *already
+    /// being used*.
+    BandwidthProbeBurst = 9,
+    /// Reply to a completed `BandwidthProbeBurst` burst, carrying the
+    /// achieved throughput the receiver measured. See
+    /// `BandwidthProbeResultPayload`.
+    BandwidthProbeResult = 10,
 }
 
 impl PacketType {
@@ -69,6 +86,8 @@ impl PacketType {
             6 => Self::Keepalive,
             7 => Self::Disconnect,
             8 => Self::StatsShare,
+            9 => Self::BandwidthProbeBurst,
+            10 => Self::BandwidthProbeResult,
             other => {
                 return Err(MlvpnError::Protocol(format!(
                     "unknown packet type byte {other}"
@@ -252,5 +271,151 @@ impl StatsPayload {
             throughput_mbps,
             state,
         })
+    }
+}
+
+/// Payload of one packet in a `BandwidthProbeBurst` (see
+/// `scheduler.active_bandwidth_probing` in `config.rs` and
+/// `tunnel::active_bandwidth_prober`/`tunnel::handle_incoming`). The
+/// receiver uses `packet_index`/`total_packets` to know when a burst is
+/// complete and to detect a fresh burst starting (a new `probe_id`)
+/// without needing any prior signaling. The header is fixed at
+/// `HEADER_LEN` bytes; callers pad the remainder out to the tunnel's MTU
+/// with zero bytes so the burst actually exercises the link at
+/// realistic packet sizes instead of measuring small-packet overhead.
+#[derive(Debug, Clone, Copy)]
+pub struct BandwidthProbeBurstPayload {
+    /// Identifies one burst attempt; freshly chosen (not necessarily
+    /// randomized -- an incrementing per-link counter is fine, since
+    /// this is just a local dedup/reset key, never trusted across
+    /// peers for anything security-sensitive) each time
+    /// `active_bandwidth_prober` starts a new burst.
+    pub probe_id: u32,
+    /// Zero-based index of this packet within the burst.
+    pub packet_index: u16,
+    /// Total number of packets in this burst; constant across every
+    /// packet in the same burst (`scheduler.active_bandwidth_probe_packets`).
+    pub total_packets: u16,
+}
+
+impl BandwidthProbeBurstPayload {
+    pub const HEADER_LEN: usize = 4 + 2 + 2;
+
+    /// Encode the fixed header and zero-pad to `total_len` bytes (no-op
+    /// if `total_len <= HEADER_LEN`, so callers can't accidentally
+    /// truncate the header itself).
+    pub fn encode_padded(&self, total_len: usize) -> Vec<u8> {
+        let mut out = vec![0u8; total_len.max(Self::HEADER_LEN)];
+        out[0..4].copy_from_slice(&self.probe_id.to_be_bytes());
+        out[4..6].copy_from_slice(&self.packet_index.to_be_bytes());
+        out[6..8].copy_from_slice(&self.total_packets.to_be_bytes());
+        out
+    }
+
+    pub fn decode(buf: &[u8]) -> Result<Self> {
+        if buf.len() < Self::HEADER_LEN {
+            return Err(MlvpnError::Protocol(
+                "bandwidth probe burst payload too short".into(),
+            ));
+        }
+        Ok(Self {
+            probe_id: u32::from_be_bytes(buf[0..4].try_into().unwrap()),
+            packet_index: u16::from_be_bytes(buf[4..6].try_into().unwrap()),
+            total_packets: u16::from_be_bytes(buf[6..8].try_into().unwrap()),
+        })
+    }
+}
+
+/// Payload of a `BandwidthProbeResult` frame: the receiver's measured
+/// achieved throughput for a just-completed `BandwidthProbeBurst`, fed
+/// into the *sender's* `LinkStats::active_bandwidth_mbps` on arrival
+/// (see `monitor::score`, which prefers this over the passive
+/// `throughput_mbps` estimate when available).
+#[derive(Debug, Clone, Copy)]
+pub struct BandwidthProbeResultPayload {
+    /// Echoes the `probe_id` of the burst this result is for, purely
+    /// for logging/debugging -- the sender doesn't need to correlate it
+    /// against anything since it only has one burst in flight per link
+    /// at a time.
+    pub probe_id: u32,
+    pub achieved_mbps: f32,
+}
+
+impl BandwidthProbeResultPayload {
+    pub const LEN: usize = 4 + 4;
+
+    pub fn encode(&self) -> [u8; Self::LEN] {
+        let mut out = [0u8; Self::LEN];
+        out[0..4].copy_from_slice(&self.probe_id.to_be_bytes());
+        out[4..8].copy_from_slice(&self.achieved_mbps.to_be_bytes());
+        out
+    }
+
+    pub fn decode(buf: &[u8]) -> Result<Self> {
+        if buf.len() < Self::LEN {
+            return Err(MlvpnError::Protocol(
+                "bandwidth probe result payload too short".into(),
+            ));
+        }
+        Ok(Self {
+            probe_id: u32::from_be_bytes(buf[0..4].try_into().unwrap()),
+            achieved_mbps: f32::from_be_bytes(buf[4..8].try_into().unwrap()),
+        })
+    }
+}
+
+#[cfg(test)]
+mod bandwidth_probe_payload_tests {
+    use super::*;
+
+    #[test]
+    fn burst_payload_round_trips_through_padding() {
+        let payload = BandwidthProbeBurstPayload {
+            probe_id: 0xdead_beef,
+            packet_index: 3,
+            total_packets: 20,
+        };
+        let encoded = payload.encode_padded(1400);
+        assert_eq!(encoded.len(), 1400);
+        let decoded = BandwidthProbeBurstPayload::decode(&encoded).unwrap();
+        assert_eq!(decoded.probe_id, payload.probe_id);
+        assert_eq!(decoded.packet_index, payload.packet_index);
+        assert_eq!(decoded.total_packets, payload.total_packets);
+    }
+
+    #[test]
+    fn burst_payload_encode_padded_never_truncates_header() {
+        let payload = BandwidthProbeBurstPayload {
+            probe_id: 1,
+            packet_index: 0,
+            total_packets: 1,
+        };
+        let encoded = payload.encode_padded(0);
+        assert_eq!(encoded.len(), BandwidthProbeBurstPayload::HEADER_LEN);
+        assert!(BandwidthProbeBurstPayload::decode(&encoded).is_ok());
+    }
+
+    #[test]
+    fn burst_payload_decode_rejects_short_buffer() {
+        let buf = [0u8; 4];
+        assert!(BandwidthProbeBurstPayload::decode(&buf).is_err());
+    }
+
+    #[test]
+    fn result_payload_round_trips() {
+        let payload = BandwidthProbeResultPayload {
+            probe_id: 42,
+            achieved_mbps: 87.5,
+        };
+        let encoded = payload.encode();
+        let decoded = BandwidthProbeResultPayload::decode(&encoded).unwrap();
+        assert_eq!(decoded.probe_id, payload.probe_id);
+        assert!((decoded.achieved_mbps - payload.achieved_mbps).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn result_payload_decode_rejects_short_buffer() {
+        let buf = [0u8; 4];
+        assert!(BandwidthProbeResultPayload::decode(&buf).is_err());
     }
 }
