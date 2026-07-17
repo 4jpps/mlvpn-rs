@@ -118,11 +118,11 @@ chmod 0750 %{_sysconfdir}/mlvpn
 - Fix systemd/mlvpn.service's PrivateDevices=no having an unsupported
   trailing inline comment on the same line.
 - Fix the mlvpn system user's primary group being able to end up as
-  nogroup instead of mlvpn on an existing install; %pre now enforces
+  nogroup instead of mlvpn on an existing install; %%pre now enforces
   this on every install/upgrade.
 - The .deb package now also restarts mlvpnd after an upgrade if it was
   already running (this .rpm already did, via
-  %systemd_postun_with_restart).
+  %%systemd_postun_with_restart).
 
 * Thu Jul 16 2026 Jeff Parrish PC Services <www.jpps.us> - 0.3.1-1
 - Fix the initial handshake exiting the whole daemon if every configured
