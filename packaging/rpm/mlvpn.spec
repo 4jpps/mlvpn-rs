@@ -6,8 +6,8 @@
 # equivalent of the user/group creation below.
 #
 # Note on %{?dist}: left in place (standard Fedora/RHEL convention) so
-# the same spec produces e.g. mlvpn-0.3.1-1.fc41.x86_64.rpm on Fedora and
-# mlvpn-0.3.1-1.el9.x86_64.rpm on RHEL/Rocky/Alma from one source tree.
+# the same spec produces e.g. mlvpn-0.3.2-1.fc41.x86_64.rpm on Fedora and
+# mlvpn-0.3.2-1.el9.x86_64.rpm on RHEL/Rocky/Alma from one source tree.
 #
 # debug_package disabled: [profile.release] in Cargo.toml sets
 # strip = true, so the compiled mlvpnd/mlvpn-tui binaries carry no
@@ -19,7 +19,7 @@
 %global debug_package %{nil}
 
 Name:           mlvpn
-Version:        0.3.1
+Version:        0.3.2
 Release:        1%{?dist}
 Summary:        Multi-link VPN bonding daemon
 
@@ -71,6 +71,12 @@ install -dm0750 %{buildroot}%{_sysconfdir}/mlvpn
 getent group mlvpn >/dev/null || groupadd -r mlvpn
 getent passwd mlvpn >/dev/null || \
     useradd -r -g mlvpn -d /nonexistent -s /sbin/nologin -c "mlvpn daemon" mlvpn
+# Enforce the primary group even when the mlvpn user already existed
+# (the useradd above is skipped entirely on upgrade once the account
+# exists, so a user whose primary group ended up wrong for any reason
+# would otherwise never get corrected by a routine package upgrade).
+# No-op, and silent, if it's already mlvpn.
+usermod -g mlvpn mlvpn
 exit 0
 
 %post
@@ -100,6 +106,24 @@ chmod 0750 %{_sysconfdir}/mlvpn
 %dir %attr(0750, root, mlvpn) %{_sysconfdir}/mlvpn
 
 %changelog
+* Fri Jul 17 2026 Jeff Parrish PC Services <www.jpps.us> - 0.3.2-1
+- Performance: bonding two links together could be slower than using
+  either one alone -- all links shared one single lock over every
+  link's metadata, so two links' receive tasks serialized against each
+  other on every packet even though they touch disjoint data. Each
+  link now has its own independent lock, removing that cross-link
+  contention entirely. See docs/performance-tuning.md.
+- Add mlvpn-tui's header showing this machine's own hostname alongside
+  the tunnel name and mode.
+- Fix systemd/mlvpn.service's PrivateDevices=no having an unsupported
+  trailing inline comment on the same line.
+- Fix the mlvpn system user's primary group being able to end up as
+  nogroup instead of mlvpn on an existing install; %pre now enforces
+  this on every install/upgrade.
+- The .deb package now also restarts mlvpnd after an upgrade if it was
+  already running (this .rpm already did, via
+  %systemd_postun_with_restart).
+
 * Thu Jul 16 2026 Jeff Parrish PC Services <www.jpps.us> - 0.3.1-1
 - Fix the initial handshake exiting the whole daemon if every configured
   link's peer is unreachable at startup; now retries in the background

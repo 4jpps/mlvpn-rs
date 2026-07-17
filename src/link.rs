@@ -116,6 +116,7 @@ impl Ewma {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct LinkStats {
     pub rtt_ms: Ewma,
     /// Jitter per RFC 3550 sec 6.4.1: EWMA of the absolute difference
@@ -307,6 +308,40 @@ pub fn is_interface_gone_error(e: &std::io::Error) -> bool {
     matches!(e.raw_os_error(), Some(libc::ENODEV) | Some(libc::ENXIO))
 }
 
+/// Every bonded link, each independently lockable. Deliberately *not*
+/// `Arc<AsyncMutex<Vec<Link>>>` (one lock for the whole collection) --
+/// see `tunnel.rs`'s module doc comment for why that used to force every
+/// link's `link_receiver` task to serialize against every other link's
+/// on every single packet, capping aggregate bonded throughput below
+/// what either link could do alone. The outer `Vec` itself needs no
+/// lock at all: its length and order are fixed at startup (`run()`
+/// builds it once from the config and never resizes it), so any task
+/// can freely index or iterate it without synchronization -- only each
+/// element's *contents* (state, stats, the learned remote address) ever
+/// change at runtime, and each now has its own independent lock for
+/// that.
+pub type Links = Arc<Vec<AsyncMutex<Link>>>;
+
+/// Read every link's current state by locking each one in turn and
+/// cloning it out, releasing that link's lock before moving to the
+/// next. Used by every call site that needs to look at (or pick from)
+/// *all* links at once -- `Scheduler::select`/`refresh`/`all_down`,
+/// building a control-socket `Snapshot`, racing/broadcasting a
+/// handshake across every link -- without ever holding one lock across
+/// the whole collection, which is exactly the contention this type
+/// exists to avoid. Each per-link lock here is only ever held long
+/// enough to clone that one entry, so this can never block a
+/// `link_receiver` task for longer than a single `Link` clone, and
+/// never blocks two different links' tasks against each other at all.
+pub async fn snapshot_links(links: &Links) -> Vec<Link> {
+    let mut out = Vec::with_capacity(links.len());
+    for l in links.iter() {
+        out.push(l.lock().await.clone());
+    }
+    out
+}
+
+#[derive(Clone)]
 pub struct Link {
     pub id: u8,
     pub config: LinkConfig,

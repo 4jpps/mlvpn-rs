@@ -92,7 +92,24 @@ ceiling actually is:
   (`scheduler.rs::swrr_pick_under_cap`), by design, not a bug. Leave it
   unset for a link that shouldn't be capped at all.
 
-## 3. How the scheduler splits traffic across links
+## 3. Bonded throughput lower than either link alone
+
+If §2's per-link isolation test shows *each* link individually beating
+the bonded number -- e.g. Comcast alone hits 143 Mbps, T-Mobile alone
+hits 118 Mbps, but bonded only reaches 55-90 Mbps -- that's not a
+kernel buffer or ISP problem (§1 already ruled those out if
+`UdpInErrors` stayed flat during the test). Versions before this fix
+had every link sharing one single lock over all link metadata
+(`Arc<AsyncMutex<Vec<Link>>>`), so two links' receive tasks serialized
+against each other on every packet even though they touch completely
+disjoint data -- the more links bonded, the worse it got, which is
+exactly backwards for a bonding daemon. Each link now has its own
+independent lock (`Arc<Vec<AsyncMutex<Link>>>`, see `tunnel.rs`'s
+module doc comment and `link::snapshot_links`), removing that
+cross-link contention entirely. If you still see this symptom on a
+current build, it's a new bug, not this one -- please report it.
+
+## 4. How the scheduler splits traffic across links
 
 `scheduler.rs` uses smooth weighted round robin, weighting each Up link
 by `monitor::score()` -- which factors in each link's measured

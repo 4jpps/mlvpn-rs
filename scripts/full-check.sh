@@ -20,6 +20,17 @@ if [[ "${1:-}" == "--skip-integration" ]]; then
     skip_integration=1
 fi
 
+# Get the sudo password prompt out of the way up front, before any real
+# output exists to scroll past it -- the veth integration tests each
+# sudo themselves individually (see the loop below), so without this
+# the prompt lands unpredictably in the middle of whichever test
+# happens to run first. `sudo -v` just refreshes/caches credentials
+# without running a real command; harmless (and near-instant) to call
+# even when --skip-integration means nothing below will actually need
+# it.
+sudo -v
+clear
+
 echo "== build =="
 cargo build --release
 

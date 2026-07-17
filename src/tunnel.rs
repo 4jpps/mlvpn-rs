@@ -54,13 +54,29 @@
 //! returns cleanly rather than the process only ever ending via signal
 //! or panic.
 //!
-//! Locking discipline: `links: Arc<AsyncMutex<Vec<Link>>>` guards
-//! *metadata only* (stats, state, the learned remote address). Every task
-//! that performs socket I/O first takes a `link::LinkHandle` (see that
-//! module) out from under a short-lived lock, reads the handle's
-//! *current* socket (`LinkHandle::current_socket`, its own separate,
-//! per-link `RwLock` -- see below), and only then awaits
-//! `send_to`/`recv_from` on that owned clone, never across the `Vec<Link>`
+//! Locking discipline: `links: link::Links` (`Arc<Vec<AsyncMutex<Link>>>`)
+//! gives each link its own independent lock over its metadata (stats,
+//! state, the learned remote address) -- *not* one lock shared across the
+//! whole collection. An earlier version of this module used
+//! `Arc<AsyncMutex<Vec<Link>>>`, a single mutex guarding every link at
+//! once; real two-link deployment testing (see `CHANGELOG.md`) found that
+//! this forced both links' `link_receiver` tasks to serialize against
+//! each other on every packet's metadata update (recording bytes,
+//! learning a peer address), even though the two links touch completely
+//! disjoint data -- measured as bonded throughput coming in at roughly
+//! half of either link's solo throughput, worse than not bonding at all.
+//! Per-link locks remove that cross-link contention entirely: locking
+//! `links[0]` never blocks anything waiting on `links[1]`. Any call site
+//! that genuinely needs to look at *every* link at once (the scheduler,
+//! a control-socket snapshot) uses `link::snapshot_links`, which locks
+//! each link only long enough to clone it, rather than holding a single
+//! lock across the whole read.
+//!
+//! Every task that performs socket I/O first takes a `link::LinkHandle`
+//! (see that module) out from under a short-lived lock, reads the
+//! handle's *current* socket (`LinkHandle::current_socket`, its own
+//! separate, per-link `RwLock` -- see below), and only then awaits
+//! `send_to`/`recv_from` on that owned clone, never across a `Link`
 //! mutex guard. Holding an async mutex across a network read/write that
 //! can block indefinitely would serialize every link behind whichever one
 //! is slowest to receive -- exactly the kind of head-of-line blocking a
@@ -192,7 +208,7 @@ use crate::config::{Mode, SchedulerConfig};
 use crate::control;
 use crate::crypto::{self, Handshake, LocalPrivateKey, Session, SessionState};
 use crate::error::{MlvpnError, Result};
-use crate::link::{is_interface_gone_error, Link, LinkHandle, LinkState};
+use crate::link::{self, is_interface_gone_error, Link, LinkHandle, LinkState, Links};
 use crate::monitor::{self, ProbeTracker};
 use crate::peerstats::PeerStatsTable;
 use crate::protocol::{
@@ -505,7 +521,7 @@ impl Shutdown {
 
 pub async fn run(tun: AsyncDevice, links: Vec<Link>, params: TunnelParams) -> Result<()> {
     let tun = Arc::new(tun);
-    let links = Arc::new(AsyncMutex::new(links));
+    let links: Links = Arc::new(links.into_iter().map(AsyncMutex::new).collect());
     let scheduler = Arc::new(std::sync::Mutex::new(Scheduler::new()));
     // Wrapped once, here, so every task below (including ones spawned
     // later, like `rekey_loop`) can cheaply clone a handle to the full
@@ -540,9 +556,8 @@ pub async fn run(tun: AsyncDevice, links: Vec<Link>, params: TunnelParams) -> Re
     // built once here and handed to *both* tasks below rather than each
     // task getting its own independent tracker.
     let trackers: Vec<Arc<AsyncMutex<ProbeTracker>>> = {
-        let links_guard = links.lock().await;
-        links_guard
-            .iter()
+        let snap = link::snapshot_links(&links).await;
+        snap.iter()
             .map(|l| {
                 // The tracker's timeout is built once, for the whole
                 // session, but `probe_interval_ms` itself can grow at
@@ -763,14 +778,10 @@ pub async fn run(tun: AsyncDevice, links: Vec<Link>, params: TunnelParams) -> Re
 /// falls back to noticing via the probe timeout it would have hit
 /// anyway -- a clean shutdown should never block on this succeeding,
 /// which is also why this doesn't retry.
-async fn broadcast_disconnect(
-    links: &Arc<AsyncMutex<Vec<Link>>>,
-    session: &Arc<AsyncMutex<SessionState>>,
-) {
+async fn broadcast_disconnect(links: &Links, session: &Arc<AsyncMutex<SessionState>>) {
     let targets: Vec<(LinkHandle, SocketAddr, u8)> = {
-        let links_guard = links.lock().await;
-        links_guard
-            .iter()
+        let snap = link::snapshot_links(links).await;
+        snap.iter()
             .filter_map(|link| link.remote.map(|r| (link.handle(), r, link.id)))
             .collect()
     };
@@ -804,10 +815,7 @@ async fn broadcast_disconnect(
 /// loop (server) -- see each for the real logic. This runs before any
 /// `link_actor` tasks exist, so the server arm is free to hold the
 /// `links` lock across its own recv calls without contending with them.
-async fn establish_session(
-    links: &Arc<AsyncMutex<Vec<Link>>>,
-    params: &TunnelParams,
-) -> Result<(u32, Session)> {
+async fn establish_session(links: &Links, params: &TunnelParams) -> Result<(u32, Session)> {
     match params.mode {
         // `None`: no `RekeyContext`/`link_receiver` tasks exist yet at
         // this point (see `run()`'s ordering), so there is no socket
@@ -830,8 +838,8 @@ async fn establish_session(
             // reconnect scenario.
             let mut sockets: Vec<(Arc<UdpSocket>, u8)> = Vec::new();
             {
-                let links_guard = links.lock().await;
-                for l in links_guard.iter() {
+                let snap = link::snapshot_links(links).await;
+                for l in snap.iter() {
                     sockets.push((l.handle().current_socket().await, l.id));
                 }
             }
@@ -893,11 +901,13 @@ async fn establish_session(
                 .await
                 {
                     Ok((session_id, session)) => {
-                        let mut links_guard = links.lock().await;
-                        if let Some(link) = links_guard.iter_mut().find(|l| l.id == link_id) {
-                            link.remote = Some(from);
+                        for l in links.iter() {
+                            let mut guard = l.lock().await;
+                            if guard.id == link_id {
+                                guard.remote = Some(from);
+                                break;
+                            }
                         }
-                        drop(links_guard);
                         return Ok((session_id, session));
                     }
                     Err(e) => {
@@ -935,10 +945,7 @@ async fn establish_session(
 /// so a client started before its peer is reachable just quietly waits
 /// it out rather than crash-looping itself into a permanently failed
 /// systemd unit.
-async fn establish_session_with_retry(
-    links: &Arc<AsyncMutex<Vec<Link>>>,
-    params: &TunnelParams,
-) -> (u32, Session) {
+async fn establish_session_with_retry(links: &Links, params: &TunnelParams) -> (u32, Session) {
     let mut backoff_ms = RECONNECT_BACKOFF_INITIAL_MS;
     loop {
         match establish_session(links, params).await {
@@ -988,7 +995,7 @@ async fn establish_session_with_retry(
 /// client had no way to learn the keys for, permanently desynchronizing
 /// the two sides under the same session id label.
 async fn perform_client_handshake(
-    links: &Arc<AsyncMutex<Vec<Link>>>,
+    links: &Links,
     params: &TunnelParams,
     rekey_ctx: Option<&Arc<RekeyContext>>,
 ) -> Result<(u32, Session)> {
@@ -1034,12 +1041,11 @@ async fn perform_client_handshake(
         // one (ARCHITECTURE.md roadmap item #1): a down or unreachable
         // first link no longer stalls handshake setup on its own.
         let targets: Vec<(LinkHandle, SocketAddr, u8)> = {
-            let links_guard = links.lock().await;
-            if links_guard.is_empty() {
+            let snap = link::snapshot_links(links).await;
+            if snap.is_empty() {
                 return Err(MlvpnError::Config("no links configured".into()));
             }
-            links_guard
-                .iter()
+            snap.iter()
                 .filter_map(|link| link.remote.map(|r| (link.handle(), r, link.id)))
                 .collect()
         };
@@ -1361,7 +1367,7 @@ async fn race_rekey_reply(
 #[allow(clippy::too_many_arguments)]
 async fn tun_reader(
     tun: Arc<AsyncDevice>,
-    links: Arc<AsyncMutex<Vec<Link>>>,
+    links: Links,
     session: Arc<AsyncMutex<SessionState>>,
     scheduler: Arc<std::sync::Mutex<Scheduler>>,
     mtu: usize,
@@ -1403,7 +1409,7 @@ async fn tun_reader(
 /// link and send there. Split out of `tun_reader` purely to keep that
 /// loop body readable now that it branches on `redundant_mode`.
 async fn send_scheduled(
-    links: &Arc<AsyncMutex<Vec<Link>>>,
+    links: &Links,
     scheduler: &Arc<std::sync::Mutex<Scheduler>>,
     session_id: u32,
     seq: u64,
@@ -1418,9 +1424,9 @@ async fn send_scheduled(
     // socket is current at send time (post-reconnect if one just
     // happened) instead of one captured slightly stale.
     let chosen: Option<(u8, LinkHandle, SocketAddr, String)> = {
-        let links_guard = links.lock().await;
+        let snap = link::snapshot_links(links).await;
         let mut sched = scheduler.lock().unwrap();
-        sched.select(&links_guard, frame_len).and_then(|l| {
+        sched.select(&snap, frame_len).and_then(|l| {
             l.remote
                 .map(|r| (l.id, l.handle(), r, l.config.name.clone()))
         })
@@ -1469,15 +1475,10 @@ async fn send_scheduled(
 /// latency-sensitive ones. Only worth enabling for a small,
 /// latency-critical tunnel (e.g. VoIP/control traffic bonded across a
 /// couple of links); a bulk-transfer tunnel should leave this off.
-async fn send_redundant(
-    links: &Arc<AsyncMutex<Vec<Link>>>,
-    session_id: u32,
-    seq: u64,
-    ciphertext: &[u8],
-) {
+async fn send_redundant(links: &Links, session_id: u32, seq: u64, ciphertext: &[u8]) {
     let targets: Vec<(u8, LinkHandle, SocketAddr, String)> = {
-        let links_guard = links.lock().await;
-        let up: Vec<_> = links_guard
+        let snap = link::snapshot_links(links).await;
+        let up: Vec<_> = snap
             .iter()
             .filter(|l| l.state == LinkState::Up)
             .filter_map(|l| {
@@ -1488,8 +1489,7 @@ async fn send_redundant(
         if !up.is_empty() {
             up
         } else {
-            links_guard
-                .iter()
+            snap.iter()
                 .filter_map(|l| {
                     l.remote
                         .map(|r| (l.id, l.handle(), r, l.config.name.clone()))
@@ -1535,7 +1535,7 @@ async fn send_redundant(
 #[allow(clippy::too_many_arguments)]
 async fn link_receiver(
     idx: usize,
-    links: Arc<AsyncMutex<Vec<Link>>>,
+    links: Links,
     session: Arc<AsyncMutex<SessionState>>,
     scheduler: Arc<std::sync::Mutex<Scheduler>>,
     tun: Arc<AsyncDevice>,
@@ -1548,8 +1548,7 @@ async fn link_receiver(
     bw_probe_state: Arc<AsyncMutex<BandwidthProbeReceiveState>>,
 ) {
     let (handle, link_id, link_name) = {
-        let links_guard = links.lock().await;
-        let link = &links_guard[idx];
+        let link = links[idx].lock().await;
         (link.handle(), link.id, link.config.name.clone())
     };
 
@@ -1630,15 +1629,14 @@ async fn link_receiver(
 /// `run()`, where both tasks are handed the same `Arc`).
 async fn link_prober(
     idx: usize,
-    links: Arc<AsyncMutex<Vec<Link>>>,
+    links: Links,
     session: Arc<AsyncMutex<SessionState>>,
     scheduler: Arc<std::sync::Mutex<Scheduler>>,
     cfg: SchedulerConfig,
     tracker: Arc<AsyncMutex<ProbeTracker>>,
 ) {
     let (handle, link_id, probe_interval_ms, link_name) = {
-        let links_guard = links.lock().await;
-        let link = &links_guard[idx];
+        let link = links[idx].lock().await;
         (
             link.handle(),
             link.id,
@@ -1719,13 +1717,16 @@ async fn link_prober(
                     t.sweep_timeouts()
                 };
                 if misses > 0 {
-                    let mut links_guard = links.lock().await;
-                    for _ in 0..misses {
-                        links_guard[idx].stats.record_miss();
+                    {
+                        let mut link = links[idx].lock().await;
+                        for _ in 0..misses {
+                            link.stats.record_miss();
+                        }
+                        monitor::update_link_state(&mut link, &cfg);
                     }
-                    monitor::update_link_state(&mut links_guard[idx], &cfg);
+                    let snap = link::snapshot_links(&links).await;
                     let mut sched = scheduler.lock().unwrap();
-                    sched.refresh(&links_guard);
+                    sched.refresh(&snap);
                 }
 
                 // Only one of the N probers needs to report the aggregate
@@ -1735,9 +1736,9 @@ async fn link_prober(
                 // whether *this* link had a miss, since a different
                 // link's state is what may have changed.
                 if idx == 0 {
-                    let links_guard = links.lock().await;
+                    let snap = link::snapshot_links(&links).await;
                     let sched = scheduler.lock().unwrap();
-                    let now_all_down = sched.all_down(&links_guard);
+                    let now_all_down = sched.all_down(&snap);
                     if now_all_down && !all_down_reported {
                         tracing::warn!(
                             "all links are currently down; still attempting delivery on the \
@@ -1751,8 +1752,7 @@ async fn link_prober(
 
                 if cfg.auto_tune_probe_interval {
                     let new_interval_ms = {
-                        let mut links_guard = links.lock().await;
-                        let link = &mut links_guard[idx];
+                        let mut link = links[idx].lock().await;
                         let suggested = suggest_probe_interval_ms(
                             link.config.probe_interval_ms,
                             cfg.probe_interval_max_ms,
@@ -1785,8 +1785,7 @@ async fn link_prober(
                 }
 
                 if cfg.auto_tune_ewma_alpha {
-                    let mut links_guard = links.lock().await;
-                    let link = &mut links_guard[idx];
+                    let mut link = links[idx].lock().await;
                     let suggested = suggest_ewma_alpha(
                         cfg.ewma_alpha_min,
                         cfg.ewma_alpha_max,
@@ -2001,7 +2000,7 @@ const ACTIVE_BANDWIDTH_PROBE_MAX_PACKETS: u32 = u16::MAX as u32;
 /// inflated) result.
 async fn active_bandwidth_prober(
     idx: usize,
-    links: Arc<AsyncMutex<Vec<Link>>>,
+    links: Links,
     session: Arc<AsyncMutex<SessionState>>,
     cfg: SchedulerConfig,
     mtu: usize,
@@ -2011,8 +2010,7 @@ async fn active_bandwidth_prober(
     }
 
     let (handle, link_id) = {
-        let links_guard = links.lock().await;
-        let link = &links_guard[idx];
+        let link = links[idx].lock().await;
         (link.handle(), link.id)
     };
 
@@ -2032,10 +2030,7 @@ async fn active_bandwidth_prober(
         // address for this link (e.g. right at startup, or a link that's
         // never come up) -- same "nothing to send to yet" condition
         // `send_probe` already handles for latency probes.
-        let remote = {
-            let links_guard = links.lock().await;
-            links_guard[idx].remote
-        };
+        let remote = links[idx].lock().await.remote;
         let Some(remote) = remote else {
             continue;
         };
@@ -2087,7 +2082,7 @@ async fn handle_incoming(
     frame: &[u8],
     from: SocketAddr,
     socket: &Arc<UdpSocket>,
-    links: &Arc<AsyncMutex<Vec<Link>>>,
+    links: &Links,
     session: &Arc<AsyncMutex<SessionState>>,
     scheduler: &Arc<std::sync::Mutex<Scheduler>>,
     tun: &Arc<AsyncDevice>,
@@ -2168,11 +2163,8 @@ async fn handle_incoming(
                     .await
                     {
                         Ok((new_id, new_session)) => {
-                            {
-                                let mut links_guard = links.lock().await;
-                                if let Some(link) = links_guard.get_mut(idx) {
-                                    link.remote = Some(from);
-                                }
+                            if let Some(l) = links.get(idx) {
+                                l.lock().await.remote = Some(from);
                             }
                             session.lock().await.install(new_id, new_session);
                             tracing::info!(session_id = new_id, "session rekeyed (peer-initiated)");
@@ -2222,23 +2214,18 @@ async fn handle_incoming(
     // automatically if a link's source address changes mid-session (e.g.
     // mobile roaming, NAT rebinding) -- without letting an unauthenticated
     // spoofed packet redirect where we send subsequent traffic.
-    {
-        let mut links_guard = links.lock().await;
-        if let Some(link) = links_guard.get_mut(idx) {
-            if link.remote != Some(from) {
-                tracing::debug!(link = %link.config.name, %from, "learned/updated peer address");
-                link.remote = Some(from);
-            }
+    if let Some(l) = links.get(idx) {
+        let mut link = l.lock().await;
+        if link.remote != Some(from) {
+            tracing::debug!(link = %link.config.name, %from, "learned/updated peer address");
+            link.remote = Some(from);
         }
     }
 
     match hdr.ptype {
         PacketType::Data => {
-            {
-                let mut links_guard = links.lock().await;
-                if let Some(link) = links_guard.get_mut(idx) {
-                    link.stats.record_bytes(frame.len() as u64);
-                }
+            if let Some(l) = links.get(idx) {
+                l.lock().await.stats.record_bytes(frame.len() as u64);
             }
 
             let ready = {
@@ -2291,13 +2278,14 @@ async fn handle_incoming(
                 t.record_reply(probe.probe_seq)
             };
             if let Some(rtt_ms) = rtt_ms {
-                let mut links_guard = links.lock().await;
-                if let Some(link) = links_guard.get_mut(idx) {
+                if let Some(l) = links.get(idx) {
+                    let mut link = l.lock().await;
                     link.stats.record_rtt(rtt_ms);
-                    monitor::update_link_state(link, cfg);
+                    monitor::update_link_state(&mut link, cfg);
                 }
+                let snap = link::snapshot_links(links).await;
                 let mut sched = scheduler.lock().unwrap();
-                sched.refresh(&links_guard);
+                sched.refresh(&snap);
             }
         }
         PacketType::StatsShare => {
@@ -2374,8 +2362,8 @@ async fn handle_incoming(
             let Ok(result) = BandwidthProbeResultPayload::decode(&plaintext) else {
                 return;
             };
-            let mut links_guard = links.lock().await;
-            if let Some(link) = links_guard.get_mut(idx) {
+            if let Some(l) = links.get(idx) {
+                let mut link = l.lock().await;
                 link.stats
                     .active_bandwidth_mbps
                     .update(result.achieved_mbps as f64);
@@ -2434,16 +2422,19 @@ async fn handle_incoming(
 /// it represents a real, present-tense delivery failure the quality
 /// hysteresis needs to know about -- it always does.
 async fn record_send_failure_as_miss(
-    links: &Arc<AsyncMutex<Vec<Link>>>,
+    links: &Links,
     idx: usize,
     cfg: &SchedulerConfig,
     scheduler: &Arc<std::sync::Mutex<Scheduler>>,
 ) {
-    let mut links_guard = links.lock().await;
-    links_guard[idx].stats.record_miss();
-    monitor::update_link_state(&mut links_guard[idx], cfg);
+    {
+        let mut link = links[idx].lock().await;
+        link.stats.record_miss();
+        monitor::update_link_state(&mut link, cfg);
+    }
+    let snap = link::snapshot_links(links).await;
     let mut sched = scheduler.lock().unwrap();
-    sched.refresh(&links_guard);
+    sched.refresh(&snap);
 }
 
 /// Outcome of one `send_probe` attempt. Deliberately more granular than a
@@ -2475,16 +2466,13 @@ enum ProbeSendOutcome {
 async fn send_probe(
     socket: &Arc<UdpSocket>,
     link_id: u8,
-    links: &Arc<AsyncMutex<Vec<Link>>>,
+    links: &Links,
     idx: usize,
     session: &Arc<AsyncMutex<SessionState>>,
     probe_seq_counter: &AtomicU32,
     tracker: &mut ProbeTracker,
 ) -> ProbeSendOutcome {
-    let remote = {
-        let links_guard = links.lock().await;
-        links_guard[idx].remote
-    };
+    let remote = links[idx].lock().await.remote;
     let Some(remote) = remote else {
         return ProbeSendOutcome::Skipped;
     };
@@ -2545,13 +2533,12 @@ async fn send_probe(
 async fn send_stats_share(
     socket: &Arc<UdpSocket>,
     link_id: u8,
-    links: &Arc<AsyncMutex<Vec<Link>>>,
+    links: &Links,
     idx: usize,
     session: &Arc<AsyncMutex<SessionState>>,
 ) {
     let (remote, payload) = {
-        let links_guard = links.lock().await;
-        let link = &links_guard[idx];
+        let link = links[idx].lock().await;
         let Some(remote) = link.remote else { return };
         let payload = StatsPayload {
             name: StatsPayload::encode_name(&link.config.name),
@@ -2595,7 +2582,7 @@ async fn send_stats_share(
 /// mirroring how it already passively accepts the very first handshake
 /// pre-session.
 async fn rekey_loop(
-    links: Arc<AsyncMutex<Vec<Link>>>,
+    links: Links,
     params: Arc<TunnelParams>,
     session: Arc<AsyncMutex<SessionState>>,
     rekey_ctx: Arc<RekeyContext>,
@@ -2770,7 +2757,7 @@ fn suggest_reorder_window_ms(rtts: &[f64], min_ms: u64, max_ms: u64) -> Option<u
 /// tick -- the same principle as the existing Up/Down hysteresis in
 /// `monitor.rs`. See `ARCHITECTURE.md` §7 for the full design.
 async fn reorder_tuning_loop(
-    links: Arc<AsyncMutex<Vec<Link>>>,
+    links: Links,
     reorder: Arc<AsyncMutex<ReorderBuffer>>,
     cfg: SchedulerConfig,
 ) {
@@ -2783,9 +2770,8 @@ async fn reorder_tuning_loop(
         tick.tick().await;
 
         let rtts: Vec<f64> = {
-            let links_guard = links.lock().await;
-            links_guard
-                .iter()
+            let snap = link::snapshot_links(&links).await;
+            snap.iter()
                 .filter(|l| l.state == LinkState::Up)
                 .filter_map(|l| l.stats.rtt_ms.get())
                 .collect()

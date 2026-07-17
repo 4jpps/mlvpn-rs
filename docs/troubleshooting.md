@@ -41,6 +41,17 @@
   always the kernel's default UDP socket buffer size silently dropping
   packets under a fast link's real bandwidth-delay product. See
   [Performance tuning](performance-tuning.md).
+- **`mlvpn` user's primary group isn't `mlvpn`** (`id mlvpn` shows something
+  else, commonly `nogroup`) -- both the `.deb` postinst and the `.rpm`
+  `%pre` scriptlet now enforce this on every install/upgrade
+  (`usermod -g mlvpn mlvpn`, harmless if already correct), but an
+  account left over from a package version predating that fix, or a
+  hand-run `useradd`/`adduser` that didn't set it, won't be corrected
+  until the next package upgrade actually runs. Fix directly in the
+  meantime with `sudo usermod -g mlvpn mlvpn`. Doesn't affect `mlvpnd`
+  itself (configs are `0600`, owned by the user directly, not the
+  group), but cross-account `mlvpn-tui` access via group membership
+  (see [Monitoring](monitoring.md)) depends on it.
 - **A link goes down after its interface is unplugged/replugged (a USB
   LTE modem, typically) and never comes back, logging "cannot
   reconnect this link's socket: ... missing required capability"

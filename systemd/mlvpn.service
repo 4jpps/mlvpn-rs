@@ -73,7 +73,13 @@ NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
-PrivateDevices=no          # TUN needs /dev/net/tun; everything else is still hidden
+# TUN needs /dev/net/tun; everything else is still hidden.
+# (Must be on its own line: systemd's unit-file parser doesn't support
+# trailing inline comments on a directive line -- `no` after a `#` here
+# used to get passed as part of the value, which systemd rejected with
+# "Invalid argument" at load time, logged but non-fatal since `no` is
+# also PrivateDevices' own default.)
+PrivateDevices=no
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectKernelLogs=yes

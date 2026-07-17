@@ -31,7 +31,7 @@
 //! provides.
 
 use crate::ipc::{Command, CommandResult, LinkSnapshot, Snapshot};
-use crate::link::{Link, LinkState};
+use crate::link::{self, LinkState, Links};
 use crate::peerstats::PeerStatsTable;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
@@ -39,7 +39,6 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::interval;
 
 const SNAPSHOT_INTERVAL_MS: u64 = 500;
@@ -52,7 +51,7 @@ const SNAPSHOT_INTERVAL_MS: u64 = 500;
 /// that should be able to take the tunnel down.
 pub async fn serve(
     path: PathBuf,
-    links: Arc<AsyncMutex<Vec<Link>>>,
+    links: Links,
     peer_stats: Arc<PeerStatsTable>,
     tunnel_name: String,
     mode: String,
@@ -147,7 +146,7 @@ pub async fn serve(
 
 async fn serve_client(
     mut stream: UnixStream,
-    links: Arc<AsyncMutex<Vec<Link>>>,
+    links: Links,
     peer_stats: Arc<PeerStatsTable>,
     tunnel_name: String,
     mode: String,
@@ -167,13 +166,13 @@ async fn serve_client(
 }
 
 async fn build_snapshot(
-    links: &Arc<AsyncMutex<Vec<Link>>>,
+    links: &Links,
     peer_stats: &Arc<PeerStatsTable>,
     tunnel_name: &str,
     mode: &str,
 ) -> Snapshot {
-    let links_guard = links.lock().await;
-    let link_snapshots = links_guard
+    let snap = link::snapshot_links(links).await;
+    let link_snapshots = snap
         .iter()
         .enumerate()
         .map(|(idx, link)| {
@@ -226,7 +225,7 @@ async fn build_snapshot(
 /// treated as "runtime link control unavailable" rather than a fatal
 /// daemon error -- this is an operator convenience, not something that
 /// should be able to take the tunnel down.
-pub async fn serve_commands(path: PathBuf, links: Arc<AsyncMutex<Vec<Link>>>) {
+pub async fn serve_commands(path: PathBuf, links: Links) {
     if let Some(parent) = path.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
             tracing::warn!(
@@ -294,7 +293,7 @@ pub async fn serve_commands(path: PathBuf, links: Arc<AsyncMutex<Vec<Link>>>) {
 /// disconnects without sending anything, or one that disappears before
 /// the reply is written -- a raced/impatient client is not a server-side
 /// problem worth a warning.
-async fn serve_command_client(stream: UnixStream, links: Arc<AsyncMutex<Vec<Link>>>) {
+async fn serve_command_client(stream: UnixStream, links: Links) {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
 
@@ -325,27 +324,40 @@ async fn serve_command_client(stream: UnixStream, links: Arc<AsyncMutex<Vec<Link
 /// Apply one already-parsed `Command` and report the outcome. Split out
 /// from `serve_command_client` so the actual link-mutation logic is
 /// testable/readable independent of the socket I/O around it.
-async fn apply_command(cmd: Command, links: &Arc<AsyncMutex<Vec<Link>>>) -> CommandResult {
+async fn apply_command(cmd: Command, links: &Links) -> CommandResult {
     match cmd {
         Command::SetLinkEnabled { link, enabled } => {
-            let mut links_guard = links.lock().await;
-            match links_guard.iter_mut().find(|l| l.config.name == link) {
-                Some(l) => {
-                    l.admin_disabled = !enabled;
-                    tracing::info!(
-                        link = %link,
-                        enabled,
-                        "link admin_disabled set via command socket"
-                    );
-                    CommandResult {
-                        ok: true,
-                        error: None,
-                    }
+            // Each link's name lives inside its own per-link mutex now
+            // (see `Links`' doc comment), so finding one by name means
+            // locking candidates one at a time rather than a single
+            // `iter_mut().find(...)` over a whole-vec guard -- fine here,
+            // this is the rarely-used command socket, not the packet hot
+            // path, and each lock is held only long enough to check one
+            // link's name (or, on a match, flip `admin_disabled`).
+            let mut found = false;
+            for l in links.iter() {
+                let mut guard = l.lock().await;
+                if guard.config.name == link {
+                    guard.admin_disabled = !enabled;
+                    found = true;
+                    break;
                 }
-                None => CommandResult {
+            }
+            if found {
+                tracing::info!(
+                    link = %link,
+                    enabled,
+                    "link admin_disabled set via command socket"
+                );
+                CommandResult {
+                    ok: true,
+                    error: None,
+                }
+            } else {
+                CommandResult {
                     ok: false,
                     error: Some(format!("no such link '{link}'")),
-                },
+                }
             }
         }
     }

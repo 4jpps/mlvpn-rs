@@ -1,3 +1,28 @@
+mlvpn (0.3.2-1) unstable; urgency=medium
+
+  * Performance: bonding two links together could be *slower* than using
+    either one alone. All links shared one single lock over every
+    link's metadata (stats, state, learned remote address), so two
+    links' receive tasks serialized against each other on every packet
+    even though they touch completely disjoint data. Each link now has
+    its own independent lock, removing that cross-link contention
+    entirely. See docs/performance-tuning.md.
+  * Add: mlvpn-tui's header now shows this machine's own hostname
+    alongside the tunnel name and mode, so a snapshot copied out of
+    context is unambiguous about which end of the tunnel it came from.
+  * Fix: systemd/mlvpn.service's PrivateDevices=no had a trailing inline
+    comment on the same line, which systemd's unit-file parser doesn't
+    support. Moved the comment to its own line above.
+  * Fix: the mlvpn system user's primary group could end up as nogroup
+    instead of mlvpn on an existing install. Both the .deb postinst and
+    the .rpm %pre scriptlet now enforce this on every install/upgrade.
+  * Fix: the .deb package now restarts mlvpnd after an upgrade if it was
+    already running, instead of leaving the old binary running in
+    memory until the operator remembered to restart it by hand. (The
+    .rpm package already did this via %systemd_postun_with_restart.)
+
+ -- Jeff Parrish PC Services <www.jpps.us>  Fri, 17 Jul 2026 00:00:00 -0500
+
 mlvpn (0.3.1-1) unstable; urgency=medium
 
   * Fix the initial handshake exiting the whole daemon if every

@@ -60,6 +60,7 @@ struct SharedState {
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let socket_path = resolve_socket_path(cli.socket)?;
+    let hostname = local_hostname();
 
     let state = Arc::new(Mutex::new(SharedState {
         snapshot: None,
@@ -74,9 +75,32 @@ fn main() -> anyhow::Result<()> {
     }
 
     let mut terminal = setup_terminal()?;
-    let result = run_app(&mut terminal, &state, &socket_path);
+    let result = run_app(&mut terminal, &state, &socket_path, &hostname);
     restore_terminal(&mut terminal)?;
     result
+}
+
+/// This machine's own hostname, shown in the header so a snapshot pasted
+/// or screenshotted out of context (e.g. into a bug report, or a chat
+/// with someone helping debug a two-host tunnel) is unambiguous about
+/// which end of the tunnel it came from -- `tunnel_name` alone doesn't
+/// help when, as is typical, both ends share the same tunnel name, and
+/// `mode` (client/server) requires the reader to already know which
+/// role runs on which host. Best-effort: a host that can't report its
+/// own hostname (extremely unusual) gets a placeholder rather than
+/// failing the whole tool over a cosmetic header detail.
+fn local_hostname() -> String {
+    let mut buf = vec![0u8; 256];
+    // SAFETY: `buf` is a valid buffer of `buf.len()` bytes; POSIX
+    // `gethostname` writes a name into it (NUL-terminated if it fits,
+    // silently truncated otherwise per POSIX.1-2001) and never writes
+    // past the given length.
+    let ret = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
+    if ret != 0 {
+        return "(unknown host)".to_string();
+    }
+    let nul = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    String::from_utf8_lossy(&buf[..nul]).into_owned()
 }
 
 /// If the peer's `mlvpnd` predates `[control]` support, or the daemon
@@ -162,11 +186,12 @@ fn run_app(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     state: &Arc<Mutex<SharedState>>,
     socket_path: &Path,
+    hostname: &str,
 ) -> anyhow::Result<()> {
     loop {
         {
             let s = state.lock().unwrap();
-            terminal.draw(|f| draw(f, &s, socket_path))?;
+            terminal.draw(|f| draw(f, &s, socket_path, hostname))?;
         }
 
         if event::poll(Duration::from_millis(250))? {
@@ -185,7 +210,7 @@ fn run_app(
     }
 }
 
-fn draw(f: &mut Frame, state: &SharedState, socket_path: &Path) {
+fn draw(f: &mut Frame, state: &SharedState, socket_path: &Path, hostname: &str) {
     let area = f.area();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -196,7 +221,7 @@ fn draw(f: &mut Frame, state: &SharedState, socket_path: &Path) {
         ])
         .split(area);
 
-    draw_header(f, chunks[0], state, socket_path);
+    draw_header(f, chunks[0], state, socket_path, hostname);
     draw_table(f, chunks[1], state);
     draw_footer(f, chunks[2], state);
 }
@@ -206,11 +231,13 @@ fn draw_header(
     area: ratatui::layout::Rect,
     state: &SharedState,
     socket_path: &Path,
+    hostname: &str,
 ) {
     let (title, style) = match &state.snapshot {
         Some(snap) => (
             format!(
-                "mlvpn-tui  --  tunnel '{}' ({})  --  {}",
+                "mlvpn-tui  --  {}  --  tunnel '{}' ({})  --  {}",
+                hostname,
                 snap.tunnel_name,
                 snap.mode,
                 socket_path.display()
@@ -221,7 +248,8 @@ fn draw_header(
         ),
         None => (
             format!(
-                "mlvpn-tui  --  waiting for data from {}...",
+                "mlvpn-tui  --  {}  --  waiting for data from {}...",
+                hostname,
                 socket_path.display()
             ),
             Style::default().fg(Color::Yellow),

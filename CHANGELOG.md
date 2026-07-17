@@ -10,6 +10,63 @@ For implementation detail beyond what's here, read the code -- most
 modules and non-trivial functions have doc comments explaining the
 design, and `ARCHITECTURE.md` covers the system as a whole.
 
+## [0.3.2] - 2026-07-17
+
+### Added
+
+- **`mlvpn-tui`'s header now shows this machine's own hostname**
+  alongside the tunnel name and mode, so a snapshot copied out of
+  context (a bug report, a chat with someone helping debug a two-host
+  tunnel) is unambiguous about which end of the tunnel it came from --
+  previously just `tunnel 'name' (client|server)`, which doesn't help
+  when, as is typical, both ends share the same tunnel name.
+
+### Performance
+
+- **Bonding two links together could be *slower* than using either one
+  alone.** A real two-host deployment (Comcast + a T-Mobile MVNO bonded
+  together) measured download throughput at 55-90 Mbps bonded, versus
+  143 Mbps on Comcast by itself and 118 Mbps on T-Mobile by itself --
+  isolating each link (`mlvpnd set-link <link> disable`) made the
+  tunnel faster, not slower, which should never happen. Root cause: all
+  of a tunnel's links shared one single `Arc<AsyncMutex<Vec<Link>>>` --
+  a single lock covering every link's metadata (stats, state, learned
+  remote address) at once -- so each link's `link_receiver` task had to
+  serialize against every *other* link's task on every single packet's
+  metadata update, even though the two links touch completely disjoint
+  data. Replaced with `Arc<Vec<AsyncMutex<Link>>>`: each link now has
+  its own independent lock, so locking one link's metadata never blocks
+  another's. See `docs/performance-tuning.md` and `tunnel.rs`'s module
+  doc comment for the full write-up.
+
+### Fixed
+
+- **`systemd/mlvpn.service`'s `PrivateDevices=no` had a trailing inline
+  comment on the same line**, which systemd's unit-file parser doesn't
+  support -- it was logging `Invalid argument` at load time (non-fatal
+  only because `no` is also this directive's own default). Moved the
+  comment to its own line above.
+- **The `mlvpn` system user's primary group could end up as `nogroup`
+  instead of `mlvpn`** on an existing install: both the `.deb` postinst
+  and the `.rpm` `%pre` scriptlet only ever created the user once, on
+  first install, and never revisited its group on a later upgrade even
+  if it had somehow ended up wrong (an account from a version predating
+  either of these scripts, or created by hand). Both now also run
+  `usermod -g mlvpn mlvpn` unconditionally on every install/upgrade,
+  harmless if it's already correct. Run `sudo usermod -g mlvpn mlvpn`
+  by hand in the meantime on an already-affected host; see
+  [Troubleshooting](docs/troubleshooting.md).
+- **The `.deb` package left the old `mlvpnd` binary running in memory
+  after an upgrade** instead of restarting it, unlike the `.rpm`
+  package (which already did this via `%systemd_postun_with_restart`).
+  `debian/rules` intentionally builds with `dh_installsystemd
+  --no-enable --no-start` so a *fresh* install doesn't try to start
+  `mlvpnd` before `/etc/mlvpn/mlvpn.toml` even exists, but that flag
+  also suppresses the usual restart-on-upgrade behavior as a side
+  effect. `debian/mlvpn.postinst` now explicitly restarts the service
+  after an upgrade if (and only if) it was already running, leaving a
+  fresh install or a deliberately-stopped service alone.
+
 ## [0.3.1] - 2026-07-16
 
 ### Performance
@@ -270,6 +327,7 @@ Initial implementation and first successful build.
 - Privilege dropping, a hardened systemd unit, and Debian packaging.
 - `ARCHITECTURE.md` design document and example configs.
 
+[0.3.2]: https://github.com/4jpps/mlvpn-rs/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/4jpps/mlvpn-rs/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/4jpps/mlvpn-rs/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/4jpps/mlvpn-rs/compare/v0.1.2...v0.2.0

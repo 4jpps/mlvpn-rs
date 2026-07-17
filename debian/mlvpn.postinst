@@ -11,6 +11,14 @@ case "$1" in
         --home /nonexistent --shell /usr/sbin/nologin \
         --gecos "mlvpn daemon" mlvpn
     fi
+    # Enforce the primary group even when the mlvpn user already existed
+    # (the adduser call above is skipped entirely on upgrade once the
+    # account exists, so a user whose primary group ended up wrong for
+    # any reason -- e.g. created under an earlier, buggy version of this
+    # script, or by hand while following older docs -- would otherwise
+    # never get corrected by a routine package upgrade). No-op, and
+    # silent, if it's already `mlvpn`.
+    usermod -g mlvpn mlvpn
     chown root:mlvpn /etc/mlvpn
     chmod 0750 /etc/mlvpn
     if [ -f /etc/mlvpn/mlvpn.toml ]; then
@@ -24,6 +32,24 @@ case "$1" in
     if [ -f /etc/mlvpn/private.key ]; then
       chown mlvpn:mlvpn /etc/mlvpn/private.key
       chmod 0600 /etc/mlvpn/private.key
+    fi
+
+    # dh_installsystemd is invoked with --no-enable --no-start (see
+    # debian/rules) so a *fresh* install never auto-starts mlvpnd before
+    # /etc/mlvpn/mlvpn.toml even exists -- it would just fail immediately
+    # on a missing config, which is worse than doing nothing. That flag
+    # also happens to suppress dh_installsystemd's usual "restart on
+    # upgrade if it was already running" behavior, though, which is a
+    # real gap on an *upgrade*: once a host is actually configured and
+    # running, every later `apt install`/`apt upgrade` leaves the old
+    # binary running in memory until someone remembers to
+    # `systemctl restart mlvpn` by hand. Restore just that half
+    # explicitly: if the service is active right now, restart it so the
+    # newly unpacked binary actually takes effect; if it isn't running
+    # (fresh install, or an operator who deliberately stopped it), leave
+    # it alone rather than force-starting something nobody asked for.
+    if systemctl is-active --quiet mlvpn.service 2>/dev/null; then
+      systemctl restart mlvpn.service || true
     fi
     ;;
 esac
