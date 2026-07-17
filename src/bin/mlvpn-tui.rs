@@ -115,7 +115,26 @@ fn resolve_socket_path(explicit: Option<String>) -> anyhow::Result<PathBuf> {
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("sock") {
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            // The command socket (`<tunnel>.command.sock`, only present
+            // when `[command] enabled = true`) speaks a completely
+            // different protocol -- one JSON `Command` in, one JSON
+            // `CommandResult` back, for `mlvpnd set-link` (see
+            // `control.rs::serve_commands`) -- not the streaming
+            // `Snapshot` this tool reads off the plain `.sock` file.
+            // Checking `path.extension() == Some("sock")` alone matched
+            // both (the extension of `mlvpnrs0.command.sock` is also
+            // just `sock`), so auto-detection broke the moment a config
+            // turned the command socket on. Explicitly exclude it here
+            // rather than trying to connect and letting it fail, so a
+            // single control socket still auto-detects cleanly with
+            // the command socket enabled alongside it.
+            if name.ends_with(".command.sock") {
+                continue;
+            }
+            if name.ends_with(".sock") {
                 found.push(path);
             }
         }

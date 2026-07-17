@@ -6,8 +6,8 @@
 # equivalent of the user/group creation below.
 #
 # Note on %{?dist}: left in place (standard Fedora/RHEL convention) so
-# the same spec produces e.g. mlvpn-0.3.2-1.fc41.x86_64.rpm on Fedora and
-# mlvpn-0.3.2-1.el9.x86_64.rpm on RHEL/Rocky/Alma from one source tree.
+# the same spec produces e.g. mlvpn-0.3.3-1.fc41.x86_64.rpm on Fedora and
+# mlvpn-0.3.3-1.el9.x86_64.rpm on RHEL/Rocky/Alma from one source tree.
 #
 # debug_package disabled: [profile.release] in Cargo.toml sets
 # strip = true, so the compiled mlvpnd/mlvpn-tui binaries carry no
@@ -19,7 +19,7 @@
 %global debug_package %{nil}
 
 Name:           mlvpn
-Version:        0.3.2
+Version:        0.3.3
 Release:        1%{?dist}
 Summary:        Multi-link VPN bonding daemon
 
@@ -106,6 +106,23 @@ chmod 0750 %{_sysconfdir}/mlvpn
 %dir %attr(0750, root, mlvpn) %{_sysconfdir}/mlvpn
 
 %changelog
+* Fri Jul 17 2026 Jeff Parrish PC Services <www.jpps.us> - 0.3.3-1
+- Fix restarting either side of a tunnel silently stopping the other
+  side too, requiring a manual restart there. A peer-initiated
+  Disconnect makes mlvpnd exit cleanly (code 0) by design, and the
+  previous Restart=on-failure systemd policy never restarts a process
+  that exited 0 -- so restarting one side for any reason sent the
+  other side a graceful Disconnect and left it stopped indefinitely.
+  systemd/mlvpn.service now uses Restart=always, so any exit -- this
+  one included -- gets the daemon back up within RestartSec=2; an
+  explicit systemctl stop is unaffected.
+- Fix mlvpn-tui failing with "multiple control sockets found" once
+  [command] enabled = true was set. Auto-detection matched any file
+  under /run/mlvpn ending in .sock, which also matched the
+  <tunnel>.command.sock write-capable command socket -- a completely
+  different protocol, not the streaming snapshot mlvpn-tui actually
+  reads. Now explicitly excludes *.command.sock.
+
 * Fri Jul 17 2026 Jeff Parrish PC Services <www.jpps.us> - 0.3.2-1
 - Performance: bonding two links together could be slower than using
   either one alone -- all links shared one single lock over every

@@ -1,3 +1,27 @@
+mlvpn (0.3.3-1) unstable; urgency=high
+
+  * Fix restarting either side of a tunnel silently stopping the other
+    side too, which then required a manual restart there. A
+    peer-initiated Disconnect makes mlvpnd exit cleanly (code 0) by
+    design, and the previous Restart=on-failure systemd policy never
+    restarts a process that exited 0 -- so restarting one side for any
+    reason (a routine package upgrade, a manual systemctl restart) sent
+    the other side a graceful Disconnect and left it stopped
+    indefinitely. This made 0.3.2's own restart-on-upgrade fix worse in
+    practice: upgrading one host now reliably stopped its peer.
+    systemd/mlvpn.service now uses Restart=always, so any exit -- this
+    one included -- gets the daemon back up within RestartSec=2; an
+    explicit systemctl stop is unaffected, since systemd always honors
+    a deliberate stop regardless of Restart=.
+  * Fix mlvpn-tui failing with "multiple control sockets found" once
+    [command] enabled = true was set. Auto-detection matched any file
+    under /run/mlvpn ending in .sock, which also matched the
+    <tunnel>.command.sock write-capable command socket -- a completely
+    different protocol, not the streaming snapshot mlvpn-tui actually
+    reads. Now explicitly excludes *.command.sock.
+
+ -- Jeff Parrish PC Services <www.jpps.us>  Fri, 17 Jul 2026 00:00:00 -0500
+
 mlvpn (0.3.2-1) unstable; urgency=medium
 
   * Performance: bonding two links together could be *slower* than using

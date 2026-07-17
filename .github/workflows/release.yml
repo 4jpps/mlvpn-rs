@@ -138,7 +138,7 @@ jobs:
         run: |
           mkdir -p ~/rpmbuild/SOURCES
           git config --global --add safe.directory "$PWD"
-          git archive --prefix=mlvpn-0.3.2/ -o ~/rpmbuild/SOURCES/mlvpn-0.3.2.tar.gz HEAD
+          git archive --prefix=mlvpn-0.3.3/ -o ~/rpmbuild/SOURCES/mlvpn-0.3.3.tar.gz HEAD
 
       # --nodeps: same reasoning as build-deb's dpkg-buildpackage -d above,
       # just for rpmbuild's equivalent check. On the RHEL-family leg, Rust

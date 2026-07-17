@@ -46,7 +46,22 @@ StartLimitBurst=5
 [Service]
 Type=simple
 ExecStart=/usr/bin/mlvpnd run --config /etc/mlvpn/mlvpn.toml
-Restart=on-failure
+# `always`, not `on-failure`: a peer-initiated Disconnect (tunnel.rs's
+# `ShutdownReason::PeerInitiated`) makes mlvpnd exit 0 -- deliberately,
+# by design, on the reasoning that if the peer is gone there's nothing
+# left for this side to do either. But that same clean exit happens
+# any time the *other* end merely restarts (a routine package upgrade,
+# for instance -- see debian/mlvpn.postinst and %systemd_postun_with_restart
+# in packaging/rpm/mlvpn.spec, both of which now restart mlvpnd on
+# upgrade if it was already running), and `on-failure` doesn't restart
+# a process that exited 0. The result: restarting either side used to
+# silently stop the *other* side too, requiring a manual restart there
+# -- exactly the "I have to start it every time" complaint this was
+# found chasing. `Restart=always` self-heals from that (and any other
+# future exit reason) within RestartSec below; it does not override an
+# explicit `systemctl stop`, which systemd always honors regardless of
+# this setting.
+Restart=always
 RestartSec=2
 
 # --- Identity -------------------------------------------------------

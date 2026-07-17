@@ -10,6 +10,34 @@ For implementation detail beyond what's here, read the code -- most
 modules and non-trivial functions have doc comments explaining the
 design, and `ARCHITECTURE.md` covers the system as a whole.
 
+## [0.3.3] - 2026-07-17
+
+### Fixed
+
+- **Restarting either side of a tunnel used to silently stop the
+  *other* side too**, requiring a manual restart there -- the exact
+  "I have to start it every time" complaint that led to 0.3.2's
+  restart-on-upgrade packaging fix (below) in the first place, except
+  this cascade meant that very fix made the *other* end stop more
+  often, not less. Root cause: a peer-initiated `Disconnect` makes
+  `mlvpnd` exit cleanly (code 0) by design (see `tunnel.rs`'s
+  `ShutdownReason::PeerInitiated`), and the shipped systemd unit only
+  restarted on a *nonzero* exit (`Restart=on-failure`) -- so the moment
+  one side restarted for any reason (a routine package upgrade, a
+  manual `systemctl restart`), it sent the other side a graceful
+  Disconnect, and that side's `mlvpnd` exited and simply stayed down.
+  `systemd/mlvpn.service` now uses `Restart=always` instead, so any
+  exit -- this one included -- gets the daemon back up within
+  `RestartSec=2`; an explicit `systemctl stop` is unaffected, since
+  systemd never overrides a deliberate stop regardless of `Restart=`.
+- **`mlvpn-tui` failed to auto-detect the control socket with
+  `multiple control sockets found` once `[command] enabled = true`**
+  was set. Its auto-detection matched any file under `/run/mlvpn`
+  ending in `.sock`, which also matched `<tunnel>.command.sock` -- a
+  completely different, write-capable protocol for `mlvpnd set-link`
+  (see `control.rs::serve_commands`), not the streaming snapshot
+  `mlvpn-tui` actually reads. Now explicitly excludes `*.command.sock`.
+
 ## [0.3.2] - 2026-07-17
 
 ### Added
@@ -327,6 +355,7 @@ Initial implementation and first successful build.
 - Privilege dropping, a hardened systemd unit, and Debian packaging.
 - `ARCHITECTURE.md` design document and example configs.
 
+[0.3.3]: https://github.com/4jpps/mlvpn-rs/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/4jpps/mlvpn-rs/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/4jpps/mlvpn-rs/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/4jpps/mlvpn-rs/compare/v0.2.0...v0.3.0
