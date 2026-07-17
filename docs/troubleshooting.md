@@ -36,6 +36,11 @@
   to inspect and modify live firewall state, which every backend it
   supports requires root for, regardless of how `mlvpnd run` itself
   drops privileges.
+- **Throughput comes in well below the bonded links' expected combined
+  speed** (especially if only one direction is affected) -- almost
+  always the kernel's default UDP socket buffer size silently dropping
+  packets under a fast link's real bandwidth-delay product. See
+  [Performance tuning](performance-tuning.md).
 - **A link goes down after its interface is unplugged/replugged (a USB
   LTE modem, typically) and never comes back, logging "cannot
   reconnect this link's socket: ... missing required capability"

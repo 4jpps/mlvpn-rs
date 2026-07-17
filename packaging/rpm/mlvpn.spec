@@ -6,8 +6,8 @@
 # equivalent of the user/group creation below.
 #
 # Note on %{?dist}: left in place (standard Fedora/RHEL convention) so
-# the same spec produces e.g. mlvpn-0.3.0-1.fc41.x86_64.rpm on Fedora and
-# mlvpn-0.3.0-1.el9.x86_64.rpm on RHEL/Rocky/Alma from one source tree.
+# the same spec produces e.g. mlvpn-0.3.1-1.fc41.x86_64.rpm on Fedora and
+# mlvpn-0.3.1-1.el9.x86_64.rpm on RHEL/Rocky/Alma from one source tree.
 #
 # debug_package disabled: [profile.release] in Cargo.toml sets
 # strip = true, so the compiled mlvpnd/mlvpn-tui binaries carry no
@@ -19,7 +19,7 @@
 %global debug_package %{nil}
 
 Name:           mlvpn
-Version:        0.3.0
+Version:        0.3.1
 Release:        1%{?dist}
 Summary:        Multi-link VPN bonding daemon
 
@@ -100,6 +100,23 @@ chmod 0750 %{_sysconfdir}/mlvpn
 %dir %attr(0750, root, mlvpn) %{_sysconfdir}/mlvpn
 
 %changelog
+* Thu Jul 16 2026 Jeff Parrish PC Services <www.jpps.us> - 0.3.1-1
+- Fix the initial handshake exiting the whole daemon if every configured
+  link's peer is unreachable at startup; now retries in the background
+  with exponential backoff instead, matching WireGuard/the original
+  MLVPN. Found on a real two-host deployment.
+- Performance: request an 8 MiB kernel socket buffer per link
+  (SO_RCVBUFFORCE/SO_SNDBUFFORCE, falling back to plain SO_RCVBUF/
+  SO_SNDBUF), instead of relying on the stock ~208KB Linux default,
+  which silently drops packets once a fast link's bandwidth-delay
+  product exceeds it. See docs/performance-tuning.md.
+- Fix a stale handshake reply being able to permanently starve every
+  future retry once the initial handshake started retrying
+  indefinitely (previous entry): race_handshake_reply now also requires
+  a reply's session id to match the current attempt's, instead of only
+  checking source address and packet type. Caught by this project's own
+  integration tests immediately after the retry change above.
+
 * Tue Jul 14 2026 Jeff Parrish PC Services <www.jpps.us> - 0.3.0-1
 - Add self-healing link reconnection, handshake racing across every
   configured link, rekeying with session migration, and graceful

@@ -447,6 +447,114 @@ fn socket_domain(config: &LinkConfig) -> Result<Domain> {
     Ok(Domain::IPV4)
 }
 
+/// Requested `SO_RCVBUF`/`SO_SNDBUF` size, in bytes, for every link
+/// socket -- see `raise_socket_buffers`. 8 MiB comfortably covers the
+/// bandwidth-delay product of a multi-gigabit link across most
+/// real-world WAN latencies (e.g. 1 Gbps x 50ms round trip is only
+/// ~6.25MB), without being large enough to meaningfully increase
+/// bufferbloat-style latency under sustained loss.
+const SOCKET_BUFFER_BYTES: usize = 8 * 1024 * 1024;
+
+/// Best-effort: raise this socket's kernel receive/send buffers well
+/// past the stock Linux default (`net.core.rmem_default`/
+/// `wmem_default`, typically ~208KB). At that size, a link's receive
+/// queue overflows the moment its bandwidth-delay product exceeds it --
+/// a 1 Gbps link at just 20ms RTT already needs roughly 2.5MB of room
+/// in flight -- and the kernel's response to overflow is to silently
+/// drop the incoming datagram before `mlvpnd` ever sees it, which looks
+/// exactly like ordinary network loss from inside the process. This is
+/// the single most common reason a bonded link's real throughput comes
+/// in far below its configured/expected speed despite every other stat
+/// (RTT, jitter) looking healthy, and specifically explains an
+/// asymmetric symptom -- one direction capped, the other fine -- since
+/// the two directions' bottleneck is on two different machines' receive
+/// paths. See `docs/performance-tuning.md`.
+///
+/// Tries `SO_RCVBUFFORCE`/`SO_SNDBUFFORCE` first (Linux only, needs
+/// `CAP_NET_ADMIN`): unlike plain `SO_RCVBUF`/`SO_SNDBUF`, the "FORCE"
+/// variants bypass the `net.core.rmem_max`/`wmem_max` ceiling entirely
+/// instead of silently being clamped to it. `Link::bind`'s initial call
+/// runs during the privileged setup phase (before
+/// `privilege::drop_privileges`), so this is exactly the one point in
+/// the process's life where that's guaranteed to work regardless of
+/// deployment model; falls back to the plain, ceiling-respecting
+/// setsockopt if the forced one fails (notably, `LinkHandle::reconnect`
+/// calls this same function again later, potentially after privileges
+/// have been dropped under the "start as root, drop after setup" model
+/// -- same caveat as `LinkHandle::reconnect`'s own doc comment). Either
+/// way this never fails link setup: a socket stuck with the OS default
+/// still works, just cannot sustain as much throughput. The actual
+/// negotiated size is read back and logged so operators can tell
+/// whether they need to raise the sysctl ceiling by hand instead.
+fn raise_socket_buffers(socket: &Socket, link_name: &str) {
+    #[cfg(target_os = "linux")]
+    {
+        let size = SOCKET_BUFFER_BYTES as libc::c_int;
+        let size_len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: `socket.as_raw_fd()` is a valid, open socket for the
+        // duration of this call; `size` is a valid, initialized
+        // `c_int` whose address and length are passed correctly.
+        // SO_RCVBUFFORCE/SO_SNDBUFFORCE simply fail (EPERM) without
+        // CAP_NET_ADMIN, handled below by falling back to the plain
+        // setsockopt -- never a memory-safety concern either way.
+        let rcv_forced = unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUFFORCE,
+                std::ptr::addr_of!(size).cast(),
+                size_len,
+            )
+        } == 0;
+        let snd_forced = unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUFFORCE,
+                std::ptr::addr_of!(size).cast(),
+                size_len,
+            )
+        } == 0;
+        if !rcv_forced {
+            let _ = socket.set_recv_buffer_size(SOCKET_BUFFER_BYTES);
+        }
+        if !snd_forced {
+            let _ = socket.set_send_buffer_size(SOCKET_BUFFER_BYTES);
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = socket.set_recv_buffer_size(SOCKET_BUFFER_BYTES);
+        let _ = socket.set_send_buffer_size(SOCKET_BUFFER_BYTES);
+    }
+
+    // The kernel typically reports back roughly double whatever value
+    // it actually accepted (bookkeeping overhead reserve is counted
+    // against the same figure), so a healthy result here reads back
+    // near or above `2 * SOCKET_BUFFER_BYTES`, not exactly it -- a
+    // reading well *below* the requested size is the signal that both
+    // the FORCE attempt and the sysctl ceiling lost.
+    let actual_recv = socket.recv_buffer_size().ok();
+    let actual_send = socket.send_buffer_size().ok();
+    tracing::debug!(
+        link = %link_name,
+        requested_bytes = SOCKET_BUFFER_BYTES,
+        actual_recv_bytes = ?actual_recv,
+        actual_send_bytes = ?actual_send,
+        "link socket buffer sizes negotiated"
+    );
+    if actual_recv.is_some_and(|n| n < SOCKET_BUFFER_BYTES) {
+        tracing::info!(
+            link = %link_name,
+            actual_recv_bytes = ?actual_recv,
+            requested_bytes = SOCKET_BUFFER_BYTES,
+            "kernel receive buffer for this link came back smaller than requested; \
+             a fast link may see throughput capped well below its real capacity. \
+             Raise net.core.rmem_max (see docs/performance-tuning.md) if so."
+        );
+    }
+}
+
 /// Create and bind one link's UDP socket: `SO_BINDTODEVICE` to
 /// `config.bind_interface` (Linux only), optionally to a specific
 /// `local_addr`, then `bind()` to `local_port`. Shared by `Link::bind`
@@ -511,6 +619,14 @@ fn bind_socket(config: &LinkConfig) -> Result<(Arc<UdpSocket>, Option<u32>)> {
                 }
             })?;
     }
+
+    // See `raise_socket_buffers`'s doc comment: the Linux default socket
+    // buffer (~208KB) silently caps real-world throughput on any link
+    // fast enough to have a meaningful bandwidth-delay product, well
+    // before anything in this process would notice -- the kernel just
+    // drops incoming datagrams that don't fit, indistinguishable from
+    // ordinary network loss. Never blocks link setup on failure.
+    raise_socket_buffers(&socket, &config.name);
 
     // Best-effort: feeds MTU auto-tuning (main.rs's
     // effective_tunnel_mtu()) at startup only, never blocks link setup

@@ -124,9 +124,14 @@ every push/PR to `main`, on both amd64(`ubuntu-latest`) and arm64
    the `release.yml` one specifically breaks the RPM build: `rpmbuild`
    expects the tarball's top-level directory to match
    `%{name}-%{version}` from the spec file.
-2. Update `CHANGELOG.md`.
+2. Update `CHANGELOG.md`. Get this one right before tagging: the
+   published GitHub Release's body is this version's own `## [X.Y.Z]`
+   section, pulled verbatim from `CHANGELOG.md` by `release.yml`'s
+   `publish` job (not GitHub's auto-generated commit/PR list) -- see
+   that job's "Extract this version's CHANGELOG.md section" step.
 3. `git tag vX.Y.Z && git push origin vX.Y.Z` -- this triggers
-   `release.yml`, which builds and publishes every package.
+   `release.yml`, which builds and publishes every package, with the
+   Release's notes taken from step 2 above.
 
 ## Local package builds, without waiting on CI
 
@@ -136,7 +141,7 @@ dpkg-buildpackage -us -uc -b -d
 
 # .rpm (needs rpm-build, rpmdevtools, systemd-rpm-macros, gcc, pkgconf-pkg-config)
 rpmdev-setuptree
-git archive --prefix=mlvpn-0.3.0/ -o ~/rpmbuild/SOURCES/mlvpn-0.3.0.tar.gz HEAD
+git archive --prefix=mlvpn-0.3.1/ -o ~/rpmbuild/SOURCES/mlvpn-0.3.1.tar.gz HEAD
 cp packaging/rpm/mlvpn.spec ~/rpmbuild/SPECS/
 rpmbuild -ba ~/rpmbuild/SPECS/mlvpn.spec
 ```
@@ -150,7 +155,7 @@ docker run --rm -v "$PWD":/src -w /src fedora:latest bash -c '
   dnf -y install git tar rust cargo gcc pkgconf-pkg-config systemd-rpm-macros rpm-build rpmdevtools &&
   git config --global --add safe.directory /src &&
   rpmdev-setuptree &&
-  git archive --prefix=mlvpn-0.3.0/ -o ~/rpmbuild/SOURCES/mlvpn-0.3.0.tar.gz HEAD &&
+  git archive --prefix=mlvpn-0.3.1/ -o ~/rpmbuild/SOURCES/mlvpn-0.3.1.tar.gz HEAD &&
   cp packaging/rpm/mlvpn.spec ~/rpmbuild/SPECS/ &&
   rpmbuild -ba ~/rpmbuild/SPECS/mlvpn.spec &&
   find ~/rpmbuild/RPMS -name "*.rpm" -exec cp {} /src/ \;

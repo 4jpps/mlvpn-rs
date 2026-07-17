@@ -7,6 +7,8 @@
   commands per backend
 - [Monitoring: mlvpn-tui](monitoring.md)
 - [Troubleshooting](troubleshooting.md)
+- [Performance tuning](performance-tuning.md) -- socket buffers,
+  sysctls, and isolating a throughput bottleneck
 - [Development](development.md) -- build/test/lint, CI, cutting a release
 - [Platform roadmap: OPNsense / pfSense](platforms/opnsense-pfsense.md)
   -- scoping notes for a future FreeBSD-based port; not implemented yet

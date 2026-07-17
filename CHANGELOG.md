@@ -10,6 +10,61 @@ For implementation detail beyond what's here, read the code -- most
 modules and non-trivial functions have doc comments explaining the
 design, and `ARCHITECTURE.md` covers the system as a whole.
 
+## [0.3.1] - 2026-07-16
+
+### Performance
+
+- **Link sockets now request an 8 MiB kernel receive/send buffer**
+  (`link::raise_socket_buffers`), using `SO_RCVBUFFORCE`/
+  `SO_SNDBUFFORCE` to bypass the `net.core.rmem_max`/`wmem_max` sysctl
+  ceiling when the process still holds `CAP_NET_ADMIN` (always true at
+  initial startup), falling back to a plain, ceiling-respecting request
+  otherwise. The stock Linux default (~208KB) silently drops incoming
+  packets -- indistinguishable from ordinary network loss -- the moment
+  a link's bandwidth-delay product exceeds it, which is an easy trap
+  for any link above a few hundred Mbps. See the new
+  [Performance tuning](docs/performance-tuning.md) doc for how to
+  confirm this was the bottleneck and raise the sysctl ceiling if the
+  forced request still didn't get everything it asked for.
+
+### Fixed
+
+- **The initial handshake no longer crashes the daemon if the peer is
+  unreachable at startup.** `mlvpnd` (client mode) used to exit the
+  whole process if every configured link's handshake attempt timed out
+  -- fine under a one-off manual run, but under `systemd`'s default
+  `Restart=on-failure` a peer that stayed unreachable for a few minutes
+  (both ends power-cycling together, one side still waiting on DHCP, a
+  route not yet converged) could burn through enough restarts to trip
+  `StartLimitBurst`/`StartLimitIntervalSec` and leave the unit
+  permanently in `failed` state -- silently down until someone happened
+  to check and run `systemctl reset-failed`. Found via exactly that
+  scenario on a real two-host deployment. Neither WireGuard nor the
+  original C `MLVPN` this project replaces ever exit on a failed
+  handshake; `mlvpnd` now matches that, logging a warning and retrying
+  with exponential backoff (same schedule as link-socket reconnection,
+  capped at 30s) in the background indefinitely instead of returning an
+  error out of `tunnel::run`.
+- **A stale handshake reply could permanently starve every future retry
+  once the initial handshake started retrying indefinitely (the fix
+  directly above).** `race_handshake_reply` only checked a reply's
+  source address and packet type, not which attempt it actually
+  belonged to. Once a reply arrived late enough to miss its own
+  attempt's timeout, the peer had already committed that session and
+  would keep responding to related traffic; every later attempt's own
+  `HandshakeInit` then got legitimately treated as a new rekey by the
+  peer, each producing its own reply -- and without a session-id check,
+  a stale one of those could win a later attempt's race, consuming that
+  attempt's one chance at the genuine reply. Before this release, 10
+  failed attempts just ended the process, never enough rounds for this
+  to compound; retrying indefinitely let stale replies pile up across
+  rounds with nothing ever clearing them, so once one late reply
+  happened the client could never recover on its own. Caught
+  immediately by re-running this project's own integration tests after
+  the fix directly above. `race_handshake_reply` now also requires a
+  reply's session id to match the current attempt's, the same guarantee
+  the mid-session (rekey) path already had.
+
 ## [0.3.0] - 2026-07-14
 
 ### Added
@@ -215,6 +270,7 @@ Initial implementation and first successful build.
 - Privilege dropping, a hardened systemd unit, and Debian packaging.
 - `ARCHITECTURE.md` design document and example configs.
 
+[0.3.1]: https://github.com/4jpps/mlvpn-rs/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/4jpps/mlvpn-rs/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/4jpps/mlvpn-rs/compare/v0.1.2...v0.2.0
 [0.1.2]: https://github.com/4jpps/mlvpn-rs/compare/v0.1.1...v0.1.2

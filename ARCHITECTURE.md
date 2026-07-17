@@ -67,8 +67,20 @@ roles run the identical data path once a session is established; the
 only asymmetry is who initiates the Noise handshake.
 
 At startup: open the TUN device, bind one UDP socket per configured
-link to its named interface, load key material, drop privileges, then
-perform the Noise handshake and spawn the steady-state tasks.
+link to its named interface (requesting an 8 MiB kernel receive/send
+buffer on each, well past the stock ~208KB Linux default that would
+otherwise silently drop packets under a fast link's real
+bandwidth-delay product -- see `docs/performance-tuning.md`), load key
+material, drop privileges, then
+perform the Noise handshake and spawn the steady-state tasks. A client
+whose peer is unreachable never gives up and exits: it logs a warning
+and retries the handshake with exponential backoff indefinitely in the
+background (`tunnel::establish_session_with_retry`), the same way
+WireGuard and the original MLVPN behave -- earlier versions instead
+exited the process on a failed handshake, which under systemd's default
+`Restart=on-failure` could trip the restart-rate-limit and leave the
+unit permanently `failed` if a peer stayed unreachable for more than a
+few minutes at boot.
 
 Steady state (`tunnel.rs`) is a small set of tokio tasks:
 
@@ -298,7 +310,8 @@ drop; all non-handshake wire traffic AEAD-authenticated; a link's peer
 address is only learned from a packet's source *after* that packet
 passes authentication, to prevent spoofed-source redirection; a
 malformed handshake attempt is logged and discarded, never crashes or
-hangs the daemon.
+hangs the daemon; and an unreachable peer at startup is retried with
+backoff in the background rather than exiting the daemon (§2).
 
 ## 9. Monitoring and runtime control: mlvpn-tui and the two sockets
 

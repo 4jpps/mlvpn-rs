@@ -84,7 +84,7 @@
 //! under the old keys at the moment of the swap aren't dropped -- see
 //! `crypto.rs`'s `SessionState` doc comment for the full design.
 //!
-//! Two correctness hazards this design has to actively guard against,
+//! Four correctness hazards this design has to actively guard against,
 //! both caught by this project's own integration tests rather than by
 //! inspection, and both worth calling out here since neither is
 //! obvious from the individual functions involved:
@@ -134,6 +134,40 @@
 //!   which `RekeyContext::register_rekey_wait`'s single up-front
 //!   registration depends on), so a late reply from an abandoned
 //!   attempt can no longer be fed into a mismatched later one this way.
+//! - **A stale reply must not win a *later* attempt's race, either.**
+//!   The fix above stops a late reply from being fed into the wrong
+//!   `Handshake` instance, but on its own that only means the stale
+//!   reply gets ignored by the attempt it actually arrived for -- it
+//!   doesn't stop `race_handshake_reply` from handing that same stale
+//!   packet to a *subsequent* attempt as if it were fresh, since it only
+//!   filtered by source address and packet type. This was unreachable
+//!   in practice before `establish_session_with_retry` existed (a failed
+//!   initial handshake used to just crash the process after one round),
+//!   but became a real, repeatable failure once retrying indefinitely
+//!   made it possible for many rounds' worth of stale replies to pile up
+//!   in the socket's receive queue, each capable of falsely winning a
+//!   future attempt's race and consuming its one shot at the genuine
+//!   reply. `race_handshake_reply` now also requires the reply's
+//!   `session_id` to match the *current* attempt's, the same guarantee
+//!   `race_rekey_reply`'s `RekeyContext::forward_rekey_reply` already
+//!   provided for the mid-session case via its own `want_id` check.
+//!
+//! **The initial handshake never crashes the daemon.** `establish_session_with_retry`
+//! wraps the client's very first handshake attempt: if every configured
+//! link is unreachable (peer not up yet, still booting, a route not
+//! converged) and `perform_client_handshake` exhausts its bounded
+//! `RETRIES` for one round, this logs a warning and retries with
+//! exponential backoff (capped at `RECONNECT_BACKOFF_MAX_MS`) instead of
+//! returning an error out of `run()`. Previously that error propagated
+//! all the way to `main()`'s top-level `anyhow::Result` handler and
+//! exited the process -- harmless under a plain `systemd start`, but
+//! under the default `Restart=on-failure` a peer that stayed
+//! unreachable for a few minutes at boot (e.g. both ends power-cycling
+//! together, or one side waiting on DHCP) could burn through
+//! `StartLimitBurst` restarts and leave the unit in `failed` state for
+//! good, silently, until someone happened to check. Neither WireGuard
+//! nor the original C `MLVPN` exit on a failed handshake; this now
+//! matches that.
 //!
 //! **Self-healing reconnection.** `link_receiver` and `link_prober` each
 //! track consecutive I/O failures on the socket they're currently using
@@ -479,7 +513,7 @@ pub async fn run(tun: AsyncDevice, links: Vec<Link>, params: TunnelParams) -> Re
     // fields threaded through as separate arguments.
     let params = Arc::new(params);
 
-    let (session_id, session) = establish_session(&links, &params).await?;
+    let (session_id, session) = establish_session_with_retry(&links, &params).await;
     let session = Arc::new(AsyncMutex::new(SessionState::new(session_id, session)));
 
     tracing::info!(session_id, "tunnel session established");
@@ -880,6 +914,50 @@ async fn establish_session(
     }
 }
 
+/// Wraps `establish_session` so the *initial* handshake retries in the
+/// background forever instead of ever taking the whole daemon down.
+/// `establish_session`'s `Mode::Server` arm already loops internally and
+/// never returns `Err`; only `Mode::Client`'s `perform_client_handshake`
+/// can exhaust its bounded `RETRIES` and give up on one round. That
+/// `Err` used to propagate straight out of `run()` via `?`, so `main()`'s
+/// top-level `anyhow::Result` handler printed it and the whole process
+/// exited. Under `systemd`'s default `Restart=on-failure`, enough
+/// consecutive failed rounds -- the peer host still booting, down for
+/// maintenance, or just briefly unreachable -- trips
+/// `StartLimitBurst`/`StartLimitIntervalSec`, and systemd gives up
+/// entirely: the unit lands in `failed` and stays down for good until
+/// someone notices and runs `systemctl reset-failed`. Neither WireGuard
+/// nor the original C `MLVPN` this project replaces ever exit on a
+/// failed handshake -- they just keep trying in the background. This
+/// matches that: log a warning and back off (the same exponential
+/// schedule `attempt_reconnect` above uses, capped at
+/// `RECONNECT_BACKOFF_MAX_MS`) instead of ever returning an error here,
+/// so a client started before its peer is reachable just quietly waits
+/// it out rather than crash-looping itself into a permanently failed
+/// systemd unit.
+async fn establish_session_with_retry(
+    links: &Arc<AsyncMutex<Vec<Link>>>,
+    params: &TunnelParams,
+) -> (u32, Session) {
+    let mut backoff_ms = RECONNECT_BACKOFF_INITIAL_MS;
+    loop {
+        match establish_session(links, params).await {
+            Ok(result) => return result,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    backoff_ms,
+                    "initial handshake failed; retrying in the background rather than \
+                     exiting -- a peer that's temporarily unreachable at startup \
+                     shouldn't take the daemon down or trip systemd's restart-rate-limit"
+                );
+                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                backoff_ms = (backoff_ms * 2).min(RECONNECT_BACKOFF_MAX_MS);
+            }
+        }
+    }
+}
+
 /// The client side of a Noise_IK handshake: broadcast message 1 on
 /// every configured link with a `remote_addr` and race them for the
 /// first valid reply, retrying up to `RETRIES` whole rounds if one comes
@@ -1004,7 +1082,7 @@ async fn perform_client_handshake(
         let reply = if let Some(rx) = rekey_rx.as_mut() {
             race_rekey_reply(rx, HANDSHAKE_TIMEOUT).await
         } else {
-            race_handshake_reply(&targets, HANDSHAKE_TIMEOUT).await
+            race_handshake_reply(&targets, session_id, HANDSHAKE_TIMEOUT).await
         };
         let (reply_link_id, payload) = match reply {
             Ok(v) => v,
@@ -1127,13 +1205,41 @@ async fn respond_to_handshake_init(
 /// One handshake attempt's receive phase, used by `establish_session`'s
 /// `Mode::Client` arm: race every `target` link's socket for the first
 /// well-formed `HandshakeResp` from that link's *expected* source
-/// address, within `timeout`. Each link is listened to in its own task
-/// (via `JoinSet`) that loops internally, silently discarding anything
-/// that doesn't look like a genuine reply from the right source
-/// (garbage, a spoofed-source injection attempt, an unrelated frame) and
+/// address *and* carrying this attempt's own `session_id`, within
+/// `timeout`. Each link is listened to in its own task (via `JoinSet`)
+/// that loops internally, silently discarding anything that doesn't
+/// look like a genuine reply to *this* attempt (garbage, a
+/// spoofed-source injection attempt, an unrelated frame, or -- see
+/// below -- a stale reply to an earlier, already-abandoned attempt) and
 /// only returning once it finds a plausible candidate -- so a single bad
 /// packet on one link can't cost the whole race the way it would if we
 /// stopped listening on that link after its first (bad) datagram.
+///
+/// The `session_id` check is not optional. Since `establish_session_with_retry`
+/// started retrying a failed initial handshake indefinitely instead of
+/// giving up, this became reachable in practice, not just in theory: if
+/// one attempt's reply arrives just late enough to miss its own
+/// timeout, the peer has (by design, see `perform_client_handshake`'s
+/// doc comment on the fresh-session-id-per-attempt fix) already
+/// committed that session and will keep responding to it if anything
+/// ever re-triggers it, and every later attempt's own `HandshakeInit`
+/// gets legitimately treated by the peer as a *new* rekey once it's
+/// past its own initial accept -- each producing its own `HandshakeResp`.
+/// Without filtering by `session_id`, this function would happily hand
+/// whichever one of those replies happened to be sitting first in the
+/// socket's receive queue to the caller, almost always a stale reply
+/// meaning nothing to the *current* attempt's Noise ephemeral, which
+/// then always fails to decrypt -- consuming the one candidate this
+/// function is allowed to return per attempt (see below) without ever
+/// reaching the genuine, matching reply potentially queued right behind
+/// it. Across repeated retry rounds this compounds: each abandoned
+/// attempt leaves one more stale reply in the queue that can wrongly
+/// win a future race, so once one late reply happens the client could
+/// otherwise never recover on its own. Filtering by `session_id` here
+/// makes a stale reply invisible to every future attempt instead,
+/// exactly the same guarantee `rekey_ctx`'s `forward_rekey_reply`
+/// (`race_rekey_reply`'s counterpart) already provides for the mid-session
+/// case via its own `want_id` check.
 ///
 /// Deliberately returns the still-encrypted message 2 payload rather
 /// than calling `Handshake::read_second` itself: that call can only
@@ -1147,6 +1253,7 @@ async fn respond_to_handshake_init(
 /// candidate.
 async fn race_handshake_reply(
     targets: &[(LinkHandle, SocketAddr, u8)],
+    session_id: u32,
     timeout: Duration,
 ) -> Result<(u8, Vec<u8>)> {
     let mut join_set: JoinSet<Option<(u8, Vec<u8>)>> = JoinSet::new();
@@ -1169,17 +1276,19 @@ async fn race_handshake_reply(
                 // addresses are trivially spoofable; the actual
                 // authentication is the Noise handshake back in
                 // `establish_session`) -- just avoids treating obvious
-                // off-target traffic as a candidate. Anything that
-                // doesn't match keeps this task listening rather than
-                // giving up, so a single stray or spoofed packet can't
-                // cost this link its chance at the real reply.
+                // off-target traffic, and stale replies to an earlier
+                // abandoned attempt (see this function's doc comment),
+                // as a candidate. Anything that doesn't match keeps
+                // this task listening rather than giving up, so a
+                // single stray, spoofed, or stale packet can't cost
+                // this link its chance at the real reply.
                 if from != remote {
                     continue;
                 }
                 let Ok((hdr, payload)) = Header::decode(&buf[..n]) else {
                     continue;
                 };
-                if hdr.ptype != PacketType::HandshakeResp {
+                if hdr.ptype != PacketType::HandshakeResp || hdr.session_id != session_id {
                     continue;
                 }
                 return Some((link_id, payload.to_vec()));

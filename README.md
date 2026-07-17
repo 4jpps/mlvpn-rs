@@ -44,10 +44,10 @@ anything real. See [CHANGELOG.md](CHANGELOG.md) for release history.
 
 ```sh
 # Debian/Ubuntu
-sudo apt install ./mlvpn_0.3.0-1_amd64.deb
+sudo apt install ./mlvpn_0.3.1-1_amd64.deb
 
 # Fedora/RHEL/Rocky/Alma
-sudo dnf install ./mlvpn-0.3.0-1.fc41.x86_64.rpm
+sudo dnf install ./mlvpn-0.3.1-1.fc41.x86_64.rpm
 ```
 
 Grab the package matching your distro/architecture from the
@@ -65,6 +65,8 @@ Full setup lives in **[docs/](docs/)**, not this README:
 - [Firewall](docs/firewall.md) -- `mlvpnd firewall-setup`, or manual
 - [Monitoring: mlvpn-tui](docs/monitoring.md)
 - [Troubleshooting](docs/troubleshooting.md)
+- [Performance tuning](docs/performance-tuning.md) -- socket buffers,
+  sysctls, and isolating a throughput bottleneck
 - [Development](docs/development.md) -- build/test/lint, CI, releases
 - [Platform roadmap: OPNsense / pfSense](docs/platforms/opnsense-pfsense.md)
   -- scoping notes for a future FreeBSD-based port (not implemented)
