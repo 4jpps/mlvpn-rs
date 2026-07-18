@@ -1,3 +1,19 @@
+mlvpn (0.3.6-1) unstable; urgency=high
+
+  * Fix postinst corruption: dh_installdeb substitutes every occurrence
+    of the literal marker token in a maintainer script, not just the
+    one intended insertion point -- this script's own explanatory
+    comments repeated that token five more times in prose, so each got
+    a second copy of debhelper's generated systemctl restart/
+    daemon-reload code spliced into the middle of the sentence,
+    breaking the script's syntax and failing dpkg --configure with
+    exit 127 on a real install (mlvpn 0.3.5 never actually installed
+    successfully as a result). Rewrote every comment to describe the
+    marker without repeating the literal token pattern debhelper
+    matches on.
+
+ -- Jeff Parrish PC Services <www.jpps.us>  Fri, 17 Jul 2026 00:00:00 -0500
+
 mlvpn (0.3.5-1) unstable; urgency=medium
 
   * A link's remote_addr now accepts a DNS hostname, not just a literal

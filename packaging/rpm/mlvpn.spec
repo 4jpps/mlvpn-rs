@@ -6,8 +6,8 @@
 # equivalent of the user/group creation below.
 #
 # Note on %{?dist}: left in place (standard Fedora/RHEL convention) so
-# the same spec produces e.g. mlvpn-0.3.5-1.fc41.x86_64.rpm on Fedora and
-# mlvpn-0.3.5-1.el9.x86_64.rpm on RHEL/Rocky/Alma from one source tree.
+# the same spec produces e.g. mlvpn-0.3.6-1.fc41.x86_64.rpm on Fedora and
+# mlvpn-0.3.6-1.el9.x86_64.rpm on RHEL/Rocky/Alma from one source tree.
 #
 # debug_package disabled: [profile.release] in Cargo.toml sets
 # strip = true, so the compiled mlvpnd/mlvpn-tui binaries carry no
@@ -19,7 +19,7 @@
 %global debug_package %{nil}
 
 Name:           mlvpn
-Version:        0.3.5
+Version:        0.3.6
 Release:        1%{?dist}
 Summary:        Multi-link VPN bonding daemon
 
@@ -106,6 +106,20 @@ chmod 0750 %{_sysconfdir}/mlvpn
 %dir %attr(0750, root, mlvpn) %{_sysconfdir}/mlvpn
 
 %changelog
+* Fri Jul 17 2026 Jeff Parrish PC Services <www.jpps.us> - 0.3.6-1
+- Fix a .deb-only postinst corruption bug: debhelper's dh_installdeb
+  substitutes every occurrence of the literal token marking where its
+  generated code gets spliced in, not just the one intended marker
+  line -- this script's own explanatory comments mentioned that token
+  five more times in prose, so each one got a second copy of
+  debhelper's generated systemctl restart/daemon-reload code spliced
+  into the middle of the sentence, corrupting the script and failing
+  dpkg --configure with exit 127 on a real install. Rewrote every
+  comment to describe the marker without repeating the literal token
+  pattern debhelper matches on. This .rpm was never affected --
+  version bumped only to keep both packages on the same release
+  number.
+
 * Fri Jul 17 2026 Jeff Parrish PC Services <www.jpps.us> - 0.3.5-1
 - A link's remote_addr now accepts a DNS hostname, not just a literal
   IP (e.g. "bgp.example.com:51000"). Resolved once at startup with a

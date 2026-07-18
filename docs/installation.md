@@ -7,10 +7,10 @@ Grab the package matching your distro and architecture from the
 
 ```sh
 # Debian/Ubuntu
-sudo apt install ./mlvpn_0.3.5-1_amd64.deb   # or the _arm64.deb build
+sudo apt install ./mlvpn_0.3.6-1_amd64.deb   # or the _arm64.deb build
 
 # Fedora/RHEL/Rocky/Alma
-sudo dnf install ./mlvpn-0.3.5-1.fc41.x86_64.rpm   # or the matching el9/aarch64 build
+sudo dnf install ./mlvpn-0.3.6-1.fc41.x86_64.rpm   # or the matching el9/aarch64 build
 ```
 
 Installing via the package manager (not bare `dpkg -i`/`rpm -i`) so any

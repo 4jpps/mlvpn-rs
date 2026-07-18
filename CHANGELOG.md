@@ -10,6 +10,25 @@ For implementation detail beyond what's here, read the code -- most
 modules and non-trivial functions have doc comments explaining the
 design, and `ARCHITECTURE.md` covers the system as a whole.
 
+## [0.3.6] - 2026-07-17
+
+### Fixed
+
+- **`.deb` postinst corruption left `mlvpn` 0.3.5 unable to install at
+  all** (`dpkg --configure` failing with exit 127, quoting a mangled
+  fragment of a comment as an unrecognized command). Root cause:
+  debhelper's `dh_installdeb` substitutes *every* occurrence of the
+  literal marker token in a maintainer script, not just the one
+  intended insertion point -- undocumented as a footgun, but
+  documented behavior (see `dh_installdeb(1)`). `debian/mlvpn.postinst`'s
+  own explanatory comments mentioned that token five more times in
+  prose, so each one got a second copy of debhelper's generated
+  `systemctl restart`/`daemon-reload` code spliced into the middle of
+  the sentence, breaking the script's syntax. Rewrote every comment to
+  describe the marker without repeating the literal token pattern
+  debhelper matches on. The `.rpm` was never affected -- version
+  bumped only to keep both packages on the same release number.
+
 ## [0.3.5] - 2026-07-17
 
 ### Added
@@ -426,6 +445,7 @@ Initial implementation and first successful build.
 - Privilege dropping, a hardened systemd unit, and Debian packaging.
 - `ARCHITECTURE.md` design document and example configs.
 
+[0.3.6]: https://github.com/4jpps/mlvpn-rs/compare/v0.3.5...v0.3.6
 [0.3.5]: https://github.com/4jpps/mlvpn-rs/compare/v0.3.4...v0.3.5
 [0.3.4]: https://github.com/4jpps/mlvpn-rs/compare/v0.3.3...v0.3.4
 [0.3.3]: https://github.com/4jpps/mlvpn-rs/compare/v0.3.2...v0.3.3
