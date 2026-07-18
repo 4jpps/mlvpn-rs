@@ -6,8 +6,8 @@
 # equivalent of the user/group creation below.
 #
 # Note on %{?dist}: left in place (standard Fedora/RHEL convention) so
-# the same spec produces e.g. mlvpn-0.3.6-1.fc41.x86_64.rpm on Fedora and
-# mlvpn-0.3.6-1.el9.x86_64.rpm on RHEL/Rocky/Alma from one source tree.
+# the same spec produces e.g. mlvpn-0.3.7-1.fc41.x86_64.rpm on Fedora and
+# mlvpn-0.3.7-1.el9.x86_64.rpm on RHEL/Rocky/Alma from one source tree.
 #
 # debug_package disabled: [profile.release] in Cargo.toml sets
 # strip = true, so the compiled mlvpnd/mlvpn-tui binaries carry no
@@ -19,7 +19,7 @@
 %global debug_package %{nil}
 
 Name:           mlvpn
-Version:        0.3.6
+Version:        0.3.7
 Release:        1%{?dist}
 Summary:        Multi-link VPN bonding daemon
 
@@ -106,6 +106,19 @@ chmod 0750 %{_sysconfdir}/mlvpn
 %dir %attr(0750, root, mlvpn) %{_sysconfdir}/mlvpn
 
 %changelog
+* Sat Jul 18 2026 Jeff Parrish PC Services <www.jpps.us> - 0.3.7-1
+- Fix compute_achieved_mbps's elapsed-time floor silently capping
+  active-bandwidth-probe results at ~229 Mbps on fast links. The 1ms
+  floor was high enough to override real, correctly-measured
+  durations for bursts that legitimately completed faster than that,
+  so achieved_mbps ceilinged at the same value every time -- confirmed
+  from production logs showing the exact same figure recurring on a
+  fast link. Since active_bandwidth_mbps feeds the scheduler's
+  throughput weighting, this systematically underweighted a link
+  relative to its real capacity. Lowered the floor to 1 microsecond
+  (Instant has nanosecond resolution, so this still only guards the
+  literal zero/negative case).
+
 * Fri Jul 17 2026 Jeff Parrish PC Services <www.jpps.us> - 0.3.6-1
 - Fix a .deb-only postinst corruption bug: debhelper's dh_installdeb
   substitutes every occurrence of the literal token marking where its

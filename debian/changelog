@@ -1,3 +1,19 @@
+mlvpn (0.3.7-1) unstable; urgency=medium
+
+  * Fix compute_achieved_mbps's elapsed-time floor silently capping
+    active-bandwidth-probe results at ~229 Mbps on fast links. The
+    1ms floor was high enough to override real, correctly-measured
+    durations for bursts that legitimately completed faster than
+    that, so achieved_mbps ceilinged at the same value every time --
+    confirmed from production logs showing the exact same figure
+    recurring on a fast link. Since active_bandwidth_mbps feeds the
+    scheduler's throughput weighting, this systematically
+    underweighted a link relative to its real capacity. Lowered the
+    floor to 1 microsecond (Instant has nanosecond resolution, so
+    this still only guards the literal zero/negative case).
+
+ -- Jeff Parrish PC Services <www.jpps.us>  Sat, 18 Jul 2026 00:00:00 -0500
+
 mlvpn (0.3.6-1) unstable; urgency=high
 
   * Fix postinst corruption: dh_installdeb substitutes every occurrence

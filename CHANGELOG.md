@@ -10,6 +10,12 @@ For implementation detail beyond what's here, read the code -- most
 modules and non-trivial functions have doc comments explaining the
 design, and `ARCHITECTURE.md` covers the system as a whole.
 
+## [0.3.7] - 2026-07-18
+
+### Fixed
+
+- **`compute_achieved_mbps`'s elapsed-time floor silently capped active-bandwidth-probe results at ~229 Mbps on fast links.** The floor guards against a zero-duration divide, but at `0.001` (1ms) it was high enough to override real, correctly-measured durations: a ~28KB probe burst only needs to sustain ~229 Mbps to be delivered in under a millisecond, which any modern broadband link can do, so `Instant::elapsed()`'s accurate (smaller) duration got replaced by the 1ms floor and `achieved_mbps` ceilinged at the same value every time -- confirmed from production `journalctl` logs showing the exact value `229.1199951171875` recurring dozens of times on a fast link. Since `active_bandwidth_mbps` feeds `monitor::score()`'s scheduler weight (`throughput.sqrt()`), a link stuck reporting a fake low ceiling was systematically underweighted relative to its real capacity -- a plausible contributor to the sub-additive bonded-throughput behavior tracked since 0.3.1. Lowered the floor to `0.000_001` (1 microsecond); `Instant` has nanosecond resolution, so this still only guards the literal zero/negative case.
+
 ## [0.3.6] - 2026-07-17
 
 ### Fixed
@@ -445,6 +451,7 @@ Initial implementation and first successful build.
 - Privilege dropping, a hardened systemd unit, and Debian packaging.
 - `ARCHITECTURE.md` design document and example configs.
 
+[0.3.7]: https://github.com/4jpps/mlvpn-rs/compare/v0.3.6...v0.3.7
 [0.3.6]: https://github.com/4jpps/mlvpn-rs/compare/v0.3.5...v0.3.6
 [0.3.5]: https://github.com/4jpps/mlvpn-rs/compare/v0.3.4...v0.3.5
 [0.3.4]: https://github.com/4jpps/mlvpn-rs/compare/v0.3.3...v0.3.4

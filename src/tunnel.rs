@@ -2138,8 +2138,27 @@ impl BandwidthProbeReceiveState {
 /// arrive. `elapsed_secs` is clamped to a small positive floor so a
 /// (practically impossible, but not unrepresentable) zero-duration burst
 /// can't divide by zero or report an infinite/nonsensical rate.
+///
+/// The floor used to be `0.001` (1ms), which sounded conservative but
+/// wasn't: a ~28KB probe burst (`active_bandwidth_probe_packets` packets
+/// padded to `mtu`) only needs to sustain ~229 Mbps to be delivered in
+/// under a millisecond, which any modern broadband link can do. Once a
+/// burst legitimately completed that fast, `Instant::elapsed()` measured
+/// it correctly but this clamp overrode the real (smaller) duration with
+/// 1ms, silently ceiling `achieved_mbps` at ~229 regardless of how much
+/// faster the link actually was -- observed in production as the exact
+/// same `achieved_mbps` value recurring over and over for a fast link,
+/// which looked like a link-identity mixup but was actually this clamp.
+/// Because `active_bandwidth_mbps` feeds `monitor::score()`'s
+/// `throughput.sqrt()` scheduler weight, a link stuck reporting a fake
+/// ~229 Mbps ceiling gets systematically underweighted relative to its
+/// true capacity. `Instant` has nanosecond resolution, so the floor only
+/// needs to guard against a literal zero/negative duration -- 1
+/// microsecond is plenty, and still lets `achieved_mbps` run up into the
+/// tens-of-Gbps range before clamping, far outside what a burst this
+/// size could plausibly produce.
 fn compute_achieved_mbps(bytes: u64, elapsed_secs: f64) -> f64 {
-    let elapsed_secs = elapsed_secs.max(0.001);
+    let elapsed_secs = elapsed_secs.max(0.000_001);
     (bytes as f64 * 8.0) / elapsed_secs / 1_000_000.0
 }
 
