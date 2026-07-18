@@ -10,6 +10,77 @@ For implementation detail beyond what's here, read the code -- most
 modules and non-trivial functions have doc comments explaining the
 design, and `ARCHITECTURE.md` covers the system as a whole.
 
+## [0.3.5] - 2026-07-17
+
+### Added
+
+- **A link's `remote_addr` now accepts a DNS hostname, not just a
+  literal IP** -- e.g. `"bgp.example.com:51000"`, handy when the server
+  side doesn't have (or you don't want to hard-code) a fixed IP.
+  Resolved once at startup via `tokio::net::lookup_host` (a 10s timeout
+  so an unreachable resolver fails fast instead of hanging the daemon
+  at boot); not re-resolved while running, so a restart is needed to
+  pick up a changed IP, same as editing a literal IP always required.
+  A hostname resolving to both an `A` and `AAAA` record (ordinary
+  dual-stack DNS) is handled automatically: `local_addr`, if set, picks
+  the family; otherwise IPv6 is preferred when both are available.
+- **New outbound queue overflow logging**, loosely modeled on the
+  original C `MLVPN`'s `freebuffer_t` (a fixed-size packet pool that
+  logs and drops rather than growing or blocking once exhausted).
+  `tun_reader` and the actual per-link send are now split across a
+  bounded channel; if the send side ever falls behind the rate packets
+  arrive from the TUN device again (exactly the failure mode the
+  Performance fix below addresses, but this catches *any* future
+  regression with the same shape), the queue fills, packets are
+  dropped rather than silently lost in the kernel's TUN queue, and a
+  `WARN`-level `"outbound queue overflowed"` line with a drop count
+  logs every couple of seconds until it clears. Silent on a healthy
+  tunnel. See `docs/performance-tuning.md` §3b.
+
+### Performance
+
+- **Bonded throughput still plateaued well below what the links could
+  do individually, even after 0.3.2's cross-link lock fix.** A real
+  two-host test pushing 200 Mbps of small UDP datagrams (~19,000
+  packets/sec) through the tunnel found a hard, flat ~65% loss ceiling
+  -- steady, non-varying loss at high packet rate, unlike the bursty
+  pattern real network congestion produces. Root cause: `tunnel::
+  send_scheduled` called `link::snapshot_links` -- a full clone of
+  every configured link, including every `LinkConfig` `String` field
+  -- on **every single outgoing packet**, just so `Scheduler::select`
+  could pick one link and discard the rest of the clones. At high
+  packet rates the heap allocation and per-link lock/clone overhead of
+  doing that every packet outpaced how fast packets arrived from the
+  TUN device, silently overflowing the kernel's TUN queue before
+  `mlvpnd` ever read the dropped packets -- invisible from inside the
+  process, the same way 0.3.1's socket-buffer overflow was. `Scheduler::
+  select` now works off a new `Copy`-only `link::LinkScore` snapshot
+  (no heap data at all) and returns just the winning link's index, so
+  only that one link is ever locked-and-cloned for its remote
+  address/socket handle -- not every candidate, on every packet,
+  regardless of which one wins. See `docs/performance-tuning.md` §3b.
+
+## [0.3.4] - 2026-07-17
+
+### Fixed
+
+- **The 0.3.3 restart-on-upgrade fix always lost the race against
+  debhelper's own generated postinst code.** It checked whether
+  `mlvpnd` was active and restarted it *before* `#DEBHELPER#`, but
+  debhelper's compat-10+ default (`--restart-after-upgrade`, with
+  `debian/rules`'s `--no-start` only suppressing the "start" half of
+  that pair) unconditionally stops the service *after* that, on every
+  upgrade -- so 0.3.3's restart always got immediately undone, leaving
+  `mlvpnd` stopped after every `.deb` upgrade exactly as before that
+  fix shipped. Found on a real two-host upgrade immediately after
+  0.3.3. Fixed by recording whether the service was active before
+  anything in the postinst (debhelper's generated code included) can
+  touch it, and restarting -- last, after `#DEBHELPER#` -- based on
+  that recorded state instead. Debian packaging only; the `.rpm` was
+  never affected (`%systemd_postun_with_restart` already handled this
+  correctly), version bumped only to keep both packages on the same
+  release number.
+
 ## [0.3.3] - 2026-07-17
 
 ### Fixed
@@ -355,6 +426,8 @@ Initial implementation and first successful build.
 - Privilege dropping, a hardened systemd unit, and Debian packaging.
 - `ARCHITECTURE.md` design document and example configs.
 
+[0.3.5]: https://github.com/4jpps/mlvpn-rs/compare/v0.3.4...v0.3.5
+[0.3.4]: https://github.com/4jpps/mlvpn-rs/compare/v0.3.3...v0.3.4
 [0.3.3]: https://github.com/4jpps/mlvpn-rs/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/4jpps/mlvpn-rs/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/4jpps/mlvpn-rs/compare/v0.3.0...v0.3.1

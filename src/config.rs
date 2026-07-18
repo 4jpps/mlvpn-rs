@@ -327,10 +327,19 @@ pub struct LinkConfig {
     pub local_addr: Option<String>,
     /// Remote host:port of the peer for this link (client mode: where we
     /// connect; server mode: not used for binding, only for source
-    /// validation once the peer's address is learned). Also what
-    /// selects this link's socket address family (IPv4 or IPv6) --
-    /// bracket the host for IPv6, e.g. `"[2001:db8::1]:51000"`, the
-    /// standard `SocketAddr` string form.
+    /// validation once the peer's address is learned). Accepts a literal
+    /// IP (bracket the host for IPv6, e.g. `"[2001:db8::1]:51000"`, the
+    /// standard `SocketAddr` string form) or a DNS hostname, e.g.
+    /// `"bgp.example.com:51000"` -- resolved once, at startup
+    /// (`link::resolve_remote_addr`), same as a literal address always
+    /// has been; not re-resolved while `mlvpnd` keeps running, so a
+    /// restart is needed to pick up a changed IP behind the hostname,
+    /// exactly like editing a literal IP in this field always required.
+    /// A hostname resolving to both an `A` and `AAAA` record (ordinary
+    /// dual-stack DNS) is handled automatically: `local_addr` below, if
+    /// set, picks the family; otherwise IPv6 is preferred when both are
+    /// available (see `link::pick_remote_addr`). Also what selects this
+    /// link's socket address family (IPv4 or IPv6) when set at all.
     pub remote_addr: Option<String>,
     /// Local UDP port to bind/listen on for this link.
     pub local_port: u16,

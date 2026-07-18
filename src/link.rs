@@ -34,7 +34,7 @@ use std::net::{IpAddr, SocketAddr, UdpSocket as StdUdpSocket};
 #[cfg(target_os = "linux")]
 use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::sync::{Mutex as AsyncMutex, RwLock as AsyncRwLock};
 
@@ -226,6 +226,11 @@ pub type SharedSocket = Arc<AsyncRwLock<Arc<UdpSocket>>>;
 pub struct LinkHandle {
     pub link_id: u8,
     config: LinkConfig,
+    /// The address `remote_addr` resolved to at `Link::bind` time,
+    /// snapshotted here the same way `config` is -- see `reconnect`'s
+    /// doc comment for why reconnect reuses this instead of re-resolving
+    /// DNS itself.
+    remote: Option<SocketAddr>,
     socket: SharedSocket,
     reconnect_lock: Arc<AsyncMutex<()>>,
 }
@@ -264,6 +269,19 @@ impl LinkHandle {
     /// already running simply waits for it and then reads whichever
     /// socket it installed, rather than both racing to bind the same
     /// interface/port pair.
+    ///
+    /// Deliberately does *not* re-resolve `remote_addr`, even if it's a
+    /// hostname (see `resolve_remote_addr`) -- reconnect exists for one
+    /// specific scenario (this module's doc comment: a *local* interface
+    /// fully removed and recreated), which has nothing to do with
+    /// whether the *remote* peer's hostname now resolves to a different
+    /// address. Conflating the two would mean an unrelated local
+    /// USB-modem replug could suddenly change which of a dual-stack
+    /// hostname's addresses this link talks to, mid-session, for no
+    /// reason connected to the actual event. Reuses whichever address
+    /// `Link::bind` originally resolved (snapshotted into `self.remote`
+    /// the same way `self.config` already is), so a rebind always keeps
+    /// the same family/target it started with.
     pub async fn reconnect(&self) -> Result<()> {
         let _guard = self.reconnect_lock.lock().await;
         // `bind_socket` is a handful of synchronous syscalls (socket
@@ -280,9 +298,11 @@ impl LinkHandle {
         // runtime's reactor (`UdpSocket::from_std` needs that), since
         // tokio propagates the current runtime handle into blocking tasks.
         let config = self.config.clone();
-        let (new_socket, _physical_mtu) = tokio::task::spawn_blocking(move || bind_socket(&config))
-            .await
-            .map_err(|e| MlvpnError::Config(format!("reconnect task panicked: {e}")))??;
+        let remote = self.remote;
+        let (new_socket, _physical_mtu) =
+            tokio::task::spawn_blocking(move || bind_socket(&config, remote))
+                .await
+                .map_err(|e| MlvpnError::Config(format!("reconnect task panicked: {e}")))??;
         *self.socket.write().await = new_socket;
         Ok(())
     }
@@ -337,6 +357,67 @@ pub async fn snapshot_links(links: &Links) -> Vec<Link> {
     let mut out = Vec::with_capacity(links.len());
     for l in links.iter() {
         out.push(l.lock().await.clone());
+    }
+    out
+}
+
+/// Everything `monitor::score()` and `Scheduler::select`'s cap-check/
+/// fallback logic need to pick a link for one outgoing packet --
+/// deliberately excludes `LinkConfig`'s `String` fields (`name`,
+/// `bind_interface`, `local_addr`, `remote_addr`), `remote`, and the
+/// socket handle, every one of which `snapshot_links` above *does*
+/// clone. That distinction matters here specifically because
+/// `tunnel::send_scheduled` calls this once per outgoing packet (not at
+/// probe-interval frequency the way `Scheduler::refresh`'s callers do):
+/// a real 200 Mbps / ~19k pps UDP test showed a hard, dead-flat ~65%
+/// loss ceiling traced to exactly this -- `snapshot_links` cloning every
+/// link's full `Link` (including heap-allocating every `LinkConfig`
+/// `String`) just to let the scheduler pick one and then throw the rest
+/// away, on every single packet. Every field here is `Copy`, so
+/// building this `Vec` allocates nothing beyond the `Vec` itself.
+#[derive(Debug, Clone, Copy)]
+pub struct LinkScore {
+    /// Index into the original `Links` slice this entry came from --
+    /// what `Scheduler::select` actually returns, so the caller can go
+    /// look up (and lock, just once, just for this one link) whatever
+    /// full `Link` data it needs next (remote address, socket handle,
+    /// name for logging).
+    pub link_index: usize,
+    pub state: LinkState,
+    pub admin_disabled: bool,
+    pub weight: f64,
+    pub bandwidth_cap_mbps: Option<f64>,
+    pub rtt_ms: Option<f64>,
+    pub jitter_ms: Option<f64>,
+    pub loss_rate: Option<f64>,
+    pub throughput_mbps: Option<f64>,
+    pub active_bandwidth_mbps: Option<f64>,
+    pub consecutive_misses: u32,
+}
+
+/// Cheap, per-packet-safe counterpart to `snapshot_links`: locks each
+/// link only long enough to copy out the handful of `Copy` fields
+/// scheduling actually needs, never cloning `LinkConfig`'s `String`
+/// fields or anything requiring a heap allocation. See `LinkScore`'s
+/// doc comment for why this exists as a separate function rather than
+/// just a cheaper `Link::clone`.
+pub async fn snapshot_scores(links: &Links) -> Vec<LinkScore> {
+    let mut out = Vec::with_capacity(links.len());
+    for (i, l) in links.iter().enumerate() {
+        let guard = l.lock().await;
+        out.push(LinkScore {
+            link_index: i,
+            state: guard.state,
+            admin_disabled: guard.admin_disabled,
+            weight: guard.config.weight,
+            bandwidth_cap_mbps: guard.config.bandwidth_cap_mbps,
+            rtt_ms: guard.stats.rtt_ms.get(),
+            jitter_ms: guard.stats.jitter_ms.get(),
+            loss_rate: guard.stats.loss_rate.get(),
+            throughput_mbps: guard.stats.throughput_mbps.get(),
+            active_bandwidth_mbps: guard.stats.active_bandwidth_mbps.get(),
+            consecutive_misses: guard.stats.consecutive_misses,
+        });
     }
     out
 }
@@ -401,14 +482,8 @@ impl Link {
     /// system (SO_BINDTODEVICE itself only needs `CAP_NET_RAW` on Linux,
     /// which `privilege::drop_to` retains explicitly for this reason).
     pub async fn bind(id: u8, config: LinkConfig, ewma_alpha: f64) -> Result<Self> {
-        let (socket, physical_mtu) = bind_socket(&config)?;
-
-        let remote = match &config.remote_addr {
-            Some(addr) => Some(addr.parse().map_err(|e| {
-                MlvpnError::Config(format!("bad remote_addr for link '{}': {e}", config.name))
-            })?),
-            None => None,
-        };
+        let remote = resolve_remote_addr(&config).await?;
+        let (socket, physical_mtu) = bind_socket(&config, remote)?;
 
         let effective_probe_interval_ms = config.probe_interval_ms;
 
@@ -435,35 +510,135 @@ impl Link {
         LinkHandle {
             link_id: self.id,
             config: self.config.clone(),
+            remote: self.remote,
             socket: self.socket.clone(),
             reconnect_lock: self.reconnect_lock.clone(),
         }
     }
 }
 
+/// How long `resolve_remote_addr` waits for `remote_addr` to resolve
+/// before giving up. DNS lookups have no built-in timeout of their own,
+/// and `Link::bind` runs at startup, before the "retry indefinitely in
+/// the background" handshake logic (`tunnel::establish_session_with_retry`)
+/// even begins -- an unreachable resolver would otherwise hang the whole
+/// daemon at startup forever instead of failing fast with a clear error,
+/// exactly the kind of silent hang this project's existing startup
+/// behavior (see `main.rs`) deliberately avoids elsewhere.
+const DNS_RESOLVE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Pick the concrete `SocketAddr` to use as a client-mode link's
+/// `remote`, given every address `remote_addr` resolved to. Split out of
+/// `resolve_remote_addr` as pure, I/O-free selection logic specifically
+/// so it's unit-testable with hand-built address lists, without a real
+/// DNS lookup (a hostname actually returning both an `A` and `AAAA`
+/// record isn't something a unit test should depend on a real resolver
+/// for) -- see `monitor.rs`'s module doc comment for this project's
+/// general preference for keeping decision logic separate from the I/O
+/// that feeds it.
+///
+/// If `local_addr` is set, it already declares this link's intended
+/// family (see its own doc comment on `LinkConfig`) -- honor that and
+/// error clearly if no resolved address matches, rather than silently
+/// binding the wrong family. Otherwise prefer an IPv6 result if one
+/// exists, falling back to IPv4: a simplified, non-racing "happy
+/// eyeballs" -- correct and predictable for a link already pinned to one
+/// physical interface via `bind_interface`, without the complexity a
+/// real dual-stack race (RFC 8305) adds for a scenario (a browser racing
+/// several outbound TCP connections) this project doesn't have. An
+/// operator who needs the *other* family from a dual-stack hostname can
+/// already force it via `local_addr`, or by writing a literal IPv4/IPv6
+/// address directly instead of a hostname.
+fn pick_remote_addr(
+    candidates: &[SocketAddr],
+    local_addr: Option<&str>,
+    link_name: &str,
+) -> Result<SocketAddr> {
+    if let Some(local) = local_addr {
+        let want_v6 = local
+            .parse::<IpAddr>()
+            .map_err(|e| MlvpnError::Config(format!("bad local_addr for link '{link_name}': {e}")))?
+            .is_ipv6();
+        return candidates
+            .iter()
+            .find(|a| a.is_ipv6() == want_v6)
+            .copied()
+            .ok_or_else(|| {
+                MlvpnError::Config(format!(
+                    "remote_addr for link '{link_name}' resolved to no {} address, but \
+                     local_addr requires one",
+                    if want_v6 { "IPv6" } else { "IPv4" }
+                ))
+            });
+    }
+    candidates
+        .iter()
+        .find(|a| a.is_ipv6())
+        .or_else(|| candidates.first())
+        .copied()
+        .ok_or_else(|| {
+            MlvpnError::Config(format!(
+                "remote_addr for link '{link_name}' resolved to no addresses"
+            ))
+        })
+}
+
+/// Resolve `config.remote_addr` (client mode) to a concrete `SocketAddr`
+/// via `tokio::net::lookup_host` -- accepts everything `remote_addr`
+/// always has (a literal `ip:port`, resolved instantly with no real
+/// network round trip) plus, now, a `hostname:port` needing an actual DNS
+/// lookup, e.g. `"bgp.example.com:5000"`. Returns `None` if `remote_addr`
+/// isn't set at all -- the normal server-mode case, where the peer's
+/// address is only ever learned at runtime instead (see `tunnel.rs`'s
+/// "learned/updated peer address" handling).
+///
+/// A hostname commonly resolves to *both* an `A` and an `AAAA` record
+/// (ordinary dual-stack DNS, e.g. most cloud providers' own hostnames) --
+/// see `pick_remote_addr` for how that gets narrowed down to the one
+/// family this link's single UDP socket actually uses.
+async fn resolve_remote_addr(config: &LinkConfig) -> Result<Option<SocketAddr>> {
+    let Some(remote_addr) = &config.remote_addr else {
+        return Ok(None);
+    };
+    let candidates: Vec<SocketAddr> =
+        tokio::time::timeout(DNS_RESOLVE_TIMEOUT, tokio::net::lookup_host(remote_addr.as_str()))
+            .await
+            .map_err(|_| {
+                MlvpnError::Config(format!(
+                    "resolving remote_addr '{remote_addr}' for link '{}' timed out after {DNS_RESOLVE_TIMEOUT:?}",
+                    config.name
+                ))
+            })?
+            .map_err(|e| {
+                MlvpnError::Config(format!(
+                    "resolving remote_addr '{remote_addr}' for link '{}': {e}",
+                    config.name
+                ))
+            })?
+            .collect();
+    pick_remote_addr(&candidates, config.local_addr.as_deref(), &config.name).map(Some)
+}
+
 /// Decide whether a link's socket should be IPv4 or IPv6, from whichever
-/// of `remote_addr`/`local_addr` actually says -- there's no separate
+/// of `remote`/`local_addr` actually says -- there's no separate
 /// `address_family` config knob; the address(es) already given say it
 /// implicitly, the same way they always have, so an existing IPv4-only
 /// config needs no changes to keep behaving exactly as before.
 ///
-/// `remote_addr` (a full `host:port` `SocketAddr` string) is checked
-/// first: every client-side link has one, and for a server-side link it
-/// still wins if somehow both are set, since it's the address this
-/// socket will actually be talking to. Falls back to `local_addr` (a
-/// bare IP, no port) for a server-side link with no `remote_addr` --
-/// the peer's address there is only *learned* at runtime from the first
-/// authenticated packet (see this module's doc comment), so there is
-/// nothing else to infer the family from until an operator wanting an
-/// IPv6-only server-side link sets `local_addr` to an IPv6 address
-/// (`"::"` for "any"). Defaults to IPv4 if neither is set, matching
-/// every config written before this existed.
-fn socket_domain(config: &LinkConfig) -> Result<Domain> {
-    if let Some(remote) = &config.remote_addr {
-        let addr: SocketAddr = remote.parse().map_err(|e| {
-            MlvpnError::Config(format!("bad remote_addr for link '{}': {e}", config.name))
-        })?;
-        return Ok(if addr.is_ipv6() {
+/// `remote` -- already resolved by `resolve_remote_addr`, not a string to
+/// parse here -- is checked first: every client-side link has one, and
+/// for a server-side link it still wins if somehow both are set, since
+/// it's the address this socket will actually be talking to. Falls back
+/// to `local_addr` (a bare IP, no port) for a server-side link with no
+/// `remote_addr` -- the peer's address there is only *learned* at
+/// runtime from the first authenticated packet (see this module's doc
+/// comment), so there is nothing else to infer the family from until an
+/// operator wanting an IPv6-only server-side link sets `local_addr` to
+/// an IPv6 address (`"::"` for "any"). Defaults to IPv4 if neither is
+/// set, matching every config written before this existed.
+fn socket_domain(config: &LinkConfig, remote: Option<SocketAddr>) -> Result<Domain> {
+    if let Some(remote) = remote {
+        return Ok(if remote.is_ipv6() {
             Domain::IPV6
         } else {
             Domain::IPV4
@@ -594,10 +769,17 @@ fn raise_socket_buffers(socket: &Socket, link_name: &str) {
 /// `config.bind_interface` (Linux only), optionally to a specific
 /// `local_addr`, then `bind()` to `local_port`. Shared by `Link::bind`
 /// (startup) and `LinkHandle::reconnect` (runtime rebind after the
-/// existing socket appears permanently dead) so both paths apply
-/// exactly the same steps and error handling.
-fn bind_socket(config: &LinkConfig) -> Result<(Arc<UdpSocket>, Option<u32>)> {
-    let domain = socket_domain(config)?;
+/// existing socket appears permanently dead) so both paths apply exactly
+/// the same steps and error handling. `remote` is the already-resolved
+/// address `resolve_remote_addr` produced (or `None`), passed in rather
+/// than resolved here -- this function stays a plain synchronous one
+/// (safe to run inside `spawn_blocking`), while DNS resolution is async
+/// and, for a hostname, needs a real `.await`.
+fn bind_socket(
+    config: &LinkConfig,
+    remote: Option<SocketAddr>,
+) -> Result<(Arc<UdpSocket>, Option<u32>)> {
+    let domain = socket_domain(config, remote)?;
     let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP)).map_err(MlvpnError::Io)?;
     socket.set_nonblocking(true).map_err(MlvpnError::Io)?;
     socket.set_reuse_address(true).map_err(MlvpnError::Io)?;
@@ -764,10 +946,13 @@ mod tests {
         assert_eq!(query_interface_mtu("mlvpn-test-nonexistent-if0"), None);
     }
 
-    /// `socket_domain` (feeding IPv6-on-links support) needs no real
-    /// socket at all -- it's pure string parsing over `LinkConfig`, so
-    /// it's covered directly here rather than only via the integration
-    /// tests that exercise a real bind.
+    /// `socket_domain`/`pick_remote_addr`/`resolve_remote_addr` (feeding
+    /// IPv6-on-links and hostname-in-`remote_addr` support) need no real
+    /// socket at all -- pure logic (plus, for a literal address, string
+    /// parsing that never touches the network -- see
+    /// `resolve_remote_addr_accepts_a_literal_ipv4_address`'s doc
+    /// comment), so they're covered directly here rather than only via
+    /// the integration tests that exercise a real bind.
     fn test_link_config(local_addr: Option<&str>, remote_addr: Option<&str>) -> LinkConfig {
         LinkConfig {
             name: "test".to_string(),
@@ -784,45 +969,131 @@ mod tests {
     #[test]
     fn socket_domain_defaults_to_ipv4_with_nothing_set() {
         let cfg = test_link_config(None, None);
-        assert_eq!(socket_domain(&cfg).unwrap(), Domain::IPV4);
+        assert_eq!(socket_domain(&cfg, None).unwrap(), Domain::IPV4);
     }
 
     #[test]
-    fn socket_domain_follows_ipv4_remote_addr() {
-        let cfg = test_link_config(None, Some("203.0.113.10:51000"));
-        assert_eq!(socket_domain(&cfg).unwrap(), Domain::IPV4);
+    fn socket_domain_follows_resolved_remote_ipv4() {
+        let cfg = test_link_config(None, None);
+        let remote: SocketAddr = "203.0.113.10:51000".parse().unwrap();
+        assert_eq!(socket_domain(&cfg, Some(remote)).unwrap(), Domain::IPV4);
     }
 
     #[test]
-    fn socket_domain_follows_ipv6_remote_addr() {
-        let cfg = test_link_config(None, Some("[2001:db8::1]:51000"));
-        assert_eq!(socket_domain(&cfg).unwrap(), Domain::IPV6);
+    fn socket_domain_follows_resolved_remote_ipv6() {
+        let cfg = test_link_config(None, None);
+        let remote: SocketAddr = "[2001:db8::1]:51000".parse().unwrap();
+        assert_eq!(socket_domain(&cfg, Some(remote)).unwrap(), Domain::IPV6);
     }
 
     #[test]
-    fn socket_domain_remote_addr_wins_over_local_addr() {
-        // Contradictory config, but remote_addr is what the socket will
-        // actually be talking to, so it should win regardless.
-        let cfg = test_link_config(Some("192.0.2.5"), Some("[2001:db8::1]:51000"));
-        assert_eq!(socket_domain(&cfg).unwrap(), Domain::IPV6);
+    fn socket_domain_resolved_remote_wins_over_local_addr() {
+        // Contradictory config, but the resolved remote is what the
+        // socket will actually be talking to, so it should win
+        // regardless.
+        let cfg = test_link_config(Some("192.0.2.5"), None);
+        let remote: SocketAddr = "[2001:db8::1]:51000".parse().unwrap();
+        assert_eq!(socket_domain(&cfg, Some(remote)).unwrap(), Domain::IPV6);
     }
 
     #[test]
     fn socket_domain_falls_back_to_local_addr_for_server_links() {
-        // No remote_addr -- the server-side case, where the peer's
+        // No resolved remote -- the server-side case, where the peer's
         // address is only learned at runtime (see this module's doc
         // comment). local_addr is the only thing left to infer from.
         let cfg = test_link_config(Some("::"), None);
-        assert_eq!(socket_domain(&cfg).unwrap(), Domain::IPV6);
+        assert_eq!(socket_domain(&cfg, None).unwrap(), Domain::IPV6);
 
         let cfg = test_link_config(Some("0.0.0.0"), None);
-        assert_eq!(socket_domain(&cfg).unwrap(), Domain::IPV4);
+        assert_eq!(socket_domain(&cfg, None).unwrap(), Domain::IPV4);
     }
 
     #[test]
-    fn socket_domain_rejects_unparseable_remote_addr() {
+    fn socket_domain_rejects_unparseable_local_addr() {
+        let cfg = test_link_config(Some("not-an-address"), None);
+        assert!(socket_domain(&cfg, None).is_err());
+    }
+
+    /// `pick_remote_addr` is where a hostname resolving to both an `A`
+    /// and `AAAA` record (dual-stack DNS -- what actually motivated this
+    /// function, e.g. `bgp.example.com` resolving to both an IPv4 and an
+    /// IPv6 address for the same cloud host) gets narrowed to one
+    /// family. Pure logic, no real DNS lookup needed to exercise it.
+    #[test]
+    fn pick_remote_addr_prefers_ipv6_when_no_local_addr_hint() {
+        let candidates = [
+            "203.0.113.10:51000".parse().unwrap(),
+            "[2001:db8::1]:51000".parse().unwrap(),
+        ];
+        let picked = pick_remote_addr(&candidates, None, "test").unwrap();
+        assert!(picked.is_ipv6());
+    }
+
+    #[test]
+    fn pick_remote_addr_falls_back_to_ipv4_when_only_ipv4_present() {
+        let candidates = ["203.0.113.10:51000".parse().unwrap()];
+        let picked = pick_remote_addr(&candidates, None, "test").unwrap();
+        assert!(picked.is_ipv4());
+    }
+
+    #[test]
+    fn pick_remote_addr_honors_local_addr_family_hint() {
+        let candidates = [
+            "203.0.113.10:51000".parse().unwrap(),
+            "[2001:db8::1]:51000".parse().unwrap(),
+        ];
+        // local_addr says IPv4, so this must pick the IPv4 candidate
+        // even though IPv6 would otherwise be preferred.
+        let picked = pick_remote_addr(&candidates, Some("192.0.2.5"), "test").unwrap();
+        assert!(picked.is_ipv4());
+    }
+
+    #[test]
+    fn pick_remote_addr_errors_when_local_addr_family_has_no_match() {
+        // local_addr demands IPv6, but only an IPv4 candidate resolved --
+        // this must error clearly rather than silently binding IPv4
+        // anyway.
+        let candidates = ["203.0.113.10:51000".parse().unwrap()];
+        assert!(pick_remote_addr(&candidates, Some("::1"), "test").is_err());
+    }
+
+    #[test]
+    fn pick_remote_addr_errors_on_empty_candidates() {
+        assert!(pick_remote_addr(&[], None, "test").is_err());
+    }
+
+    #[tokio::test]
+    async fn resolve_remote_addr_returns_none_when_unset() {
+        let cfg = test_link_config(None, None);
+        assert_eq!(resolve_remote_addr(&cfg).await.unwrap(), None);
+    }
+
+    /// A literal `ip:port` resolves via `ToSocketAddrs`' own fast path
+    /// (a plain parse, tried before any real `getaddrinfo` call), so
+    /// this stays fast and network-free in CI -- exercising the
+    /// hostname-resolution *path* end-to-end needs a real DNS lookup,
+    /// which is exactly what `pick_remote_addr`'s tests above avoid by
+    /// testing the selection logic directly instead.
+    #[tokio::test]
+    async fn resolve_remote_addr_accepts_a_literal_ipv4_address() {
+        let cfg = test_link_config(None, Some("203.0.113.10:51000"));
+        let resolved = resolve_remote_addr(&cfg).await.unwrap();
+        assert_eq!(resolved, Some("203.0.113.10:51000".parse().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn resolve_remote_addr_accepts_a_literal_ipv6_address() {
+        let cfg = test_link_config(None, Some("[2001:db8::1]:51000"));
+        let resolved = resolve_remote_addr(&cfg).await.unwrap();
+        assert_eq!(resolved, Some("[2001:db8::1]:51000".parse().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn resolve_remote_addr_rejects_a_malformed_address() {
+        // No port separator at all -- fails during string parsing,
+        // before any network access, so this stays fast and non-flaky.
         let cfg = test_link_config(None, Some("not-an-address"));
-        assert!(socket_domain(&cfg).is_err());
+        assert!(resolve_remote_addr(&cfg).await.is_err());
     }
 
     #[test]

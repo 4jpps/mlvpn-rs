@@ -84,8 +84,14 @@ few minutes at boot.
 
 Steady state (`tunnel.rs`) is a small set of tokio tasks:
 
-- `tun_reader` -- reads the TUN device, encrypts, sends out whichever
-  link the scheduler picks.
+- `tun_reader` -- reads the TUN device, encrypts, and hands each frame
+  off (a bounded, non-blocking queue) to `outbound_sender`, which asks
+  the scheduler which link to use and sends it. Split into two tasks
+  specifically so a slow send side can never stall draining the TUN
+  device; a full queue drops the packet and counts it instead of
+  blocking. `outbound_queue_drop_reporter` periodically logs that count
+  (silent when it's zero) -- modeled on the original C `MLVPN`'s
+  `freebuffer_t`. See §6 and `docs/performance-tuning.md`.
 - two tasks per physical link -- `link_receiver` reads and dispatches
   incoming frames; `link_prober` independently sends probes and stats
   on its own timer. Kept as separate tasks so a busy link's receive
@@ -254,8 +260,12 @@ both across its links. `link::socket_domain` infers which from
 whichever of `remote_addr`/`local_addr` is set on that link's config
 entry (a client-side link always has `remote_addr`; a server-side link
 with none set falls back to `local_addr`, e.g. `"::"` for IPv6), so an
-existing IPv4-only config keeps working unchanged. This is distinct
-from `tunnel.address6` (§12), which is about the TUN interface's own
+existing IPv4-only config keeps working unchanged. `remote_addr` accepts
+a DNS hostname as well as a literal IP (`link::resolve_remote_addr`,
+resolved once at startup); if it resolves to both an `A` and `AAAA`
+record, `local_addr` picks the family if set, otherwise IPv6 is
+preferred (`link::pick_remote_addr`). This is distinct from
+`tunnel.address6` (§12), which is about the TUN interface's own
 address, not the transport sockets between the two `mlvpnd` instances.
 
 ## 7. Receive-side reordering

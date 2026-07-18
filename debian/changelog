@@ -1,3 +1,49 @@
+mlvpn (0.3.5-1) unstable; urgency=medium
+
+  * A link's remote_addr now accepts a DNS hostname, not just a literal
+    IP (e.g. "bgp.example.com:51000"). Resolved once at startup with a
+    10s timeout; a hostname resolving to both an A and AAAA record
+    prefers IPv6 unless local_addr pins the family.
+  * New outbound queue overflow logging, modeled on the original C
+    MLVPN's freebuffer_t: tun_reader and the actual per-link send are
+    now split across a bounded channel, so a send side that falls
+    behind drops packets and logs a WARN-level "outbound queue
+    overflowed" line (with a drop count) instead of silently losing
+    them in the kernel's TUN queue, as happened below. Silent on a
+    healthy tunnel.
+  * Performance: bonded throughput still plateaued well below what the
+    links could do individually, even after 0.3.2's cross-link lock fix.
+    A real two-host test pushing 200 Mbps of small UDP datagrams
+    (~19,000 packets/sec) found a hard, flat ~65% loss ceiling. Root
+    cause: send_scheduled cloned every configured link's full Link
+    (including every LinkConfig String field) on every single outgoing
+    packet just to let the scheduler pick one and discard the rest --
+    the heap allocation and per-link lock/clone overhead of that
+    outpaced packet arrival at high rates, silently overflowing the
+    kernel's TUN queue before mlvpnd ever read the dropped packets.
+    Scheduler::select now works off a Copy-only LinkScore snapshot and
+    returns just the winning link's index, so only that one link is
+    ever locked-and-cloned. See docs/performance-tuning.md.
+
+ -- Jeff Parrish PC Services <www.jpps.us>  Fri, 17 Jul 2026 00:00:00 -0500
+
+mlvpn (0.3.4-1) unstable; urgency=high
+
+  * Fix the 0.3.3 restart-on-upgrade fix always losing the race: it
+    checked/restarted the service before #DEBHELPER#, but debhelper's
+    own generated postinst code (compat 10+ default
+    --restart-after-upgrade, with --no-start only suppressing the
+    "start" half) unconditionally stops mlvpnd *after* that on every
+    upgrade -- so 0.3.3's restart always got immediately undone,
+    leaving the service down after every upgrade exactly as before.
+    Fixed by recording whether the service was active before anything
+    in this postinst (debhelper's own code included) can touch it, and
+    restarting -- last, after #DEBHELPER# -- based on that recorded
+    state instead. Found on a real two-host upgrade immediately after
+    0.3.3 shipped.
+
+ -- Jeff Parrish PC Services <www.jpps.us>  Fri, 17 Jul 2026 00:00:00 -0500
+
 mlvpn (0.3.3-1) unstable; urgency=high
 
   * Fix restarting either side of a tunnel silently stopping the other

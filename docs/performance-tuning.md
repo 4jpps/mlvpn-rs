@@ -109,6 +109,46 @@ module doc comment and `link::snapshot_links`), removing that
 cross-link contention entirely. If you still see this symptom on a
 current build, it's a new bug, not this one -- please report it.
 
+## 3b. Bonded throughput plateaus at a fixed rate regardless of packet size
+
+A different symptom from §3, and easy to mistake for the same bug: if
+bonded throughput sits at roughly the same ceiling for both a
+large-packet TCP test *and* a small-packet UDP test at a much higher
+packet rate -- e.g. ~110 Mbps at ~9,500 packets/sec but only ~35% of a
+200 Mbps / ~19,000 packets/sec UDP send making it through, with a flat,
+non-varying loss percentage rather than the bursty pattern real network
+congestion produces -- that's a packets-per-second processing ceiling in
+the outbound send path, not link bandwidth or the §3 lock contention
+(that fix is orthogonal to this one and doesn't affect it).
+
+Versions before this fix had `tunnel::send_scheduled` calling
+`link::snapshot_links` -- a full clone of every configured link,
+including every `LinkConfig` `String` field -- on **every single
+outgoing packet**, just to let `Scheduler::select` pick one link and
+throw the rest of the clones away. At high packet rates the heap
+allocation and per-link lock/clone overhead of doing that on every
+packet outpaced how fast packets arrived from the TUN device, so the
+kernel's TUN queue silently overflowed and dropped datagrams before
+`mlvpnd` ever read them -- the same "invisible from inside the process"
+failure mode as §1's socket buffer overflow, just one level up the
+stack. `send_scheduled` now calls `link::snapshot_scores` instead: a
+`Copy`-only snapshot (no `String`/heap data at all) used purely to pick
+a winner, with only that one winning link ever locked-and-cloned for
+its remote address and socket handle. If you still see a flat,
+rate-independent ceiling like this on a current build, it's a new bug,
+not this one -- please report it.
+
+This exact bug was the motivation for a new diagnostic: `tun_reader` and
+the actual per-link send are now split across a bounded queue (see
+`tunnel.rs`'s `OUTBOUND_QUEUE_CAPACITY` doc comment -- loosely modeled
+on the original C `MLVPN`'s `freebuffer_t`), and an overflowing queue
+logs a `WARN`-level `"outbound queue overflowed"` line (with a drop
+count) every couple of seconds instead of silently vanishing into the
+kernel's TUN queue the way this bug originally did. If bonded throughput
+ever plateaus unexpectedly again, check the logs for that line *first*
+-- it points straight at "the send path can't keep up" without needing
+an external `iperf3` comparison to even suspect it.
+
 ## 4. How the scheduler splits traffic across links
 
 `scheduler.rs` uses smooth weighted round robin, weighting each Up link

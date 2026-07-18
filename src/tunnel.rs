@@ -4,8 +4,22 @@
 //! Task layout (all spawned on the shared tokio runtime):
 //!
 //! - one `tun_reader` task: reads plaintext IP packets from the TUN
-//!   device, encrypts them, asks the `Scheduler` which link to use, and
-//!   sends the resulting datagram out that link's socket.
+//!   device and encrypts them, then hands each one off (a bounded,
+//!   non-blocking `try_send`, see `OUTBOUND_QUEUE_CAPACITY`'s doc
+//!   comment) to...
+//! - one `outbound_sender` task: asks the `Scheduler` which link to use
+//!   for each queued frame and sends the resulting datagram out that
+//!   link's socket. Split from `tun_reader` specifically so a slow send
+//!   side can never stall draining the TUN device -- a full queue drops
+//!   the packet and counts it instead, logged by...
+//! - one `outbound_queue_drop_reporter` task: silent on a healthy
+//!   tunnel, periodically logs (and resets) the outbound queue's drop
+//!   counter otherwise. The original C `MLVPN`'s equivalent mechanism
+//!   (`freebuffer_t`, a fixed-size packet-object pool that returns
+//!   `NULL` once exhausted) inspired this -- see `OUTBOUND_QUEUE_CAPACITY`'s
+//!   doc comment for the real bug (silent, kernel-level TUN-queue
+//!   overflow, invisible from inside this process) this exists to catch
+//!   sooner next time.
 //! - two tasks per link: `link_receiver` owns that link's UDP socket and
 //!   demultiplexes incoming frames by `PacketType` (Data goes to the
 //!   reorder buffer and then the TUN device; Probe/ProbeReply feed the
@@ -67,10 +81,24 @@
 //! half of either link's solo throughput, worse than not bonding at all.
 //! Per-link locks remove that cross-link contention entirely: locking
 //! `links[0]` never blocks anything waiting on `links[1]`. Any call site
-//! that genuinely needs to look at *every* link at once (the scheduler,
-//! a control-socket snapshot) uses `link::snapshot_links`, which locks
-//! each link only long enough to clone it, rather than holding a single
-//! lock across the whole read.
+//! that genuinely needs to look at *every* link at once (a control-socket
+//! snapshot, `Scheduler::refresh`, the rare all-links-Down fallback) uses
+//! `link::snapshot_links`, which locks each link only long enough to
+//! clone it, rather than holding a single lock across the whole read.
+//!
+//! That full clone is still too expensive for a true per-packet hot path,
+//! though: fixing the lock contention above wasn't enough on its own --
+//! a real two-link deployment test pushing 200 Mbps of small UDP
+//! datagrams (~19k packets/sec) found a hard, flat ~65% loss ceiling
+//! traced to `send_scheduled` calling `snapshot_links` (cloning every
+//! link's full `Link`, including heap-allocating every `LinkConfig`
+//! `String` field) on *every outgoing packet*, just to let the scheduler
+//! pick one and throw the rest away. `send_scheduled` now calls
+//! `link::snapshot_scores` instead -- a `Copy`-only snapshot with no
+//! `String`/heap data at all -- and `Scheduler::select` returns just the
+//! winning index, so only that *one* link ever gets locked-and-cloned
+//! for its remote address/socket handle, not every candidate up front.
+
 //!
 //! Every task that performs socket I/O first takes a `link::LinkHandle`
 //! (see that module) out from under a short-lived lock, reads the
@@ -219,12 +247,12 @@ use crate::scheduler::Scheduler;
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::UdpSocket;
 use tokio::signal::unix::{signal, SignalKind};
-use tokio::sync::mpsc;
+use tokio::sync::mpsc::{self, error::TrySendError};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinSet;
 use tokio::time::interval;
@@ -668,26 +696,39 @@ pub async fn run(tun: AsyncDevice, links: Vec<Link>, params: TunnelParams) -> Re
         }));
     }
 
+    // Bounded outbound queue between tun_reader (producer) and
+    // outbound_sender (consumer) -- see OUTBOUND_QUEUE_CAPACITY's doc
+    // comment. dropped is shared between tun_reader (increments on a
+    // full queue) and outbound_queue_drop_reporter (periodically reads
+    // and resets it into a log line).
+    let (outbound_tx, outbound_rx) = mpsc::channel::<OutboundFrame>(OUTBOUND_QUEUE_CAPACITY);
+    let outbound_dropped = Arc::new(AtomicU64::new(0));
+
     {
         let links = links.clone();
-        let session = session.clone();
         let scheduler = scheduler.clone();
+        let redundant_mode = params.scheduler_cfg.redundant_mode;
+        handles.push(tokio::spawn(async move {
+            outbound_sender(outbound_rx, links, scheduler, redundant_mode).await;
+        }));
+    }
+
+    {
+        let dropped = outbound_dropped.clone();
+        handles.push(tokio::spawn(async move {
+            outbound_queue_drop_reporter(dropped).await;
+        }));
+    }
+
+    {
+        let session = session.clone();
         let tun = tun.clone();
         let mtu = params.mtu as usize;
         let clamp_mss = params.clamp_mss;
-        let redundant_mode = params.scheduler_cfg.redundant_mode;
+        let tx = outbound_tx.clone();
+        let dropped = outbound_dropped.clone();
         handles.push(tokio::spawn(async move {
-            if let Err(e) = tun_reader(
-                tun,
-                links,
-                session,
-                scheduler,
-                mtu,
-                clamp_mss,
-                redundant_mode,
-            )
-            .await
-            {
+            if let Err(e) = tun_reader(tun, session, mtu, clamp_mss, tx, dropped).await {
                 tracing::error!(error = %e, "tun reader exited");
             }
         }));
@@ -1364,15 +1405,75 @@ async fn race_rekey_reply(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Capacity of the bounded channel between `tun_reader` (producer: reads
+/// the TUN device, clamps MSS, encrypts) and `outbound_sender` (consumer:
+/// asks the `Scheduler` for a link and does the actual socket I/O).
+///
+/// Loosely modeled on the original C `MLVPN`'s `freebuffer_t`
+/// (`src/buffer.c` upstream): a fixed-size pool of packet slots that
+/// returns `NULL` once exhausted rather than growing or blocking, with
+/// the caller logging and dropping the packet at that point instead of
+/// silently stalling. This channel is the same idea reimplemented as a
+/// bounded `tokio::sync::mpsc` channel instead of a hand-rolled free
+/// list (Rust's ownership model already gives per-packet allocation
+/// lifetime management for free, so there's no need to pool packet
+/// objects the way the C version did) -- see `tun_reader`'s `try_send`
+/// and `outbound_queue_drop_reporter` for the drop-and-log side of it.
+///
+/// This exists specifically because of a real, hard-to-diagnose bug: the
+/// per-packet overhead `send_scheduled` used to have (cloning every
+/// configured link's full `Link` just to pick one, see this module's
+/// module doc comment) made the *combined* read-encrypt-select-send
+/// pipeline unable to keep up with a high packet rate, and the resulting
+/// drops happened silently in the *kernel's* TUN receive queue --
+/// entirely invisible to `mlvpnd`, discoverable only by comparing
+/// external `iperf3` throughput numbers against what the links should
+/// support. Splitting the pipeline at this exact boundary means any
+/// future regression that makes the send side too slow again shows up
+/// immediately as a logged warning here instead of requiring that same
+/// external-throughput detective work.
+///
+/// Deliberately bounded, not unbounded: an unbounded channel would just
+/// relocate the "silently drops packets no one notices" failure mode
+/// from the kernel's TUN queue into an ever-growing userspace `Vec`,
+/// trading a *diagnosable* problem for an out-of-memory one. Sized to
+/// absorb a brief stall (a scheduling hiccup, a momentarily slow
+/// syscall) without dropping anything, while staying small enough that
+/// a *sustained* backlog -- the send side genuinely unable to keep up --
+/// overflows and gets logged within a fraction of a second rather than
+/// being silently absorbed for minutes.
+const OUTBOUND_QUEUE_CAPACITY: usize = 256;
+
+/// How often `outbound_queue_drop_reporter` checks for and logs outbound
+/// queue drops. A dedicated timer task rather than a `tokio::select!`
+/// inside `outbound_sender`'s own receive loop, deliberately -- see this
+/// module's doc comment on why `link_receiver`/`link_prober` are kept
+/// as separate tasks instead of one task racing a receive branch against
+/// a timer branch: under sustained high packet rate, a biased or even
+/// fairly-randomized `select!` can keep preferring the always-ready
+/// receive branch and starve the timer branch, which here would mean
+/// drops happening under exactly the sustained-overload condition this
+/// mechanism exists to surface, but the report itself never firing.
+const OUTBOUND_QUEUE_DROP_REPORT_INTERVAL: Duration = Duration::from_secs(2);
+
+/// One packet, already encrypted and ready to hand to a link's socket --
+/// what `tun_reader` pushes onto the outbound queue and `outbound_sender`
+/// pulls back off. Just the pieces `send_scheduled`/`send_redundant`
+/// already took as separate arguments, bundled so a single value can
+/// travel through the channel.
+struct OutboundFrame {
+    session_id: u32,
+    seq: u64,
+    ciphertext: Vec<u8>,
+}
+
 async fn tun_reader(
     tun: Arc<AsyncDevice>,
-    links: Links,
     session: Arc<AsyncMutex<SessionState>>,
-    scheduler: Arc<std::sync::Mutex<Scheduler>>,
     mtu: usize,
     clamp_mss: bool,
-    redundant_mode: bool,
+    tx: mpsc::Sender<OutboundFrame>,
+    dropped: Arc<AtomicU64>,
 ) -> Result<()> {
     let mut buf = vec![0u8; mtu + 64];
     loop {
@@ -1397,10 +1498,76 @@ async fn tun_reader(
             s.encrypt(&plaintext)?
         };
 
+        // `try_send`, never `.send().await`: this loop's whole job is to
+        // keep draining the kernel's TUN queue as fast as packets arrive
+        // there, so blocking it on a full outbound queue would defeat
+        // the point -- see `OUTBOUND_QUEUE_CAPACITY`'s doc comment. A
+        // full queue means the send side is genuinely falling behind;
+        // drop this packet and count it rather than stall reading the
+        // next one, same drop-rather-than-block policy the original C
+        // MLVPN's `freebuffer_t` used.
+        if let Err(TrySendError::Full(_)) = tx.try_send(OutboundFrame {
+            session_id,
+            seq,
+            ciphertext,
+        }) {
+            dropped.fetch_add(1, Ordering::Relaxed);
+        }
+        // TrySendError::Closed would mean outbound_sender's receiver was
+        // dropped -- only happens during shutdown, when this task is
+        // about to be aborted anyway; nothing useful to do about it here.
+    }
+}
+
+/// Pulls encrypted frames off the outbound queue and actually sends
+/// them -- the other half of `tun_reader`'s split, see
+/// `OUTBOUND_QUEUE_CAPACITY`'s doc comment for why this is a separate
+/// task rather than `tun_reader` calling `send_scheduled`/`send_redundant`
+/// directly. Returns once `tx` (held by `tun_reader`) is dropped, i.e.
+/// only during shutdown.
+async fn outbound_sender(
+    mut rx: mpsc::Receiver<OutboundFrame>,
+    links: Links,
+    scheduler: Arc<std::sync::Mutex<Scheduler>>,
+    redundant_mode: bool,
+) {
+    while let Some(frame) = rx.recv().await {
         if redundant_mode {
-            send_redundant(&links, session_id, seq, &ciphertext).await;
+            send_redundant(&links, frame.session_id, frame.seq, &frame.ciphertext).await;
         } else {
-            send_scheduled(&links, &scheduler, session_id, seq, &ciphertext).await;
+            send_scheduled(
+                &links,
+                &scheduler,
+                frame.session_id,
+                frame.seq,
+                &frame.ciphertext,
+            )
+            .await;
+        }
+    }
+}
+
+/// Periodically logs (and resets) the outbound queue's drop counter --
+/// silent when nothing was dropped, so this produces zero log output on
+/// a healthy tunnel. See `OUTBOUND_QUEUE_CAPACITY`'s doc comment for the
+/// bug this mechanism exists to make visible next time, instead of only
+/// discoverable by comparing external `iperf3` numbers against what the
+/// links should support.
+async fn outbound_queue_drop_reporter(dropped: Arc<AtomicU64>) {
+    let mut tick = interval(OUTBOUND_QUEUE_DROP_REPORT_INTERVAL);
+    loop {
+        tick.tick().await;
+        let n = dropped.swap(0, Ordering::Relaxed);
+        if n > 0 {
+            tracing::warn!(
+                dropped_packets = n,
+                window_secs = OUTBOUND_QUEUE_DROP_REPORT_INTERVAL.as_secs(),
+                queue_capacity = OUTBOUND_QUEUE_CAPACITY,
+                "outbound queue overflowed: the send path (link scheduling/socket I/O) is \
+                 falling behind the rate packets arrive from the TUN device, so packets were \
+                 dropped here rather than stalling the TUN read loop. If this persists, see \
+                 docs/performance-tuning.md."
+            );
         }
     }
 }
@@ -1417,19 +1584,37 @@ async fn send_scheduled(
 ) {
     let frame_len = HEADER_LEN + ciphertext.len();
 
-    // Brief, non-awaiting critical section: pick a link and copy out
-    // just what we need (a link handle + address) before releasing the
-    // lock. `LinkHandle` rather than a resolved socket here,
+    // Scoring pass: a cheap, `Copy`-only snapshot (see
+    // `link::LinkScore`'s doc comment for why this matters here
+    // specifically -- this runs once per outgoing packet) rather than
+    // `link::snapshot_links`'s full `Link` clone. `Scheduler::select`
+    // returns just the winning index; nothing here has looked at (or
+    // locked) any link's remote address or socket handle yet.
+    let chosen_idx: Option<usize> = {
+        let scores = link::snapshot_scores(links).await;
+        let mut sched = scheduler.lock().unwrap();
+        sched.select(&scores, frame_len)
+    };
+    let Some(idx) = chosen_idx else {
+        tracing::warn!("no link available to send on; dropping packet");
+        return;
+    };
+    let Some(link_mutex) = links.get(idx) else {
+        tracing::warn!("no link available to send on; dropping packet");
+        return;
+    };
+
+    // Only *now*, having already picked a winner, do we lock a link at
+    // all for its full data -- and only this one, not every candidate
+    // that didn't win. `LinkHandle` rather than a resolved socket here,
     // specifically so the actual send below always reads whatever
     // socket is current at send time (post-reconnect if one just
     // happened) instead of one captured slightly stale.
     let chosen: Option<(u8, LinkHandle, SocketAddr, String)> = {
-        let snap = link::snapshot_links(links).await;
-        let mut sched = scheduler.lock().unwrap();
-        sched.select(&snap, frame_len).and_then(|l| {
-            l.remote
-                .map(|r| (l.id, l.handle(), r, l.config.name.clone()))
-        })
+        let guard = link_mutex.lock().await;
+        guard
+            .remote
+            .map(|r| (guard.id, guard.handle(), r, guard.config.name.clone()))
     };
     let Some((link_id, handle, remote, link_name)) = chosen else {
         tracing::warn!("no link available to send on; dropping packet");

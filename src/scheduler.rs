@@ -19,7 +19,7 @@
 //! unreachable, which is indistinguishable from "all links down" from
 //! inside the process.
 
-use crate::link::{Link, LinkState};
+use crate::link::{Link, LinkScore, LinkState};
 use crate::monitor;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -28,6 +28,11 @@ struct SwrrEntry {
     link_index: usize,
     effective_weight: f64,
     current_weight: f64,
+    /// Copied out of `LinkConfig` once, here in `refresh()` (which only
+    /// runs at probe-interval frequency), specifically so the per-packet
+    /// `select()`/`swrr_pick_under_cap` path never needs to touch a
+    /// `Link`/`LinkConfig` at all -- see `select`'s doc comment.
+    bandwidth_cap_mbps: Option<f64>,
 }
 
 /// Per-link byte counter backing `bandwidth_cap_mbps` enforcement,
@@ -108,44 +113,56 @@ impl Scheduler {
                 link_index: i,
                 effective_weight: w,
                 current_weight: 0.0,
+                bandwidth_cap_mbps: links[i].config.bandwidth_cap_mbps,
             })
             .collect();
     }
 
-    /// Pick the link to send the next packet on. `links` is passed again
-    /// here (not cached) so the fallback path can inspect live state
-    /// without the scheduler needing its own copy of link stats.
-    /// `frame_len` is the size (in bytes) of the frame about to be sent
-    /// on whichever link is returned -- needed to enforce each link's
-    /// `bandwidth_cap_mbps`, if configured (see `swrr_pick_under_cap`).
-    pub fn select<'a>(&mut self, links: &'a [Link], frame_len: usize) -> Option<&'a Link> {
+    /// Pick the link to send the next packet on, returning its index into
+    /// whatever `Links` collection the caller is working with (not a
+    /// reference into `links` -- see below for why). `frame_len` is the
+    /// size (in bytes) of the frame about to be sent on whichever link is
+    /// returned -- needed to enforce each link's `bandwidth_cap_mbps`, if
+    /// configured (see `swrr_pick_under_cap`).
+    ///
+    /// Deliberately takes `&[LinkScore]` (a cheap, `Copy`-only snapshot --
+    /// see `link::snapshot_scores`) rather than `&[Link]`, and returns
+    /// `Option<usize>` rather than `Option<&Link>`: this is called once
+    /// per outgoing packet (`tunnel::send_scheduled`), and the normal
+    /// (non-fallback) path below doesn't actually need anything from
+    /// `Link` at all -- `refresh()` already cached each candidate's
+    /// `bandwidth_cap_mbps` in its own `SwrrEntry` above, so
+    /// `swrr_pick_under_cap` needs no `Link`/`LinkScore` access either.
+    /// A real 200 Mbps UDP test showed a flat ~65% loss ceiling traced to
+    /// this call site cloning every link's full `Link` (heap-allocating
+    /// `LinkConfig`'s `String` fields) on every packet just to discard
+    /// all but one -- returning an index instead of a reference is what
+    /// lets the caller resolve only the *winning* link's remote
+    /// address/socket handle, locking it just once, instead of every
+    /// link being locked-and-cloned up front regardless of which one
+    /// wins.
+    pub fn select(&mut self, links: &[LinkScore], frame_len: usize) -> Option<usize> {
         if links.is_empty() {
             return None;
         }
 
         if !self.entries.is_empty() {
-            return Some(&links[self.swrr_pick_under_cap(links, frame_len)]);
+            return Some(self.swrr_pick_under_cap(frame_len));
         }
 
         // Fallback: nothing is currently Up. Pick whichever configured
         // link looks least-bad, so we keep attempting delivery instead of
-        // stalling the tunnel. See module docs for rationale.
-        let best = links
+        // stalling the tunnel. See module docs for rationale. Rare enough
+        // (every link Down) that reading `LinkScore` for every link here
+        // costs nothing worth avoiding.
+        links
             .iter()
-            .enumerate()
-            .min_by(|(_, a), (_, b)| {
-                let a_key = (
-                    a.stats.consecutive_misses,
-                    a.stats.rtt_ms.get().unwrap_or(f64::MAX) as i64,
-                );
-                let b_key = (
-                    b.stats.consecutive_misses,
-                    b.stats.rtt_ms.get().unwrap_or(f64::MAX) as i64,
-                );
+            .min_by(|a, b| {
+                let a_key = (a.consecutive_misses, a.rtt_ms.unwrap_or(f64::MAX) as i64);
+                let b_key = (b.consecutive_misses, b.rtt_ms.unwrap_or(f64::MAX) as i64);
                 a_key.cmp(&b_key)
             })
-            .map(|(i, _)| i)?;
-        Some(&links[best])
+            .map(|l| l.link_index)
     }
 
     fn swrr_pick(&mut self) -> usize {
@@ -181,15 +198,18 @@ impl Scheduler {
     /// respecting a cap is a best-effort shaping policy, never a reason
     /// to drop a packet outright (see the module doc comment's
     /// zero-downtime rationale).
-    fn swrr_pick_under_cap(&mut self, links: &[Link], frame_len: usize) -> usize {
+    fn swrr_pick_under_cap(&mut self, frame_len: usize) -> usize {
         // First pass, read-only: which entries are under their cap right
         // now. Kept as its own pass (rather than checked inline in the
         // weight-update loop below) so it's obvious this never mutates
-        // `entries`, only `rate_limits`.
+        // `entries`, only `rate_limits`. Reads `bandwidth_cap_mbps` off
+        // the entry itself (cached by `refresh()`), not `links` -- this
+        // function no longer takes a `links` parameter at all, since
+        // nothing here needs one anymore.
         let mut eligible: Vec<usize> = Vec::with_capacity(self.entries.len());
         for pos in 0..self.entries.len() {
             let idx = self.entries[pos].link_index;
-            let under_cap = match links[idx].config.bandwidth_cap_mbps {
+            let under_cap = match self.entries[pos].bandwidth_cap_mbps {
                 None => true,
                 Some(cap_mbps) => {
                     let state = self
@@ -265,11 +285,13 @@ mod tests {
                 link_index: 0,
                 effective_weight: 3.0,
                 current_weight: 0.0,
+                bandwidth_cap_mbps: None,
             },
             SwrrEntry {
                 link_index: 1,
                 effective_weight: 1.0,
                 current_weight: 0.0,
+                bandwidth_cap_mbps: None,
             },
         ];
         let mut counts = [0usize; 2];

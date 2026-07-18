@@ -6,8 +6,8 @@
 # equivalent of the user/group creation below.
 #
 # Note on %{?dist}: left in place (standard Fedora/RHEL convention) so
-# the same spec produces e.g. mlvpn-0.3.3-1.fc41.x86_64.rpm on Fedora and
-# mlvpn-0.3.3-1.el9.x86_64.rpm on RHEL/Rocky/Alma from one source tree.
+# the same spec produces e.g. mlvpn-0.3.5-1.fc41.x86_64.rpm on Fedora and
+# mlvpn-0.3.5-1.el9.x86_64.rpm on RHEL/Rocky/Alma from one source tree.
 #
 # debug_package disabled: [profile.release] in Cargo.toml sets
 # strip = true, so the compiled mlvpnd/mlvpn-tui binaries carry no
@@ -19,7 +19,7 @@
 %global debug_package %{nil}
 
 Name:           mlvpn
-Version:        0.3.3
+Version:        0.3.5
 Release:        1%{?dist}
 Summary:        Multi-link VPN bonding daemon
 
@@ -106,6 +106,39 @@ chmod 0750 %{_sysconfdir}/mlvpn
 %dir %attr(0750, root, mlvpn) %{_sysconfdir}/mlvpn
 
 %changelog
+* Fri Jul 17 2026 Jeff Parrish PC Services <www.jpps.us> - 0.3.5-1
+- A link's remote_addr now accepts a DNS hostname, not just a literal
+  IP (e.g. "bgp.example.com:51000"). Resolved once at startup with a
+  10s timeout; a hostname resolving to both an A and AAAA record
+  prefers IPv6 unless local_addr pins the family.
+- New outbound queue overflow logging, modeled on the original C
+  MLVPN's freebuffer_t: tun_reader and the actual per-link send are
+  now split across a bounded channel, so a send side that falls behind
+  drops packets and logs a WARN-level "outbound queue overflowed" line
+  (with a drop count) instead of silently losing them in the kernel's
+  TUN queue, as happened below. Silent on a healthy tunnel.
+- Performance: bonded throughput still plateaued well below what the
+  links could do individually, even after 0.3.2's cross-link lock fix.
+  A real two-host test pushing 200 Mbps of small UDP datagrams
+  (~19,000 packets/sec) found a hard, flat ~65%% loss ceiling. Root
+  cause: send_scheduled cloned every configured link's full Link
+  (including every LinkConfig String field) on every single outgoing
+  packet just to let the scheduler pick one and discard the rest --
+  the heap allocation and per-link lock/clone overhead of that
+  outpaced packet arrival at high rates, silently overflowing the
+  kernel's TUN queue before mlvpnd ever read the dropped packets.
+  Scheduler::select now works off a Copy-only LinkScore snapshot and
+  returns just the winning link's index, so only that one link is ever
+  locked-and-cloned. See docs/performance-tuning.md.
+
+* Fri Jul 17 2026 Jeff Parrish PC Services <www.jpps.us> - 0.3.4-1
+- Debian packaging only this release: fixes debian/mlvpn.postinst's
+  restart-on-upgrade check always losing a race against debhelper's
+  own generated postinst code and leaving mlvpnd stopped after every
+  .deb upgrade. This .rpm was never affected (%systemd_postun_with_restart
+  already handled this correctly) -- version bumped only to keep both
+  packages on the same release number.
+
 * Fri Jul 17 2026 Jeff Parrish PC Services <www.jpps.us> - 0.3.3-1
 - Fix restarting either side of a tunnel silently stopping the other
   side too, requiring a manual restart there. A peer-initiated

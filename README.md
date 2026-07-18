@@ -44,10 +44,10 @@ anything real. See [CHANGELOG.md](CHANGELOG.md) for release history.
 
 ```sh
 # Debian/Ubuntu
-sudo apt install ./mlvpn_0.3.3-1_amd64.deb
+sudo apt install ./mlvpn_0.3.5-1_amd64.deb
 
 # Fedora/RHEL/Rocky/Alma
-sudo dnf install ./mlvpn-0.3.3-1.fc41.x86_64.rpm
+sudo dnf install ./mlvpn-0.3.5-1.fc41.x86_64.rpm
 ```
 
 Grab the package matching your distro/architecture from the

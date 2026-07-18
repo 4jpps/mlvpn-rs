@@ -110,11 +110,22 @@ enabled = true           # exposes live stats to `mlvpn-tui`; see README.md "Mon
 # server-side link with no remote_addr, from local_addr (e.g. "::" for
 # "any IPv6"). A single tunnel can freely mix address families across
 # its links -- see ARCHITECTURE.md §6.
+#
+# remote_addr also accepts a DNS hostname instead of a literal IP, e.g.
+# "bgp.example.com:51000" -- handy when the server side doesn't have a
+# fixed IP you want to hard-code into every client. Resolved once, at
+# startup; a restart is needed to pick up a changed IP behind the
+# hostname, same as editing a literal IP here always required. If the
+# hostname has both an A and AAAA record (ordinary dual-stack DNS),
+# IPv6 is preferred automatically unless local_addr below pins this
+# link to a specific family.
 
 [[links]]
 name = "fiber"
 bind_interface = "eth0"
 remote_addr = "203.0.113.10:51000"   # server's address:port for this link
+                                     # (a hostname like "bgp.example.com:51000"
+                                     # works here too -- see note above)
 local_port = 51000
 weight = 1.0
 probe_interval_ms = 200
