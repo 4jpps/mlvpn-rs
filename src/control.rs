@@ -33,13 +33,15 @@
 use crate::ipc::{Command, CommandResult, DaemonSnapshot, LinkSnapshot, Snapshot};
 use crate::link::{self, LinkState, Links};
 use crate::peerstats::PeerStatsTable;
-use crate::tunnel::SessionMeta;
+use crate::tunnel::{OutboundFrame, SessionMeta};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::mpsc;
 use tokio::time::interval;
 
 const SNAPSHOT_INTERVAL_MS: u64 = 500;
@@ -50,6 +52,7 @@ const SNAPSHOT_INTERVAL_MS: u64 = 500;
 /// logged and treated as "monitoring unavailable" rather than a fatal
 /// daemon error -- a stats socket is a convenience feature, not something
 /// that should be able to take the tunnel down.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn serve(
     path: PathBuf,
     links: Links,
@@ -57,6 +60,8 @@ pub(crate) async fn serve(
     tunnel_name: String,
     mode: String,
     session_meta: Arc<SessionMeta>,
+    outbound_tx: mpsc::Sender<OutboundFrame>,
+    outbound_dropped_total: Arc<AtomicU64>,
 ) {
     if let Some(parent) = path.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
@@ -141,12 +146,25 @@ pub(crate) async fn serve(
         let tunnel_name = tunnel_name.clone();
         let mode = mode.clone();
         let session_meta = session_meta.clone();
+        let outbound_tx = outbound_tx.clone();
+        let outbound_dropped_total = outbound_dropped_total.clone();
         tokio::spawn(async move {
-            serve_client(stream, links, peer_stats, tunnel_name, mode, session_meta).await;
+            serve_client(
+                stream,
+                links,
+                peer_stats,
+                tunnel_name,
+                mode,
+                session_meta,
+                outbound_tx,
+                outbound_dropped_total,
+            )
+            .await;
         });
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn serve_client(
     mut stream: UnixStream,
     links: Links,
@@ -154,12 +172,22 @@ async fn serve_client(
     tunnel_name: String,
     mode: String,
     session_meta: Arc<SessionMeta>,
+    outbound_tx: mpsc::Sender<OutboundFrame>,
+    outbound_dropped_total: Arc<AtomicU64>,
 ) {
     let mut tick = interval(Duration::from_millis(SNAPSHOT_INTERVAL_MS));
     loop {
         tick.tick().await;
-        let snapshot =
-            build_snapshot(&links, &peer_stats, &tunnel_name, &mode, &session_meta).await;
+        let snapshot = build_snapshot(
+            &links,
+            &peer_stats,
+            &tunnel_name,
+            &mode,
+            &session_meta,
+            &outbound_tx,
+            &outbound_dropped_total,
+        )
+        .await;
         let Ok(mut line) = serde_json::to_vec(&snapshot) else {
             continue;
         };
@@ -176,6 +204,8 @@ async fn build_snapshot(
     tunnel_name: &str,
     mode: &str,
     session_meta: &SessionMeta,
+    outbound_tx: &mpsc::Sender<OutboundFrame>,
+    outbound_dropped_total: &AtomicU64,
 ) -> Snapshot {
     let snap = link::snapshot_links(links).await;
     let link_snapshots = snap
@@ -219,6 +249,15 @@ async fn build_snapshot(
 
     let (session_id, rekey_count, session_uptime_ms) = session_meta.snapshot();
 
+    // `max_capacity` is fixed (OUTBOUND_QUEUE_CAPACITY) for the channel's
+    // whole lifetime; `capacity` is the number of currently-free slots,
+    // so `max_capacity - capacity` is the current queue depth. Reading
+    // both off a cloned `Sender` never contends with `tun_reader`'s
+    // `try_send` -- these are lock-free atomic loads internal to the
+    // channel, not a new lock on the hot path.
+    let outbound_queue_capacity = outbound_tx.max_capacity();
+    let outbound_queue_len = outbound_queue_capacity - outbound_tx.capacity();
+
     Snapshot {
         tunnel_name: tunnel_name.to_string(),
         mode: mode.to_string(),
@@ -231,6 +270,9 @@ async fn build_snapshot(
             session_id,
             session_uptime_ms,
             rekey_count,
+            outbound_queue_len: outbound_queue_len as u64,
+            outbound_queue_capacity: outbound_queue_capacity as u64,
+            outbound_queue_dropped_total: outbound_dropped_total.load(Ordering::Relaxed),
         },
     }
 }

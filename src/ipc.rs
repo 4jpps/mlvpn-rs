@@ -48,6 +48,21 @@ pub struct DaemonSnapshot {
     /// Total rekeys since this process started (not since the tunnel
     /// was first configured -- a daemon restart resets this to 0).
     pub rekey_count: u32,
+    /// Frames currently buffered between `tun_reader` and
+    /// `outbound_sender`, waiting to be sent -- 0 on a healthy tunnel
+    /// keeping up with the TUN device's read rate.
+    pub outbound_queue_len: u64,
+    /// Fixed capacity of that same queue (`OUTBOUND_QUEUE_CAPACITY`);
+    /// included alongside `outbound_queue_len` so a viewer can show a
+    /// fill ratio without hardcoding the constant.
+    pub outbound_queue_capacity: u64,
+    /// Lifetime count of packets dropped because the outbound queue was
+    /// full when `tun_reader` tried to enqueue them -- monotonic, never
+    /// reset, same "only ever grows" convention as `LinkSnapshot`'s
+    /// `tx_bytes`/`rx_bytes`. See `outbound_queue_drop_reporter`'s doc
+    /// comment for why this counter and its periodic log line are now
+    /// independent of each other.
+    pub outbound_queue_dropped_total: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -182,6 +197,30 @@ mod tests {
         assert_eq!(back.rx_bytes, 2_000_000);
         assert_eq!(back.tx_packets, 700);
         assert_eq!(back.rx_packets, 1400);
+    }
+
+    /// `DaemonSnapshot` picks up new fields far less often than
+    /// `LinkSnapshot`, but the same drop/rename risk exists between
+    /// `control::build_snapshot` and `mlvpn-tui`'s deserialize -- worth
+    /// the same cheap round-trip coverage.
+    #[test]
+    fn daemon_snapshot_round_trips_with_outbound_queue_fields() {
+        let snap = DaemonSnapshot {
+            session_id: 42,
+            session_uptime_ms: 5_000,
+            rekey_count: 3,
+            outbound_queue_len: 12,
+            outbound_queue_capacity: 256,
+            outbound_queue_dropped_total: 7,
+        };
+        let json = serde_json::to_string(&snap).expect("serialize");
+        let back: DaemonSnapshot = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.session_id, 42);
+        assert_eq!(back.session_uptime_ms, 5_000);
+        assert_eq!(back.rekey_count, 3);
+        assert_eq!(back.outbound_queue_len, 12);
+        assert_eq!(back.outbound_queue_capacity, 256);
+        assert_eq!(back.outbound_queue_dropped_total, 7);
     }
 
     /// `serve_commands` reads one line of JSON per connection and a CLI

@@ -680,6 +680,14 @@ pub async fn run(tun: AsyncDevice, links: Vec<Link>, params: TunnelParams) -> Re
 
     let mut handles = Vec::new();
 
+    // Bounded outbound queue between tun_reader (producer) and
+    // outbound_sender (consumer) -- see OUTBOUND_QUEUE_CAPACITY's doc
+    // comment. Built here, ahead of the control-socket spawn below, so
+    // control::serve can be handed a clone of outbound_tx (to read
+    // .capacity()/.max_capacity()) and outbound_dropped_total.
+    let (outbound_tx, outbound_rx) = mpsc::channel::<OutboundFrame>(OUTBOUND_QUEUE_CAPACITY);
+    let outbound_dropped_total = Arc::new(AtomicU64::new(0));
+
     for (idx, (tracker, bw_state)) in trackers.iter().zip(bw_probe_states.iter()).enumerate() {
         let tracker = tracker.clone();
         {
@@ -749,8 +757,20 @@ pub async fn run(tun: AsyncDevice, links: Vec<Link>, params: TunnelParams) -> Re
         let tunnel_name = params.tunnel_name.clone();
         let mode = params.mode.as_str().to_string();
         let session_meta = session_meta.clone();
+        let outbound_tx = outbound_tx.clone();
+        let outbound_dropped_total = outbound_dropped_total.clone();
         handles.push(tokio::spawn(async move {
-            control::serve(path, links, peer_stats, tunnel_name, mode, session_meta).await;
+            control::serve(
+                path,
+                links,
+                peer_stats,
+                tunnel_name,
+                mode,
+                session_meta,
+                outbound_tx,
+                outbound_dropped_total,
+            )
+            .await;
         }));
     }
 
@@ -760,14 +780,6 @@ pub async fn run(tun: AsyncDevice, links: Vec<Link>, params: TunnelParams) -> Re
             control::serve_commands(path, links).await;
         }));
     }
-
-    // Bounded outbound queue between tun_reader (producer) and
-    // outbound_sender (consumer) -- see OUTBOUND_QUEUE_CAPACITY's doc
-    // comment. dropped is shared between tun_reader (increments on a
-    // full queue) and outbound_queue_drop_reporter (periodically reads
-    // and resets it into a log line).
-    let (outbound_tx, outbound_rx) = mpsc::channel::<OutboundFrame>(OUTBOUND_QUEUE_CAPACITY);
-    let outbound_dropped = Arc::new(AtomicU64::new(0));
 
     {
         let links = links.clone();
@@ -779,9 +791,9 @@ pub async fn run(tun: AsyncDevice, links: Vec<Link>, params: TunnelParams) -> Re
     }
 
     {
-        let dropped = outbound_dropped.clone();
+        let dropped_total = outbound_dropped_total.clone();
         handles.push(tokio::spawn(async move {
-            outbound_queue_drop_reporter(dropped).await;
+            outbound_queue_drop_reporter(dropped_total).await;
         }));
     }
 
@@ -791,9 +803,9 @@ pub async fn run(tun: AsyncDevice, links: Vec<Link>, params: TunnelParams) -> Re
         let mtu = params.mtu as usize;
         let clamp_mss = params.clamp_mss;
         let tx = outbound_tx.clone();
-        let dropped = outbound_dropped.clone();
+        let dropped_total = outbound_dropped_total.clone();
         handles.push(tokio::spawn(async move {
-            if let Err(e) = tun_reader(tun, session, mtu, clamp_mss, tx, dropped).await {
+            if let Err(e) = tun_reader(tun, session, mtu, clamp_mss, tx, dropped_total).await {
                 tracing::error!(error = %e, "tun reader exited");
             }
         }));
@@ -1527,7 +1539,7 @@ const OUTBOUND_QUEUE_DROP_REPORT_INTERVAL: Duration = Duration::from_secs(2);
 /// pulls back off. Just the pieces `send_scheduled`/`send_redundant`
 /// already took as separate arguments, bundled so a single value can
 /// travel through the channel.
-struct OutboundFrame {
+pub(crate) struct OutboundFrame {
     session_id: u32,
     seq: u64,
     ciphertext: Vec<u8>,
@@ -1539,7 +1551,7 @@ async fn tun_reader(
     mtu: usize,
     clamp_mss: bool,
     tx: mpsc::Sender<OutboundFrame>,
-    dropped: Arc<AtomicU64>,
+    dropped_total: Arc<AtomicU64>,
 ) -> Result<()> {
     let mut buf = vec![0u8; mtu + 64];
     loop {
@@ -1577,7 +1589,7 @@ async fn tun_reader(
             seq,
             ciphertext,
         }) {
-            dropped.fetch_add(1, Ordering::Relaxed);
+            dropped_total.fetch_add(1, Ordering::Relaxed);
         }
         // TrySendError::Closed would mean outbound_sender's receiver was
         // dropped -- only happens during shutdown, when this task is
@@ -1613,17 +1625,30 @@ async fn outbound_sender(
     }
 }
 
-/// Periodically logs (and resets) the outbound queue's drop counter --
-/// silent when nothing was dropped, so this produces zero log output on
-/// a healthy tunnel. See `OUTBOUND_QUEUE_CAPACITY`'s doc comment for the
-/// bug this mechanism exists to make visible next time, instead of only
-/// discoverable by comparing external `iperf3` numbers against what the
-/// links should support.
-async fn outbound_queue_drop_reporter(dropped: Arc<AtomicU64>) {
+/// Periodically logs the outbound queue's drop counter -- silent when
+/// nothing new was dropped since the last check, so this produces zero
+/// log output on a healthy tunnel. See `OUTBOUND_QUEUE_CAPACITY`'s doc
+/// comment for the bug this mechanism exists to make visible next time,
+/// instead of only discoverable by comparing external `iperf3` numbers
+/// against what the links should support.
+///
+/// `dropped_total` itself is monotonic (never reset) -- it's also
+/// exposed to monitoring clients via `control::build_snapshot` as
+/// `DaemonSnapshot::outbound_queue_dropped_total`, a lifetime counter
+/// mirroring the per-link `tx_bytes`/`rx_bytes` convention (see
+/// `LinkStats::record_tx`/`record_rx`). Only this reporter's own
+/// `last_reported` local tracks where the previous window ended, so it
+/// can still log a windowed delta count without needing to zero the
+/// shared counter out from under a concurrently-polling monitoring
+/// client.
+async fn outbound_queue_drop_reporter(dropped_total: Arc<AtomicU64>) {
     let mut tick = interval(OUTBOUND_QUEUE_DROP_REPORT_INTERVAL);
+    let mut last_reported = 0u64;
     loop {
         tick.tick().await;
-        let n = dropped.swap(0, Ordering::Relaxed);
+        let total = dropped_total.load(Ordering::Relaxed);
+        let n = total.saturating_sub(last_reported);
+        last_reported = total;
         if n > 0 {
             tracing::warn!(
                 dropped_packets = n,
