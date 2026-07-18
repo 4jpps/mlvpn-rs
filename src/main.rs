@@ -3,10 +3,13 @@ use mlvpn::config::{self, Config};
 use mlvpn::error::{MlvpnError, Result};
 use mlvpn::firewall;
 use mlvpn::ipc::{Command as SocketCommand, CommandResult};
+use mlvpn::logbuf::{LogRing, LogRingLayer};
 use mlvpn::{crypto, link, privilege, tunnel};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use tracing_subscriber::prelude::*;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -82,11 +85,11 @@ fn main() -> anyhow::Result<()> {
         Command::Genkey { out } => genkey(out),
         Command::Run { config } => {
             let cfg = Config::load(&config)?;
-            init_logging(&cfg.logging.level);
+            let log_ring = init_logging(&cfg.logging.level);
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
-            rt.block_on(run(cfg))
+            rt.block_on(run(cfg, log_ring))
         }
         Command::FirewallSetup {
             config,
@@ -172,7 +175,16 @@ fn set_link(config_path: &Path, link: &str, enabled: bool) -> anyhow::Result<()>
     }
 }
 
-fn init_logging(level: &str) {
+/// Builds the process-wide `tracing` subscriber as a `Registry` of two
+/// composed layers rather than the single `tracing_subscriber::fmt()`
+/// call this used to be: the existing fmt/journald output (`fmt_layer`,
+/// filtered by the operator's own `[logging].level`/`RUST_LOG`), plus a
+/// new `LogRingLayer` (`ring_layer`, independently filtered to INFO+
+/// regardless of the operator's own filter -- see its doc comment) that
+/// feeds the in-memory ring `mlvpn-tui`'s Logs tab streams from over the
+/// control socket. Returns the `Arc<LogRing>` so the caller can thread
+/// it into `tunnel::run`.
+fn init_logging(level: &str) -> Arc<LogRing> {
     let filter = EnvFilter::try_new(level).unwrap_or_else(|_| EnvFilter::new("info"));
     // `with_ansi(false)`: mlvpnd is a background daemon whose stdout/stderr
     // normally lands in journald or a log file, not an interactive
@@ -194,10 +206,19 @@ fn init_logging(level: &str) {
     // exact same text is plainly visible on screen. Existing log-based
     // tests happened to only search the plain message text and never hit
     // this.
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
+    let fmt_layer = tracing_subscriber::fmt::layer()
         .with_ansi(false)
+        .with_filter(filter);
+
+    let log_ring = Arc::new(LogRing::new());
+    let ring_layer = LogRingLayer::new(log_ring.clone());
+
+    tracing_subscriber::registry()
+        .with(fmt_layer)
+        .with(ring_layer)
         .init();
+
+    log_ring
 }
 
 fn genkey(out: Option<PathBuf>) -> anyhow::Result<()> {
@@ -229,7 +250,7 @@ fn genkey(out: Option<PathBuf>) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run(cfg: Config) -> anyhow::Result<()> {
+async fn run(cfg: Config, log_ring: Arc<LogRing>) -> anyhow::Result<()> {
     tracing::info!(mode = ?cfg.mode, tunnel = %cfg.tunnel.name, "starting mlvpnd");
 
     // --- Privileged setup phase -------------------------------------
@@ -318,7 +339,7 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     // best-effort `Disconnect` frame to the peer before exiting -- that
     // needs access to the live links/session, which only exists inside
     // `tunnel::run` itself. See `tunnel.rs`'s `Shutdown` doc comment.
-    tunnel::run(tun, links, params)
+    tunnel::run(tun, links, params, log_ring)
         .await
         .map_err(anyhow::Error::from)
 }

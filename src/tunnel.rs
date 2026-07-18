@@ -598,7 +598,12 @@ impl SessionMeta {
     }
 }
 
-pub async fn run(tun: AsyncDevice, links: Vec<Link>, params: TunnelParams) -> Result<()> {
+pub async fn run(
+    tun: AsyncDevice,
+    links: Vec<Link>,
+    params: TunnelParams,
+    log_ring: Arc<crate::logbuf::LogRing>,
+) -> Result<()> {
     let tun = Arc::new(tun);
     let links: Links = Arc::new(links.into_iter().map(AsyncMutex::new).collect());
     let scheduler = Arc::new(std::sync::Mutex::new(Scheduler::new()));
@@ -759,6 +764,7 @@ pub async fn run(tun: AsyncDevice, links: Vec<Link>, params: TunnelParams) -> Re
         let session_meta = session_meta.clone();
         let outbound_tx = outbound_tx.clone();
         let outbound_dropped_total = outbound_dropped_total.clone();
+        let log_ring = log_ring.clone();
         handles.push(tokio::spawn(async move {
             control::serve(
                 path,
@@ -769,6 +775,7 @@ pub async fn run(tun: AsyncDevice, links: Vec<Link>, params: TunnelParams) -> Re
                 session_meta,
                 outbound_tx,
                 outbound_dropped_total,
+                log_ring,
             )
             .await;
         }));

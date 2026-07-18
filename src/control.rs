@@ -34,6 +34,7 @@ use crate::ipc::{
     Command, CommandResult, DaemonSnapshot, LinkSnapshot, Snapshot, SystemSnapshot, TunSnapshot,
 };
 use crate::link::{self, LinkState, Links};
+use crate::logbuf::LogRing;
 use crate::peerstats::PeerStatsTable;
 use crate::procstats;
 use crate::sysfs_net;
@@ -66,6 +67,7 @@ pub(crate) async fn serve(
     session_meta: Arc<SessionMeta>,
     outbound_tx: mpsc::Sender<OutboundFrame>,
     outbound_dropped_total: Arc<AtomicU64>,
+    log_ring: Arc<LogRing>,
 ) {
     if let Some(parent) = path.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
@@ -152,6 +154,7 @@ pub(crate) async fn serve(
         let session_meta = session_meta.clone();
         let outbound_tx = outbound_tx.clone();
         let outbound_dropped_total = outbound_dropped_total.clone();
+        let log_ring = log_ring.clone();
         tokio::spawn(async move {
             serve_client(
                 stream,
@@ -162,6 +165,7 @@ pub(crate) async fn serve(
                 session_meta,
                 outbound_tx,
                 outbound_dropped_total,
+                log_ring,
             )
             .await;
         });
@@ -178,11 +182,18 @@ async fn serve_client(
     session_meta: Arc<SessionMeta>,
     outbound_tx: mpsc::Sender<OutboundFrame>,
     outbound_dropped_total: Arc<AtomicU64>,
+    log_ring: Arc<LogRing>,
 ) {
     let mut tick = interval(Duration::from_millis(SNAPSHOT_INTERVAL_MS));
+    // Per-connection cursor into `log_ring` -- each connected client
+    // gets its own independent view of "what have I already sent",
+    // starting at 0 (see `LogRing::new`'s doc comment for why real
+    // `seq`s start at 1, making 0 mean "nothing sent yet" rather than
+    // needing an `Option<u64>` here).
+    let mut last_log_seq = 0u64;
     loop {
         tick.tick().await;
-        let snapshot = build_snapshot(
+        let (snapshot, new_last_log_seq) = build_snapshot(
             &links,
             &peer_stats,
             &tunnel_name,
@@ -190,8 +201,11 @@ async fn serve_client(
             &session_meta,
             &outbound_tx,
             &outbound_dropped_total,
+            &log_ring,
+            last_log_seq,
         )
         .await;
+        last_log_seq = new_last_log_seq;
         let Ok(mut line) = serde_json::to_vec(&snapshot) else {
             continue;
         };
@@ -202,6 +216,7 @@ async fn serve_client(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn build_snapshot(
     links: &Links,
     peer_stats: &Arc<PeerStatsTable>,
@@ -210,7 +225,9 @@ async fn build_snapshot(
     session_meta: &SessionMeta,
     outbound_tx: &mpsc::Sender<OutboundFrame>,
     outbound_dropped_total: &AtomicU64,
-) -> Snapshot {
+    log_ring: &LogRing,
+    last_log_seq: u64,
+) -> (Snapshot, u64) {
     let snap = link::snapshot_links(links).await;
     let link_snapshots = snap
         .iter()
@@ -268,7 +285,10 @@ async fn build_snapshot(
     let tun_stats = sysfs_net::read_tun_stats(tunnel_name);
     let system_stats = procstats::read_system_stats();
 
-    Snapshot {
+    let new_log_lines = log_ring.entries_since(last_log_seq);
+    let new_last_log_seq = new_log_lines.last().map(|e| e.seq).unwrap_or(last_log_seq);
+
+    let snapshot = Snapshot {
         tunnel_name: tunnel_name.to_string(),
         mode: mode.to_string(),
         unix_ts_ms: SystemTime::now()
@@ -301,7 +321,10 @@ async fn build_snapshot(
                 uptime_secs: system_stats.uptime_secs,
             },
         },
-    }
+        new_log_lines,
+    };
+
+    (snapshot, new_last_log_seq)
 }
 
 /// Bind the command socket and serve `ipc::Command` requests until the

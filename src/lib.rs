@@ -16,6 +16,7 @@ pub mod error;
 pub mod firewall;
 pub mod ipc;
 pub mod link;
+pub mod logbuf;
 pub mod monitor;
 pub mod mss;
 pub mod peerstats;

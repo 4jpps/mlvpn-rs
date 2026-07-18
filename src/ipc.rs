@@ -29,6 +29,33 @@ pub struct Snapshot {
     pub unix_ts_ms: u64,
     pub links: Vec<LinkSnapshot>,
     pub daemon: DaemonSnapshot,
+    /// Log lines produced since the connected client's last poll --
+    /// almost always empty on a quiet tunnel. See `logbuf::LogRing` for
+    /// the ring buffer this is drained from and `control::serve_client`
+    /// for the per-connection `last_log_seq` cursor that makes this a
+    /// delta rather than the whole ring resent every tick.
+    pub new_log_lines: Vec<LogEntry>,
+}
+
+/// One captured log line, INFO-severity or higher (see
+/// `logbuf::LogRingLayer`'s doc comment for why DEBUG/TRACE never reach
+/// this ring regardless of the operator's own configured log level).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogEntry {
+    /// Monotonically increasing within one daemon process's lifetime,
+    /// never reused -- the cursor `new_log_lines` delta streaming is
+    /// built on. Resets to 0 on a daemon restart, same as `rekey_count`.
+    pub seq: u64,
+    pub unix_ts_ms: u64,
+    /// "ERROR" | "WARN" | "INFO" (`tracing::Level::as_str()`'s own
+    /// formatting, uppercase).
+    pub level: String,
+    /// The event's `tracing` target (typically a module path like
+    /// `mlvpn::tunnel`) -- `Option` for forward compatibility even
+    /// though `tracing::Event::metadata().target()` is always
+    /// populated in practice.
+    pub target: Option<String>,
+    pub message: String,
 }
 
 /// Daemon/host-level health, as opposed to `LinkSnapshot`'s
@@ -286,6 +313,26 @@ mod tests {
         assert_eq!(back.system.load1, Some(0.52));
         assert_eq!(back.system.load15, None);
         assert_eq!(back.system.mem_available_kb, Some(8_192_000));
+    }
+
+    /// `new_log_lines` is the delta-streaming mechanism the Logs tab
+    /// depends on entirely -- if a `LogEntry` field silently drops or
+    /// renames across the wire, this is the cheapest place to catch it.
+    #[test]
+    fn log_entry_round_trips() {
+        let entry = LogEntry {
+            seq: 17,
+            unix_ts_ms: 1_700_000_000_000,
+            level: "WARN".to_string(),
+            target: Some("mlvpn::tunnel".to_string()),
+            message: "outbound queue overflowed".to_string(),
+        };
+        let json = serde_json::to_string(&entry).expect("serialize");
+        let back: LogEntry = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.seq, 17);
+        assert_eq!(back.level, "WARN");
+        assert_eq!(back.target.as_deref(), Some("mlvpn::tunnel"));
+        assert_eq!(back.message, "outbound queue overflowed");
     }
 
     /// `serve_commands` reads one line of JSON per connection and a CLI
