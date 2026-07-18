@@ -41,8 +41,11 @@ real Noise handshake, real probing, real rekeying, real graceful
 shutdown, real redundancy-mode traffic, a real control-socket JSON
 stream, (via the real `mlvpnd set-link` CLI) a real command-socket
 round trip, (via real `tc netem` latency injection) a real
-reorder-window auto-tuning decision, and (via real `tc tbf` rate
-shaping) a real active-bandwidth-probing discovery. This needs root
+reorder-window auto-tuning decision, (via real `tc tbf` rate shaping) a
+real active-bandwidth-probing discovery, and real daemon/host health
+(session id/rekey count, outbound queue, TUN interface sysfs counters,
+`/proc` system stats, and the log-ring delta streaming `mlvpn-tui`'s
+Logs tab depends on). This needs root
 (namespace/veth creation, `mlvpnd`'s own `CAP_NET_ADMIN`/`CAP_NET_RAW`
 setup), `iproute2`'s `ip` on `PATH`, and the `mlvpn` system user/group
 (created automatically if missing, mirroring
@@ -62,6 +65,7 @@ sudo env "PATH=$PATH" HOME="$HOME" cargo test --release --locked --test veth_ipv
 sudo env "PATH=$PATH" HOME="$HOME" cargo test --release --locked --test veth_probe_interval_tuning -- --ignored --nocapture
 sudo env "PATH=$PATH" HOME="$HOME" cargo test --release --locked --test veth_ewma_alpha_tuning -- --ignored --nocapture
 sudo env "PATH=$PATH" HOME="$HOME" cargo test --release --locked --test veth_active_bandwidth_probing -- --ignored --nocapture
+sudo env "PATH=$PATH" HOME="$HOME" cargo test --release --locked --test veth_daemon_health -- --ignored --nocapture
 ```
 
 `veth_reorder_tuning` and `veth_active_bandwidth_probing` additionally

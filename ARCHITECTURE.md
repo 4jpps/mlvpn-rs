@@ -335,6 +335,20 @@ streams live JSON snapshots over a local Unix socket
 (`/run/mlvpn/<tunnel.name>.sock`, mode 0600) for `mlvpn-tui` to render
 -- read-only, no command/write side.
 
+Beyond per-link stats, each `Snapshot` carries a `DaemonSnapshot`
+(session id/uptime/rekey count off the hot-path lock via `SessionMeta`;
+outbound queue depth/capacity/lifetime drops; the TUN device's own
+`/sys/class/net/<iface>/statistics/*` counters via `sysfs_net.rs`;
+machine-wide load/memory/uptime from `/proc` via `procstats.rs`) and a
+`new_log_lines` delta from an in-memory ring of the daemon's own INFO+
+log output (`logbuf::LogRing`, fed by a `tracing_subscriber::Layer`
+independent of whatever verbosity `[logging].level` sets for the
+primary log output). Each connected client tracks its own cursor into
+the ring (`control::serve_client`'s `last_log_seq`), so the log tail
+streams as a delta over the same 500ms cadence rather than needing a
+dedicated socket. `mlvpn-tui` renders all of this as three tabs --
+Links, Daemon, Logs -- see [monitoring.md](docs/monitoring.md).
+
 **Command socket** (`[command] enabled`, off by default). A second,
 separate Unix socket -- different path
 (`/run/mlvpn/<tunnel.name>.command.sock` by default), same mode-0600

@@ -96,9 +96,13 @@ src/
   ipc.rs          JSON schema for the monitoring/command sockets
   control.rs      Unix-socket servers: streams ipc::Snapshot to mlvpn-tui,
                   and (opt-in) accepts runtime link-control commands
+  sysfs_net.rs    TUN interface's own kernel byte/error/drop counters
+  procstats.rs    Machine-wide load/memory/uptime from /proc
+  logbuf.rs       In-memory log ring + tracing layer feeding mlvpn-tui's Logs tab
   firewall.rs     mlvpnd firewall-setup: detects/drives firewalld, ufw,
                   nftables, iptables
-  bin/mlvpn-tui.rs  Terminal monitoring view (see docs/monitoring.md)
+  bin/mlvpn-tui.rs  Terminal monitoring view: Links/Daemon/Logs tabs
+                  (see docs/monitoring.md)
 config/          Example client/server TOML configs
 systemd/         Hardened systemd unit
 debian/          .deb packaging
