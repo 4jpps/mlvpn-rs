@@ -1,11 +1,21 @@
 #!/bin/sh
 set -e
 
-# Captured *before* anything below (including #DEBHELPER#'s own
-# generated code, further down) can touch the service's running state --
-# see the long comment right before the matching restart, after
-# #DEBHELPER#, for why this has to be recorded this early and acted on
-# this late rather than doing both right here in one place.
+# Captured *before* anything below -- including debhelper's own
+# generated code, spliced in further down at the marker line by itself
+# -- can touch the service's running state. See the long comment right
+# before the matching restart, after that marker, for why this has to
+# be recorded this early and acted on this late rather than doing both
+# right here in one place.
+#
+# Deliberately described only in prose here, never written as the
+# literal marker token itself: debhelper's token substitution replaces
+# *every* occurrence of that exact string in this script, not just the
+# one real marker line below -- writing it again here, even inside a
+# comment, would silently splice a second copy of debhelper's generated
+# shell code into the middle of this sentence. Found the hard way: a
+# `dpkg --configure` failure quoting a mangled fragment of this very
+# comment as an unrecognized command.
 MLVPN_WAS_ACTIVE=no
 if systemctl is-active --quiet mlvpn.service 2>/dev/null; then
   MLVPN_WAS_ACTIVE=yes
@@ -53,31 +63,36 @@ esac
 # /etc/mlvpn/mlvpn.toml even exists -- it would just fail immediately on
 # a missing config, which is worse than doing nothing. In compat 10+,
 # though, dh_installsystemd's default upgrade behavior
-# (--restart-after-upgrade) is to stop-then-start the service from
-# *its own* generated code above (`#DEBHELPER#`), deferred until after
-# the new files are unpacked -- and `--no-start` only suppresses the
-# "start" half of that pair, not the "stop" half. So on every upgrade,
-# debhelper's own hook above stops mlvpnd and, because of --no-start,
-# never starts it back up -- meaning a naive "restart it if it's
-# currently active" check placed *before* #DEBHELPER# (which this used
-# to be) always loses the race: it restarts the service, and then
-# debhelper's own code immediately stops it again a moment later,
-# leaving it down until an operator notices and starts it by hand. This
-# is exactly the "have to start it every time" gap 0.3.2 first tried to
-# close, and 0.3.2's fix -- checking is-active *before* #DEBHELPER# --
-# didn't actually close it, for the reason above; caught on a real
-# two-host upgrade.
+# (--restart-after-upgrade) is to stop-then-start the service from its
+# own generated code above (the marker line right before this comment
+# block), deferred until after the new files are unpacked -- and
+# `--no-start` only suppresses the "start" half of that pair, not the
+# "stop" half. So on every upgrade, debhelper's own hook above stops
+# mlvpnd and, because of --no-start, never starts it back up -- meaning
+# a naive "restart it if it's currently active" check placed *before*
+# that marker (which this used to be) always loses the race: it
+# restarts the service, and then debhelper's own code immediately stops
+# it again a moment later, leaving it down until an operator notices
+# and starts it by hand. This is exactly the "have to start it every
+# time" gap 0.3.2 first tried to close, and 0.3.2's fix -- checking
+# is-active *before* that marker -- didn't actually close it, for the
+# reason above; caught on a real two-host upgrade.
 #
 # Fixed by recording whether the service was active *before* any of
-# this postinst (including #DEBHELPER#'s own code) could touch it --
-# see MLVPN_WAS_ACTIVE right at the top of this script -- and restoring
-# that state here, last, after everything else (debhelper included) has
-# already had its say. `restart`, not `start`: if debhelper's own code
-# already stopped it, this brings it back up; if debhelper's code
-# somehow left it running the old binary for any reason, this still
-# swaps in the newly unpacked one either way. Skipped entirely for a
-# fresh install or a deliberately-stopped service, same reasoning as
-# before.
+# this postinst, including debhelper's own generated code, could touch
+# it -- see MLVPN_WAS_ACTIVE right at the top of this script -- and
+# restoring that state here, last, after everything else (debhelper
+# included) has already had its say. `restart`, not `start`: if
+# debhelper's own code already stopped it, this brings it back up; if
+# debhelper's code somehow left it running the old binary for any
+# reason, this still swaps in the newly unpacked one either way.
+# Skipped entirely for a fresh install or a deliberately-stopped
+# service, same reasoning as before.
+#
+# (See the top-of-file comment above MLVPN_WAS_ACTIVE for why this
+# whole explanation carefully never spells out the literal marker
+# token: debhelper's substitution matches every occurrence of it in
+# this file, comments included, not just the one intended below.)
 if [ "$1" = "configure" ] && [ "$MLVPN_WAS_ACTIVE" = "yes" ]; then
   systemctl restart mlvpn.service || true
 fi
