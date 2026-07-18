@@ -30,9 +30,12 @@
 //! or out, the same guarantee any other 0600 Unix socket or file
 //! provides.
 
-use crate::ipc::{Command, CommandResult, DaemonSnapshot, LinkSnapshot, Snapshot, TunSnapshot};
+use crate::ipc::{
+    Command, CommandResult, DaemonSnapshot, LinkSnapshot, Snapshot, SystemSnapshot, TunSnapshot,
+};
 use crate::link::{self, LinkState, Links};
 use crate::peerstats::PeerStatsTable;
+use crate::procstats;
 use crate::sysfs_net;
 use crate::tunnel::{OutboundFrame, SessionMeta};
 use std::os::unix::fs::PermissionsExt;
@@ -263,6 +266,7 @@ async fn build_snapshot(
     // created with (see `main.rs::open_tun`), so no separate iface
     // field needs threading through just for this sysfs lookup.
     let tun_stats = sysfs_net::read_tun_stats(tunnel_name);
+    let system_stats = procstats::read_system_stats();
 
     Snapshot {
         tunnel_name: tunnel_name.to_string(),
@@ -287,6 +291,14 @@ async fn build_snapshot(
                 tx_errors: tun_stats.tx_errors,
                 rx_dropped: tun_stats.rx_dropped,
                 tx_dropped: tun_stats.tx_dropped,
+            },
+            system: SystemSnapshot {
+                load1: system_stats.load1,
+                load5: system_stats.load5,
+                load15: system_stats.load15,
+                mem_total_kb: system_stats.mem_total_kb,
+                mem_available_kb: system_stats.mem_available_kb,
+                uptime_secs: system_stats.uptime_secs,
             },
         },
     }

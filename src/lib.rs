@@ -20,6 +20,7 @@ pub mod monitor;
 pub mod mss;
 pub mod peerstats;
 pub mod privilege;
+pub mod procstats;
 pub mod protocol;
 pub mod scheduler;
 pub mod sysfs_net;

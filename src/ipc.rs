@@ -66,6 +66,24 @@ pub struct DaemonSnapshot {
     /// The TUN device's own kernel-tracked counters -- see
     /// `sysfs_net::read_tun_stats`.
     pub tun: TunSnapshot,
+    /// Machine-wide health -- see `procstats::read_system_stats`.
+    pub system: SystemSnapshot,
+}
+
+/// Host-wide load/memory/uptime, independent of anything tunnel- or
+/// link-specific -- context for whether a problem elsewhere in the
+/// snapshot is actually a symptom of the host itself being under load
+/// or low on memory. Every field is `Option` since `/proc/loadavg`,
+/// `/proc/meminfo`, and `/proc/uptime` are read and parsed
+/// independently and any one of them can fail on its own.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SystemSnapshot {
+    pub load1: Option<f64>,
+    pub load5: Option<f64>,
+    pub load15: Option<f64>,
+    pub mem_total_kb: Option<u64>,
+    pub mem_available_kb: Option<u64>,
+    pub uptime_secs: Option<u64>,
 }
 
 /// `/sys/class/net/<iface>/statistics/*` counters for the TUN device,
@@ -245,6 +263,14 @@ mod tests {
                 rx_dropped: Some(0),
                 tx_dropped: None,
             },
+            system: SystemSnapshot {
+                load1: Some(0.52),
+                load5: Some(0.58),
+                load15: None,
+                mem_total_kb: Some(16_384_000),
+                mem_available_kb: Some(8_192_000),
+                uptime_secs: Some(12_345),
+            },
         };
         let json = serde_json::to_string(&snap).expect("serialize");
         let back: DaemonSnapshot = serde_json::from_str(&json).expect("deserialize");
@@ -257,6 +283,9 @@ mod tests {
         assert_eq!(back.tun.iface, "mlvpn0");
         assert_eq!(back.tun.rx_bytes, Some(1_000));
         assert_eq!(back.tun.tx_errors, None);
+        assert_eq!(back.system.load1, Some(0.52));
+        assert_eq!(back.system.load15, None);
+        assert_eq!(back.system.mem_available_kb, Some(8_192_000));
     }
 
     /// `serve_commands` reads one line of JSON per connection and a CLI
