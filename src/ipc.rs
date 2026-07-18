@@ -28,6 +28,26 @@ pub struct Snapshot {
     pub mode: String,
     pub unix_ts_ms: u64,
     pub links: Vec<LinkSnapshot>,
+    pub daemon: DaemonSnapshot,
+}
+
+/// Daemon/host-level health, as opposed to `LinkSnapshot`'s
+/// per-bonded-link view -- session identity, the outbound queue, the
+/// TUN device's own kernel counters, and machine-wide system stats.
+/// Always present (not `Option`) since the daemon itself is always
+/// running by the time anything is connected to read this; individual
+/// fields inside `tun`/`system` are `Option` where the underlying
+/// read (sysfs/`/proc`) can fail independently.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DaemonSnapshot {
+    /// The active Noise transport session's id right now.
+    pub session_id: u32,
+    /// How long (ms) the *current* session has been active -- resets
+    /// to 0 on every rekey, successful or peer-initiated alike.
+    pub session_uptime_ms: u64,
+    /// Total rekeys since this process started (not since the tunnel
+    /// was first configured -- a daemon restart resets this to 0).
+    pub rekey_count: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

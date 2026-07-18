@@ -547,6 +547,57 @@ impl Shutdown {
     }
 }
 
+/// Session identity/uptime/rekey-count, readable by `control::serve`
+/// without ever contending with `SessionState`'s own mutex -- which is
+/// locked on every single outgoing packet (`tun_reader`'s
+/// `s.encrypt(...)` call). Adding a getter directly to `SessionState`
+/// and polling it once per connected monitoring client per 500ms tick
+/// would add read contention against that hot-path lock, however
+/// small; this project has already been burned once by underestimated
+/// per-packet lock contention (see `link::LinkScore`'s doc comment), so
+/// it's kept as its own independent, rarely-touched piece of state
+/// instead. `established_at` uses a plain `std::sync::Mutex` (not the
+/// async one `SessionState` uses) since it's only ever touched at
+/// rekey time (every few minutes at most) and once per monitoring
+/// tick -- nowhere near contended enough to need async-aware locking.
+pub(crate) struct SessionMeta {
+    session_id: std::sync::atomic::AtomicU32,
+    rekey_count: std::sync::atomic::AtomicU32,
+    established_at: std::sync::Mutex<Instant>,
+}
+
+impl SessionMeta {
+    fn new(session_id: u32) -> Self {
+        Self {
+            session_id: std::sync::atomic::AtomicU32::new(session_id),
+            rekey_count: std::sync::atomic::AtomicU32::new(0),
+            established_at: std::sync::Mutex::new(Instant::now()),
+        }
+    }
+
+    /// Called alongside every `SessionState::install` -- both the
+    /// client-initiated (`rekey_loop`) and peer-initiated
+    /// (`handle_incoming`'s `HandshakeInit` arm) rekey paths.
+    fn record_rekey(&self, new_session_id: u32) {
+        self.session_id
+            .store(new_session_id, std::sync::atomic::Ordering::Relaxed);
+        self.rekey_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        *self.established_at.lock().unwrap() = Instant::now();
+    }
+
+    /// `(session_id, rekey_count, session_uptime_ms)` -- already-elapsed
+    /// duration, not a raw timestamp, matching this codebase's existing
+    /// `peer_stats_age_ms`/`state_duration_ms` convention so a viewer
+    /// never has to do its own clock math.
+    pub(crate) fn snapshot(&self) -> (u32, u32, u64) {
+        let id = self.session_id.load(std::sync::atomic::Ordering::Relaxed);
+        let count = self.rekey_count.load(std::sync::atomic::Ordering::Relaxed);
+        let uptime_ms = self.established_at.lock().unwrap().elapsed().as_millis() as u64;
+        (id, count, uptime_ms)
+    }
+}
+
 pub async fn run(tun: AsyncDevice, links: Vec<Link>, params: TunnelParams) -> Result<()> {
     let tun = Arc::new(tun);
     let links: Links = Arc::new(links.into_iter().map(AsyncMutex::new).collect());
@@ -559,6 +610,7 @@ pub async fn run(tun: AsyncDevice, links: Vec<Link>, params: TunnelParams) -> Re
 
     let (session_id, session) = establish_session_with_retry(&links, &params).await;
     let session = Arc::new(AsyncMutex::new(SessionState::new(session_id, session)));
+    let session_meta = Arc::new(SessionMeta::new(session_id));
 
     tracing::info!(session_id, "tunnel session established");
 
@@ -642,6 +694,7 @@ pub async fn run(tun: AsyncDevice, links: Vec<Link>, params: TunnelParams) -> Re
             let rekey_ctx = rekey_ctx.clone();
             let shutdown = shutdown.clone();
             let bw_state = bw_state.clone();
+            let session_meta = session_meta.clone();
             handles.push(tokio::spawn(async move {
                 // link_receiver never returns under normal operation --
                 // see its doc comment: socket errors are retried/
@@ -649,8 +702,19 @@ pub async fn run(tun: AsyncDevice, links: Vec<Link>, params: TunnelParams) -> Re
                 // task only ends via panic (a bug) or the process
                 // exiting.
                 link_receiver(
-                    idx, links, session, scheduler, tun, reorder, cfg, tracker, peer_stats,
-                    rekey_ctx, shutdown, bw_state,
+                    idx,
+                    links,
+                    session,
+                    scheduler,
+                    tun,
+                    reorder,
+                    cfg,
+                    tracker,
+                    peer_stats,
+                    rekey_ctx,
+                    shutdown,
+                    bw_state,
+                    session_meta,
                 )
                 .await;
             }));
@@ -684,8 +748,9 @@ pub async fn run(tun: AsyncDevice, links: Vec<Link>, params: TunnelParams) -> Re
         let peer_stats = peer_stats.clone();
         let tunnel_name = params.tunnel_name.clone();
         let mode = params.mode.as_str().to_string();
+        let session_meta = session_meta.clone();
         handles.push(tokio::spawn(async move {
-            control::serve(path, links, peer_stats, tunnel_name, mode).await;
+            control::serve(path, links, peer_stats, tunnel_name, mode, session_meta).await;
         }));
     }
 
@@ -766,8 +831,9 @@ pub async fn run(tun: AsyncDevice, links: Vec<Link>, params: TunnelParams) -> Re
         let params = params.clone();
         let session = session.clone();
         let rekey_ctx = rekey_ctx.clone();
+        let session_meta = session_meta.clone();
         handles.push(tokio::spawn(async move {
-            rekey_loop(links, params, session, rekey_ctx).await;
+            rekey_loop(links, params, session, rekey_ctx, session_meta).await;
         }));
     }
 
@@ -1755,6 +1821,7 @@ async fn link_receiver(
     rekey_ctx: Arc<RekeyContext>,
     shutdown: Arc<Shutdown>,
     bw_probe_state: Arc<AsyncMutex<BandwidthProbeReceiveState>>,
+    session_meta: Arc<SessionMeta>,
 ) {
     let (handle, link_id, link_name) = {
         let link = links[idx].lock().await;
@@ -1786,6 +1853,7 @@ async fn link_receiver(
                     &rekey_ctx,
                     &shutdown,
                     &bw_probe_state,
+                    &session_meta,
                 )
                 .await;
             }
@@ -2321,6 +2389,7 @@ async fn handle_incoming(
     rekey_ctx: &Arc<RekeyContext>,
     shutdown: &Arc<Shutdown>,
     bw_probe_state: &Arc<AsyncMutex<BandwidthProbeReceiveState>>,
+    session_meta: &Arc<SessionMeta>,
 ) {
     let Ok((hdr, ciphertext)) = Header::decode(frame) else {
         return;
@@ -2395,6 +2464,7 @@ async fn handle_incoming(
                                 l.lock().await.remote = Some(from);
                             }
                             session.lock().await.install(new_id, new_session);
+                            session_meta.record_rekey(new_id);
                             tracing::info!(session_id = new_id, "session rekeyed (peer-initiated)");
                         }
                         Err(e) => {
@@ -2816,6 +2886,7 @@ async fn rekey_loop(
     params: Arc<TunnelParams>,
     session: Arc<AsyncMutex<SessionState>>,
     rekey_ctx: Arc<RekeyContext>,
+    session_meta: Arc<SessionMeta>,
 ) {
     let mut tick = interval(params.rekey_interval);
     // tokio::time::interval's first tick fires immediately; skip it so
@@ -2831,6 +2902,7 @@ async fn rekey_loop(
         match perform_client_handshake(&links, &params, Some(&rekey_ctx)).await {
             Ok((new_id, new_session)) => {
                 session.lock().await.install(new_id, new_session);
+                session_meta.record_rekey(new_id);
                 tracing::info!(session_id = new_id, "session rekeyed");
             }
             Err(e) => {

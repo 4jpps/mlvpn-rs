@@ -30,9 +30,10 @@
 //! or out, the same guarantee any other 0600 Unix socket or file
 //! provides.
 
-use crate::ipc::{Command, CommandResult, LinkSnapshot, Snapshot};
+use crate::ipc::{Command, CommandResult, DaemonSnapshot, LinkSnapshot, Snapshot};
 use crate::link::{self, LinkState, Links};
 use crate::peerstats::PeerStatsTable;
+use crate::tunnel::SessionMeta;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -49,12 +50,13 @@ const SNAPSHOT_INTERVAL_MS: u64 = 500;
 /// logged and treated as "monitoring unavailable" rather than a fatal
 /// daemon error -- a stats socket is a convenience feature, not something
 /// that should be able to take the tunnel down.
-pub async fn serve(
+pub(crate) async fn serve(
     path: PathBuf,
     links: Links,
     peer_stats: Arc<PeerStatsTable>,
     tunnel_name: String,
     mode: String,
+    session_meta: Arc<SessionMeta>,
 ) {
     if let Some(parent) = path.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
@@ -138,8 +140,9 @@ pub async fn serve(
         let peer_stats = peer_stats.clone();
         let tunnel_name = tunnel_name.clone();
         let mode = mode.clone();
+        let session_meta = session_meta.clone();
         tokio::spawn(async move {
-            serve_client(stream, links, peer_stats, tunnel_name, mode).await;
+            serve_client(stream, links, peer_stats, tunnel_name, mode, session_meta).await;
         });
     }
 }
@@ -150,11 +153,13 @@ async fn serve_client(
     peer_stats: Arc<PeerStatsTable>,
     tunnel_name: String,
     mode: String,
+    session_meta: Arc<SessionMeta>,
 ) {
     let mut tick = interval(Duration::from_millis(SNAPSHOT_INTERVAL_MS));
     loop {
         tick.tick().await;
-        let snapshot = build_snapshot(&links, &peer_stats, &tunnel_name, &mode).await;
+        let snapshot =
+            build_snapshot(&links, &peer_stats, &tunnel_name, &mode, &session_meta).await;
         let Ok(mut line) = serde_json::to_vec(&snapshot) else {
             continue;
         };
@@ -170,6 +175,7 @@ async fn build_snapshot(
     peer_stats: &Arc<PeerStatsTable>,
     tunnel_name: &str,
     mode: &str,
+    session_meta: &SessionMeta,
 ) -> Snapshot {
     let snap = link::snapshot_links(links).await;
     let link_snapshots = snap
@@ -211,6 +217,8 @@ async fn build_snapshot(
         })
         .collect();
 
+    let (session_id, rekey_count, session_uptime_ms) = session_meta.snapshot();
+
     Snapshot {
         tunnel_name: tunnel_name.to_string(),
         mode: mode.to_string(),
@@ -219,6 +227,11 @@ async fn build_snapshot(
             .unwrap_or_default()
             .as_millis() as u64,
         links: link_snapshots,
+        daemon: DaemonSnapshot {
+            session_id,
+            session_uptime_ms,
+            rekey_count,
+        },
     }
 }
 
