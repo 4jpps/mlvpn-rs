@@ -24,13 +24,13 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use mlvpn::ipc::{LinkSnapshot, Snapshot};
+use mlvpn::ipc::{DaemonSnapshot, LinkSnapshot, Snapshot, TunSnapshot};
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Cell, Paragraph, Row, Table, Tabs},
+    widgets::{Block, Borders, Cell, Gauge, Paragraph, Row, Table, Tabs},
     Frame, Terminal,
 };
 use std::io::{self, BufRead, BufReader, Stdout};
@@ -299,7 +299,7 @@ fn draw(f: &mut Frame, state: &SharedState, socket_path: &Path, hostname: &str, 
     draw_tabs_header(f, chunks[0], state, socket_path, hostname, active_tab);
     match active_tab {
         Tab::Links => draw_links_tab(f, chunks[1], state),
-        Tab::Daemon => draw_daemon_tab_stub(f, chunks[1]),
+        Tab::Daemon => draw_daemon_tab(f, chunks[1], state),
         Tab::Logs => draw_logs_tab_stub(f, chunks[1]),
     }
     draw_footer(f, chunks[2], state, active_tab);
@@ -438,14 +438,179 @@ fn link_row(l: &LinkSnapshot) -> Row<'static> {
     ])
 }
 
-fn draw_daemon_tab_stub(f: &mut Frame, area: Rect) {
-    let block = Block::default().borders(Borders::ALL).title(" Daemon ");
-    let para = Paragraph::new(Line::from(Span::styled(
-        "daemon health is on the way -- session/queue/tun/system panels land next",
-        Style::default().fg(COLOR_MUTED),
-    )))
-    .block(block);
-    f.render_widget(para, area);
+fn draw_daemon_tab(f: &mut Frame, area: Rect, state: &SharedState) {
+    let Some(snap) = &state.snapshot else {
+        let block = Block::default().borders(Borders::ALL).title(" Daemon ");
+        let para = Paragraph::new(Line::from(Span::styled(
+            "waiting for data...",
+            Style::default().fg(COLOR_MUTED),
+        )))
+        .block(block);
+        f.render_widget(para, area);
+        return;
+    };
+    let daemon = &snap.daemon;
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Length(4),
+            Constraint::Length(5),
+            Constraint::Length(5),
+            Constraint::Min(0),
+        ])
+        .split(area);
+
+    draw_session_panel(f, chunks[0], daemon);
+    draw_outbound_queue_panel(f, chunks[1], daemon);
+    draw_tun_panel(f, chunks[2], &daemon.tun);
+    draw_system_panel(f, chunks[3], daemon);
+}
+
+fn draw_session_panel(f: &mut Frame, area: Rect, daemon: &DaemonSnapshot) {
+    let line = Line::from(vec![
+        Span::raw("Session ID: "),
+        Span::styled(
+            format!("{:08x}", daemon.session_id),
+            Style::default().fg(COLOR_ACCENT),
+        ),
+        Span::raw("   Uptime: "),
+        Span::raw(fmt_duration_ms(daemon.session_uptime_ms)),
+        Span::raw("   Rekeys: "),
+        Span::raw(daemon.rekey_count.to_string()),
+    ]);
+    let block = Block::default().borders(Borders::ALL).title(" Session ");
+    f.render_widget(Paragraph::new(line).block(block), area);
+}
+
+/// A `Gauge` colored by fill ratio (good/warn/bad thresholds match the
+/// same semantics as `state_style`'s link coloring) plus the lifetime
+/// drop count -- see `outbound_queue_drop_reporter`'s doc comment in
+/// `tunnel.rs` for why that counter is monotonic rather than windowed.
+fn draw_outbound_queue_panel(f: &mut Frame, area: Rect, daemon: &DaemonSnapshot) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Outbound Queue ");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Length(1)])
+        .split(inner);
+
+    let ratio = if daemon.outbound_queue_capacity > 0 {
+        (daemon.outbound_queue_len as f64 / daemon.outbound_queue_capacity as f64).min(1.0)
+    } else {
+        0.0
+    };
+    let gauge_color = if ratio > 0.75 {
+        COLOR_BAD
+    } else if ratio > 0.25 {
+        COLOR_WARN
+    } else {
+        COLOR_GOOD
+    };
+    let gauge = Gauge::default()
+        .gauge_style(Style::default().fg(gauge_color))
+        .ratio(ratio)
+        .label(format!(
+            "{} / {}",
+            daemon.outbound_queue_len, daemon.outbound_queue_capacity
+        ));
+    f.render_widget(gauge, rows[0]);
+
+    let dropped_style = if daemon.outbound_queue_dropped_total > 0 {
+        Style::default().fg(COLOR_BAD)
+    } else {
+        Style::default().fg(COLOR_MUTED)
+    };
+    let dropped_line = Line::from(vec![
+        Span::raw("Dropped (lifetime): "),
+        Span::styled(
+            daemon.outbound_queue_dropped_total.to_string(),
+            dropped_style,
+        ),
+    ]);
+    f.render_widget(Paragraph::new(dropped_line), rows[1]);
+}
+
+fn draw_tun_panel(f: &mut Frame, area: Rect, tun: &TunSnapshot) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Tun Interface ");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let errors = tun.rx_errors.unwrap_or(0) + tun.tx_errors.unwrap_or(0);
+    let dropped = tun.rx_dropped.unwrap_or(0) + tun.tx_dropped.unwrap_or(0);
+    let errors_style = if errors > 0 || dropped > 0 {
+        Style::default().fg(COLOR_BAD)
+    } else {
+        Style::default().fg(COLOR_MUTED)
+    };
+
+    let lines = vec![
+        Line::from(format!("Interface: {}", tun.iface)),
+        Line::from(format!(
+            "Rx {}   Tx {}",
+            fmt_bytes_opt(tun.rx_bytes),
+            fmt_bytes_opt(tun.tx_bytes),
+        )),
+        Line::from(Span::styled(
+            format!(
+                "Errors: rx {} tx {}   Dropped: rx {} tx {}",
+                fmt_opt_u64(tun.rx_errors),
+                fmt_opt_u64(tun.tx_errors),
+                fmt_opt_u64(tun.rx_dropped),
+                fmt_opt_u64(tun.tx_dropped),
+            ),
+            errors_style,
+        )),
+    ];
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+fn draw_system_panel(f: &mut Frame, area: Rect, daemon: &DaemonSnapshot) {
+    let sys = &daemon.system;
+    let block = Block::default().borders(Borders::ALL).title(" System ");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let mem_line = match (sys.mem_total_kb, sys.mem_available_kb) {
+        (Some(total), Some(avail)) => {
+            let used = total.saturating_sub(avail);
+            let pct = if total > 0 {
+                used as f64 / total as f64 * 100.0
+            } else {
+                0.0
+            };
+            format!(
+                "Mem: {} / {} ({pct:.0}% used)",
+                fmt_bytes(used * 1024),
+                fmt_bytes(total * 1024),
+            )
+        }
+        _ => "Mem: --".to_string(),
+    };
+
+    let uptime_line = match sys.uptime_secs {
+        Some(secs) => format!("Uptime: {}", fmt_duration_ms(secs.saturating_mul(1000))),
+        None => "Uptime: --".to_string(),
+    };
+
+    let lines = vec![
+        Line::from(format!(
+            "Load: {} {} {}",
+            fmt_load(sys.load1),
+            fmt_load(sys.load5),
+            fmt_load(sys.load15),
+        )),
+        Line::from(mem_line),
+        Line::from(uptime_line),
+    ];
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 fn draw_logs_tab_stub(f: &mut Frame, area: Rect) {
@@ -526,6 +691,22 @@ fn fmt_bytes(bytes: u64) -> String {
     } else {
         format!("{value:.1}{}", UNITS[unit])
     }
+}
+
+/// `fmt_bytes` for the `Option<u64>` sysfs counters on the Daemon tab
+/// (`TunSnapshot`'s fields) -- `None` reads as "unknown" (the sysfs
+/// read failed or the interface is gone), never as zero traffic.
+fn fmt_bytes_opt(v: Option<u64>) -> String {
+    v.map(fmt_bytes).unwrap_or_else(|| "-".to_string())
+}
+
+fn fmt_opt_u64(v: Option<u64>) -> String {
+    v.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string())
+}
+
+fn fmt_load(v: Option<f64>) -> String {
+    v.map(|v| format!("{v:.2}"))
+        .unwrap_or_else(|| "-".to_string())
 }
 
 /// Formats a millisecond duration as a compact "how long" string --
