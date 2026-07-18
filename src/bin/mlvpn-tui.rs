@@ -24,15 +24,16 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use mlvpn::ipc::{DaemonSnapshot, LinkSnapshot, Snapshot, TunSnapshot};
+use mlvpn::ipc::{DaemonSnapshot, LinkSnapshot, LogEntry, Snapshot, TunSnapshot};
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Cell, Gauge, Paragraph, Row, Table, Tabs},
+    widgets::{Block, Borders, Cell, Gauge, List, ListItem, Paragraph, Row, Table, Tabs},
     Frame, Terminal,
 };
+use std::collections::VecDeque;
 use std::io::{self, BufRead, BufReader, Stdout};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -97,10 +98,21 @@ impl Tab {
     }
 }
 
+/// How many recent log lines to keep client-side. Independent of (and
+/// larger than) the daemon's own `logbuf::LOG_RING_CAPACITY` -- this
+/// just bounds local memory use for a long-running `mlvpn-tui` session;
+/// the daemon's ring is what actually limits how far back history can
+/// go after a fresh connection.
+const TUI_LOG_CAPACITY: usize = 2000;
+
 struct SharedState {
     snapshot: Option<Snapshot>,
     connected: bool,
     last_update: Option<Instant>,
+    /// Accumulated from every `Snapshot::new_log_lines` delta seen so
+    /// far -- see `reader_thread`. Oldest-first, capped at
+    /// `TUI_LOG_CAPACITY`.
+    logs: VecDeque<LogEntry>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -112,6 +124,7 @@ fn main() -> anyhow::Result<()> {
         snapshot: None,
         connected: false,
         last_update: None,
+        logs: VecDeque::new(),
     }));
 
     {
@@ -214,6 +227,12 @@ fn reader_thread(socket_path: PathBuf, state: Arc<Mutex<SharedState>>) {
                         Ok(text) => {
                             if let Ok(snapshot) = serde_json::from_str::<Snapshot>(&text) {
                                 let mut s = state.lock().unwrap();
+                                for entry in &snapshot.new_log_lines {
+                                    if s.logs.len() == TUI_LOG_CAPACITY {
+                                        s.logs.pop_front();
+                                    }
+                                    s.logs.push_back(entry.clone());
+                                }
                                 s.snapshot = Some(snapshot);
                                 s.last_update = Some(Instant::now());
                             }
@@ -254,11 +273,18 @@ fn run_app(
     hostname: &str,
 ) -> anyhow::Result<()> {
     let mut active_tab = Tab::Links;
+    // Lines scrolled up from the bottom of the Logs tab -- 0 means
+    // "pinned to the newest line" (standard tail -f auto-follow: as
+    // long as this stays 0, `draw_logs_tab` always shows whatever's
+    // most recent, no extra "am I following" bit needed). Only
+    // meaningful on `Tab::Logs`; harmless if stale while another tab
+    // is active.
+    let mut log_scroll: usize = 0;
 
     loop {
         {
             let s = state.lock().unwrap();
-            terminal.draw(|f| draw(f, &s, socket_path, hostname, active_tab))?;
+            terminal.draw(|f| draw(f, &s, socket_path, hostname, active_tab, log_scroll))?;
         }
 
         if event::poll(Duration::from_millis(250))? {
@@ -278,6 +304,18 @@ fn run_app(
                     KeyCode::Char('1') => active_tab = Tab::Links,
                     KeyCode::Char('2') => active_tab = Tab::Daemon,
                     KeyCode::Char('3') => active_tab = Tab::Logs,
+                    KeyCode::Up if active_tab == Tab::Logs => {
+                        log_scroll = log_scroll.saturating_add(1);
+                    }
+                    KeyCode::Down if active_tab == Tab::Logs => {
+                        log_scroll = log_scroll.saturating_sub(1);
+                    }
+                    KeyCode::PageUp if active_tab == Tab::Logs => {
+                        log_scroll = log_scroll.saturating_add(10);
+                    }
+                    KeyCode::PageDown if active_tab == Tab::Logs => {
+                        log_scroll = log_scroll.saturating_sub(10);
+                    }
                     _ => {}
                 }
             }
@@ -285,7 +323,14 @@ fn run_app(
     }
 }
 
-fn draw(f: &mut Frame, state: &SharedState, socket_path: &Path, hostname: &str, active_tab: Tab) {
+fn draw(
+    f: &mut Frame,
+    state: &SharedState,
+    socket_path: &Path,
+    hostname: &str,
+    active_tab: Tab,
+    log_scroll: usize,
+) {
     let area = f.area();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -300,7 +345,7 @@ fn draw(f: &mut Frame, state: &SharedState, socket_path: &Path, hostname: &str, 
     match active_tab {
         Tab::Links => draw_links_tab(f, chunks[1], state),
         Tab::Daemon => draw_daemon_tab(f, chunks[1], state),
-        Tab::Logs => draw_logs_tab_stub(f, chunks[1]),
+        Tab::Logs => draw_logs_tab(f, chunks[1], state, log_scroll),
     }
     draw_footer(f, chunks[2], state, active_tab);
 }
@@ -613,14 +658,84 @@ fn draw_system_panel(f: &mut Frame, area: Rect, daemon: &DaemonSnapshot) {
     f.render_widget(Paragraph::new(lines), inner);
 }
 
-fn draw_logs_tab_stub(f: &mut Frame, area: Rect) {
-    let block = Block::default().borders(Borders::ALL).title(" Logs ");
-    let para = Paragraph::new(Line::from(Span::styled(
-        "live log tail is on the way",
-        Style::default().fg(COLOR_MUTED),
-    )))
-    .block(block);
-    f.render_widget(para, area);
+/// Renders a fixed window of `state.logs`, most-recent-at-bottom.
+/// Deliberately not a stateful `ratatui::widgets::ListState` scroll --
+/// `log_scroll` (lines back from the newest entry) is plain, and the
+/// visible slice is recomputed from it every frame, so "pinned to the
+/// bottom" falls out for free whenever `log_scroll == 0`: as new
+/// entries arrive, the end of the slice always tracks `state.logs`'s
+/// current length rather than a remembered index into a list that just
+/// grew underneath it.
+fn draw_logs_tab(f: &mut Frame, area: Rect, state: &SharedState, log_scroll: usize) {
+    let following = log_scroll == 0;
+    let title = if following {
+        " Logs ".to_string()
+    } else {
+        format!(" Logs (scrolled up {log_scroll} -- Down/PageDown to catch up) ")
+    };
+    let block = Block::default().borders(Borders::ALL).title(title);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let visible = inner.height as usize;
+    let total = state.logs.len();
+    let end = total.saturating_sub(log_scroll.min(total));
+    let start = end.saturating_sub(visible);
+
+    let items: Vec<ListItem> = state
+        .logs
+        .range(start..end)
+        .map(|entry| ListItem::new(log_entry_line(entry)))
+        .collect();
+    f.render_widget(List::new(items), inner);
+}
+
+fn log_entry_line(entry: &LogEntry) -> Line<'static> {
+    let level_style = match entry.level.as_str() {
+        "ERROR" => Style::default().fg(COLOR_BAD).add_modifier(Modifier::BOLD),
+        "WARN" => Style::default().fg(COLOR_WARN),
+        _ => Style::default(),
+    };
+    let target = entry.target.as_deref().unwrap_or("-");
+    Line::from(vec![
+        Span::styled(
+            fmt_log_timestamp(entry.unix_ts_ms),
+            Style::default().fg(COLOR_MUTED),
+        ),
+        Span::raw(" "),
+        Span::styled(format!("{:5}", entry.level), level_style),
+        Span::raw(" "),
+        Span::styled(
+            format!("{:24}", truncate(target, 24)),
+            Style::default().fg(COLOR_MUTED),
+        ),
+        Span::raw(" "),
+        Span::raw(entry.message.clone()),
+    ])
+}
+
+/// Truncates on char boundaries (module-path targets are always ASCII
+/// in practice, but this avoids ever panicking on a byte-index mid
+/// multi-byte character regardless) and appends an ellipsis when it
+/// actually cut something off.
+fn truncate(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max_chars.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
+/// `HH:MM:SS`, UTC (matching `tracing_subscriber::fmt`'s own default
+/// timestamp format for the primary log output) -- computed by hand
+/// rather than pulling in a `chrono`/`time` dependency just for this.
+fn fmt_log_timestamp(unix_ts_ms: u64) -> String {
+    let secs = unix_ts_ms / 1000;
+    let h = (secs / 3600) % 24;
+    let m = (secs / 60) % 60;
+    let s = secs % 60;
+    format!("{h:02}:{m:02}:{s:02}")
 }
 
 fn draw_footer(f: &mut Frame, area: Rect, state: &SharedState, active_tab: Tab) {
@@ -642,13 +757,14 @@ fn draw_footer(f: &mut Frame, area: Rect, state: &SharedState, active_tab: Tab) 
         )
     };
 
-    let _ = active_tab; // reserved for tab-specific footer hints added in later commits
+    let keys = match active_tab {
+        Tab::Logs => {
+            "q/Esc: quit   Tab/Shift+Tab or 1/2/3: switch tab   Up/Down/PgUp/PgDn: scroll   "
+        }
+        _ => "q/Esc: quit   Tab/Shift+Tab or 1/2/3: switch tab   ",
+    };
 
-    let line = Line::from(vec![
-        Span::raw("q/Esc: quit   Tab/Shift+Tab or 1/2/3: switch tab   "),
-        Span::raw("status: "),
-        status,
-    ]);
+    let line = Line::from(vec![Span::raw(keys), Span::raw("status: "), status]);
     f.render_widget(Paragraph::new(line), area);
 }
 
