@@ -135,7 +135,7 @@ chmod 0750 %{_sysconfdir}/mlvpn
 - Debian packaging only this release: fixes debian/mlvpn.postinst's
   restart-on-upgrade check always losing a race against debhelper's
   own generated postinst code and leaving mlvpnd stopped after every
-  .deb upgrade. This .rpm was never affected (%systemd_postun_with_restart
+  .deb upgrade. This .rpm was never affected (%%systemd_postun_with_restart
   already handled this correctly) -- version bumped only to keep both
   packages on the same release number.
 
