@@ -143,6 +143,14 @@ pub struct LinkStats {
     pub consecutive_hits: u32,
     pub bytes_since_last_sample: u64,
     pub last_throughput_sample: Instant,
+    /// Lifetime totals, unlike `bytes_since_last_sample` which resets
+    /// every ~1s into the `throughput_mbps` EWMA -- these only ever
+    /// grow, for `mlvpn-tui`'s "how much has actually crossed this
+    /// link" display.
+    pub tx_bytes: u64,
+    pub rx_bytes: u64,
+    pub tx_packets: u64,
+    pub rx_packets: u64,
 }
 
 impl LinkStats {
@@ -158,6 +166,10 @@ impl LinkStats {
             consecutive_hits: 0,
             bytes_since_last_sample: 0,
             last_throughput_sample: Instant::now(),
+            tx_bytes: 0,
+            rx_bytes: 0,
+            tx_packets: 0,
+            rx_packets: 0,
         }
     }
 
@@ -205,6 +217,23 @@ impl LinkStats {
             self.bytes_since_last_sample = 0;
             self.last_throughput_sample = Instant::now();
         }
+    }
+
+    /// Lifetime counter only -- unlike `record_bytes`, never feeds an
+    /// EWMA or resets. Called once per packet actually handed to the
+    /// socket, on the send side.
+    pub fn record_tx(&mut self, n: u64) {
+        self.tx_bytes += n;
+        self.tx_packets += 1;
+    }
+
+    /// Lifetime counter only, receive-side counterpart to `record_tx`.
+    /// Deliberately separate from `record_bytes` (which only feeds the
+    /// `throughput_mbps` EWMA and is rx-only today) so a future change
+    /// to one doesn't silently affect the other.
+    pub fn record_rx(&mut self, n: u64) {
+        self.rx_bytes += n;
+        self.rx_packets += 1;
     }
 }
 
@@ -430,6 +459,12 @@ pub struct Link {
     reconnect_lock: Arc<AsyncMutex<()>>,
     pub remote: Option<SocketAddr>,
     pub state: LinkState,
+    /// When `state` last changed, per `monitor::update_link_state` --
+    /// the single call site for every transition. Reset to
+    /// `Instant::now()` at bind time too, so a link that's never
+    /// transitioned still reports a sane (if slightly early) duration
+    /// rather than a stale zero/garbage value.
+    pub state_since: Instant,
     pub stats: LinkStats,
     /// The `bind_interface`'s actual kernel-reported MTU at bind time
     /// (via `SIOCGIFMTU`), if we could determine it. `None` on non-Linux
@@ -494,6 +529,7 @@ impl Link {
             reconnect_lock: Arc::new(AsyncMutex::new(())),
             remote,
             state: LinkState::Probing,
+            state_since: Instant::now(),
             stats: LinkStats::new(ewma_alpha),
             physical_mtu,
             admin_disabled: false,
@@ -944,6 +980,27 @@ mod tests {
         // doesn't, to exercise the ioctl-failure path without requiring
         // any particular network configuration in CI.
         assert_eq!(query_interface_mtu("mlvpn-test-nonexistent-if0"), None);
+    }
+
+    /// `record_tx`/`record_rx` are lifetime counters, independent of
+    /// `record_bytes`'s windowed EWMA feed -- this pins that they
+    /// accumulate correctly and never get reset by unrelated activity
+    /// on the same `LinkStats`, so a future refactor that touches one
+    /// doesn't silently fold it into the other.
+    #[test]
+    fn record_tx_and_rx_accumulate_independently_of_the_throughput_ewma() {
+        let mut stats = LinkStats::new(0.2);
+        stats.record_tx(100);
+        stats.record_tx(50);
+        stats.record_rx(300);
+        // Unrelated windowed call -- must not perturb the lifetime
+        // counters above.
+        stats.record_bytes(9000);
+
+        assert_eq!(stats.tx_bytes, 150);
+        assert_eq!(stats.tx_packets, 2);
+        assert_eq!(stats.rx_bytes, 300);
+        assert_eq!(stats.rx_packets, 1);
     }
 
     /// `socket_domain`/`pick_remote_addr`/`resolve_remote_addr` (feeding

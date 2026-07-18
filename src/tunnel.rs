@@ -1632,8 +1632,19 @@ async fn send_scheduled(
     .encode(&mut frame);
     frame.extend_from_slice(ciphertext);
 
-    if let Err(e) = socket.send_to(&frame, remote).await {
-        tracing::debug!(link = %link_name, error = %e, "send failed");
+    match socket.send_to(&frame, remote).await {
+        Ok(_) => {
+            // Re-lock just the winning link, only on success, purely to
+            // update the lifetime tx counters -- everything else in this
+            // function already released `link_mutex` before the `.await`
+            // above (see the comment on `chosen` for why), so this is one
+            // more short lock on one link, not a scan over every
+            // candidate that didn't win.
+            link_mutex.lock().await.stats.record_tx(frame_len as u64);
+        }
+        Err(e) => {
+            tracing::debug!(link = %link_name, error = %e, "send failed");
+        }
     }
 }
 
@@ -1690,7 +1701,8 @@ async fn send_redundant(links: &Links, session_id: u32, seq: u64, ciphertext: &[
 
     for (link_id, handle, remote, link_name) in targets {
         let socket = handle.current_socket().await;
-        let mut frame = Vec::with_capacity(HEADER_LEN + ciphertext.len());
+        let frame_len = HEADER_LEN + ciphertext.len();
+        let mut frame = Vec::with_capacity(frame_len);
         Header {
             ptype: PacketType::Data,
             link_id,
@@ -1699,8 +1711,20 @@ async fn send_redundant(links: &Links, session_id: u32, seq: u64, ciphertext: &[
         }
         .encode(&mut frame);
         frame.extend_from_slice(ciphertext);
-        if let Err(e) = socket.send_to(&frame, remote).await {
-            tracing::debug!(link = %link_name, error = %e, "redundant send failed");
+        match socket.send_to(&frame, remote).await {
+            Ok(_) => {
+                // `link_id` is always the live link's own Vec index (see
+                // main.rs's `Link::bind(id, ...)` call site: id is
+                // assigned from the config Vec's own position), so this
+                // reaches the real, live `Link`, not the `snapshot_links`
+                // copy `targets` was built from above.
+                if let Some(link_mutex) = links.get(link_id as usize) {
+                    link_mutex.lock().await.stats.record_tx(frame_len as u64);
+                }
+            }
+            Err(e) => {
+                tracing::debug!(link = %link_name, error = %e, "redundant send failed");
+            }
         }
     }
 }
@@ -2429,7 +2453,9 @@ async fn handle_incoming(
     match hdr.ptype {
         PacketType::Data => {
             if let Some(l) = links.get(idx) {
-                l.lock().await.stats.record_bytes(frame.len() as u64);
+                let mut link = l.lock().await;
+                link.stats.record_bytes(frame.len() as u64);
+                link.stats.record_rx(frame.len() as u64);
             }
 
             let ready = {

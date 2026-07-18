@@ -41,6 +41,19 @@ pub struct LinkSnapshot {
     /// This process's own SWRR weight for the link right now (0 when not
     /// Up); mirrors what the scheduler is actually doing with traffic.
     pub score: f64,
+    /// How long (ms) the link has held its *current* `state` --
+    /// meaningful for every state, not just "up": "down for 42s" is
+    /// exactly as useful as "up for 3h" (see `Link::state_since`'s doc
+    /// comment). Already-elapsed, like `peer_stats_age_ms` below, so
+    /// the viewer never has to do its own clock math.
+    pub state_duration_ms: u64,
+
+    /// Lifetime totals -- only ever grow, unlike the throughput EWMAs
+    /// above which are windowed. See `LinkStats::record_tx`/`record_rx`.
+    pub tx_bytes: u64,
+    pub rx_bytes: u64,
+    pub tx_packets: u64,
+    pub rx_packets: u64,
 
     // Locally measured -- this process's own view of the link.
     pub local_rtt_ms: Option<f64>,
@@ -119,6 +132,11 @@ mod tests {
             remote_addr: Some("198.51.100.1:51000".to_string()),
             state: "up".to_string(),
             score: 1.5,
+            state_duration_ms: 12_345,
+            tx_bytes: 1_000_000,
+            rx_bytes: 2_000_000,
+            tx_packets: 700,
+            rx_packets: 1400,
             local_rtt_ms: Some(42.0),
             local_jitter_ms: Some(1.5),
             local_loss_pct: Some(0.0),
@@ -139,6 +157,11 @@ mod tests {
         assert_eq!(back.local_active_bandwidth_mbps, Some(193.4));
         assert_eq!(back.local_consecutive_hits, 12);
         assert_eq!(back.local_consecutive_misses, 0);
+        assert_eq!(back.state_duration_ms, 12_345);
+        assert_eq!(back.tx_bytes, 1_000_000);
+        assert_eq!(back.rx_bytes, 2_000_000);
+        assert_eq!(back.tx_packets, 700);
+        assert_eq!(back.rx_packets, 1400);
     }
 
     /// `serve_commands` reads one line of JSON per connection and a CLI

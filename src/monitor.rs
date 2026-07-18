@@ -70,6 +70,7 @@ pub fn update_link_state(link: &mut Link, cfg: &SchedulerConfig) {
         other => other,
     };
     if was != link.state {
+        link.state_since = Instant::now();
         tracing::info!(
             link = %link.config.name,
             from = ?was,
