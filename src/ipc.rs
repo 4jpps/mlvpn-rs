@@ -47,6 +47,18 @@ pub struct LinkSnapshot {
     pub local_jitter_ms: Option<f64>,
     pub local_loss_pct: Option<f64>,
     pub local_throughput_mbps: Option<f64>,
+    /// Throughput from an explicit active bandwidth probe burst, as
+    /// opposed to `local_throughput_mbps` (real-traffic-derived).
+    /// `None` until the first probe completes, or forever if
+    /// `scheduler.active_bandwidth_probing` is off. See
+    /// `LinkStats::active_bandwidth_mbps`'s doc comment.
+    pub local_active_bandwidth_mbps: Option<f64>,
+    /// Consecutive successful/missed probes right now -- one of these
+    /// two is always 0 (a hit resets the miss streak and vice versa).
+    /// Shows a link's short-term probe health at a glance, e.g. "3
+    /// misses in a row" ahead of a state transition actually firing.
+    pub local_consecutive_hits: u32,
+    pub local_consecutive_misses: u32,
 
     // Peer-reported -- their view of the same physical link, received
     // over the wire via a `StatsShare` frame (see `protocol.rs`). `None`
@@ -93,6 +105,41 @@ pub struct CommandResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `LinkSnapshot` is rebuilt fresh every 500ms and re-serialized --
+    /// the cheapest place to catch a field getting dropped or renamed
+    /// between `control::build_snapshot` and `mlvpn-tui`'s `Snapshot`
+    /// deserialize is right here, not in an integration test.
+    #[test]
+    fn link_snapshot_round_trips_with_active_bandwidth_and_streak_fields() {
+        let snap = LinkSnapshot {
+            name: "lte0".to_string(),
+            bind_interface: "wwan0".to_string(),
+            local_port: 51000,
+            remote_addr: Some("198.51.100.1:51000".to_string()),
+            state: "up".to_string(),
+            score: 1.5,
+            local_rtt_ms: Some(42.0),
+            local_jitter_ms: Some(1.5),
+            local_loss_pct: Some(0.0),
+            local_throughput_mbps: Some(93.4),
+            local_active_bandwidth_mbps: Some(193.4),
+            local_consecutive_hits: 12,
+            local_consecutive_misses: 0,
+            peer_name: None,
+            peer_state: None,
+            peer_rtt_ms: None,
+            peer_jitter_ms: None,
+            peer_loss_pct: None,
+            peer_throughput_mbps: None,
+            peer_stats_age_ms: None,
+        };
+        let json = serde_json::to_string(&snap).expect("serialize");
+        let back: LinkSnapshot = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.local_active_bandwidth_mbps, Some(193.4));
+        assert_eq!(back.local_consecutive_hits, 12);
+        assert_eq!(back.local_consecutive_misses, 0);
+    }
 
     /// `serve_commands` reads one line of JSON per connection and a CLI
     /// client writes it -- if the shape drifts between a serialize on

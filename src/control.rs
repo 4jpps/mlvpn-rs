@@ -188,6 +188,9 @@ async fn build_snapshot(
                 local_jitter_ms: link.stats.jitter_ms.get(),
                 local_loss_pct: link.stats.loss_rate.get().map(|v| v * 100.0),
                 local_throughput_mbps: link.stats.throughput_mbps.get(),
+                local_active_bandwidth_mbps: link.stats.active_bandwidth_mbps.get(),
+                local_consecutive_hits: link.stats.consecutive_hits,
+                local_consecutive_misses: link.stats.consecutive_misses,
                 peer_name: peer.as_ref().map(|p| p.name.clone()),
                 peer_state: peer
                     .as_ref()
