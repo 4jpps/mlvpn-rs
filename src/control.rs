@@ -30,9 +30,10 @@
 //! or out, the same guarantee any other 0600 Unix socket or file
 //! provides.
 
-use crate::ipc::{Command, CommandResult, DaemonSnapshot, LinkSnapshot, Snapshot};
+use crate::ipc::{Command, CommandResult, DaemonSnapshot, LinkSnapshot, Snapshot, TunSnapshot};
 use crate::link::{self, LinkState, Links};
 use crate::peerstats::PeerStatsTable;
+use crate::sysfs_net;
 use crate::tunnel::{OutboundFrame, SessionMeta};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
@@ -258,6 +259,11 @@ async fn build_snapshot(
     let outbound_queue_capacity = outbound_tx.max_capacity();
     let outbound_queue_len = outbound_queue_capacity - outbound_tx.capacity();
 
+    // `tunnel_name` is the same string the TUN device itself was
+    // created with (see `main.rs::open_tun`), so no separate iface
+    // field needs threading through just for this sysfs lookup.
+    let tun_stats = sysfs_net::read_tun_stats(tunnel_name);
+
     Snapshot {
         tunnel_name: tunnel_name.to_string(),
         mode: mode.to_string(),
@@ -273,6 +279,15 @@ async fn build_snapshot(
             outbound_queue_len: outbound_queue_len as u64,
             outbound_queue_capacity: outbound_queue_capacity as u64,
             outbound_queue_dropped_total: outbound_dropped_total.load(Ordering::Relaxed),
+            tun: TunSnapshot {
+                iface: tunnel_name.to_string(),
+                rx_bytes: tun_stats.rx_bytes,
+                tx_bytes: tun_stats.tx_bytes,
+                rx_errors: tun_stats.rx_errors,
+                tx_errors: tun_stats.tx_errors,
+                rx_dropped: tun_stats.rx_dropped,
+                tx_dropped: tun_stats.tx_dropped,
+            },
         },
     }
 }

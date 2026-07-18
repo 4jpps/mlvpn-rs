@@ -63,6 +63,30 @@ pub struct DaemonSnapshot {
     /// comment for why this counter and its periodic log line are now
     /// independent of each other.
     pub outbound_queue_dropped_total: u64,
+    /// The TUN device's own kernel-tracked counters -- see
+    /// `sysfs_net::read_tun_stats`.
+    pub tun: TunSnapshot,
+}
+
+/// `/sys/class/net/<iface>/statistics/*` counters for the TUN device,
+/// independent of and a cross-check against the per-link
+/// `LinkSnapshot` tx/rx counters above (those only count bytes this
+/// process handed to a link's socket; these are the kernel's own view
+/// of the TUN device as a whole). Every counter is `Option` since the
+/// sysfs read can fail independently of everything else in a
+/// `Snapshot` (e.g. the interface was renamed or torn down).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TunSnapshot {
+    /// The TUN interface name this data was read for -- same string as
+    /// `Snapshot::tunnel_name`, included here too so a viewer never has
+    /// to cross-reference the two.
+    pub iface: String,
+    pub rx_bytes: Option<u64>,
+    pub tx_bytes: Option<u64>,
+    pub rx_errors: Option<u64>,
+    pub tx_errors: Option<u64>,
+    pub rx_dropped: Option<u64>,
+    pub tx_dropped: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -204,7 +228,7 @@ mod tests {
     /// `control::build_snapshot` and `mlvpn-tui`'s deserialize -- worth
     /// the same cheap round-trip coverage.
     #[test]
-    fn daemon_snapshot_round_trips_with_outbound_queue_fields() {
+    fn daemon_snapshot_round_trips_with_outbound_queue_and_tun_fields() {
         let snap = DaemonSnapshot {
             session_id: 42,
             session_uptime_ms: 5_000,
@@ -212,6 +236,15 @@ mod tests {
             outbound_queue_len: 12,
             outbound_queue_capacity: 256,
             outbound_queue_dropped_total: 7,
+            tun: TunSnapshot {
+                iface: "mlvpn0".to_string(),
+                rx_bytes: Some(1_000),
+                tx_bytes: Some(2_000),
+                rx_errors: Some(0),
+                tx_errors: None,
+                rx_dropped: Some(0),
+                tx_dropped: None,
+            },
         };
         let json = serde_json::to_string(&snap).expect("serialize");
         let back: DaemonSnapshot = serde_json::from_str(&json).expect("deserialize");
@@ -221,6 +254,9 @@ mod tests {
         assert_eq!(back.outbound_queue_len, 12);
         assert_eq!(back.outbound_queue_capacity, 256);
         assert_eq!(back.outbound_queue_dropped_total, 7);
+        assert_eq!(back.tun.iface, "mlvpn0");
+        assert_eq!(back.tun.rx_bytes, Some(1_000));
+        assert_eq!(back.tun.tx_errors, None);
     }
 
     /// `serve_commands` reads one line of JSON per connection and a CLI

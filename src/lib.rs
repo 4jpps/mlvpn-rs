@@ -22,4 +22,5 @@ pub mod peerstats;
 pub mod privilege;
 pub mod protocol;
 pub mod scheduler;
+pub mod sysfs_net;
 pub mod tunnel;
