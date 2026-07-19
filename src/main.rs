@@ -527,10 +527,11 @@ async fn run(cfg: Config, log_ring: Arc<LogRing>) -> anyhow::Result<()> {
     };
 
     // Off by default -- see `config::DiagnosticsConfig::auto_dump_enabled`'s
-    // doc comment. `dump_dir` defaults to `/run/mlvpn`, matching
-    // `control_socket`/`command_socket`'s own default-path convention
-    // above (and already writable under the shipped systemd unit's
-    // `RuntimeDirectory=mlvpn`).
+    // doc comment. `dump_dir` defaults to `/var/log/mlvpn`, matching
+    // where most other services on the system log to (and already
+    // writable under the shipped systemd unit's `LogsDirectory=mlvpn`
+    // -- unlike `/run/mlvpn`, this persists across restarts/reboots,
+    // which matters for evidence of a loss event caught automatically).
     let diagnostics_watch = if cfg.diagnostics.auto_dump_enabled {
         Some(tunnel::DiagnosticsWatchParams {
             loss_threshold_pct: cfg.diagnostics.loss_threshold_pct,
@@ -540,7 +541,7 @@ async fn run(cfg: Config, log_ring: Arc<LogRing>) -> anyhow::Result<()> {
                 .dump_dir
                 .clone()
                 .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("/run/mlvpn")),
+                .unwrap_or_else(|| PathBuf::from("/var/log/mlvpn")),
         })
     } else {
         None

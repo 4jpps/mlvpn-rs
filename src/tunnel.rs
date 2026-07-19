@@ -2857,6 +2857,21 @@ pub(crate) async fn send_throughput_test_stream(
     duration: Duration,
     mtu: usize,
 ) -> Result<()> {
+    // Logged here (not just on completion) specifically so a diagnostic
+    // dump's log tail (`diag.rs`, `mlvpnd diag-dump`) makes it obvious a
+    // deliberate self-test -- not organic traffic -- was saturating this
+    // link during whatever time window it covers. A self-test is a
+    // common, intentional way to *induce* real loss for testing, and
+    // without this line a loss event captured mid-test looks
+    // indistinguishable from an unexplained one.
+    tracing::info!(
+        link_id,
+        test_id,
+        %remote,
+        duration_secs = duration.as_secs(),
+        "throughput self-test stream starting"
+    );
+
     let payload_len = mtu.max(ThroughputTestDataPayload::HEADER_LEN);
     let deadline = Instant::now() + duration;
 
@@ -3277,6 +3292,18 @@ async fn handle_incoming(
                 state.test_id = Some(data.test_id);
                 state.first_seen = Instant::now();
                 state.bytes_seen = 0;
+                // Same reasoning as `send_throughput_test_stream`'s own
+                // start-of-stream log: marks the receive side's log tail
+                // too, so a diagnostic dump covering this window shows
+                // both "we started sending a self-test stream" and "we
+                // started receiving one," bracketing exactly when
+                // deliberate self-test load was on this link.
+                tracing::info!(
+                    link_id,
+                    test_id = data.test_id,
+                    %from,
+                    "throughput self-test stream receiving"
+                );
             }
             state.bytes_seen += frame.len() as u64;
             if data.done {

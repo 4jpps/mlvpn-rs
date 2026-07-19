@@ -151,13 +151,18 @@ transient loss event's evidence even if no one is watching
 auto_dump_enabled = true
 loss_threshold_pct = 10.0        # default
 cooldown_secs = 300              # minimum time between auto dumps, default
-dump_dir = "/run/mlvpn"          # default -- tmpfs, cleared on stop/reboot;
-                                  # point this at a persistent directory to
-                                  # keep dumps across restarts
+dump_dir = "/var/log/mlvpn"      # default -- matches where most other
+                                  # services log to, already writable
+                                  # under the shipped systemd unit's
+                                  # LogsDirectory=mlvpn
 ```
 
 Off by default -- this is the one setting that has the daemon write
-arbitrary files to disk on its own initiative. The automatic dump does
+arbitrary files to disk on its own initiative. A `dump_dir` other than
+the default needs its own `ReadWritePaths=` added to the systemd unit
+under the hardened `ProtectSystem=strict` (which makes everywhere else
+on the filesystem read-only) -- create the directory and `chown` it to
+the `mlvpn` user first. The automatic dump does
 *not* include the kernel-diagnostics section (that needs shelling out to
 external tools, which the daemon deliberately doesn't do on its own --
 see `diag.rs`'s module doc comment); run `mlvpnd diag-dump` by hand

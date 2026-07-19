@@ -111,11 +111,13 @@ enabled = true           # exposes live stats to `mlvpn-tui`; see README.md "Mon
                            # one setting that has the daemon write arbitrary
                            # files to disk on its own initiative. See
                            # docs/monitoring.md "Diagnostic dump".
-# loss_threshold_pct = 10.0  # default
-# cooldown_secs = 300        # minimum time between auto dumps, default
-# dump_dir = "/run/mlvpn"    # default -- tmpfs, cleared on stop/reboot;
-                           # point this at a persistent directory to keep
-                           # dumps across restarts
+# loss_threshold_pct = 10.0     # default
+# cooldown_secs = 300           # minimum time between auto dumps, default
+# dump_dir = "/var/log/mlvpn"   # default -- already writable under the
+                           # shipped systemd unit's LogsDirectory=mlvpn.
+                           # A different path needs its own
+                           # ReadWritePaths= added to the unit under
+                           # ProtectSystem=strict.
 
 # One [[links]] block per physical uplink to bond together. Traffic is
 # split across every link currently marked Up in proportion to its

@@ -748,6 +748,19 @@ async fn run_throughput_test_command(
 
     let mut results = Vec::with_capacity(targets.len());
     for (link_name, link_id, remote, socket) in targets {
+        // Marks operator intent in the log tail as early as possible --
+        // before either leg sends a single packet -- so a diagnostic
+        // dump (`mlvpnd diag-dump`) covering this window makes it clear
+        // a self-test was deliberately invoked against this link, not
+        // just that a stream happened to start (see
+        // `tunnel::send_throughput_test_stream`'s own start-of-stream
+        // log for the per-leg detail).
+        tracing::info!(
+            link = %link_name,
+            duration_secs,
+            bidirectional,
+            "starting throughput self-test"
+        );
         let upload_mbps = run_throughput_test_leg_upload(
             &socket,
             remote,

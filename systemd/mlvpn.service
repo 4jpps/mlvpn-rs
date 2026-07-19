@@ -83,6 +83,19 @@ SupplementaryGroups=
 RuntimeDirectory=mlvpn
 RuntimeDirectoryMode=0750
 
+# Creates /var/log/mlvpn (mode 0750, owned by mlvpn:mlvpn) before
+# ExecStart runs, persists across restarts/reboots (unlike
+# RuntimeDirectory= above, which is tmpfs) -- same mechanism, applied to
+# /var/log instead of /run, specifically so it's already a writable
+# exception under ProtectSystem=strict below without needing a manual
+# ReadWritePaths= entry. This is what makes the default
+# `[diagnostics] dump_dir` (`/var/log/mlvpn`, see config.rs) work out of
+# the box, consistent with where most other services on the system log
+# to. Pointing `dump_dir` at some *other* path instead needs its own
+# `ReadWritePaths=` added here.
+LogsDirectory=mlvpn
+LogsDirectoryMode=0750
+
 # --- Sandboxing (systemd hardening) ----------------------------------
 NoNewPrivileges=yes
 ProtectSystem=strict

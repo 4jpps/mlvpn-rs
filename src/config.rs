@@ -490,13 +490,15 @@ pub struct DiagnosticsConfig {
     /// repeating it every few seconds adds nothing.
     #[serde(default = "default_diag_cooldown_secs")]
     pub cooldown_secs: u64,
-    /// Directory dumps are written to. Defaults to `/run/mlvpn`, which
-    /// is already writable under the shipped systemd unit's
-    /// `RuntimeDirectory=mlvpn` (see systemd/mlvpn.service) -- note that
-    /// path is tmpfs and cleared on stop/reboot, so an operator relying
-    /// on auto-dumps surviving a restart should point this at a real
-    /// persistent directory instead (and grant it write access via
-    /// `ReadWritePaths=` if running under the hardened unit).
+    /// Directory dumps are written to. Defaults to `/var/log/mlvpn`,
+    /// matching where most other services on the system log to --
+    /// already writable under the shipped systemd unit's
+    /// `LogsDirectory=mlvpn` (see systemd/mlvpn.service), and persists
+    /// across restarts/reboots (unlike `/run/mlvpn`, tmpfs, which would
+    /// lose a captured dump before anyone could read it). Pointing this
+    /// at some *other* path needs its own `ReadWritePaths=` added to
+    /// the unit if running under the hardened default -- `ProtectSystem=strict`
+    /// makes everywhere else on the filesystem read-only.
     pub dump_dir: Option<String>,
 }
 
