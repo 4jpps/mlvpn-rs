@@ -10,6 +10,17 @@ For implementation detail beyond what's here, read the code -- most
 modules and non-trivial functions have doc comments explaining the
 design, and `ARCHITECTURE.md` covers the system as a whole.
 
+## [0.4.3] - 2026-07-19
+
+### Fixed
+
+- **A client-mode link whose `remote_addr` hostname resolves to both an `A` and `AAAA` record could get permanently stuck trying an unreachable address family** (e.g. IPv6 disabled on that link's own interface) while a second, unrelated link came up fine. The v0.4.1 happy-eyeballs fix (`link::pick_remote_addr` racing IPv4/IPv6 on the first handshake) only ever resolved the family for whichever *one* link's reply happened to win the tunnel's overall initial-handshake race across every configured link -- the peer deduplicates every copy of that broadcast by session id, so only the very first arrival across *all* targets ever gets a reply, and every other link's own primary-vs-alternate ambiguity was simply discarded unused (`commit_remote(None)`, unconditionally, for every link that didn't win). Added `tunnel::resolve_remaining_alternates`: right after the session is established, it races a real authenticated `Probe`/`ProbeReply` round trip between each remaining link's primary and alternate address (no second handshake needed) and commits whichever one actually answers, falling back to the original primary -- exactly the old behavior -- only if neither does.
+
+### Added
+
+- **On-demand diagnostic-dump capture**: `mlvpnd diag-dump --config ... [--output PATH]` (new `ipc::Command::DiagDump` on the command socket) captures every link's health, daemon/session state, outbound queue, TUN counters, system stats, and every log line currently held in the log ring into one text bundle, plus kernel-level UDP diagnostics (`nstat -az` filtered to UDP lines, `ss -lu -n -a`, `/proc/net/udp`) gathered by the CLI process itself rather than the sandboxed daemon -- meant to be attached to a bug report the moment loss is observed.
+- **Automatic loss-triggered dumps**: new `[diagnostics]` config section (`auto_dump_enabled`, off by default; `loss_threshold_pct`, default 10%; `cooldown_secs`, default 300; `dump_dir`, default `/run/mlvpn`). With it enabled, the daemon watches every link's own locally-measured loss and writes the daemon-visible half of the same dump to disk on its own the moment one crosses the threshold -- catching a transient loss event's evidence even if no one is watching `mlvpn-tui` at the time.
+
 ## [0.4.2] - 2026-07-19
 
 ### Fixed

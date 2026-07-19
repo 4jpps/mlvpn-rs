@@ -19,7 +19,7 @@
 %global debug_package %{nil}
 
 Name:           mlvpn
-Version:        0.4.2
+Version:        0.4.3
 Release:        1%{?dist}
 Summary:        Multi-link VPN bonding daemon
 
@@ -106,6 +106,31 @@ chmod 0750 %{_sysconfdir}/mlvpn
 %dir %attr(0750, root, mlvpn) %{_sysconfdir}/mlvpn
 
 %changelog
+* Sun Jul 19 2026 Jeff Parrish PC Services <www.jpps.us> - 0.4.3-1
+- Fix a client-mode link whose remote_addr hostname resolves to both
+  an A and AAAA record getting permanently stuck trying an
+  unreachable address family (e.g. IPv6 disabled on that link's own
+  interface) while a second, unrelated link came up fine. The
+  v0.4.1 happy-eyeballs fix only ever resolved the family for
+  whichever one link's reply happened to win the tunnel's overall
+  initial-handshake race; every other link's own primary-vs-
+  alternate ambiguity was simply discarded unused. Added
+  tunnel::resolve_remaining_alternates: right after the session is
+  established, it races a real authenticated probe between each
+  remaining link's primary and alternate address and commits
+  whichever one actually answers, instead of just dropping the
+  alternate outright.
+- Add an on-demand diagnostic-dump capture (mlvpnd diag-dump):
+  captures every link's health, daemon/session state, outbound
+  queue, TUN counters, system stats, and recent logs into one text
+  file, plus kernel-level UDP diagnostics (nstat, ss, /proc/net/udp)
+  gathered by the CLI itself -- meant to be attached to a bug
+  report. Also adds an automatic variant ([diagnostics]
+  auto_dump_enabled = true, off by default) that watches every
+  link's own locally-measured loss and writes the daemon-visible
+  half of the dump to disk on its own when a link crosses
+  loss_threshold_pct.
+
 * Sun Jul 19 2026 Jeff Parrish PC Services <www.jpps.us> - 0.4.2-1
 - Fix empty Daemon-tab System panel: drop ProcSubset=pid from the
   shipped systemd unit. That option hid all non-PID top-level /proc
