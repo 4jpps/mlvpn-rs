@@ -123,17 +123,29 @@ pub struct LinkStats {
     /// between consecutive RTT samples.
     pub jitter_ms: Ewma,
     pub loss_rate: Ewma,
-    /// Empirically observed throughput, updated from bytes actually
-    /// transferred rather than a synthetic bandwidth probe (cheaper, no
-    /// extra traffic, and reflects real contention on the link).
-    pub throughput_mbps: Ewma,
+    /// Empirically observed receive-side throughput, updated from bytes
+    /// actually received rather than a synthetic bandwidth probe
+    /// (cheaper, no extra traffic, and reflects real contention on the
+    /// link). A real-time rate (re-sampled every ~1s), not a cumulative
+    /// total -- see `rx_bytes` for that. `tx_throughput_mbps` below is
+    /// the send-side counterpart.
+    pub rx_throughput_mbps: Ewma,
+    /// Send-side counterpart to `rx_throughput_mbps` -- same windowed-EWMA
+    /// real-time-rate design, fed from bytes actually handed to the
+    /// socket rather than received. Kept as an entirely separate EWMA
+    /// (own window, own smoothing state) since a link's send and
+    /// receive rates are frequently asymmetric (e.g. most real traffic
+    /// flowing predominantly one direction) and conflating them would
+    /// average away exactly the asymmetry an operator watching live
+    /// bonding behavior wants to see.
+    pub tx_throughput_mbps: Ewma,
     /// Achieved throughput as measured by an explicit active bandwidth
     /// probe burst (`scheduler.active_bandwidth_probing`, opt-in and off
     /// by default -- see `tunnel::active_bandwidth_prober`), as opposed
-    /// to `throughput_mbps` above which only reflects bytes actually
+    /// to `rx_throughput_mbps` above which only reflects bytes actually
     /// carried by real traffic. `None` until the first probe completes,
     /// or forever if the feature is off. Deliberately a separate EWMA
-    /// rather than feeding into `throughput_mbps` itself: an active
+    /// rather than feeding into `rx_throughput_mbps` itself: an active
     /// probe's burst and a lull in real traffic measure different
     /// things, and conflating them would make either signal noisier.
     /// `monitor::score` prefers this one when it has a value.
@@ -141,12 +153,14 @@ pub struct LinkStats {
     last_rtt_ms: Option<f64>,
     pub consecutive_misses: u32,
     pub consecutive_hits: u32,
-    pub bytes_since_last_sample: u64,
-    pub last_throughput_sample: Instant,
-    /// Lifetime totals, unlike `bytes_since_last_sample` which resets
-    /// every ~1s into the `throughput_mbps` EWMA -- these only ever
-    /// grow, for `mlvpn-tui`'s "how much has actually crossed this
-    /// link" display.
+    pub rx_bytes_since_last_sample: u64,
+    pub last_rx_throughput_sample: Instant,
+    pub tx_bytes_since_last_sample: u64,
+    pub last_tx_throughput_sample: Instant,
+    /// Lifetime totals, unlike the `*_bytes_since_last_sample` fields
+    /// above (which reset every ~1s into their respective throughput
+    /// EWMA) -- these only ever grow, for `mlvpn-tui`'s "how much has
+    /// actually crossed this link" display.
     pub tx_bytes: u64,
     pub rx_bytes: u64,
     pub tx_packets: u64,
@@ -159,13 +173,16 @@ impl LinkStats {
             rtt_ms: Ewma::new(alpha),
             jitter_ms: Ewma::new(alpha),
             loss_rate: Ewma::new(alpha),
-            throughput_mbps: Ewma::new(alpha),
+            rx_throughput_mbps: Ewma::new(alpha),
+            tx_throughput_mbps: Ewma::new(alpha),
             active_bandwidth_mbps: Ewma::new(alpha),
             last_rtt_ms: None,
             consecutive_misses: 0,
             consecutive_hits: 0,
-            bytes_since_last_sample: 0,
-            last_throughput_sample: Instant::now(),
+            rx_bytes_since_last_sample: 0,
+            last_rx_throughput_sample: Instant::now(),
+            tx_bytes_since_last_sample: 0,
+            last_tx_throughput_sample: Instant::now(),
             tx_bytes: 0,
             rx_bytes: 0,
             tx_packets: 0,
@@ -173,19 +190,20 @@ impl LinkStats {
         }
     }
 
-    /// Apply a new smoothing factor to the four per-packet EWMAs at once
-    /// -- they're always tuned together (see
-    /// `scheduler.auto_tune_ewma_alpha`'s doc comment in `config.rs`),
-    /// so a caller never needs to reach into e.g. just `rtt_ms` alone.
-    /// Deliberately does *not* touch `active_bandwidth_mbps`: that EWMA
-    /// is fed by a probe every few minutes rather than every packet, so
-    /// the fast-reacting/slow-reacting tradeoff `auto_tune_ewma_alpha`
-    /// makes for the others doesn't apply to it in the same way.
+    /// Apply a new smoothing factor to the per-packet EWMAs that
+    /// `scheduler.auto_tune_ewma_alpha` tunes together (see its own doc
+    /// comment in `config.rs`), so a caller never needs to reach into
+    /// e.g. just `rtt_ms` alone. Deliberately does *not* touch
+    /// `active_bandwidth_mbps`: that EWMA is fed by a probe every few
+    /// minutes rather than every packet, so the fast-reacting/
+    /// slow-reacting tradeoff `auto_tune_ewma_alpha` makes for the
+    /// others doesn't apply to it in the same way.
     pub fn set_alpha(&mut self, alpha: f64) {
         self.rtt_ms.set_alpha(alpha);
         self.jitter_ms.set_alpha(alpha);
         self.loss_rate.set_alpha(alpha);
-        self.throughput_mbps.set_alpha(alpha);
+        self.rx_throughput_mbps.set_alpha(alpha);
+        self.tx_throughput_mbps.set_alpha(alpha);
     }
 
     /// Record a successful probe round trip.
@@ -207,33 +225,41 @@ impl LinkStats {
         self.consecutive_hits = 0;
     }
 
-    pub fn record_bytes(&mut self, n: u64) {
-        self.bytes_since_last_sample += n;
-        let elapsed = self.last_throughput_sample.elapsed();
-        if elapsed.as_secs_f64() >= 1.0 {
-            let mbps =
-                (self.bytes_since_last_sample as f64 * 8.0) / elapsed.as_secs_f64() / 1_000_000.0;
-            self.throughput_mbps.update(mbps);
-            self.bytes_since_last_sample = 0;
-            self.last_throughput_sample = Instant::now();
-        }
-    }
-
-    /// Lifetime counter only -- unlike `record_bytes`, never feeds an
-    /// EWMA or resets. Called once per packet actually handed to the
-    /// socket, on the send side.
+    /// Lifetime counter (`tx_bytes`/`tx_packets`) *and* the windowed
+    /// `tx_throughput_mbps` real-time-rate EWMA, both from one call --
+    /// call once per packet actually handed to the socket, on the send
+    /// side.
     pub fn record_tx(&mut self, n: u64) {
         self.tx_bytes += n;
         self.tx_packets += 1;
+        self.tx_bytes_since_last_sample += n;
+        let elapsed = self.last_tx_throughput_sample.elapsed();
+        if elapsed.as_secs_f64() >= 1.0 {
+            let mbps = (self.tx_bytes_since_last_sample as f64 * 8.0)
+                / elapsed.as_secs_f64()
+                / 1_000_000.0;
+            self.tx_throughput_mbps.update(mbps);
+            self.tx_bytes_since_last_sample = 0;
+            self.last_tx_throughput_sample = Instant::now();
+        }
     }
 
-    /// Lifetime counter only, receive-side counterpart to `record_tx`.
-    /// Deliberately separate from `record_bytes` (which only feeds the
-    /// `throughput_mbps` EWMA and is rx-only today) so a future change
-    /// to one doesn't silently affect the other.
+    /// Receive-side counterpart to `record_tx`: lifetime counter
+    /// (`rx_bytes`/`rx_packets`) and the windowed `rx_throughput_mbps`
+    /// real-time-rate EWMA, both from one call.
     pub fn record_rx(&mut self, n: u64) {
         self.rx_bytes += n;
         self.rx_packets += 1;
+        self.rx_bytes_since_last_sample += n;
+        let elapsed = self.last_rx_throughput_sample.elapsed();
+        if elapsed.as_secs_f64() >= 1.0 {
+            let mbps = (self.rx_bytes_since_last_sample as f64 * 8.0)
+                / elapsed.as_secs_f64()
+                / 1_000_000.0;
+            self.rx_throughput_mbps.update(mbps);
+            self.rx_bytes_since_last_sample = 0;
+            self.last_rx_throughput_sample = Instant::now();
+        }
     }
 }
 
@@ -419,7 +445,7 @@ pub struct LinkScore {
     pub rtt_ms: Option<f64>,
     pub jitter_ms: Option<f64>,
     pub loss_rate: Option<f64>,
-    pub throughput_mbps: Option<f64>,
+    pub rx_throughput_mbps: Option<f64>,
     pub active_bandwidth_mbps: Option<f64>,
     pub consecutive_misses: u32,
 }
@@ -443,7 +469,7 @@ pub async fn snapshot_scores(links: &Links) -> Vec<LinkScore> {
             rtt_ms: guard.stats.rtt_ms.get(),
             jitter_ms: guard.stats.jitter_ms.get(),
             loss_rate: guard.stats.loss_rate.get(),
-            throughput_mbps: guard.stats.throughput_mbps.get(),
+            rx_throughput_mbps: guard.stats.rx_throughput_mbps.get(),
             active_bandwidth_mbps: guard.stats.active_bandwidth_mbps.get(),
             consecutive_misses: guard.stats.consecutive_misses,
         });
@@ -1092,20 +1118,17 @@ mod tests {
         assert_eq!(query_interface_mtu("mlvpn-test-nonexistent-if0"), None);
     }
 
-    /// `record_tx`/`record_rx` are lifetime counters, independent of
-    /// `record_bytes`'s windowed EWMA feed -- this pins that they
-    /// accumulate correctly and never get reset by unrelated activity
-    /// on the same `LinkStats`, so a future refactor that touches one
-    /// doesn't silently fold it into the other.
+    /// `record_tx`/`record_rx` each update a lifetime counter *and* feed
+    /// their respective windowed throughput EWMA from one call -- this
+    /// pins that repeated calls accumulate the lifetime counters
+    /// correctly, and that the tx/rx sides stay independent of each
+    /// other (calling one doesn't perturb the other's counters).
     #[test]
-    fn record_tx_and_rx_accumulate_independently_of_the_throughput_ewma() {
+    fn record_tx_and_rx_accumulate_lifetime_counters_independently() {
         let mut stats = LinkStats::new(0.2);
         stats.record_tx(100);
         stats.record_tx(50);
         stats.record_rx(300);
-        // Unrelated windowed call -- must not perturb the lifetime
-        // counters above.
-        stats.record_bytes(9000);
 
         assert_eq!(stats.tx_bytes, 150);
         assert_eq!(stats.tx_packets, 2);
@@ -1365,17 +1388,19 @@ mod tests {
     }
 
     #[test]
-    fn link_stats_set_alpha_applies_to_all_four_ewmas() {
+    fn link_stats_set_alpha_applies_to_all_five_ewmas() {
         let mut stats = LinkStats::new(0.5);
         stats.rtt_ms.update(100.0);
         stats.jitter_ms.update(10.0);
         stats.loss_rate.update(0.0);
-        stats.throughput_mbps.update(50.0);
+        stats.rx_throughput_mbps.update(50.0);
+        stats.tx_throughput_mbps.update(20.0);
         stats.set_alpha(0.1);
         // Same probe as above: a 0.1 alpha blending toward 0 from a
         // prior value of X gives 0.9 * X.
         assert!((stats.rtt_ms.update(0.0) - 90.0).abs() < 1e-9);
         assert!((stats.jitter_ms.update(0.0) - 9.0).abs() < 1e-9);
-        assert!((stats.throughput_mbps.update(0.0) - 45.0).abs() < 1e-9);
+        assert!((stats.rx_throughput_mbps.update(0.0) - 45.0).abs() < 1e-9);
+        assert!((stats.tx_throughput_mbps.update(0.0) - 18.0).abs() < 1e-9);
     }
 }

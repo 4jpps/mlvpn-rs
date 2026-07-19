@@ -163,9 +163,19 @@ pub struct LinkSnapshot {
     pub local_rtt_ms: Option<f64>,
     pub local_jitter_ms: Option<f64>,
     pub local_loss_pct: Option<f64>,
-    pub local_throughput_mbps: Option<f64>,
+    /// Real-time (windowed-EWMA, re-sampled every ~1s -- not cumulative,
+    /// see `tx_bytes`/`rx_bytes` above for that) receive-side throughput,
+    /// from bytes actually received on this link. `local_tx_throughput_mbps`
+    /// below is the send-side counterpart; the two are tracked
+    /// independently since a link's send/receive rates are often
+    /// asymmetric. Named `local_rx_throughput_mbps` (not just
+    /// `local_throughput_mbps`, its name before both directions were
+    /// exposed) so its rx-only-ness is explicit in the wire schema
+    /// itself, not just in a doc comment.
+    pub local_rx_throughput_mbps: Option<f64>,
+    pub local_tx_throughput_mbps: Option<f64>,
     /// Throughput from an explicit active bandwidth probe burst, as
-    /// opposed to `local_throughput_mbps` (real-traffic-derived).
+    /// opposed to `local_rx_throughput_mbps` (real-traffic-derived).
     /// `None` until the first probe completes, or forever if
     /// `scheduler.active_bandwidth_probing` is off. See
     /// `LinkStats::active_bandwidth_mbps`'s doc comment.
@@ -244,7 +254,8 @@ mod tests {
             local_rtt_ms: Some(42.0),
             local_jitter_ms: Some(1.5),
             local_loss_pct: Some(0.0),
-            local_throughput_mbps: Some(93.4),
+            local_rx_throughput_mbps: Some(93.4),
+            local_tx_throughput_mbps: Some(12.1),
             local_active_bandwidth_mbps: Some(193.4),
             local_consecutive_hits: 12,
             local_consecutive_misses: 0,
@@ -258,6 +269,8 @@ mod tests {
         };
         let json = serde_json::to_string(&snap).expect("serialize");
         let back: LinkSnapshot = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.local_rx_throughput_mbps, Some(93.4));
+        assert_eq!(back.local_tx_throughput_mbps, Some(12.1));
         assert_eq!(back.local_active_bandwidth_mbps, Some(193.4));
         assert_eq!(back.local_consecutive_hits, 12);
         assert_eq!(back.local_consecutive_misses, 0);

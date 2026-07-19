@@ -108,7 +108,7 @@ pub fn score(link: &Link) -> f64 {
         .stats
         .active_bandwidth_mbps
         .get()
-        .or_else(|| link.stats.throughput_mbps.get())
+        .or_else(|| link.stats.rx_throughput_mbps.get())
         .unwrap_or(1.0)
         .max(0.1)
         .min(link.config.bandwidth_cap_mbps.unwrap_or(f64::MAX));

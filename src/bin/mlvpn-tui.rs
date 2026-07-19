@@ -647,7 +647,7 @@ fn draw_links_tab(f: &mut Frame, area: Rect, state: &SharedState) {
         Cell::from("Up For"),
         Cell::from("Peer Addr"),
         Cell::from("Score"),
-        Cell::from("Tx / Rx"),
+        Cell::from("Tx / Rx (total)"),
         Cell::from("Local (this side's own measurement)"),
         Cell::from("Peer (their self-reported measurement)"),
     ])
@@ -670,25 +670,55 @@ fn draw_links_tab(f: &mut Frame, area: Rect, state: &SharedState) {
         Constraint::Percentage(20),
     ];
 
+    let title = match &state.snapshot {
+        Some(snap) => {
+            let (agg_rx, agg_tx) = aggregate_throughput(&snap.links);
+            format!(" Links -- tunnel aggregate: rx {agg_rx:.1} Mbps / tx {agg_tx:.1} Mbps (up links only) ")
+        }
+        None => " Links ".to_string(),
+    };
+
     let table = Table::new(rows, widths)
         .header(header)
-        .block(Block::default().borders(Borders::ALL).title(" Links "))
+        .block(Block::default().borders(Borders::ALL).title(title))
         .column_spacing(1);
 
     f.render_widget(table, area);
+}
+
+/// Sums each up link's real-time local rx/tx throughput EWMAs --
+/// `local_rx_throughput_mbps`/`local_tx_throughput_mbps`, both
+/// windowed real-time rates re-sampled every ~1s, not the cumulative
+/// `tx_bytes`/`rx_bytes` totals -- into one "how much is the whole
+/// bonded tunnel actually moving right now" figure. Computed client-side
+/// from data every snapshot already carries rather than adding a
+/// daemon-side aggregate field, since mlvpn-tui already has everything
+/// it needs. Down/probing links are excluded: a link that isn't
+/// currently carrying scheduled traffic shouldn't count toward "what
+/// the tunnel is doing right now" even if its EWMA hasn't yet decayed
+/// to zero.
+fn aggregate_throughput(links: &[LinkSnapshot]) -> (f64, f64) {
+    links
+        .iter()
+        .filter(|l| l.state == "up")
+        .fold((0.0, 0.0), |(rx, tx), l| {
+            (
+                rx + l.local_rx_throughput_mbps.unwrap_or(0.0),
+                tx + l.local_tx_throughput_mbps.unwrap_or(0.0),
+            )
+        })
 }
 
 fn link_row(l: &LinkSnapshot) -> Row<'static> {
     let state_style = state_style(&l.state);
     let peer_stale = l.peer_stats_age_ms.map(|a| a > 5000).unwrap_or(true);
 
-    let local_line = measurement_line(
+    let local_line = local_measurement_line(
         l.local_rtt_ms,
         l.local_jitter_ms,
         l.local_loss_pct,
-        l.local_throughput_mbps,
-        "",
-        false,
+        l.local_rx_throughput_mbps,
+        l.local_tx_throughput_mbps,
     );
 
     let peer_line = if l.peer_rtt_ms.is_none() && l.peer_name.is_none() {
@@ -733,6 +763,12 @@ fn link_row(l: &LinkSnapshot) -> Row<'static> {
 /// uniformly instead -- used for stale peer-reported data, where
 /// individual-field coloring would overstate confidence in numbers
 /// that might be well out of date.
+///
+/// Peer-only: the wire protocol's `StatsShare` frame (`protocol.rs`)
+/// carries a single receive-side throughput figure, not a separate
+/// tx/rx pair the way this process's own `LinkSnapshot` fields do --
+/// see `local_measurement_line` below for the local (both-directions)
+/// counterpart.
 fn measurement_line(
     rtt_ms: Option<f64>,
     jitter_ms: Option<f64>,
@@ -754,6 +790,36 @@ fn measurement_line(
         ),
         Span::styled(fmt_pct(loss_pct), loss_span_style),
         Span::styled(format!("  {}{suffix}", fmt_mbps(throughput_mbps)), base),
+    ])
+}
+
+/// Local counterpart to `measurement_line`, showing both directions'
+/// real-time throughput (`local_rx_throughput_mbps`/
+/// `local_tx_throughput_mbps` -- windowed EWMAs re-sampled every ~1s,
+/// not the cumulative `Tx / Rx (total)` column) side by side, since a
+/// link's send/receive rates are often meaningfully asymmetric and this
+/// process always has both. No `muted`/`suffix` parameters -- unlike
+/// peer data, local measurements are never stale (there's no wire hop
+/// for them to arrive late over) and there's no "age" to report.
+fn local_measurement_line(
+    rtt_ms: Option<f64>,
+    jitter_ms: Option<f64>,
+    loss_pct: Option<f64>,
+    rx_mbps: Option<f64>,
+    tx_mbps: Option<f64>,
+) -> Line<'static> {
+    Line::from(vec![
+        Span::raw(format!(
+            "rtt {}  jit {}  loss ",
+            fmt_ms(rtt_ms),
+            fmt_ms(jitter_ms)
+        )),
+        Span::styled(fmt_pct(loss_pct), loss_style(loss_pct)),
+        Span::raw(format!(
+            "  rx {}  tx {}",
+            fmt_mbps(rx_mbps),
+            fmt_mbps(tx_mbps)
+        )),
     ])
 }
 

@@ -2646,7 +2646,6 @@ async fn handle_incoming(
         PacketType::Data => {
             if let Some(l) = links.get(idx) {
                 let mut link = l.lock().await;
-                link.stats.record_bytes(frame.len() as u64);
                 link.stats.record_rx(frame.len() as u64);
             }
 
@@ -2967,7 +2966,7 @@ async fn send_stats_share(
             rtt_ms: link.stats.rtt_ms.get().unwrap_or(0.0) as f32,
             jitter_ms: link.stats.jitter_ms.get().unwrap_or(0.0) as f32,
             loss_pct: (link.stats.loss_rate.get().unwrap_or(0.0) * 100.0) as f32,
-            throughput_mbps: link.stats.throughput_mbps.get().unwrap_or(0.0) as f32,
+            throughput_mbps: link.stats.rx_throughput_mbps.get().unwrap_or(0.0) as f32,
             state: link.state.to_wire(),
         };
         (remote, payload)
