@@ -2382,6 +2382,28 @@ const ACTIVE_BANDWIDTH_PROBE_MAX_PACKETS: u32 = u16::MAX as u32;
 /// redundant copies of an already-completed burst's final packet a
 /// harmless no-op rather than a spurious second (near-instant, wildly
 /// inflated) result.
+///
+/// Every packet in a burst is encrypted under a single `session.lock()`
+/// acquisition, not one lock acquisition per packet -- this used to be
+/// a real, if subtle, measurement bug, not just a latency concern:
+/// `tun_reader` locks this exact same `SessionState` mutex for every
+/// single outgoing Data packet, so under real concurrent traffic (the
+/// same condition this probe exists to measure the throughput of), a
+/// per-packet lock acquisition here got interleaved with that Data
+/// traffic's own encrypts and had to wait its turn, unpredictably
+/// stretching out how long it took the *sender* to get the whole burst
+/// out the door. `compute_achieved_mbps` (receiver side) has no way to
+/// tell that apart from genuine network transit time -- it just clocks
+/// from the burst's first packet arriving to its last -- so that
+/// sender-side dispatch delay directly deflated the reported
+/// `achieved_mbps`, worse the busier the link actually was. Holding the
+/// lock for the whole burst means every packet's encrypt happens
+/// back-to-back as one atomic unit, immune to that interleaving, at the
+/// cost of briefly blocking `tun_reader`'s own encrypts for that same
+/// short window -- bounded (`active_bandwidth_probe_packets` is capped
+/// at 100) and infrequent (`active_bandwidth_probe_interval_secs` has a
+/// 30s floor), a clearly worthwhile trade for a probe whose entire
+/// purpose is producing an accurate number.
 async fn active_bandwidth_prober(
     idx: usize,
     links: Links,
@@ -2422,35 +2444,47 @@ async fn active_bandwidth_prober(
         probe_id = probe_id.wrapping_add(1);
         let socket = handle.current_socket().await;
         // Two extra copies of the final packet, after the main
-        // 0..packet_count loop below -- see this function's doc
-        // comment for why the last packet specifically gets this
-        // redundancy. `packets_to_send` yields every index once, then
-        // the last index twice more.
-        let packets_to_send = (0..packet_count).chain(std::iter::repeat_n(packet_count - 1, 2));
-        for packet_index in packets_to_send {
-            let burst_payload = BandwidthProbeBurstPayload {
-                probe_id,
-                packet_index,
-                total_packets: packet_count,
+        // 0..packet_count run -- see this function's doc comment for
+        // why the last packet specifically gets this redundancy.
+        // `packet_indices` holds every index once, then the last index
+        // twice more; collected up front (small, at most
+        // `ACTIVE_BANDWIDTH_PROBE_MAX_PACKETS + 2`) so it can be walked
+        // twice below -- once to encrypt, once to send.
+        let packet_indices: Vec<u16> = (0..packet_count)
+            .chain(std::iter::repeat_n(packet_count.saturating_sub(1), 2))
+            .collect();
+
+        // See this function's doc comment for why every packet in the
+        // burst is encrypted under one lock acquisition rather than one
+        // per packet.
+        let mut frames: Vec<Vec<u8>> = Vec::with_capacity(packet_indices.len());
+        {
+            let s = session.lock().await;
+            for &packet_index in &packet_indices {
+                let burst_payload = BandwidthProbeBurstPayload {
+                    probe_id,
+                    packet_index,
+                    total_packets: packet_count,
+                }
+                .encode_padded(payload_len);
+                let Ok((session_id, seq, ct)) = s.encrypt(&burst_payload) else {
+                    break;
+                };
+                let mut out = Vec::with_capacity(HEADER_LEN + ct.len());
+                Header {
+                    ptype: PacketType::BandwidthProbeBurst,
+                    link_id,
+                    session_id,
+                    seq,
+                }
+                .encode(&mut out);
+                out.extend_from_slice(&ct);
+                frames.push(out);
             }
-            .encode_padded(payload_len);
-            let encrypted = {
-                let s = session.lock().await;
-                s.encrypt(&burst_payload)
-            };
-            let Ok((session_id, seq, ct)) = encrypted else {
-                break;
-            };
-            let mut out = Vec::with_capacity(HEADER_LEN + ct.len());
-            Header {
-                ptype: PacketType::BandwidthProbeBurst,
-                link_id,
-                session_id,
-                seq,
-            }
-            .encode(&mut out);
-            out.extend_from_slice(&ct);
-            if socket.send_to(&out, remote).await.is_err() {
+        }
+
+        for frame in &frames {
+            if socket.send_to(frame, remote).await.is_err() {
                 // Best-effort, as documented above: abandon this burst
                 // attempt and let the next scheduled tick try again.
                 break;
