@@ -92,20 +92,50 @@ impl Default for LogRing {
     }
 }
 
-/// Extracts just an event's formatted `message` field, the same field
-/// `tracing_subscriber::fmt` renders as the free-text portion of its
-/// own output -- ignoring span context and other structured fields,
-/// since the Logs tab is meant as a compact tail, not a full
-/// structured-log viewer.
+/// Extracts an event's formatted `message` field plus every other
+/// structured field it carries (e.g. `error = %e`, `link = %name`) --
+/// this codebase's own logging conventions routinely put the actually
+/// useful diagnostic detail in those fields rather than the free-text
+/// message (see any `tracing::warn!`/`error!` call with named
+/// arguments), so dropping them here would mean the Logs tab and
+/// `mlvpnd diag-dump`'s log section -- the two consumers of this ring,
+/// and precisely the tools meant to help diagnose a problem after the
+/// fact -- show a line like "failed to write diagnostic dump" with no
+/// way to tell *why* or *where*. Previously only `message` was kept;
+/// found the hard way when a real `diagnostics_watch_loop` write
+/// failure's `error`/`dir` fields were silently missing from a dump
+/// meant to explain exactly that failure.
 #[derive(Default)]
-struct MessageVisitor(String);
+struct MessageVisitor {
+    message: String,
+    /// Every other field, in the order `tracing` visits them --
+    /// appended after `message` as `" key=value"` pairs, the same
+    /// `key=value` shape `tracing_subscriber::fmt`'s own default
+    /// formatter uses for its structured fields.
+    fields: Vec<(&'static str, String)>,
+}
 
 impl Visit for MessageVisitor {
     fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
         if field.name() == "message" {
             use std::fmt::Write;
-            let _ = write!(self.0, "{value:?}");
+            let _ = write!(self.message, "{value:?}");
+        } else {
+            self.fields.push((field.name(), format!("{value:?}")));
         }
+    }
+}
+
+impl MessageVisitor {
+    /// Renders `message` followed by every captured field as
+    /// `key=value`, e.g. `"failed to write diagnostic dump error=Permission denied (os error 13) dir=/var/log/mlvpn"`.
+    fn into_rendered(self) -> String {
+        let mut out = self.message;
+        for (key, value) in &self.fields {
+            use std::fmt::Write;
+            let _ = write!(out, " {key}={value}");
+        }
+        out
     }
 }
 
@@ -141,7 +171,7 @@ impl<S: Subscriber> Layer<S> for LogRingLayer {
         self.ring.push(
             event.metadata().level().as_str(),
             Some(event.metadata().target().to_string()),
-            visitor.0,
+            visitor.into_rendered(),
         );
     }
 }
@@ -202,10 +232,11 @@ mod tests {
 
     /// Drives a real `tracing::Event` through `LogRingLayer` (rather
     /// than calling `LogRing::push` directly, as the tests above do) to
-    /// verify the `Visit` implementation actually extracts a message
-    /// and the level filter behaves as documented.
+    /// verify the `Visit` implementation actually extracts a message,
+    /// appends its other field(s), and the level filter behaves as
+    /// documented.
     #[test]
-    fn a_real_tracing_event_reaches_the_ring_with_its_message_and_level() {
+    fn a_real_tracing_event_reaches_the_ring_with_its_message_fields_and_level() {
         let ring = Arc::new(LogRing::new());
         let layer = LogRingLayer::new(ring.clone());
         let subscriber = tracing_subscriber::registry().with(layer);
@@ -216,6 +247,42 @@ mod tests {
         let entries = ring.entries_since(0);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].level, "INFO");
-        assert_eq!(entries[0].message, "hello from a test event");
+        assert_eq!(entries[0].message, "hello from a test event some_field=42");
+    }
+
+    /// Real-world regression case: a `tracing::warn!` whose actually
+    /// useful detail lives entirely in named fields (this codebase's own
+    /// convention -- `error = %e` alongside a short static message) used
+    /// to reach the ring as just the bare message, discarding exactly
+    /// the information needed to diagnose the warning after the fact.
+    /// Found via `diagnostics_watch_loop`'s "loss threshold exceeded but
+    /// failed to write diagnostic dump" warning showing up in a real
+    /// `mlvpnd diag-dump` output with no `error`/`dir` detail at all.
+    #[test]
+    fn multiple_named_fields_are_all_preserved_in_declaration_order() {
+        let ring = Arc::new(LogRing::new());
+        let layer = LogRingLayer::new(ring.clone());
+        let subscriber = tracing_subscriber::registry().with(layer);
+        // `%`-prefixed, matching this codebase's own convention for
+        // exactly this kind of warning (e.g.
+        // `control::diagnostics_watch_loop`'s `error = %e, dir = %..`) --
+        // renders via each value's `Display` impl, not `Debug`, so a
+        // string value comes through unquoted.
+        let error_detail = "Permission denied (os error 13)";
+        let dir_detail = "/var/log/mlvpn";
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::warn!(
+                error = %error_detail,
+                dir = %dir_detail,
+                "loss threshold exceeded but failed to write diagnostic dump"
+            );
+        });
+        let entries = ring.entries_since(0);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].message,
+            "loss threshold exceeded but failed to write diagnostic dump \
+             error=Permission denied (os error 13) dir=/var/log/mlvpn"
+        );
     }
 }
