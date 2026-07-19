@@ -45,10 +45,13 @@ reorder-window auto-tuning decision, (via real `tc tbf` rate shaping) a
 real active-bandwidth-probing discovery, real daemon/host health
 (session id/rekey count, outbound queue, TUN interface sysfs counters,
 `/proc` system stats, and the log-ring delta streaming `mlvpn-tui`'s
-Logs tab depends on), and (via the real `mlvpnd self-test` CLI, both
+Logs tab depends on), (via the real `mlvpnd self-test` CLI, both
 unidirectional and bidirectional) a real on-demand throughput
 self-test, including the bidirectional case's autonomous
-peer-triggered reverse stream. This needs root
+peer-triggered reverse stream, and (via the real `mlvpnd diag-dump`
+CLI, plus a real `tc netem loss` injection for the automatic
+loss-threshold watcher) a real diagnostic-dump capture, both manual
+and automatic. This needs root
 (namespace/veth creation, `mlvpnd`'s own `CAP_NET_ADMIN`/`CAP_NET_RAW`
 setup), `iproute2`'s `ip` on `PATH`, and the `mlvpn` system user/group
 (created automatically if missing, mirroring
@@ -70,6 +73,7 @@ sudo env "PATH=$PATH" HOME="$HOME" cargo test --release --locked --test veth_ewm
 sudo env "PATH=$PATH" HOME="$HOME" cargo test --release --locked --test veth_active_bandwidth_probing -- --ignored --nocapture
 sudo env "PATH=$PATH" HOME="$HOME" cargo test --release --locked --test veth_daemon_health -- --ignored --nocapture
 sudo env "PATH=$PATH" HOME="$HOME" cargo test --release --locked --test veth_throughput_selftest -- --ignored --nocapture
+sudo env "PATH=$PATH" HOME="$HOME" cargo test --release --locked --test veth_diag_dump -- --ignored --nocapture
 ```
 
 `veth_reorder_tuning` and `veth_active_bandwidth_probing` additionally

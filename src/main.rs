@@ -95,6 +95,23 @@ enum Command {
         #[arg(short, long)]
         bidirectional: bool,
     },
+    /// Capture a diagnostic dump for a running mlvpnd: every link's
+    /// health, daemon/session state, and recent log lines (via the
+    /// command socket, same `[command] enabled = true` requirement as
+    /// `set-link`/`self-test`), plus -- run from this CLI process
+    /// directly, not the sandboxed daemon -- kernel-level UDP
+    /// diagnostics (`nstat -az`, `ss -lu -n -a`, `/proc/net/udp`).
+    /// Meant to be run the moment loss is observed (e.g. mid-`iperf3`
+    /// test) and the resulting file attached to a bug report.
+    DiagDump {
+        #[arg(short, long, default_value = "/etc/mlvpn/mlvpn.toml")]
+        config: PathBuf,
+        /// Write the dump to this file instead of an auto-named one
+        /// (`mlvpn-diag-<tunnel>-<unix-seconds>.txt`) in the current
+        /// directory.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -142,6 +159,7 @@ fn main() -> anyhow::Result<()> {
             duration,
             bidirectional,
         } => run_throughput_selftest(&config, link, duration, bidirectional),
+        Command::DiagDump { config, output } => run_diag_dump(&config, output),
     }
 }
 
@@ -268,6 +286,99 @@ fn run_throughput_selftest(
         }
     }
     Ok(())
+}
+
+/// Sends `Command::DiagDump` and writes the combined dump (the daemon's
+/// own text, plus this CLI process's own kernel-level UDP diagnostics --
+/// see `capture_kernel_udp_diagnostics`) to `output`, or an auto-named
+/// file in the current directory when `output` is `None`.
+fn run_diag_dump(config_path: &Path, output: Option<PathBuf>) -> anyhow::Result<()> {
+    let cfg = Config::load(config_path)?;
+    let result = send_command(config_path, &SocketCommand::DiagDump)?;
+
+    if !result.ok {
+        anyhow::bail!(
+            "mlvpnd rejected the command: {}",
+            result
+                .error
+                .unwrap_or_else(|| "(no error detail)".to_string())
+        );
+    }
+    let daemon_dump = result
+        .diag_dump
+        .unwrap_or_else(|| "(daemon returned no dump text)".to_string());
+    let kernel_dump = capture_kernel_udp_diagnostics();
+
+    let path = output.unwrap_or_else(|| {
+        let unix_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        PathBuf::from(format!("mlvpn-diag-{}-{unix_secs}.txt", cfg.tunnel.name))
+    });
+    std::fs::write(&path, format!("{daemon_dump}\n{kernel_dump}"))?;
+    println!("wrote diagnostic dump to {}", path.display());
+    Ok(())
+}
+
+/// Captures kernel-level UDP diagnostics from *this* CLI process --
+/// running as whatever account/privileges invoked `mlvpnd diag-dump`,
+/// not the (systemd-sandboxed by default) daemon -- rather than having
+/// the daemon shell out to external tools on its own. Mirrors the
+/// specific commands recommended for chasing this project's own
+/// still-open real-world loss investigation: `nstat -az` (filtered to
+/// UDP-related lines, same reasoning as the `| grep -i udp` in that
+/// recommendation, just done in Rust instead of depending on `grep`
+/// being on `PATH` too), `ss -lu -n -a` (UDP socket receive-queue
+/// depth), and `/proc/net/udp`'s own drops column. Every source degrades
+/// gracefully (a missing binary or unreadable file becomes a note in
+/// the output, not a hard failure) since this is best-effort diagnostic
+/// context, not something the dump should fail over.
+fn capture_kernel_udp_diagnostics() -> String {
+    let mut out = String::new();
+    out.push_str("--- Kernel UDP diagnostics (captured here, not by the daemon) ---\n\n");
+    out.push_str(&run_and_capture_filtered("nstat", &["-az"], Some("udp")));
+    out.push_str(&run_and_capture_filtered("ss", &["-lu", "-n", "-a"], None));
+    out.push_str("$ /proc/net/udp\n");
+    match std::fs::read_to_string("/proc/net/udp") {
+        Ok(s) => out.push_str(&s),
+        Err(e) => out.push_str(&format!("(could not read /proc/net/udp: {e})\n")),
+    }
+    out.push('\n');
+    out
+}
+
+/// Runs `cmd args...` and captures stdout+stderr, optionally keeping
+/// only lines whose lowercased form contains `needle` (plus the output's
+/// first line, so column headers survive the filter too). `None` keeps
+/// every line unfiltered.
+fn run_and_capture_filtered(cmd: &str, args: &[&str], needle: Option<&str>) -> String {
+    let mut out = format!("$ {cmd} {}\n", args.join(" "));
+    match std::process::Command::new(cmd).args(args).output() {
+        Ok(o) => {
+            let combined = format!(
+                "{}{}",
+                String::from_utf8_lossy(&o.stdout),
+                String::from_utf8_lossy(&o.stderr)
+            );
+            match needle {
+                Some(needle) => {
+                    for (i, line) in combined.lines().enumerate() {
+                        if i == 0 || line.to_lowercase().contains(needle) {
+                            out.push_str(line);
+                            out.push('\n');
+                        }
+                    }
+                }
+                None => out.push_str(&combined),
+            }
+        }
+        Err(e) => out.push_str(&format!(
+            "(could not run {cmd}: {e} -- is it installed and on PATH?)\n"
+        )),
+    }
+    out.push('\n');
+    out
 }
 
 /// Builds the process-wide `tracing` subscriber as a `Registry` of two
@@ -415,6 +526,26 @@ async fn run(cfg: Config, log_ring: Arc<LogRing>) -> anyhow::Result<()> {
         None
     };
 
+    // Off by default -- see `config::DiagnosticsConfig::auto_dump_enabled`'s
+    // doc comment. `dump_dir` defaults to `/run/mlvpn`, matching
+    // `control_socket`/`command_socket`'s own default-path convention
+    // above (and already writable under the shipped systemd unit's
+    // `RuntimeDirectory=mlvpn`).
+    let diagnostics_watch = if cfg.diagnostics.auto_dump_enabled {
+        Some(tunnel::DiagnosticsWatchParams {
+            loss_threshold_pct: cfg.diagnostics.loss_threshold_pct,
+            cooldown: std::time::Duration::from_secs(cfg.diagnostics.cooldown_secs),
+            dump_dir: cfg
+                .diagnostics
+                .dump_dir
+                .clone()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("/run/mlvpn")),
+        })
+    } else {
+        None
+    };
+
     let params = tunnel::TunnelParams {
         mode: cfg.mode,
         mtu: effective_mtu,
@@ -426,6 +557,7 @@ async fn run(cfg: Config, log_ring: Arc<LogRing>) -> anyhow::Result<()> {
         tunnel_name: cfg.tunnel.name.clone(),
         control_socket,
         command_socket,
+        diagnostics_watch,
     };
 
     // `tunnel::run` races SIGINT/SIGTERM against the tunnel's own tasks

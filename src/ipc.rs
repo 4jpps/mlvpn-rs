@@ -229,6 +229,14 @@ pub enum Command {
         duration_secs: u32,
         bidirectional: bool,
     },
+    /// Captures a text diagnostic dump of every link's health, daemon
+    /// state, and recent log lines right now (`mlvpnd diag-dump` on the
+    /// CLI) -- see `diag::format_dump` and `control::apply_command`'s
+    /// handling of this variant. Distinct from the *automatic* dump
+    /// `control::diagnostics_watch_loop` can also produce on its own
+    /// (see `config::DiagnosticsConfig`): this is always the operator
+    /// asking for one right now, unconditionally.
+    DiagDump,
 }
 
 /// One link's result from a completed `Command::RunThroughputTest`.
@@ -262,6 +270,12 @@ pub struct CommandResult {
     /// testing anything -- see `error` in that case).
     #[serde(default)]
     pub throughput_results: Vec<ThroughputTestLinkResult>,
+    /// Populated only by `Command::DiagDump` -- the formatted text
+    /// bundle from `diag::format_dump`. `None` for every other command,
+    /// and for a `DiagDump` that failed before it could be assembled
+    /// (see `error` in that case).
+    #[serde(default)]
+    pub diag_dump: Option<String>,
 }
 
 #[cfg(test)]
@@ -438,6 +452,7 @@ mod tests {
                 upload_mbps: Some(94.2),
                 download_mbps: None,
             }],
+            diag_dump: None,
         };
         let ok_back: CommandResult =
             serde_json::from_str(&serde_json::to_string(&ok).unwrap()).unwrap();
@@ -447,16 +462,45 @@ mod tests {
         assert_eq!(ok_back.throughput_results[0].link, "lte0");
         assert_eq!(ok_back.throughput_results[0].upload_mbps, Some(94.2));
         assert_eq!(ok_back.throughput_results[0].download_mbps, None);
+        assert!(ok_back.diag_dump.is_none());
 
         let err = CommandResult {
             ok: false,
             error: Some("no such link 'bogus'".to_string()),
             throughput_results: Vec::new(),
+            diag_dump: None,
         };
         let err_back: CommandResult =
             serde_json::from_str(&serde_json::to_string(&err).unwrap()).unwrap();
         assert!(!err_back.ok);
         assert_eq!(err_back.error.as_deref(), Some("no such link 'bogus'"));
         assert!(err_back.throughput_results.is_empty());
+        assert!(err_back.diag_dump.is_none());
+    }
+
+    #[test]
+    fn diag_dump_command_json_round_trips() {
+        let cmd = Command::DiagDump;
+        let json = serde_json::to_string(&cmd).expect("serialize");
+        assert_eq!(json, r#"{"command":"diag_dump"}"#);
+        let back: Command = serde_json::from_str(&json).expect("deserialize");
+        assert!(matches!(back, Command::DiagDump));
+    }
+
+    #[test]
+    fn command_result_diag_dump_round_trips() {
+        let result = CommandResult {
+            ok: true,
+            error: None,
+            throughput_results: Vec::new(),
+            diag_dump: Some("=== mlvpn diagnostic dump ===\n...".to_string()),
+        };
+        let back: CommandResult =
+            serde_json::from_str(&serde_json::to_string(&result).unwrap()).unwrap();
+        assert!(back.ok);
+        assert_eq!(
+            back.diag_dump.as_deref(),
+            Some("=== mlvpn diagnostic dump ===\n...")
+        );
     }
 }

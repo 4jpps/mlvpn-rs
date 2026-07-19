@@ -12,6 +12,7 @@
 pub mod config;
 pub mod control;
 pub mod crypto;
+pub mod diag;
 pub mod error;
 pub mod firewall;
 pub mod ipc;

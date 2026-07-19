@@ -56,6 +56,12 @@
 //!   (`Link::admin_disabled`) without editing the config and
 //!   restarting. See `control.rs`'s module doc comment for why this is
 //!   a separate socket from the read-only one above.
+//! - one optional `control::diagnostics_watch_loop` task (`[diagnostics]
+//!   auto_dump_enabled = true` to turn it on, off by default): watches
+//!   every link's locally-measured loss and writes a text diagnostic
+//!   dump to disk the moment one crosses `loss_threshold_pct`, so a
+//!   transient loss event's evidence gets captured even if no one is
+//!   watching live. See `diag.rs` and `config::DiagnosticsConfig`.
 //!
 //! **Graceful shutdown.** `run()`'s tail races a local SIGINT/SIGTERM
 //! against an authenticated `Disconnect` frame arriving from the peer
@@ -359,6 +365,20 @@ pub struct TunnelParams {
     /// -- see `config::CommandConfig::enabled`'s doc comment for why
     /// this one, unlike `control_socket`, is opt-in).
     pub command_socket: Option<PathBuf>,
+    /// `None` (the default) disables the automatic loss-threshold
+    /// diagnostic-dump watcher entirely -- see
+    /// `config::DiagnosticsConfig::auto_dump_enabled`'s doc comment.
+    pub diagnostics_watch: Option<DiagnosticsWatchParams>,
+}
+
+/// Config for `control::diagnostics_watch_loop`, threaded from
+/// `config::DiagnosticsConfig` -- see that type's doc comment for what
+/// each field means and why the feature exists.
+#[derive(Clone)]
+pub struct DiagnosticsWatchParams {
+    pub loss_threshold_pct: f64,
+    pub cooldown: Duration,
+    pub dump_dir: PathBuf,
 }
 
 /// How long a retired ("previous") session's keys remain able to
@@ -879,8 +899,33 @@ pub async fn run(
         let session = session.clone();
         let throughput_test_ctx = throughput_test_ctx.clone();
         let mtu = params.mtu as usize;
+        let diag_ctx = control::DiagContext {
+            peer_stats: peer_stats.clone(),
+            tunnel_name: params.tunnel_name.clone(),
+            mode: params.mode.as_str().to_string(),
+            session_meta: session_meta.clone(),
+            outbound_tx: outbound_tx.clone(),
+            outbound_dropped_total: outbound_dropped_total.clone(),
+            log_ring: log_ring.clone(),
+        };
         handles.push(tokio::spawn(async move {
-            control::serve_commands(path, links, session, throughput_test_ctx, mtu).await;
+            control::serve_commands(path, links, session, throughput_test_ctx, mtu, diag_ctx).await;
+        }));
+    }
+
+    if let Some(watch) = params.diagnostics_watch.clone() {
+        let links = links.clone();
+        let diag_ctx = control::DiagContext {
+            peer_stats: peer_stats.clone(),
+            tunnel_name: params.tunnel_name.clone(),
+            mode: params.mode.as_str().to_string(),
+            session_meta: session_meta.clone(),
+            outbound_tx: outbound_tx.clone(),
+            outbound_dropped_total: outbound_dropped_total.clone(),
+            log_ring: log_ring.clone(),
+        };
+        handles.push(tokio::spawn(async move {
+            control::diagnostics_watch_loop(watch, links, diag_ctx).await;
         }));
     }
 

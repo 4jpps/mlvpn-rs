@@ -353,7 +353,7 @@ Overview, Links, Daemon, Logs -- see [monitoring.md](docs/monitoring.md).
 separate Unix socket -- different path
 (`/run/mlvpn/<tunnel.name>.command.sock` by default), same mode-0600
 creation as the monitoring socket above -- for runtime link control,
-currently two commands:
+currently three commands:
 
 - Pin a link enabled/disabled (`ipc::Command::SetLinkEnabled`,
   `mlvpnd set-link` on the CLI). This sets `Link::admin_disabled`,
@@ -382,6 +382,22 @@ currently two commands:
   stream deliberately does *not* batch its encrypts under one lock
   acquisition -- a multi-second stream is meant to compete fairly with
   real Data traffic for the shared session lock, not race around it.
+- Capture a diagnostic dump right now (`ipc::Command::DiagDump`,
+  `mlvpnd diag-dump` on the CLI) -- builds a fresh `ipc::Snapshot` the
+  same way the monitoring socket does (link/session/queue/tun/system
+  state, plus every log line currently in `logbuf::LogRing`, not just a
+  recent delta) and renders it via `diag.rs::format_dump` into the
+  `CommandResult`'s `diag_dump` text field. The CLI then appends its own
+  kernel-level UDP diagnostics (`nstat -az`, `ss -lu -n -a`,
+  `/proc/net/udp`), gathered by the CLI process itself rather than the
+  daemon, and writes the combined bundle to a file -- meant to be
+  attached to a bug report. `[diagnostics] auto_dump_enabled = true`
+  (off by default) additionally runs `control::diagnostics_watch_loop`,
+  which watches every link's own locally-measured loss and writes the
+  daemon-visible half of the same dump to disk on its own the moment one
+  crosses `loss_threshold_pct` -- catching a transient loss event's
+  evidence even when no one is watching live. See `docs/monitoring.md`'s
+  "Diagnostic dump" section.
 
 Kept as a second socket, not a write mode bolted onto the monitoring
 one, so a client authorized only to read link/traffic stats (a

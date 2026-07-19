@@ -31,6 +31,7 @@
 //! provides.
 
 use crate::crypto::{random_session_id, SessionState};
+use crate::diag;
 use crate::ipc::{
     Command, CommandResult, DaemonSnapshot, LinkSnapshot, Snapshot, SystemSnapshot,
     ThroughputTestLinkResult, TunSnapshot,
@@ -41,15 +42,15 @@ use crate::peerstats::PeerStatsTable;
 use crate::procstats;
 use crate::sysfs_net;
 use crate::tunnel::{
-    send_throughput_test_reverse_request, send_throughput_test_stream, OutboundFrame, SessionMeta,
-    ThroughputTestContext,
+    send_throughput_test_reverse_request, send_throughput_test_stream, DiagnosticsWatchParams,
+    OutboundFrame, SessionMeta, ThroughputTestContext,
 };
 use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UdpSocket, UnixListener, UnixStream};
 use tokio::sync::{mpsc, Mutex as AsyncMutex};
@@ -334,6 +335,26 @@ async fn build_snapshot(
     (snapshot, new_last_log_seq)
 }
 
+/// Bundles the pieces `apply_command`'s `Command::DiagDump` handler
+/// needs to build a fresh `ipc::Snapshot` on demand -- the same data
+/// `build_snapshot` already assembles for the read-only monitoring
+/// socket. Grouped into one struct (rather than adding another five
+/// positional parameters to `serve_commands`/`serve_command_client`/
+/// `apply_command`, on top of the throughput-test ones already there)
+/// specifically because none of it is otherwise needed by the command
+/// socket's other, link/session-only commands -- `SetLinkEnabled` and
+/// `RunThroughputTest` never touch this.
+#[derive(Clone)]
+pub(crate) struct DiagContext {
+    pub(crate) peer_stats: Arc<PeerStatsTable>,
+    pub(crate) tunnel_name: String,
+    pub(crate) mode: String,
+    pub(crate) session_meta: Arc<SessionMeta>,
+    pub(crate) outbound_tx: mpsc::Sender<OutboundFrame>,
+    pub(crate) outbound_dropped_total: Arc<AtomicU64>,
+    pub(crate) log_ring: Arc<LogRing>,
+}
+
 /// Bind the command socket and serve `ipc::Command` requests until the
 /// process exits. Setup (directory creation, umask-tightened bind,
 /// belt-and-suspenders 0600 re-assertion) exactly mirrors `serve` above
@@ -345,12 +366,14 @@ async fn build_snapshot(
 /// treated as "runtime link control unavailable" rather than a fatal
 /// daemon error -- this is an operator convenience, not something that
 /// should be able to take the tunnel down.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn serve_commands(
     path: PathBuf,
     links: Links,
     session: Arc<AsyncMutex<SessionState>>,
     throughput_test_ctx: Arc<ThroughputTestContext>,
     mtu: usize,
+    diag_ctx: DiagContext,
 ) {
     if let Some(parent) = path.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
@@ -409,8 +432,9 @@ pub(crate) async fn serve_commands(
         let links = links.clone();
         let session = session.clone();
         let throughput_test_ctx = throughput_test_ctx.clone();
+        let diag_ctx = diag_ctx.clone();
         tokio::spawn(async move {
-            serve_command_client(stream, links, session, throughput_test_ctx, mtu).await;
+            serve_command_client(stream, links, session, throughput_test_ctx, mtu, diag_ctx).await;
         });
     }
 }
@@ -421,12 +445,14 @@ pub(crate) async fn serve_commands(
 /// disconnects without sending anything, or one that disappears before
 /// the reply is written -- a raced/impatient client is not a server-side
 /// problem worth a warning.
+#[allow(clippy::too_many_arguments)]
 async fn serve_command_client(
     stream: UnixStream,
     links: Links,
     session: Arc<AsyncMutex<SessionState>>,
     throughput_test_ctx: Arc<ThroughputTestContext>,
     mtu: usize,
+    diag_ctx: DiagContext,
 ) {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
@@ -441,11 +467,12 @@ async fn serve_command_client(
     };
 
     let result = match serde_json::from_str::<Command>(&line) {
-        Ok(cmd) => apply_command(cmd, &links, &session, &throughput_test_ctx, mtu).await,
+        Ok(cmd) => apply_command(cmd, &links, &session, &throughput_test_ctx, mtu, &diag_ctx).await,
         Err(e) => CommandResult {
             ok: false,
             error: Some(format!("invalid command: {e}")),
             throughput_results: Vec::new(),
+            diag_dump: None,
         },
     };
 
@@ -459,12 +486,14 @@ async fn serve_command_client(
 /// Apply one already-parsed `Command` and report the outcome. Split out
 /// from `serve_command_client` so the actual link-mutation logic is
 /// testable/readable independent of the socket I/O around it.
+#[allow(clippy::too_many_arguments)]
 async fn apply_command(
     cmd: Command,
     links: &Links,
     session: &Arc<AsyncMutex<SessionState>>,
     throughput_test_ctx: &Arc<ThroughputTestContext>,
     mtu: usize,
+    diag_ctx: &DiagContext,
 ) -> CommandResult {
     match cmd {
         Command::SetLinkEnabled { link, enabled } => {
@@ -494,12 +523,14 @@ async fn apply_command(
                     ok: true,
                     error: None,
                     throughput_results: Vec::new(),
+                    diag_dump: None,
                 }
             } else {
                 CommandResult {
                     ok: false,
                     error: Some(format!("no such link '{link}'")),
                     throughput_results: Vec::new(),
+                    diag_dump: None,
                 }
             }
         }
@@ -519,7 +550,140 @@ async fn apply_command(
             )
             .await
         }
+        Command::DiagDump => run_diag_dump_command(links, diag_ctx).await,
     }
+}
+
+/// Implements `Command::DiagDump`: builds a fresh `ipc::Snapshot` (same
+/// assembly `build_snapshot` does for the monitoring socket) with the
+/// log cursor forced to `0` so the dump's log section carries everything
+/// currently in `LogRing`, not just a recent delta, then renders it via
+/// `diag::format_dump`. Always succeeds (there is no failure mode here
+/// short of a bug -- unlike `RunThroughputTest`, nothing here waits on
+/// the peer or can time out).
+async fn run_diag_dump_command(links: &Links, diag_ctx: &DiagContext) -> CommandResult {
+    let (snapshot, _) = build_snapshot(
+        links,
+        &diag_ctx.peer_stats,
+        &diag_ctx.tunnel_name,
+        &diag_ctx.mode,
+        &diag_ctx.session_meta,
+        &diag_ctx.outbound_tx,
+        &diag_ctx.outbound_dropped_total,
+        &diag_ctx.log_ring,
+        0,
+    )
+    .await;
+    let text = diag::format_dump(&snapshot, "manual (mlvpnd diag-dump)");
+    tracing::info!("diagnostic dump captured via command socket");
+    CommandResult {
+        ok: true,
+        error: None,
+        throughput_results: Vec::new(),
+        diag_dump: Some(text),
+    }
+}
+
+/// How often `diagnostics_watch_loop` re-checks every link's loss
+/// against `DiagnosticsWatchParams::loss_threshold_pct`. Frequent enough
+/// to catch a loss event not long after it starts (loss itself is a
+/// windowed EWMA already smoothed over multiple probes, so there is no
+/// benefit to checking faster than that smoothing resolves), infrequent
+/// enough to be negligible overhead on top of the periodic
+/// `procstats`/`sysfs_net` reads `build_snapshot` already does for every
+/// connected monitoring client.
+const DIAGNOSTICS_WATCH_INTERVAL_SECS: u64 = 5;
+
+/// Watches every link's own locally-measured loss (`LinkSnapshot::local_loss_pct`,
+/// the same figure `mlvpn-tui`'s Links tab shows) and writes a text
+/// diagnostic dump to `watch.dump_dir` the moment one crosses
+/// `watch.loss_threshold_pct` -- the automatic counterpart to
+/// `Command::DiagDump`'s on-demand capture, meant to catch a transient
+/// loss event's evidence even if no one is watching live at the moment
+/// it happens. `watch.cooldown` rate-limits repeat dumps so a
+/// persistently lossy link doesn't fill the directory with near-
+/// duplicate captures -- each dump already reflects that moment fully,
+/// repeating it every few seconds adds nothing. Deliberately does not
+/// shell out to `nstat`/`ss` the way `mlvpnd diag-dump`'s CLI side does
+/// -- see `diag.rs`'s module doc comment for why that split exists.
+pub(crate) async fn diagnostics_watch_loop(
+    watch: DiagnosticsWatchParams,
+    links: Links,
+    diag_ctx: DiagContext,
+) {
+    let mut tick = interval(Duration::from_secs(DIAGNOSTICS_WATCH_INTERVAL_SECS));
+    let mut last_dump_at: Option<Instant> = None;
+    loop {
+        tick.tick().await;
+
+        if let Some(last) = last_dump_at {
+            if last.elapsed() < watch.cooldown {
+                continue;
+            }
+        }
+
+        let (snapshot, _) = build_snapshot(
+            &links,
+            &diag_ctx.peer_stats,
+            &diag_ctx.tunnel_name,
+            &diag_ctx.mode,
+            &diag_ctx.session_meta,
+            &diag_ctx.outbound_tx,
+            &diag_ctx.outbound_dropped_total,
+            &diag_ctx.log_ring,
+            0,
+        )
+        .await;
+
+        let Some((link_name, loss_pct)) =
+            diag::worst_loss_link(&snapshot, watch.loss_threshold_pct)
+        else {
+            continue;
+        };
+
+        let trigger = format!(
+            "automatic: link '{link_name}' loss {loss_pct:.1}% exceeded threshold {:.1}%",
+            watch.loss_threshold_pct
+        );
+        let text = diag::format_dump(&snapshot, &trigger);
+        match write_dump_file(&watch.dump_dir, &diag_ctx.tunnel_name, &text) {
+            Ok(path) => {
+                tracing::warn!(
+                    link = %link_name,
+                    loss_pct,
+                    threshold_pct = watch.loss_threshold_pct,
+                    path = %path.display(),
+                    "loss threshold exceeded; wrote automatic diagnostic dump"
+                );
+                last_dump_at = Some(Instant::now());
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    dir = %watch.dump_dir.display(),
+                    "loss threshold exceeded but failed to write diagnostic dump"
+                );
+            }
+        }
+    }
+}
+
+/// Writes `text` to a new, uniquely-named file under `dir` (created if
+/// missing) and returns the path written. Mode 0600 for the same reason
+/// every other file this daemon creates on its own is restricted --
+/// a dump includes learned peer IP:port and recent log lines, which
+/// while not secret material, are still only this process's own
+/// business to hand out.
+fn write_dump_file(dir: &Path, tunnel_name: &str, text: &str) -> std::io::Result<PathBuf> {
+    std::fs::create_dir_all(dir)?;
+    let unix_ts_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let path = dir.join(format!("mlvpn-diag-{tunnel_name}-{unix_ts_ms}.txt"));
+    std::fs::write(&path, text)?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(path)
 }
 
 /// Extra time to wait, beyond a leg's own `duration_secs`, for its
@@ -578,6 +742,7 @@ async fn run_throughput_test_command(
                 None => "no configured link has a known peer address yet".to_string(),
             }),
             throughput_results: Vec::new(),
+            diag_dump: None,
         };
     }
 
@@ -626,6 +791,7 @@ async fn run_throughput_test_command(
         ok: true,
         error: None,
         throughput_results: results,
+        diag_dump: None,
     }
 }
 

@@ -90,13 +90,32 @@ enabled = true           # exposes live stats to `mlvpn-tui`; see README.md "Mon
 [command]
 # enabled = false          # off by default: lets `mlvpnd set-link <link>
                            # <enable|disable>` pin a link out of scheduling at
-                           # runtime, without editing this file and restarting.
-                           # A separate socket from [control] above (different
-                           # path, same 0600 permissions) so a client only
-                           # authorized to read stats never gains the ability
-                           # to redirect traffic. See ARCHITECTURE.md §9.
+                           # runtime, `mlvpnd self-test` run an on-demand
+                           # throughput test, and `mlvpnd diag-dump` capture a
+                           # diagnostic bundle -- all without editing this file
+                           # and restarting. A separate socket from [control]
+                           # above (different path, same 0600 permissions) so a
+                           # client only authorized to read stats never gains
+                           # the ability to redirect traffic. See
+                           # ARCHITECTURE.md §9 and docs/monitoring.md.
 # socket_path = "/run/mlvpn/mlvpn0.command.sock"   # default is
                            # /run/mlvpn/<tunnel.name>.command.sock
+
+[diagnostics]
+# auto_dump_enabled = false  # off by default: watch every link's own
+                           # locally-measured loss and write a text
+                           # diagnostic dump to disk on its own the moment
+                           # one crosses loss_threshold_pct -- catches a
+                           # transient loss event's evidence even if no one
+                           # is watching mlvpn-tui at the time. This is the
+                           # one setting that has the daemon write arbitrary
+                           # files to disk on its own initiative. See
+                           # docs/monitoring.md "Diagnostic dump".
+# loss_threshold_pct = 10.0  # default
+# cooldown_secs = 300        # minimum time between auto dumps, default
+# dump_dir = "/run/mlvpn"    # default -- tmpfs, cleared on stop/reboot;
+                           # point this at a persistent directory to keep
+                           # dumps across restarts
 
 # One [[links]] block per physical uplink to bond together. Traffic is
 # split across every link currently marked Up in proportion to its

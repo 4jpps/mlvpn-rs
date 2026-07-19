@@ -113,3 +113,53 @@ bonding decisions.
 A `None` result for a direction means it timed out or the peer doesn't
 support this feature yet (an older `mlvpnd` silently drops the
 unrecognized packet type) -- not necessarily that the link is down.
+
+## Diagnostic dump
+
+Also over the command socket: capture a single text bundle of every
+link's health, daemon/session state, and recent log lines -- meant to be
+attached to a bug report, e.g. right after reproducing loss with
+`iperf3` or `mlvpnd self-test` above:
+
+```sh
+mlvpnd diag-dump --config /etc/mlvpn/mlvpn.toml
+mlvpnd diag-dump --config /etc/mlvpn/mlvpn.toml --output /tmp/before-upgrade.txt
+```
+
+Writes `mlvpn-diag-<tunnel>-<unix-seconds>.txt` in the current directory
+(or `--output`'s path). The file has two parts: the daemon-visible
+section (link state/score/rtt/jitter/loss/throughput, both this side's
+own measurement and the peer's; session id/uptime/rekey count; outbound
+queue depth and lifetime drops; the TUN device's kernel counters;
+machine load/memory/uptime; and every log line currently held in the
+daemon's log ring, not just a recent delta), and a kernel-diagnostics
+section gathered by the CLI process itself, not the daemon: `nstat -az`
+(filtered to UDP-related lines), `ss -lu -n -a`, and `/proc/net/udp`'s
+own drop counters. Each of those degrades gracefully to a note in the
+output if the tool isn't installed or the read fails, rather than
+failing the whole dump.
+
+**Automatic capture on loss.** `[diagnostics] auto_dump_enabled = true`
+has the daemon watch its own locally-measured per-link loss and write
+the same daemon-visible dump section to disk on its own the moment a
+link's loss crosses `loss_threshold_pct` (default 10%) -- catching a
+transient loss event's evidence even if no one is watching
+`mlvpn-tui` at the exact moment it happens:
+
+```toml
+[diagnostics]
+auto_dump_enabled = true
+loss_threshold_pct = 10.0        # default
+cooldown_secs = 300              # minimum time between auto dumps, default
+dump_dir = "/run/mlvpn"          # default -- tmpfs, cleared on stop/reboot;
+                                  # point this at a persistent directory to
+                                  # keep dumps across restarts
+```
+
+Off by default -- this is the one setting that has the daemon write
+arbitrary files to disk on its own initiative. The automatic dump does
+*not* include the kernel-diagnostics section (that needs shelling out to
+external tools, which the daemon deliberately doesn't do on its own --
+see `diag.rs`'s module doc comment); run `mlvpnd diag-dump` by hand
+alongside it for the fuller picture while the loss condition is likely
+still reproducible.

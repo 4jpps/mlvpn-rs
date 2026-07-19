@@ -37,6 +37,9 @@ pub struct Config {
 
     #[serde(default)]
     pub command: CommandConfig,
+
+    #[serde(default)]
+    pub diagnostics: DiagnosticsConfig,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -461,6 +464,64 @@ pub struct CommandConfig {
     /// directory, so the two are never confusable at a glance in `ls`
     /// output or a firewall/AppArmor rule.
     pub socket_path: Option<String>,
+}
+
+/// Diagnostic-dump capture -- both the on-demand `mlvpnd diag-dump` CLI
+/// command (always available whenever `[command] enabled = true`,
+/// unaffected by anything here) and an *automatic* capture this section
+/// actually configures: watch every link's own locally-measured loss and
+/// write a text dump to disk the moment one crosses `loss_threshold_pct`,
+/// so evidence of a transient loss event is captured even if no one is
+/// watching `mlvpn-tui` at the exact moment it happens. Off by default:
+/// this is the one config section that has the daemon write arbitrary
+/// files to disk on its own initiative, so an operator has to opt in
+/// deliberately. See `diag.rs` and `control::diagnostics_watch_loop`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DiagnosticsConfig {
+    #[serde(default)]
+    pub auto_dump_enabled: bool,
+    /// A link's `local_loss_pct` (same figure `mlvpn-tui`'s Links tab
+    /// shows) has to exceed this before a dump fires.
+    #[serde(default = "default_diag_loss_threshold_pct")]
+    pub loss_threshold_pct: f64,
+    /// Minimum time between automatic dumps, so a persistently lossy
+    /// link doesn't fill `dump_dir` with near-duplicate captures --
+    /// each dump already captures everything needed for that event,
+    /// repeating it every few seconds adds nothing.
+    #[serde(default = "default_diag_cooldown_secs")]
+    pub cooldown_secs: u64,
+    /// Directory dumps are written to. Defaults to `/run/mlvpn`, which
+    /// is already writable under the shipped systemd unit's
+    /// `RuntimeDirectory=mlvpn` (see systemd/mlvpn.service) -- note that
+    /// path is tmpfs and cleared on stop/reboot, so an operator relying
+    /// on auto-dumps surviving a restart should point this at a real
+    /// persistent directory instead (and grant it write access via
+    /// `ReadWritePaths=` if running under the hardened unit).
+    pub dump_dir: Option<String>,
+}
+
+fn default_diag_loss_threshold_pct() -> f64 {
+    10.0
+}
+
+fn default_diag_cooldown_secs() -> u64 {
+    300
+}
+
+impl Default for DiagnosticsConfig {
+    // Hand-written for the same reason as `ControlConfig::default()`
+    // above: this is what serde calls when the whole `[diagnostics]`
+    // table is absent from the TOML, and it must still produce the same
+    // defaults the field-level `#[serde(default = "...")]` attributes
+    // above do.
+    fn default() -> Self {
+        Self {
+            auto_dump_enabled: false,
+            loss_threshold_pct: default_diag_loss_threshold_pct(),
+            cooldown_secs: default_diag_cooldown_secs(),
+            dump_dir: None,
+        }
+    }
 }
 
 impl Config {
