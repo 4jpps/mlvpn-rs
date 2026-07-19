@@ -614,6 +614,21 @@ pub async fn run(
     let params = Arc::new(params);
 
     let (session_id, session) = establish_session_with_retry(&links, &params).await;
+
+    // Every link's `link::Link::alternate` (if any) was only ever meant
+    // to be raced during that initial handshake above -- see its own
+    // doc comment. The link that actually answered already resolved its
+    // own via `commit_remote` inside `perform_client_handshake`; this
+    // covers every *other* link, which otherwise would keep an
+    // untested, never-referenced alternate socket bound (and its fd/port
+    // held) for the rest of this process's life. `commit_remote(None)`
+    // is a no-op for the link that already resolved (its `alternate` is
+    // already `None`), so this is safe to run unconditionally over
+    // every link without needing to know here which one actually won.
+    for link in links.iter() {
+        link.lock().await.commit_remote(None);
+    }
+
     let session = Arc::new(AsyncMutex::new(SessionState::new(session_id, session)));
     let session_meta = Arc::new(SessionMeta::new(session_id));
 
@@ -1171,9 +1186,25 @@ async fn perform_client_handshake(
             if snap.is_empty() {
                 return Err(MlvpnError::Config("no links configured".into()));
             }
-            snap.iter()
+            let mut targets: Vec<(LinkHandle, SocketAddr, u8)> = snap
+                .iter()
                 .filter_map(|link| link.remote.map(|r| (link.handle(), r, link.id)))
-                .collect()
+                .collect();
+            // A link's not-yet-confirmed alternate-family candidate
+            // (see `link::Link::alternate`'s doc comment) only ever
+            // races here, on the very first handshake attempt
+            // (`rekey_ctx` is `None` exactly then) -- by the time a
+            // rekey runs, `link_receiver`/`link_prober` already hold
+            // their own `LinkHandle` snapshotted at spawn time, which
+            // wouldn't observe a `remote` flip happening this late.
+            if rekey_ctx.is_none() {
+                targets.extend(snap.iter().filter_map(|link| {
+                    let (alt_remote, _) = link.alternate.as_ref()?;
+                    let alt_handle = link.alternate_handle()?;
+                    Some((alt_handle, *alt_remote, link.id))
+                }));
+            }
+            targets
         };
         if targets.is_empty() {
             return Err(MlvpnError::Config(
@@ -1211,12 +1242,20 @@ async fn perform_client_handshake(
             }
         }
 
+        // `reply_remote` is `None` on the rekey path (never races an
+        // alternate -- see the target-building comment above) and
+        // `Some` on the initial-handshake path, carrying whichever of
+        // that link's raced addresses actually answered.
         let reply = if let Some(rx) = rekey_rx.as_mut() {
-            race_rekey_reply(rx, HANDSHAKE_TIMEOUT).await
+            race_rekey_reply(rx, HANDSHAKE_TIMEOUT)
+                .await
+                .map(|(link_id, payload)| (link_id, None, payload))
         } else {
-            race_handshake_reply(&targets, session_id, HANDSHAKE_TIMEOUT).await
+            race_handshake_reply(&targets, session_id, HANDSHAKE_TIMEOUT)
+                .await
+                .map(|(link_id, remote, payload)| (link_id, Some(remote), payload))
         };
-        let (reply_link_id, payload) = match reply {
+        let (reply_link_id, reply_remote, payload) = match reply {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(attempt, error = %e, "handshake attempt failed, retrying");
@@ -1259,6 +1298,17 @@ async fn perform_client_handshake(
                     session_id,
                     "handshake completed via this link"
                 );
+                // Only on the initial handshake (see the target-building
+                // comment above for why): resolve this link's
+                // primary-vs-alternate race now that we know which
+                // address actually answered. Every other link's own
+                // still-unresolved alternate gets cleaned up right after
+                // `establish_session_with_retry` returns in `run()`.
+                if rekey_ctx.is_none() {
+                    if let Some(link) = links.get(reply_link_id as usize) {
+                        link.lock().await.commit_remote(reply_remote);
+                    }
+                }
                 return Ok((session_id, hs.into_session()?));
             }
             Some(_) => {
@@ -1383,12 +1433,18 @@ async fn respond_to_handshake_init(
 /// and having Noise itself reject it there consumes the whole attempt
 /// round rather than letting this function keep searching for another
 /// candidate.
+///
+/// Returns `(link_id, remote, payload)` -- `remote` is which of that
+/// link's raced addresses actually answered (its primary, or its
+/// not-yet-confirmed alternate -- see `link::Link::alternate`), so the
+/// caller (`perform_client_handshake`) can commit that link to whichever
+/// one just proved itself reachable.
 async fn race_handshake_reply(
     targets: &[(LinkHandle, SocketAddr, u8)],
     session_id: u32,
     timeout: Duration,
-) -> Result<(u8, Vec<u8>)> {
-    let mut join_set: JoinSet<Option<(u8, Vec<u8>)>> = JoinSet::new();
+) -> Result<(u8, SocketAddr, Vec<u8>)> {
+    let mut join_set: JoinSet<Option<(u8, SocketAddr, Vec<u8>)>> = JoinSet::new();
     for (handle, remote, link_id) in targets.iter().cloned() {
         join_set.spawn(async move {
             let socket = handle.current_socket().await;
@@ -1423,7 +1479,7 @@ async fn race_handshake_reply(
                 if hdr.ptype != PacketType::HandshakeResp || hdr.session_id != session_id {
                     continue;
                 }
-                return Some((link_id, payload.to_vec()));
+                return Some((link_id, remote, payload.to_vec()));
             }
         });
     }
@@ -1449,7 +1505,7 @@ async fn race_handshake_reply(
     join_set.abort_all();
 
     match winner {
-        Ok(Some((link_id, payload))) => Ok((link_id, payload)),
+        Ok(Some((link_id, remote, payload))) => Ok((link_id, remote, payload)),
         Ok(None) => Err(MlvpnError::Handshake(
             "no valid handshake reply on any link".into(),
         )),

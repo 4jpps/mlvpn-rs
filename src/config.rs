@@ -337,8 +337,17 @@ pub struct LinkConfig {
     /// exactly like editing a literal IP in this field always required.
     /// A hostname resolving to both an `A` and `AAAA` record (ordinary
     /// dual-stack DNS) is handled automatically: `local_addr` below, if
-    /// set, picks the family; otherwise IPv6 is preferred when both are
-    /// available (see `link::pick_remote_addr`). Also what selects this
+    /// set, picks the family with no further checks. Otherwise IPv6 is
+    /// tried first, but only provisionally -- both candidates are raced
+    /// during the very first handshake attempt, and whichever one
+    /// actually answers wins (see `link::pick_remote_addr` and
+    /// `link::Link::alternate`). This matters in practice: a hostname's
+    /// `AAAA` record existing doesn't mean that IPv6 path is actually
+    /// reachable end-to-end, and residential/consumer ISPs with a
+    /// broken or absent IPv6 route are common enough that blindly
+    /// committing to "IPv6 if present" with no fallback could wedge the
+    /// initial handshake forever against a peer that was perfectly
+    /// reachable over IPv4 the whole time. Also what selects this
     /// link's socket address family (IPv4 or IPv6) when set at all.
     pub remote_addr: Option<String>,
     /// Local UDP port to bind/listen on for this link.

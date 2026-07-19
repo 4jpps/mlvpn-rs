@@ -508,6 +508,22 @@ pub struct Link {
     /// ever changes at runtime when `scheduler.auto_tune_ewma_alpha` is
     /// on -- see `LinkStats::set_alpha`.
     pub effective_ewma_alpha: f64,
+    /// A not-yet-confirmed alternate-family candidate for this link's
+    /// `remote_addr`, together with its own already-bound socket -- set
+    /// at `Link::bind` time only when resolution produced both an IPv4
+    /// and IPv6 candidate and `local_addr` didn't pin one (see
+    /// `pick_remote_addr`'s doc comment). Raced against `remote`/`socket`
+    /// during the very first handshake attempt only
+    /// (`tunnel::perform_client_handshake`, gated on `rekey_ctx.is_none()`)
+    /// -- deliberately never re-raced on a later rekey: by then,
+    /// `link_receiver`/`link_prober` already hold their own `LinkHandle`
+    /// snapshotted at spawn time (right after the initial handshake
+    /// commits), which wouldn't observe a `remote` flip happening that
+    /// late without a much larger change to how those tasks pick up a
+    /// changed remote. Always `None` again once the initial handshake
+    /// has resolved which family actually works, win or lose -- see
+    /// `commit_remote`.
+    pub alternate: Option<(SocketAddr, SharedSocket)>,
 }
 
 impl Link {
@@ -516,9 +532,26 @@ impl Link {
     /// if `bind_interface` requires `CAP_NET_RAW`/root on the target
     /// system (SO_BINDTODEVICE itself only needs `CAP_NET_RAW` on Linux,
     /// which `privilege::drop_to` retains explicitly for this reason).
+    ///
+    /// When `remote_addr` resolved to both an IPv4 and IPv6 candidate
+    /// (see `pick_remote_addr`), this also binds a *second* socket for
+    /// the alternate family up front -- see `alternate`'s doc comment
+    /// for why it exists and when it gets raced/dropped. Both sockets
+    /// share the same `bind_interface`/`local_port`, which is fine: one
+    /// is `AF_INET`, the other `AF_INET6` (`IPV6_V6ONLY` set, see
+    /// `bind_socket`), so there's no actual port conflict at the kernel
+    /// level, the same way an ordinary dual-stack service binds both
+    /// families to one port today.
     pub async fn bind(id: u8, config: LinkConfig, ewma_alpha: f64) -> Result<Self> {
-        let remote = resolve_remote_addr(&config).await?;
+        let (remote, alternate_remote) = resolve_remote_addr(&config).await?;
         let (socket, physical_mtu) = bind_socket(&config, remote)?;
+        let alternate = match alternate_remote {
+            Some(alt_remote) => {
+                let (alt_socket, _) = bind_socket(&config, Some(alt_remote))?;
+                Some((alt_remote, Arc::new(AsyncRwLock::new(alt_socket))))
+            }
+            None => None,
+        };
 
         let effective_probe_interval_ms = config.probe_interval_ms;
 
@@ -535,6 +568,7 @@ impl Link {
             admin_disabled: false,
             effective_probe_interval_ms,
             effective_ewma_alpha: ewma_alpha,
+            alternate,
         })
     }
 
@@ -551,6 +585,62 @@ impl Link {
             reconnect_lock: self.reconnect_lock.clone(),
         }
     }
+
+    /// A synthetic `LinkHandle` wrapping `alternate`'s not-yet-confirmed
+    /// socket/address, for `tunnel::perform_client_handshake` to race
+    /// alongside the real one from `handle()` above -- `None` once
+    /// there's no alternate left to race (never had one, or already
+    /// resolved via `commit_remote`). `reconnect_lock` is a fresh,
+    /// never-shared lock: `reconnect()` is never called against this
+    /// handle (there's nothing worth reconnecting *to* until this
+    /// candidate has actually won a race and been committed), so it
+    /// doesn't need to coordinate with the real link's own lock.
+    pub fn alternate_handle(&self) -> Option<LinkHandle> {
+        let (remote, socket) = self.alternate.as_ref()?;
+        Some(LinkHandle {
+            link_id: self.id,
+            config: self.config.clone(),
+            remote: Some(*remote),
+            socket: socket.clone(),
+            reconnect_lock: Arc::new(AsyncMutex::new(())),
+        })
+    }
+
+    /// Resolves `alternate` after the very first handshake attempt has
+    /// finished (win or lose) -- called once, from
+    /// `tunnel::perform_client_handshake`'s success arm for whichever
+    /// link actually answered, and unconditionally for every other link
+    /// right after `tunnel::establish_session_with_retry` returns (see
+    /// `tunnel::run`), so no link is ever left holding an untested
+    /// alternate socket open for the rest of the process's life.
+    ///
+    /// `winner`, if `Some`, is the address that actually answered this
+    /// specific handshake attempt. If it matches `alternate`'s address,
+    /// that candidate just proved itself reachable where the original
+    /// `remote`/`socket` apparently wasn't (within this attempt's
+    /// timeout, at least) -- promote it: swap it into `remote`/`socket`
+    /// so every per-link task spawned after this point (`link_receiver`,
+    /// `link_prober`, `active_bandwidth_prober` -- all spawned later in
+    /// `tunnel::run`, using `handle()`/this same `Link`) uses the
+    /// address that's actually known to work. Otherwise (the primary
+    /// won, a *different* link entirely answered, or nothing answered
+    /// yet), the alternate is simply dropped, closing its socket.
+    pub fn commit_remote(&mut self, winner: Option<SocketAddr>) {
+        let Some((alt_remote, alt_socket)) = self.alternate.take() else {
+            return;
+        };
+        if winner == Some(alt_remote) {
+            tracing::info!(
+                link = %self.config.name,
+                previous = ?self.remote,
+                winner = %alt_remote,
+                "alternate address family answered the initial handshake first; \
+                 switching this link to it"
+            );
+            self.remote = Some(alt_remote);
+            self.socket = alt_socket;
+        }
+    }
 }
 
 /// How long `resolve_remote_addr` waits for `remote_addr` to resolve
@@ -563,33 +653,48 @@ impl Link {
 /// behavior (see `main.rs`) deliberately avoids elsewhere.
 const DNS_RESOLVE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Pick the concrete `SocketAddr` to use as a client-mode link's
-/// `remote`, given every address `remote_addr` resolved to. Split out of
-/// `resolve_remote_addr` as pure, I/O-free selection logic specifically
-/// so it's unit-testable with hand-built address lists, without a real
-/// DNS lookup (a hostname actually returning both an `A` and `AAAA`
-/// record isn't something a unit test should depend on a real resolver
-/// for) -- see `monitor.rs`'s module doc comment for this project's
-/// general preference for keeping decision logic separate from the I/O
-/// that feeds it.
+/// Pick the concrete `SocketAddr`(es) to use as a client-mode link's
+/// `remote`, given every address `remote_addr` resolved to. Returns
+/// `(primary, alternate)`: `primary` is what `Link::bind` immediately
+/// binds a socket to and uses, exactly as before; `alternate`, when
+/// `Some`, is a second, not-yet-confirmed candidate from the *other*
+/// address family, raced alongside `primary` during the very first
+/// handshake attempt only (see `Link::alternate`'s and
+/// `tunnel::perform_client_handshake`'s doc comments for why "only the
+/// first attempt" and not every rekey). Split out of `resolve_remote_addr`
+/// as pure, I/O-free selection logic specifically so it's unit-testable
+/// with hand-built address lists, without a real DNS lookup (a hostname
+/// actually returning both an `A` and `AAAA` record isn't something a
+/// unit test should depend on a real resolver for) -- see `monitor.rs`'s
+/// module doc comment for this project's general preference for keeping
+/// decision logic separate from the I/O that feeds it.
 ///
 /// If `local_addr` is set, it already declares this link's intended
-/// family (see its own doc comment on `LinkConfig`) -- honor that and
-/// error clearly if no resolved address matches, rather than silently
-/// binding the wrong family. Otherwise prefer an IPv6 result if one
-/// exists, falling back to IPv4: a simplified, non-racing "happy
-/// eyeballs" -- correct and predictable for a link already pinned to one
-/// physical interface via `bind_interface`, without the complexity a
-/// real dual-stack race (RFC 8305) adds for a scenario (a browser racing
-/// several outbound TCP connections) this project doesn't have. An
-/// operator who needs the *other* family from a dual-stack hostname can
-/// already force it via `local_addr`, or by writing a literal IPv4/IPv6
-/// address directly instead of a hostname.
+/// family (see its own doc comment on `LinkConfig`) -- honor that
+/// unconditionally (no alternate to race: an operator who pinned a
+/// family explicitly gets exactly that family, full stop) and error
+/// clearly if no resolved address matches, rather than silently binding
+/// the wrong family. Otherwise `primary` prefers an IPv6 result if one
+/// exists, falling back to IPv4, with the other family (if resolved)
+/// returned as `alternate` -- a real, if deliberately narrow (at most
+/// one candidate per family, and only for the very first handshake),
+/// two-way happy-eyeballs-style race rather than RFC 8305's full
+/// N-candidate concurrent racing, which this project doesn't need: each
+/// link is already pinned to one physical interface via
+/// `bind_interface`, so there's only ever one dual-stack ambiguity to
+/// resolve, not several outbound paths to choose among. This exists
+/// because a hostname's `AAAA` record existing is not the same thing as
+/// that IPv6 address actually being reachable end-to-end -- routing
+/// gaps and silent blackholes on the IPv6 path are common enough on
+/// residential/consumer ISPs that blindly committing to "IPv6 if
+/// present" with no fallback used to mean a dual-stack hostname could
+/// wedge the client's initial handshake forever even though the exact
+/// same peer was perfectly reachable over IPv4.
 fn pick_remote_addr(
     candidates: &[SocketAddr],
     local_addr: Option<&str>,
     link_name: &str,
-) -> Result<SocketAddr> {
+) -> Result<(SocketAddr, Option<SocketAddr>)> {
     if let Some(local) = local_addr {
         let want_v6 = local
             .parse::<IpAddr>()
@@ -599,6 +704,7 @@ fn pick_remote_addr(
             .iter()
             .find(|a| a.is_ipv6() == want_v6)
             .copied()
+            .map(|primary| (primary, None))
             .ok_or_else(|| {
                 MlvpnError::Config(format!(
                     "remote_addr for link '{link_name}' resolved to no {} address, but \
@@ -607,34 +713,36 @@ fn pick_remote_addr(
                 ))
             });
     }
-    candidates
-        .iter()
-        .find(|a| a.is_ipv6())
-        .or_else(|| candidates.first())
-        .copied()
-        .ok_or_else(|| {
-            MlvpnError::Config(format!(
-                "remote_addr for link '{link_name}' resolved to no addresses"
-            ))
-        })
+    let v6 = candidates.iter().find(|a| a.is_ipv6()).copied();
+    let v4 = candidates.iter().find(|a| !a.is_ipv6()).copied();
+    match (v6, v4) {
+        (Some(primary), alternate @ Some(_)) => Ok((primary, alternate)),
+        (Some(primary), None) => Ok((primary, None)),
+        (None, Some(primary)) => Ok((primary, None)),
+        (None, None) => Err(MlvpnError::Config(format!(
+            "remote_addr for link '{link_name}' resolved to no addresses"
+        ))),
+    }
 }
 
-/// Resolve `config.remote_addr` (client mode) to a concrete `SocketAddr`
+/// Resolve `config.remote_addr` (client mode) to concrete `SocketAddr`(es)
 /// via `tokio::net::lookup_host` -- accepts everything `remote_addr`
 /// always has (a literal `ip:port`, resolved instantly with no real
 /// network round trip) plus, now, a `hostname:port` needing an actual DNS
-/// lookup, e.g. `"bgp.example.com:5000"`. Returns `None` if `remote_addr`
-/// isn't set at all -- the normal server-mode case, where the peer's
-/// address is only ever learned at runtime instead (see `tunnel.rs`'s
-/// "learned/updated peer address" handling).
+/// lookup, e.g. `"bgp.example.com:5000"`. Returns `(None, None)` if
+/// `remote_addr` isn't set at all -- the normal server-mode case, where
+/// the peer's address is only ever learned at runtime instead (see
+/// `tunnel.rs`'s "learned/updated peer address" handling).
 ///
 /// A hostname commonly resolves to *both* an `A` and an `AAAA` record
 /// (ordinary dual-stack DNS, e.g. most cloud providers' own hostnames) --
-/// see `pick_remote_addr` for how that gets narrowed down to the one
-/// family this link's single UDP socket actually uses.
-async fn resolve_remote_addr(config: &LinkConfig) -> Result<Option<SocketAddr>> {
+/// see `pick_remote_addr` for how that produces this function's
+/// `(primary, alternate)` pair from that.
+async fn resolve_remote_addr(
+    config: &LinkConfig,
+) -> Result<(Option<SocketAddr>, Option<SocketAddr>)> {
     let Some(remote_addr) = &config.remote_addr else {
-        return Ok(None);
+        return Ok((None, None));
     };
     let candidates: Vec<SocketAddr> =
         tokio::time::timeout(DNS_RESOLVE_TIMEOUT, tokio::net::lookup_host(remote_addr.as_str()))
@@ -652,7 +760,9 @@ async fn resolve_remote_addr(config: &LinkConfig) -> Result<Option<SocketAddr>> 
                 ))
             })?
             .collect();
-    pick_remote_addr(&candidates, config.local_addr.as_deref(), &config.name).map(Some)
+    let (primary, alternate) =
+        pick_remote_addr(&candidates, config.local_addr.as_deref(), &config.name)?;
+    Ok((Some(primary), alternate))
 }
 
 /// Decide whether a link's socket should be IPv4 or IPv6, from whichever
@@ -1074,35 +1184,42 @@ mod tests {
     /// `pick_remote_addr` is where a hostname resolving to both an `A`
     /// and `AAAA` record (dual-stack DNS -- what actually motivated this
     /// function, e.g. `bgp.example.com` resolving to both an IPv4 and an
-    /// IPv6 address for the same cloud host) gets narrowed to one
-    /// family. Pure logic, no real DNS lookup needed to exercise it.
+    /// IPv6 address for the same cloud host) gets narrowed to a
+    /// (primary, alternate) pair. Pure logic, no real DNS lookup needed
+    /// to exercise it.
     #[test]
-    fn pick_remote_addr_prefers_ipv6_when_no_local_addr_hint() {
+    fn pick_remote_addr_prefers_ipv6_primary_with_ipv4_as_alternate() {
         let candidates = [
             "203.0.113.10:51000".parse().unwrap(),
             "[2001:db8::1]:51000".parse().unwrap(),
         ];
-        let picked = pick_remote_addr(&candidates, None, "test").unwrap();
-        assert!(picked.is_ipv6());
+        let (primary, alternate) = pick_remote_addr(&candidates, None, "test").unwrap();
+        assert!(primary.is_ipv6());
+        assert!(alternate.unwrap().is_ipv4());
     }
 
     #[test]
-    fn pick_remote_addr_falls_back_to_ipv4_when_only_ipv4_present() {
+    fn pick_remote_addr_falls_back_to_ipv4_with_no_alternate_when_only_ipv4_present() {
         let candidates = ["203.0.113.10:51000".parse().unwrap()];
-        let picked = pick_remote_addr(&candidates, None, "test").unwrap();
-        assert!(picked.is_ipv4());
+        let (primary, alternate) = pick_remote_addr(&candidates, None, "test").unwrap();
+        assert!(primary.is_ipv4());
+        assert!(alternate.is_none());
     }
 
     #[test]
-    fn pick_remote_addr_honors_local_addr_family_hint() {
+    fn pick_remote_addr_honors_local_addr_family_hint_with_no_alternate_to_race() {
         let candidates = [
             "203.0.113.10:51000".parse().unwrap(),
             "[2001:db8::1]:51000".parse().unwrap(),
         ];
         // local_addr says IPv4, so this must pick the IPv4 candidate
-        // even though IPv6 would otherwise be preferred.
-        let picked = pick_remote_addr(&candidates, Some("192.0.2.5"), "test").unwrap();
-        assert!(picked.is_ipv4());
+        // even though IPv6 would otherwise be preferred as primary --
+        // and, since the operator pinned a family explicitly, there's
+        // nothing left to race: no alternate at all.
+        let (primary, alternate) =
+            pick_remote_addr(&candidates, Some("192.0.2.5"), "test").unwrap();
+        assert!(primary.is_ipv4());
+        assert!(alternate.is_none());
     }
 
     #[test]
@@ -1122,7 +1239,7 @@ mod tests {
     #[tokio::test]
     async fn resolve_remote_addr_returns_none_when_unset() {
         let cfg = test_link_config(None, None);
-        assert_eq!(resolve_remote_addr(&cfg).await.unwrap(), None);
+        assert_eq!(resolve_remote_addr(&cfg).await.unwrap(), (None, None));
     }
 
     /// A literal `ip:port` resolves via `ToSocketAddrs`' own fast path
@@ -1134,15 +1251,17 @@ mod tests {
     #[tokio::test]
     async fn resolve_remote_addr_accepts_a_literal_ipv4_address() {
         let cfg = test_link_config(None, Some("203.0.113.10:51000"));
-        let resolved = resolve_remote_addr(&cfg).await.unwrap();
-        assert_eq!(resolved, Some("203.0.113.10:51000".parse().unwrap()));
+        let (primary, alternate) = resolve_remote_addr(&cfg).await.unwrap();
+        assert_eq!(primary, Some("203.0.113.10:51000".parse().unwrap()));
+        assert_eq!(alternate, None);
     }
 
     #[tokio::test]
     async fn resolve_remote_addr_accepts_a_literal_ipv6_address() {
         let cfg = test_link_config(None, Some("[2001:db8::1]:51000"));
-        let resolved = resolve_remote_addr(&cfg).await.unwrap();
-        assert_eq!(resolved, Some("[2001:db8::1]:51000".parse().unwrap()));
+        let (primary, alternate) = resolve_remote_addr(&cfg).await.unwrap();
+        assert_eq!(primary, Some("[2001:db8::1]:51000".parse().unwrap()));
+        assert_eq!(alternate, None);
     }
 
     #[tokio::test]
@@ -1151,6 +1270,83 @@ mod tests {
         // before any network access, so this stays fast and non-flaky.
         let cfg = test_link_config(None, Some("not-an-address"));
         assert!(resolve_remote_addr(&cfg).await.is_err());
+    }
+
+    /// A minimal but fully real `Link` for `commit_remote` tests --
+    /// plain loopback-bound sockets (no `SO_BINDTODEVICE`/privileged
+    /// path needed, unlike `Link::bind` itself) so these run in an
+    /// ordinary unprivileged `cargo test`.
+    async fn test_link_with_alternate() -> (Link, SocketAddr, SocketAddr) {
+        let primary_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let primary_remote: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let alt_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let alt_remote: SocketAddr = "127.0.0.1:2".parse().unwrap();
+
+        let link = Link {
+            id: 0,
+            config: test_link_config(None, None),
+            socket: Arc::new(AsyncRwLock::new(Arc::new(primary_socket))),
+            reconnect_lock: Arc::new(AsyncMutex::new(())),
+            remote: Some(primary_remote),
+            state: LinkState::Probing,
+            state_since: Instant::now(),
+            stats: LinkStats::new(0.2),
+            physical_mtu: None,
+            admin_disabled: false,
+            effective_probe_interval_ms: 200,
+            effective_ewma_alpha: 0.2,
+            alternate: Some((alt_remote, Arc::new(AsyncRwLock::new(Arc::new(alt_socket))))),
+        };
+        (link, primary_remote, alt_remote)
+    }
+
+    #[tokio::test]
+    async fn commit_remote_switches_to_the_alternate_when_it_wins() {
+        let (mut link, _primary_remote, alt_remote) = test_link_with_alternate().await;
+        link.commit_remote(Some(alt_remote));
+        assert_eq!(link.remote, Some(alt_remote));
+        assert!(link.alternate.is_none());
+    }
+
+    #[tokio::test]
+    async fn commit_remote_keeps_the_primary_when_it_wins() {
+        let (mut link, primary_remote, _alt_remote) = test_link_with_alternate().await;
+        link.commit_remote(Some(primary_remote));
+        assert_eq!(link.remote, Some(primary_remote));
+        assert!(link.alternate.is_none());
+    }
+
+    #[tokio::test]
+    async fn commit_remote_drops_the_alternate_when_a_different_link_won() {
+        // `None` -- or any address that isn't this link's own
+        // alternate -- is exactly what `tunnel::run`'s post-handshake
+        // cleanup loop passes for every link *other* than the one that
+        // actually answered: nothing to switch to, just release the
+        // now-pointless alternate socket.
+        let (mut link, primary_remote, _alt_remote) = test_link_with_alternate().await;
+        link.commit_remote(None);
+        assert_eq!(link.remote, Some(primary_remote));
+        assert!(link.alternate.is_none());
+    }
+
+    #[tokio::test]
+    async fn commit_remote_is_a_no_op_once_already_resolved() {
+        let (mut link, primary_remote, alt_remote) = test_link_with_alternate().await;
+        link.commit_remote(Some(alt_remote));
+        assert_eq!(link.remote, Some(alt_remote));
+        // Calling it again (as the cleanup loop's unconditional pass
+        // over every link would, for the link that already resolved
+        // its own race inside perform_client_handshake) must not undo
+        // the switch or panic.
+        link.commit_remote(Some(primary_remote));
+        assert_eq!(link.remote, Some(alt_remote));
+    }
+
+    #[tokio::test]
+    async fn alternate_handle_is_none_without_an_alternate() {
+        let (mut link, _primary_remote, _alt_remote) = test_link_with_alternate().await;
+        link.commit_remote(None);
+        assert!(link.alternate_handle().is_none());
     }
 
     #[test]

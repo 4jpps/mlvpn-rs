@@ -117,8 +117,12 @@ enabled = true           # exposes live stats to `mlvpn-tui`; see README.md "Mon
 # startup; a restart is needed to pick up a changed IP behind the
 # hostname, same as editing a literal IP here always required. If the
 # hostname has both an A and AAAA record (ordinary dual-stack DNS),
-# IPv6 is preferred automatically unless local_addr below pins this
-# link to a specific family.
+# IPv6 is tried first but not blindly trusted: both addresses are
+# raced during the very first handshake, and whichever one actually
+# answers wins -- so a broken/absent IPv6 route (common enough on
+# residential ISPs, and not the same thing as the AAAA record simply
+# existing) automatically falls back to IPv4 instead of hanging
+# forever. local_addr below pins a specific family with no racing.
 
 [[links]]
 name = "fiber"
