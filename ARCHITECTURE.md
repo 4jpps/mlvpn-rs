@@ -268,6 +268,29 @@ preferred (`link::pick_remote_addr`). This is distinct from
 `tunnel.address6` (§12), which is about the TUN interface's own
 address, not the transport sockets between the two `mlvpnd` instances.
 
+**Resolving a dual-stack ambiguity for real.** An `AAAA` record
+existing doesn't mean that IPv6 path actually works end-to-end --
+residential/consumer ISPs with a broken or absent IPv6 route are common
+enough that blindly committing to "IPv6 if present" could otherwise
+strand a link forever. `link::Link::alternate` holds the untried other
+family alongside the chosen primary; `tunnel::perform_client_handshake`
+broadcasts both during the very first handshake attempt, and whichever
+one the peer actually answers wins. But the peer deduplicates every
+copy of that broadcast by `session_id` (they're identical except for
+source link/address), so only the very first arrival *across every
+configured link* ever gets a real reply -- every other link, and every
+other family on whichever link did win, learns nothing from that
+exchange. `tunnel::resolve_remaining_alternates` covers those: right
+after the session is established, it races a real authenticated
+`Probe`/`ProbeReply` between each remaining link's own primary and
+alternate (cheap -- the session already exists, no second handshake
+needed) and commits whichever one actually answers, falling back to the
+original primary only if neither does. Without this second pass, a
+link whose primary family happened to be the broken one -- reported in
+practice as "this link is stuck trying IPv6 even though IPv6 is
+disabled on its interface" -- would sit in `Probing` forever, having
+had a working alternate that was simply discarded unused.
+
 ## 7. Receive-side reordering
 
 `tunnel::ReorderBuffer` holds decrypted packets keyed by sequence

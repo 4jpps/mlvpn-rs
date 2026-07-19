@@ -51,7 +51,10 @@ self-test, including the bidirectional case's autonomous
 peer-triggered reverse stream, and (via the real `mlvpnd diag-dump`
 CLI, plus a real `tc netem loss` injection for the automatic
 loss-threshold watcher) a real diagnostic-dump capture, both manual
-and automatic. This needs root
+and automatic, and (via a real dual-stack veth link, a temporary
+`/etc/hosts` entry, and `tc netem delay` to force a specific race
+outcome) a real post-handshake alternate-address-family failover for a
+link that lost the initial multi-link handshake race. This needs root
 (namespace/veth creation, `mlvpnd`'s own `CAP_NET_ADMIN`/`CAP_NET_RAW`
 setup), `iproute2`'s `ip` on `PATH`, and the `mlvpn` system user/group
 (created automatically if missing, mirroring
@@ -74,16 +77,24 @@ sudo env "PATH=$PATH" HOME="$HOME" cargo test --release --locked --test veth_act
 sudo env "PATH=$PATH" HOME="$HOME" cargo test --release --locked --test veth_daemon_health -- --ignored --nocapture
 sudo env "PATH=$PATH" HOME="$HOME" cargo test --release --locked --test veth_throughput_selftest -- --ignored --nocapture
 sudo env "PATH=$PATH" HOME="$HOME" cargo test --release --locked --test veth_diag_dump -- --ignored --nocapture
+sudo env "PATH=$PATH" HOME="$HOME" cargo test --release --locked --test veth_dualstack_alternate_failover -- --ignored --nocapture
 ```
 
-`veth_reorder_tuning` and `veth_active_bandwidth_probing` additionally
-need `tc` (also part of `iproute2`, though occasionally packaged
-separately as `iproute2-tc`), and both take noticeably longer than the
-others (tens of seconds): `veth_reorder_tuning` has to wait through at
-least one real 30-second `reorder_tuning_loop` tick, and
-`veth_active_bandwidth_probing` waits through the validated 30-second
-floor of `active_bandwidth_probe_interval_secs` -- see each test's own
-module doc comment.
+`veth_reorder_tuning`, `veth_active_bandwidth_probing`, `veth_diag_dump`,
+and `veth_dualstack_alternate_failover` additionally need `tc` (also
+part of `iproute2`, though occasionally packaged separately as
+`iproute2-tc`). `veth_reorder_tuning` and `veth_active_bandwidth_probing`
+also take noticeably longer than the others (tens of seconds):
+`veth_reorder_tuning` has to wait through at least one real 30-second
+`reorder_tuning_loop` tick, and `veth_active_bandwidth_probing` waits
+through the validated 30-second floor of
+`active_bandwidth_probe_interval_secs` -- see each test's own module
+doc comment. `veth_dualstack_alternate_failover` additionally appends a
+temporary, uniquely-named entry to the real `/etc/hosts` (removed again
+on drop, even on panic -- see that test's own `HostsEntryGuard`) since
+`ip netns exec` isolates the network stack, not the filesystem, and
+this project has no other way to make a synthetic hostname resolve to
+two addresses without a real DNS server.
 
 Plain `sudo -E` isn't enough for a rustup-managed toolchain: many
 sudoers configs force `secure_path` for `PATH` regardless of `-E` (so

@@ -632,25 +632,31 @@ impl Link {
         })
     }
 
-    /// Resolves `alternate` after the very first handshake attempt has
-    /// finished (win or lose) -- called once, from
-    /// `tunnel::perform_client_handshake`'s success arm for whichever
-    /// link actually answered, and unconditionally for every other link
-    /// right after `tunnel::establish_session_with_retry` returns (see
-    /// `tunnel::run`), so no link is ever left holding an untested
-    /// alternate socket open for the rest of the process's life.
+    /// Resolves `alternate` once this link's own primary-vs-alternate
+    /// ambiguity has actually been tested -- called from two places:
+    /// `tunnel::perform_client_handshake`'s success arm, for whichever
+    /// link's reply happened to win the initial handshake broadcast (the
+    /// only link that gets a real signal from *that* exchange, since the
+    /// peer only ever answers the first-arriving copy of it -- see that
+    /// function's doc comment); and `tunnel::resolve_remaining_alternates`,
+    /// right after, for every *other* link, using a lightweight
+    /// authenticated probe race instead since the handshake itself never
+    /// gave them a chance to prove anything. Either way, this runs
+    /// exactly once per link before any `link_receiver`/`link_prober`
+    /// task exists to hold a stale copy of the pre-resolution socket, so
+    /// no link is ever left holding an untested alternate open for the
+    /// rest of the process's life.
     ///
-    /// `winner`, if `Some`, is the address that actually answered this
-    /// specific handshake attempt. If it matches `alternate`'s address,
-    /// that candidate just proved itself reachable where the original
-    /// `remote`/`socket` apparently wasn't (within this attempt's
-    /// timeout, at least) -- promote it: swap it into `remote`/`socket`
-    /// so every per-link task spawned after this point (`link_receiver`,
-    /// `link_prober`, `active_bandwidth_prober` -- all spawned later in
-    /// `tunnel::run`, using `handle()`/this same `Link`) uses the
-    /// address that's actually known to work. Otherwise (the primary
-    /// won, a *different* link entirely answered, or nothing answered
-    /// yet), the alternate is simply dropped, closing its socket.
+    /// `winner`, if `Some`, is the address that actually answered.  If it
+    /// matches `alternate`'s address, that candidate just proved itself
+    /// reachable where the original `remote`/`socket` apparently wasn't --
+    /// promote it: swap it into `remote`/`socket` so every per-link task
+    /// spawned after this point (`link_receiver`, `link_prober`,
+    /// `active_bandwidth_prober` -- all spawned later in `tunnel::run`,
+    /// using `handle()`/this same `Link`) uses the address that's
+    /// actually known to work. Otherwise (the primary won, a *different*
+    /// link entirely answered, or nothing answered at all), the
+    /// alternate is simply dropped, closing its socket.
     pub fn commit_remote(&mut self, winner: Option<SocketAddr>) {
         let Some((alt_remote, alt_socket)) = self.alternate.take() else {
             return;
@@ -660,8 +666,7 @@ impl Link {
                 link = %self.config.name,
                 previous = ?self.remote,
                 winner = %alt_remote,
-                "alternate address family answered the initial handshake first; \
-                 switching this link to it"
+                "alternate address family confirmed reachable; switching this link to it"
             );
             self.remote = Some(alt_remote);
             self.socket = alt_socket;

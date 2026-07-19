@@ -689,25 +689,25 @@ pub async fn run(
     let params = Arc::new(params);
 
     let (session_id, session) = establish_session_with_retry(&links, &params).await;
+    let session = Arc::new(AsyncMutex::new(SessionState::new(session_id, session)));
+    let session_meta = Arc::new(SessionMeta::new(session_id));
+
+    tracing::info!(session_id, "tunnel session established");
 
     // Every link's `link::Link::alternate` (if any) was only ever meant
     // to be raced during that initial handshake above -- see its own
     // doc comment. The link that actually answered already resolved its
     // own via `commit_remote` inside `perform_client_handshake`; this
-    // covers every *other* link, which otherwise would keep an
-    // untested, never-referenced alternate socket bound (and its fd/port
-    // held) for the rest of this process's life. `commit_remote(None)`
-    // is a no-op for the link that already resolved (its `alternate` is
-    // already `None`), so this is safe to run unconditionally over
-    // every link without needing to know here which one actually won.
-    for link in links.iter() {
-        link.lock().await.commit_remote(None);
-    }
-
-    let session = Arc::new(AsyncMutex::new(SessionState::new(session_id, session)));
-    let session_meta = Arc::new(SessionMeta::new(session_id));
-
-    tracing::info!(session_id, "tunnel session established");
+    // actively verifies every *other* link's still-untested alternate
+    // now that a session exists to authenticate a probe with, rather
+    // than just discarding it -- see `resolve_remaining_alternates`'s
+    // doc comment for why (CHANGELOG: a link whose primary family
+    // turned out to be unreachable, e.g. IPv6 administratively disabled
+    // on that link's own physical interface, used to be stuck that way
+    // forever, never given the chance to fail over to a working
+    // alternate it never lost this race against -- it simply never got
+    // to run it).
+    resolve_remaining_alternates(&links, &session).await;
 
     let rekey_ctx = Arc::new(RekeyContext {
         mode: params.mode,
@@ -1636,6 +1636,174 @@ async fn race_handshake_reply(
             "no valid handshake reply on any link".into(),
         )),
         Err(_) => Err(MlvpnError::Handshake("timeout".into())),
+    }
+}
+
+/// How long `resolve_remaining_alternates` waits for either a link's
+/// primary or alternate address to answer a probe before giving up on
+/// both and falling back to the primary (today's pre-fix behavior).
+/// Generous enough for a real round trip plus normal jitter; this runs
+/// once, for at most a handful of links, all racing concurrently, so
+/// it's not worth trimming tighter at the cost of a spurious failure
+/// under momentary network noise right at startup.
+const RESOLVE_ALTERNATE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Actively resolves every remaining link's untested primary-vs-
+/// alternate ambiguity (see `link::Link::alternate`'s doc comment),
+/// rather than just discarding the alternate the way `run()` used to.
+///
+/// Only one link+family combination ever gets a real reply during the
+/// initial handshake broadcast in `perform_client_handshake`: the peer
+/// deduplicates every copy of that broadcast by `session_id` (they're
+/// all identical except for source address/link), so whichever one
+/// arrives first is the only one that ever gets a `HandshakeResp` --
+/// every other link, and every other family on the winning link, gets
+/// no reply at all, not even a delayed one, no matter how long anyone
+/// waited. That's fine for the link that won (it obviously has a
+/// working path), but it means every *other* configured link's own
+/// primary-vs-alternate ambiguity is never actually tested -- the old
+/// code just kept `pick_remote_addr`'s IPv6-preferred guess and dropped
+/// the alternate outright. If that guess was wrong (e.g. IPv6
+/// administratively disabled on that link's own physical interface),
+/// the link would sit in `Probing` forever: its primary never works,
+/// and its one working alternate was already closed before anything
+/// tried it.
+///
+/// Fixes that by racing a real authenticated `Probe`/`ProbeReply` round
+/// trip between each remaining link's primary and alternate, now that a
+/// session exists to encrypt one under -- no second handshake needed.
+/// Runs once, here, before any `link_receiver` task exists to contend
+/// with these sockets' `recv_from` calls (same reasoning as
+/// `establish_session`'s pre-session server-mode loop). A link where
+/// neither address answers within `RESOLVE_ALTERNATE_TIMEOUT` falls
+/// back to its primary and drops the alternate -- exactly the old
+/// behavior, so this can only ever improve a link's outcome, never make
+/// one worse than before this existed.
+async fn resolve_remaining_alternates(links: &Links, session: &Arc<AsyncMutex<SessionState>>) {
+    let snap = link::snapshot_links(links).await;
+    let mut join_set: JoinSet<(u8, Option<SocketAddr>)> = JoinSet::new();
+    for link in snap.iter() {
+        let (Some((alt_remote, _)), Some(primary_remote)) = (link.alternate.as_ref(), link.remote)
+        else {
+            continue;
+        };
+        let Some(alt_handle) = link.alternate_handle() else {
+            continue;
+        };
+        let primary_handle = link.handle();
+        let link_id = link.id;
+        let alt_remote = *alt_remote;
+        let session = session.clone();
+        join_set.spawn(async move {
+            let mut inner: JoinSet<Option<SocketAddr>> = JoinSet::new();
+            inner.spawn(probe_one_address(
+                primary_handle,
+                primary_remote,
+                link_id,
+                session.clone(),
+            ));
+            inner.spawn(probe_one_address(alt_handle, alt_remote, link_id, session));
+            let winner = tokio::time::timeout(RESOLVE_ALTERNATE_TIMEOUT, async {
+                while let Some(joined) = inner.join_next().await {
+                    if let Ok(Some(addr)) = joined {
+                        return Some(addr);
+                    }
+                }
+                None
+            })
+            .await
+            .ok()
+            .flatten();
+            inner.abort_all();
+            (link_id, winner)
+        });
+    }
+    while let Some(joined) = join_set.join_next().await {
+        let Ok((link_id, winner)) = joined else {
+            continue;
+        };
+        if let Some(link) = links.get(link_id as usize) {
+            let mut guard = link.lock().await;
+            if winner.is_none() {
+                tracing::warn!(
+                    link = %guard.config.name,
+                    "neither primary nor alternate address answered a post-handshake probe; \
+                     keeping the originally selected primary -- this link may not actually be \
+                     reachable over that family"
+                );
+            }
+            guard.commit_remote(winner);
+        }
+    }
+}
+
+/// Sends one authenticated `Probe` on `handle`'s current socket to
+/// `remote` and waits for a matching `ProbeReply` (by `probe_seq`),
+/// returning `remote` on success. Used only by
+/// `resolve_remaining_alternates`, to test one candidate address of one
+/// link's primary-vs-alternate pair; `None` on a send failure. Loops on
+/// `recv_from` with no timeout of its own -- the caller is always
+/// responsible for bounding this, same pattern as
+/// `race_handshake_reply`'s per-target receive tasks.
+async fn probe_one_address(
+    handle: LinkHandle,
+    remote: SocketAddr,
+    link_id: u8,
+    session: Arc<AsyncMutex<SessionState>>,
+) -> Option<SocketAddr> {
+    let probe_seq = crypto::random_session_id();
+    let now_ns = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    let payload = ProbePayload {
+        probe_seq,
+        send_ts_ns: now_ns,
+    }
+    .encode();
+
+    let socket = handle.current_socket().await;
+    let (session_id, seq, ciphertext) = {
+        let s = session.lock().await;
+        s.encrypt(&payload).ok()?
+    };
+    let mut frame = Vec::with_capacity(HEADER_LEN + ciphertext.len());
+    Header {
+        ptype: PacketType::Probe,
+        link_id,
+        session_id,
+        seq,
+    }
+    .encode(&mut frame);
+    frame.extend_from_slice(&ciphertext);
+    socket.send_to(&frame, remote).await.ok()?;
+
+    let mut buf = vec![0u8; MAX_FRAME];
+    loop {
+        let (n, from) = socket.recv_from(&mut buf).await.ok()?;
+        if from != remote {
+            continue;
+        }
+        let Ok((hdr, ct)) = Header::decode(&buf[..n]) else {
+            continue;
+        };
+        if hdr.ptype != PacketType::ProbeReply {
+            continue;
+        }
+        let plaintext = {
+            let mut s = session.lock().await;
+            match s.decrypt(hdr.session_id, hdr.seq, ct) {
+                Ok(pt) => pt,
+                Err(_) => continue,
+            }
+        };
+        let Ok(reply) = ProbePayload::decode(&plaintext) else {
+            continue;
+        };
+        if reply.probe_seq != probe_seq {
+            continue;
+        }
+        return Some(remote);
     }
 }
 
