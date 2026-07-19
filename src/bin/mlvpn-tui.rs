@@ -2,14 +2,17 @@
 //!
 //! Connects to the daemon's local control socket (see `control.rs` in the
 //! `mlvpn` lib crate) and renders a continuously-updating, tabbed view:
-//! **Links** (every bonded link's state, the peer address it's talking
-//! to, and both this side's own measured RTT/jitter/loss/throughput *and*
-//! the peer's self-reported view of the same link, received over the
-//! wire via `StatsShare` frames -- see `protocol.rs`), **Daemon**
-//! (session/rekey state, the outbound queue, the TUN device's own kernel
-//! counters, and machine-wide load/memory/uptime), and **Logs** (a live
-//! tail of the daemon's own log output, streamed incrementally rather
-//! than requiring a separate `journalctl -f` window).
+//! **Overview** (the default tab at startup -- condensed Links/Daemon/Logs
+//! panes stacked in one screen, for an at-a-glance/screenshot-friendly
+//! view without switching tabs), **Links** (every bonded link's state,
+//! the peer address it's talking to, and both this side's own measured
+//! RTT/jitter/loss/throughput *and* the peer's self-reported view of the
+//! same link, received over the wire via `StatsShare` frames -- see
+//! `protocol.rs`), **Daemon** (session/rekey state, the outbound queue,
+//! the TUN device's own kernel counters, and machine-wide load/memory/
+//! uptime), and **Logs** (a live tail of the daemon's own log output,
+//! streamed incrementally rather than requiring a separate
+//! `journalctl -f` window).
 //!
 //! Deliberately does not use tokio: the only I/O here is one blocking
 //! Unix-socket read loop (run on its own OS thread) feeding a shared
@@ -64,21 +67,23 @@ struct Cli {
     socket: Option<String>,
 }
 
-/// Which of the three tabs is currently on screen -- pure UI-input
+/// Which of the four tabs is currently on screen -- pure UI-input
 /// state local to `run_app`'s loop, not shared with `reader_thread`, so
 /// it deliberately doesn't live on `SharedState`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
+    Overview,
     Links,
     Daemon,
     Logs,
 }
 
 impl Tab {
-    const ALL: [Tab; 3] = [Tab::Links, Tab::Daemon, Tab::Logs];
+    const ALL: [Tab; 4] = [Tab::Overview, Tab::Links, Tab::Daemon, Tab::Logs];
 
     fn title(self) -> &'static str {
         match self {
+            Tab::Overview => "Overview",
             Tab::Links => "Links",
             Tab::Daemon => "Daemon",
             Tab::Logs => "Logs",
@@ -113,28 +118,37 @@ struct SharedState {
     /// far -- see `reader_thread`. Oldest-first, capped at
     /// `TUI_LOG_CAPACITY`.
     logs: VecDeque<LogEntry>,
+    /// `None` while auto-detecting and no control socket has been found
+    /// yet (see `SocketSource::AutoDetect`); `Some` once known, either
+    /// because `--socket` was given explicitly or auto-detection found
+    /// it. Purely for header/footer display -- `reader_thread` tracks
+    /// its own working copy independently.
+    socket_path: Option<PathBuf>,
 }
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    let socket_path = resolve_socket_path(cli.socket)?;
     let hostname = local_hostname();
+    let socket_source = resolve_socket_source(cli.socket)?;
 
     let state = Arc::new(Mutex::new(SharedState {
         snapshot: None,
         connected: false,
         last_update: None,
         logs: VecDeque::new(),
+        socket_path: match &socket_source {
+            SocketSource::Fixed(p) => Some(p.clone()),
+            SocketSource::AutoDetect => None,
+        },
     }));
 
     {
         let state = state.clone();
-        let socket_path = socket_path.clone();
-        thread::spawn(move || reader_thread(socket_path, state));
+        thread::spawn(move || reader_thread(socket_source, state));
     }
 
     let mut terminal = setup_terminal()?;
-    let result = run_app(&mut terminal, &state, &socket_path, &hostname);
+    let result = run_app(&mut terminal, &state, &hostname);
     restore_terminal(&mut terminal)?;
     result
 }
@@ -162,13 +176,38 @@ fn local_hostname() -> String {
     String::from_utf8_lossy(&buf[..nul]).into_owned()
 }
 
-/// If the peer's `mlvpnd` predates `[control]` support, or the daemon
-/// simply isn't running, there is nothing for this tool to connect to;
-/// fail with a clear message up front rather than guessing.
-fn resolve_socket_path(explicit: Option<String>) -> anyhow::Result<PathBuf> {
-    if let Some(p) = explicit {
-        return Ok(PathBuf::from(p));
-    }
+/// Name of the systemd unit this tool knows how to check/start for the
+/// "no control socket yet" recovery flow in `resolve_socket_source`
+/// below -- matches `systemd/mlvpn.service`'s install location
+/// (`/etc/systemd/system/mlvpn.service`). This project ships exactly
+/// one, non-templated unit (one tunnel per host, by convention), so a
+/// single hardcoded name is enough; a host running `mlvpnd` some other
+/// way (manually, a different init system) just falls through to
+/// `ServiceStatus::Unknown` and gets the original plain error.
+const MLVPN_SYSTEMD_UNIT: &str = "mlvpn.service";
+
+/// Where `reader_thread` should look for the control socket.
+enum SocketSource {
+    Fixed(PathBuf),
+    /// The control socket's exact path isn't known yet -- keep
+    /// rescanning `/run/mlvpn` for it (see `reader_thread`). Reached
+    /// only after `resolve_socket_source` has already established
+    /// there's a reasonable chance one will actually show up (the
+    /// service is active, or the operator just asked to start it).
+    AutoDetect,
+}
+
+enum AutoDetectOutcome {
+    Found(PathBuf),
+    NoneFound,
+    Ambiguous(Vec<PathBuf>),
+}
+
+/// Scans `/run/mlvpn` for exactly one monitoring control socket. Used
+/// both by `resolve_socket_source`'s first attempt and by
+/// `reader_thread` on every retry while in `SocketSource::AutoDetect`
+/// mode.
+fn scan_auto_socket_dir() -> AutoDetectOutcome {
     let dir = Path::new("/run/mlvpn");
     let mut found = Vec::new();
     if let Ok(entries) = std::fs::read_dir(dir) {
@@ -199,26 +238,166 @@ fn resolve_socket_path(explicit: Option<String>) -> anyhow::Result<PathBuf> {
         }
     }
     match found.len() {
-        1 => Ok(found.remove(0)),
-        0 => anyhow::bail!(
-            "no control socket found under {}; pass --socket explicitly, or check that mlvpnd \
-             is running with [control] enabled (the default)",
-            dir.display()
-        ),
-        _ => anyhow::bail!(
-            "multiple control sockets found under {}: {found:?} -- pass --socket to pick one",
-            dir.display()
-        ),
+        1 => AutoDetectOutcome::Found(found.remove(0)),
+        0 => AutoDetectOutcome::NoneFound,
+        _ => AutoDetectOutcome::Ambiguous(found),
     }
+}
+
+/// If the peer's `mlvpnd` predates `[control]` support, the daemon
+/// simply isn't running, or -- the common case this recovers from --
+/// it's running but still establishing its very first connection to
+/// the peer, there is nothing to connect to *yet*. `control::serve`
+/// isn't spawned until after that initial handshake succeeds (see
+/// `tunnel::run`), so the socket genuinely doesn't exist on a freshly
+/// (re)started daemon that's waiting on an unreachable peer -- that's
+/// not an error condition, just something to wait out.
+///
+/// Rather than failing immediately the moment no socket is found, this
+/// checks whether `mlvpn.service` is actually running: if so, hands
+/// back `SocketSource::AutoDetect` and lets `reader_thread` keep
+/// rescanning `/run/mlvpn` in the background while the TUI itself
+/// already renders (see that variant's own doc comment) -- no need to
+/// block startup on it. If the service isn't running at all, offers to
+/// start it right here (a plain stdin prompt, before the terminal
+/// switches to raw/alternate-screen mode) instead of just erroring
+/// out. Only truly gives up -- the original plain error -- when
+/// systemd itself can't be queried (non-systemd host, `mlvpnd` run
+/// some other way) or the operator declines to start it.
+fn resolve_socket_source(explicit: Option<String>) -> anyhow::Result<SocketSource> {
+    if let Some(p) = explicit {
+        return Ok(SocketSource::Fixed(PathBuf::from(p)));
+    }
+
+    match scan_auto_socket_dir() {
+        AutoDetectOutcome::Found(path) => Ok(SocketSource::Fixed(path)),
+        AutoDetectOutcome::Ambiguous(found) => anyhow::bail!(
+            "multiple control sockets found under /run/mlvpn: {found:?} -- pass --socket to \
+             pick one"
+        ),
+        AutoDetectOutcome::NoneFound => match systemd_service_status(MLVPN_SYSTEMD_UNIT) {
+            ServiceStatus::Active => {
+                println!(
+                    "{MLVPN_SYSTEMD_UNIT} is running but hasn't created a control socket yet -- \
+                     probably still waiting for the remote end to connect. Watching \
+                     /run/mlvpn for it to appear (Ctrl+C to give up)..."
+                );
+                Ok(SocketSource::AutoDetect)
+            }
+            ServiceStatus::InactiveOrFailed => {
+                print!(
+                    "No control socket found under /run/mlvpn, and {MLVPN_SYSTEMD_UNIT} isn't \
+                     running. Start it now? [y/N] "
+                );
+                let _ = io::Write::flush(&mut io::stdout());
+                let mut answer = String::new();
+                io::stdin().read_line(&mut answer)?;
+                if answer.trim().eq_ignore_ascii_case("y") {
+                    start_service(MLVPN_SYSTEMD_UNIT)?;
+                    println!(
+                        "Started {MLVPN_SYSTEMD_UNIT} -- watching /run/mlvpn for its control \
+                         socket to appear..."
+                    );
+                    Ok(SocketSource::AutoDetect)
+                } else {
+                    anyhow::bail!(
+                        "no control socket found under /run/mlvpn; pass --socket explicitly, \
+                         or start {MLVPN_SYSTEMD_UNIT} yourself first"
+                    );
+                }
+            }
+            ServiceStatus::Unknown => anyhow::bail!(
+                "no control socket found under /run/mlvpn; pass --socket explicitly, or check \
+                 that mlvpnd is running with [control] enabled (the default)"
+            ),
+        },
+    }
+}
+
+enum ServiceStatus {
+    Active,
+    InactiveOrFailed,
+    /// Couldn't tell -- no `systemctl` on `PATH`, this isn't a systemd
+    /// host, or the query itself failed for some other reason. Treated
+    /// as "can't help here", falling back to the original plain error
+    /// rather than guessing.
+    Unknown,
+}
+
+fn systemd_service_status(unit: &str) -> ServiceStatus {
+    match std::process::Command::new("systemctl")
+        .args(["is-active", unit])
+        .output()
+    {
+        Ok(out) => match String::from_utf8_lossy(&out.stdout).trim() {
+            "active" | "activating" | "reloading" => ServiceStatus::Active,
+            "inactive" | "failed" | "deactivating" => ServiceStatus::InactiveOrFailed,
+            _ => ServiceStatus::Unknown,
+        },
+        Err(_) => ServiceStatus::Unknown,
+    }
+}
+
+/// Runs `systemctl start <unit>`, via `sudo` if we're not already root
+/// -- this whole recovery flow happens before the terminal switches to
+/// raw/alternate-screen mode, so an interactive `sudo` password prompt
+/// here behaves exactly like it would from any other plain shell
+/// command.
+fn start_service(unit: &str) -> anyhow::Result<()> {
+    // SAFETY: geteuid() takes no arguments and has no failure mode.
+    let is_root = unsafe { libc::geteuid() } == 0;
+    let status = if is_root {
+        std::process::Command::new("systemctl")
+            .args(["start", unit])
+            .status()?
+    } else {
+        std::process::Command::new("sudo")
+            .args(["systemctl", "start", unit])
+            .status()?
+    };
+    if !status.success() {
+        anyhow::bail!("systemctl start {unit} failed");
+    }
+    Ok(())
 }
 
 /// Runs forever on its own thread: connect, stream newline-delimited JSON
 /// snapshots into `state` for as long as the connection lasts, and
 /// reconnect on any error or EOF (the daemon may not have started yet, or
 /// may restart mid-session -- neither should crash the viewer).
-fn reader_thread(socket_path: PathBuf, state: Arc<Mutex<SharedState>>) {
+///
+/// In `SocketSource::AutoDetect` mode, also re-scans `/run/mlvpn` on
+/// every retry until exactly one control socket shows up -- see
+/// `resolve_socket_source`'s doc comment for why this mode exists at
+/// all (a freshly started `mlvpnd` waiting on an unreachable peer
+/// doesn't create the socket until its initial handshake succeeds).
+/// Once found, that path is written to `state.socket_path` (purely for
+/// the header/footer to display) and the local `source` is pinned to
+/// `Fixed` from then on -- no need to keep rescanning a directory for a
+/// daemon that's already shown up once.
+fn reader_thread(mut source: SocketSource, state: Arc<Mutex<SharedState>>) {
     loop {
-        match UnixStream::connect(&socket_path) {
+        let path = match &source {
+            SocketSource::Fixed(p) => p.clone(),
+            SocketSource::AutoDetect => match scan_auto_socket_dir() {
+                AutoDetectOutcome::Found(p) => {
+                    state.lock().unwrap().socket_path = Some(p.clone());
+                    source = SocketSource::Fixed(p.clone());
+                    p
+                }
+                AutoDetectOutcome::NoneFound | AutoDetectOutcome::Ambiguous(_) => {
+                    // Ambiguous here would mean a second tunnel's socket
+                    // appeared after startup -- not this tool's problem
+                    // to resolve interactively mid-session; just keep
+                    // waiting for exactly one, same as "not found yet".
+                    state.lock().unwrap().connected = false;
+                    thread::sleep(Duration::from_secs(2));
+                    continue;
+                }
+            },
+        };
+
+        match UnixStream::connect(&path) {
             Ok(stream) => {
                 state.lock().unwrap().connected = true;
                 let reader = BufReader::new(stream);
@@ -269,10 +448,13 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> anyhow
 fn run_app(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     state: &Arc<Mutex<SharedState>>,
-    socket_path: &Path,
     hostname: &str,
 ) -> anyhow::Result<()> {
-    let mut active_tab = Tab::Links;
+    // Overview first: a screenshot-friendly, at-a-glance combination of
+    // every other tab's panes is the most useful thing to see the
+    // instant this tool starts up, before an operator has decided which
+    // single tab they actually want to drill into.
+    let mut active_tab = Tab::Overview;
     // Lines scrolled up from the bottom of the Logs tab -- 0 means
     // "pinned to the newest line" (standard tail -f auto-follow: as
     // long as this stays 0, `draw_logs_tab` always shows whatever's
@@ -284,7 +466,7 @@ fn run_app(
     loop {
         {
             let s = state.lock().unwrap();
-            terminal.draw(|f| draw(f, &s, socket_path, hostname, active_tab, log_scroll))?;
+            terminal.draw(|f| draw(f, &s, hostname, active_tab, log_scroll))?;
         }
 
         if event::poll(Duration::from_millis(250))? {
@@ -301,9 +483,10 @@ fn run_app(
                 match key.code {
                     KeyCode::Tab => active_tab = active_tab.next(),
                     KeyCode::BackTab => active_tab = active_tab.prev(),
-                    KeyCode::Char('1') => active_tab = Tab::Links,
-                    KeyCode::Char('2') => active_tab = Tab::Daemon,
-                    KeyCode::Char('3') => active_tab = Tab::Logs,
+                    KeyCode::Char('1') => active_tab = Tab::Overview,
+                    KeyCode::Char('2') => active_tab = Tab::Links,
+                    KeyCode::Char('3') => active_tab = Tab::Daemon,
+                    KeyCode::Char('4') => active_tab = Tab::Logs,
                     KeyCode::Up if active_tab == Tab::Logs => {
                         log_scroll = log_scroll.saturating_add(1);
                     }
@@ -323,14 +506,7 @@ fn run_app(
     }
 }
 
-fn draw(
-    f: &mut Frame,
-    state: &SharedState,
-    socket_path: &Path,
-    hostname: &str,
-    active_tab: Tab,
-    log_scroll: usize,
-) {
+fn draw(f: &mut Frame, state: &SharedState, hostname: &str, active_tab: Tab, log_scroll: usize) {
     let area = f.area();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -341,8 +517,9 @@ fn draw(
         ])
         .split(area);
 
-    draw_tabs_header(f, chunks[0], state, socket_path, hostname, active_tab);
+    draw_tabs_header(f, chunks[0], state, hostname, active_tab);
     match active_tab {
+        Tab::Overview => draw_overview_tab(f, chunks[1], state),
         Tab::Links => draw_links_tab(f, chunks[1], state),
         Tab::Daemon => draw_daemon_tab(f, chunks[1], state),
         Tab::Logs => draw_logs_tab(f, chunks[1], state, log_scroll),
@@ -354,28 +531,34 @@ fn draw_tabs_header(
     f: &mut Frame,
     area: Rect,
     state: &SharedState,
-    socket_path: &Path,
     hostname: &str,
     active_tab: Tab,
 ) {
-    let (title, style) = match &state.snapshot {
-        Some(snap) => (
+    let (title, style) = match (&state.snapshot, &state.socket_path) {
+        (Some(snap), Some(path)) => (
             format!(
                 " {}  --  tunnel '{}' ({})  --  {} ",
                 hostname,
                 snap.tunnel_name,
                 snap.mode,
-                socket_path.display()
+                path.display()
             ),
             Style::default()
                 .fg(COLOR_ACCENT)
                 .add_modifier(Modifier::BOLD),
         ),
-        None => (
+        (_, Some(path)) => (
             format!(
                 " {}  --  waiting for data from {}... ",
                 hostname,
-                socket_path.display()
+                path.display()
+            ),
+            Style::default().fg(COLOR_WARN),
+        ),
+        (_, None) => (
+            format!(
+                " {}  --  waiting for mlvpnd's control socket under /run/mlvpn... ",
+                hostname
             ),
             Style::default().fg(COLOR_WARN),
         ),
@@ -396,6 +579,65 @@ fn draw_tabs_header(
         )
         .divider(" | ");
     f.render_widget(tabs, area);
+}
+
+/// The default tab at startup: condensed panes from every other tab
+/// stacked into one screen -- the full Links table on top (unchanged,
+/// just reused directly), the four Daemon panels arranged as a 2x2
+/// grid in the middle, and a following Logs tail at the bottom. Meant
+/// to be screenshot-friendly on its own, without needing to switch
+/// tabs to see the whole picture at a glance. The embedded Logs pane
+/// always follows the tail (no scrolling here -- switch to the real
+/// Logs tab for that).
+fn draw_overview_tab(f: &mut Frame, area: Rect, state: &SharedState) {
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(45),
+            Constraint::Length(10),
+            Constraint::Min(3),
+        ])
+        .split(area);
+
+    draw_links_tab(f, rows[0], state);
+
+    let Some(snap) = &state.snapshot else {
+        let block = Block::default().borders(Borders::ALL).title(" Daemon ");
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "waiting for data...",
+                Style::default().fg(COLOR_MUTED),
+            )))
+            .block(block),
+            rows[1],
+        );
+        f.render_widget(
+            Block::default().borders(Borders::ALL).title(" Logs "),
+            rows[2],
+        );
+        return;
+    };
+    let daemon = &snap.daemon;
+
+    let daemon_rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(5), Constraint::Length(5)])
+        .split(rows[1]);
+    let top_cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(daemon_rows[0]);
+    let bottom_cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(daemon_rows[1]);
+
+    draw_session_panel(f, top_cols[0], daemon);
+    draw_outbound_queue_panel(f, top_cols[1], daemon);
+    draw_tun_panel(f, bottom_cols[0], &daemon.tun);
+    draw_system_panel(f, bottom_cols[1], daemon);
+
+    draw_logs_tab(f, rows[2], state, 0);
 }
 
 fn draw_links_tab(f: &mut Frame, area: Rect, state: &SharedState) {
@@ -439,33 +681,33 @@ fn draw_links_tab(f: &mut Frame, area: Rect, state: &SharedState) {
 fn link_row(l: &LinkSnapshot) -> Row<'static> {
     let state_style = state_style(&l.state);
     let peer_stale = l.peer_stats_age_ms.map(|a| a > 5000).unwrap_or(true);
-    let peer_style = if peer_stale {
-        Style::default().fg(COLOR_MUTED)
-    } else {
-        Style::default()
-    };
 
-    let local_text = format!(
-        "rtt {}  jit {}  loss {}  {}",
-        fmt_ms(l.local_rtt_ms),
-        fmt_ms(l.local_jitter_ms),
-        fmt_pct(l.local_loss_pct),
-        fmt_mbps(l.local_throughput_mbps),
+    let local_line = measurement_line(
+        l.local_rtt_ms,
+        l.local_jitter_ms,
+        l.local_loss_pct,
+        l.local_throughput_mbps,
+        "",
+        false,
     );
 
-    let peer_text = if l.peer_rtt_ms.is_none() && l.peer_name.is_none() {
-        "(no StatsShare received yet)".to_string()
+    let peer_line = if l.peer_rtt_ms.is_none() && l.peer_name.is_none() {
+        Line::from(Span::styled(
+            "(no StatsShare received yet)",
+            Style::default().fg(COLOR_MUTED),
+        ))
     } else {
         let age = l
             .peer_stats_age_ms
             .map(|a| format!(" [{:.1}s ago]", a as f64 / 1000.0))
             .unwrap_or_default();
-        format!(
-            "rtt {}  jit {}  loss {}  {}{age}",
-            fmt_ms(l.peer_rtt_ms),
-            fmt_ms(l.peer_jitter_ms),
-            fmt_pct(l.peer_loss_pct),
-            fmt_mbps(l.peer_throughput_mbps),
+        measurement_line(
+            l.peer_rtt_ms,
+            l.peer_jitter_ms,
+            l.peer_loss_pct,
+            l.peer_throughput_mbps,
+            &age,
+            peer_stale,
         )
     };
 
@@ -476,11 +718,70 @@ fn link_row(l: &LinkSnapshot) -> Row<'static> {
         Cell::from(l.state.clone()).style(state_style),
         Cell::from(fmt_duration_ms(l.state_duration_ms)),
         Cell::from(l.remote_addr.clone().unwrap_or_else(|| "-".to_string())),
-        Cell::from(format!("{:.2}", l.score)),
+        Cell::from(format!("{:.2}", l.score)).style(score_style(l.score)),
         Cell::from(tx_rx_text),
-        Cell::from(local_text),
-        Cell::from(peer_text).style(peer_style),
+        Cell::from(local_line),
+        Cell::from(peer_line),
     ])
+}
+
+/// Builds one "rtt X  jit Y  loss Z  N Mbps[ age]" line with the loss
+/// percentage colored by severity (see `loss_style`) -- RTT/jitter/
+/// throughput stay plain since none of them has as clear-cut a
+/// universal good/bad threshold as loss does. `muted`, when set,
+/// overrides every span (including the loss one) to `COLOR_MUTED`
+/// uniformly instead -- used for stale peer-reported data, where
+/// individual-field coloring would overstate confidence in numbers
+/// that might be well out of date.
+fn measurement_line(
+    rtt_ms: Option<f64>,
+    jitter_ms: Option<f64>,
+    loss_pct: Option<f64>,
+    throughput_mbps: Option<f64>,
+    suffix: &str,
+    muted: bool,
+) -> Line<'static> {
+    let base = if muted {
+        Style::default().fg(COLOR_MUTED)
+    } else {
+        Style::default()
+    };
+    let loss_span_style = if muted { base } else { loss_style(loss_pct) };
+    Line::from(vec![
+        Span::styled(
+            format!("rtt {}  jit {}  loss ", fmt_ms(rtt_ms), fmt_ms(jitter_ms)),
+            base,
+        ),
+        Span::styled(fmt_pct(loss_pct), loss_span_style),
+        Span::styled(format!("  {}{suffix}", fmt_mbps(throughput_mbps)), base),
+    ])
+}
+
+/// Green above 0.5 (this link is carrying a healthy share of traffic),
+/// yellow above 0 (up and eligible, but a small share -- e.g. a
+/// low-`weight` or bandwidth-capped link, or one just coming back into
+/// rotation), muted at exactly 0 (down, admin-disabled, or otherwise
+/// excluded from scheduling -- see `ipc::LinkSnapshot::score`'s doc
+/// comment).
+fn score_style(score: f64) -> Style {
+    if score <= 0.0 {
+        Style::default().fg(COLOR_MUTED)
+    } else if score < 0.5 {
+        Style::default().fg(COLOR_WARN)
+    } else {
+        Style::default().fg(COLOR_GOOD)
+    }
+}
+
+/// Green at exactly 0% loss, yellow under 5%, red at 5% or above --
+/// `None` (no measurement yet) reads as muted, not a false "good".
+fn loss_style(pct: Option<f64>) -> Style {
+    match pct {
+        None => Style::default().fg(COLOR_MUTED),
+        Some(p) if p <= 0.0 => Style::default().fg(COLOR_GOOD),
+        Some(p) if p < 5.0 => Style::default().fg(COLOR_WARN),
+        Some(_) => Style::default().fg(COLOR_BAD),
+    }
 }
 
 fn draw_daemon_tab(f: &mut Frame, area: Rect, state: &SharedState) {
@@ -624,20 +925,20 @@ fn draw_system_panel(f: &mut Frame, area: Rect, daemon: &DaemonSnapshot) {
     f.render_widget(block, area);
 
     let mem_line = match (sys.mem_total_kb, sys.mem_available_kb) {
-        (Some(total), Some(avail)) => {
+        (Some(total), Some(avail)) if total > 0 => {
             let used = total.saturating_sub(avail);
-            let pct = if total > 0 {
-                used as f64 / total as f64 * 100.0
-            } else {
-                0.0
-            };
-            format!(
-                "Mem: {} / {} ({pct:.0}% used)",
-                fmt_bytes(used * 1024),
-                fmt_bytes(total * 1024),
-            )
+            let pct = used as f64 / total as f64 * 100.0;
+            Line::from(vec![
+                Span::raw(format!(
+                    "Mem: {} / {} (",
+                    fmt_bytes(used * 1024),
+                    fmt_bytes(total * 1024),
+                )),
+                Span::styled(format!("{pct:.0}%"), mem_pct_style(pct)),
+                Span::raw(" used)"),
+            ])
         }
-        _ => "Mem: --".to_string(),
+        _ => Line::from("Mem: --"),
     };
 
     let uptime_line = match sys.uptime_secs {
@@ -652,10 +953,21 @@ fn draw_system_panel(f: &mut Frame, area: Rect, daemon: &DaemonSnapshot) {
             fmt_load(sys.load5),
             fmt_load(sys.load15),
         )),
-        Line::from(mem_line),
+        mem_line,
         Line::from(uptime_line),
     ];
     f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Green under 70% used, yellow 70-90%, red at 90% or above.
+fn mem_pct_style(pct: f64) -> Style {
+    if pct >= 90.0 {
+        Style::default().fg(COLOR_BAD)
+    } else if pct >= 70.0 {
+        Style::default().fg(COLOR_WARN)
+    } else {
+        Style::default().fg(COLOR_GOOD)
+    }
 }
 
 /// Renders a fixed window of `state.logs`, most-recent-at-bottom.
@@ -750,6 +1062,11 @@ fn draw_footer(f: &mut Frame, area: Rect, state: &SharedState, active_tab: Tab) 
                 Style::default().fg(COLOR_WARN),
             ),
         }
+    } else if state.socket_path.is_none() {
+        Span::styled(
+            "waiting for mlvpnd's control socket to appear...",
+            Style::default().fg(COLOR_WARN),
+        )
     } else {
         Span::styled(
             "disconnected -- retrying...",
@@ -759,9 +1076,9 @@ fn draw_footer(f: &mut Frame, area: Rect, state: &SharedState, active_tab: Tab) 
 
     let keys = match active_tab {
         Tab::Logs => {
-            "q/Esc: quit   Tab/Shift+Tab or 1/2/3: switch tab   Up/Down/PgUp/PgDn: scroll   "
+            "q/Esc: quit   Tab/Shift+Tab or 1/2/3/4: switch tab   Up/Down/PgUp/PgDn: scroll   "
         }
-        _ => "q/Esc: quit   Tab/Shift+Tab or 1/2/3: switch tab   ",
+        _ => "q/Esc: quit   Tab/Shift+Tab or 1/2/3/4: switch tab   ",
     };
 
     let line = Line::from(vec![Span::raw(keys), Span::raw("status: "), status]);

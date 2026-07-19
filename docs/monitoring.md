@@ -10,22 +10,29 @@ mlvpn-tui                    # auto-detects the socket under /run/mlvpn
 mlvpn-tui --socket /run/mlvpn/mlvpn0.sock
 ```
 
-- **Links** -- every bonded link's state, current SWRR score, how long
-  it's held that state, cumulative tx/rx byte totals, and both this
-  side's own measured RTT/jitter/loss/throughput *and* the peer's
-  self-reported view of the same link (received over the tunnel
-  itself, so one terminal on either end shows the full picture without
-  cross-referencing logs on both machines).
+- **Overview** -- the default tab at startup: condensed panes from
+  every other tab stacked into one screen (the Links table, a 2x2 grid
+  of the four Daemon panels, and a following Logs tail) so the whole
+  picture is visible -- and screenshot-friendly -- without switching
+  tabs.
+- **Links** -- every bonded link's state, current SWRR score (colored
+  by how much traffic it's actually carrying), how long it's held that
+  state, cumulative tx/rx byte totals, and both this side's own
+  measured RTT/jitter/loss/throughput *and* the peer's self-reported
+  view of the same link (received over the tunnel itself, so one
+  terminal on either end shows the full picture without
+  cross-referencing logs on both machines) -- the loss percentage in
+  each is colored by severity.
 - **Daemon** -- session id/uptime/rekey count, the outbound queue's
   current depth and lifetime drop count, the TUN interface's own
   kernel-tracked byte/error/drop counters, and machine-wide load
-  average/memory/uptime.
+  average/memory/uptime (memory-used percentage colored by severity).
 - **Logs** -- a live tail of the daemon's own log output (INFO and
   above, streamed incrementally over the same control socket), so an
   operator doesn't need a separate `journalctl -f` window open
   alongside `mlvpn-tui`.
 
-Switch tabs with `Tab`/`Shift+Tab` or `1`/`2`/`3`. On the Logs tab,
+Switch tabs with `Tab`/`Shift+Tab` or `1`/`2`/`3`/`4`. On the Logs tab,
 `Up`/`Down`/`PageUp`/`PageDown` scroll back through history; scrolling
 back to the newest line (or never having scrolled at all) keeps the
 view pinned to the tail, same as `tail -f`. Press `q` or `Esc` to quit
@@ -36,6 +43,27 @@ section for the wire/IPC details (`ipc.rs`, `control.rs`,
 The control socket is mode 0600 under `/run/mlvpn` (mode 0750), both
 owned by `mlvpn`. Run `sudo mlvpn-tui`, or add your own account to the
 `mlvpn` group to connect without `sudo`.
+
+### Startup when the control socket doesn't exist yet
+
+`control::serve` isn't spawned until `mlvpnd`'s initial handshake with
+its peer actually succeeds (see `tunnel::run`), so a freshly (re)started
+daemon waiting on an unreachable peer genuinely has no control socket
+to find yet -- that's not an error, just something to wait out.
+Auto-detecting (no `--socket` given) with nothing found under
+`/run/mlvpn` checks whether `mlvpn.service` is active:
+
+- **Active**: prints a note that it's likely still waiting for the
+  remote end to connect, then goes straight to the full-screen view
+  (default Overview tab), which keeps watching `/run/mlvpn` in the
+  background and starts populating live the moment the socket appears
+  -- no restart needed.
+- **Not running**: offers to start it (`systemctl start mlvpn.service`,
+  via `sudo` if not already root) right there at the prompt, before
+  switching to full-screen mode.
+- **Can't tell** (no `systemctl`, non-systemd host, or `mlvpnd` run some
+  other way): falls back to the original plain error asking you to pass
+  `--socket` explicitly or check `mlvpnd` yourself.
 
 ## Runtime link control
 
