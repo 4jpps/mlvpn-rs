@@ -84,3 +84,32 @@ not marked unhealthy, and reverts to enabled on the next restart. This
 is a deliberately separate socket from the read-only one above, so
 being allowed to watch link stats never implies being allowed to
 redirect traffic.
+
+## Throughput self-test
+
+The same command socket also runs an on-demand throughput test against
+the peer, without needing a separate tool like `iperf3`:
+
+```sh
+mlvpnd self-test --config /etc/mlvpn/mlvpn.toml                        # every link, upload only
+mlvpnd self-test --config /etc/mlvpn/mlvpn.toml --link lte             # one named link
+mlvpnd self-test --config /etc/mlvpn/mlvpn.toml --duration 15          # longer stream, more stable number
+mlvpnd self-test --config /etc/mlvpn/mlvpn.toml --bidirectional        # also measure the reverse direction
+```
+
+Sends a real, MTU-sized packet stream to the peer for `--duration`
+seconds (default 10) and reports the achieved rate -- the receiving
+side measures it and reports back, no configuration or command-socket
+access needed on that end. `--bidirectional` additionally asks the
+peer to send its own stream back afterward (sequentially, not at the
+same time, so this roughly doubles the total time); the peer does this
+entirely on its own in response to that request, so both directions
+can be measured by running the command from just one side. Omitting
+`--link` tests every configured link with a currently-known peer
+address, one at a time -- useful for spot-checking each physical
+uplink's real achievable rate independent of the scheduler's own
+bonding decisions.
+
+A `None` result for a direction means it timed out or the peer doesn't
+support this feature yet (an older `mlvpnd` silently drops the
+unrecognized packet type) -- not necessarily that the link is down.

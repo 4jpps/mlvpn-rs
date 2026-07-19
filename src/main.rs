@@ -70,6 +70,31 @@ enum Command {
         #[arg(value_enum)]
         state: LinkEnableState,
     },
+    /// Run an on-demand throughput self-test against a running mlvpnd's
+    /// peer, without needing a separate tool like iperf3. Talks to the
+    /// command socket, same as `set-link` (`[command] enabled = true`
+    /// required first). Sends a real, MTU-sized packet stream for
+    /// `--duration` seconds and reports the achieved rate; add
+    /// `--bidirectional` to also measure the reverse direction
+    /// (sequentially, so this roughly doubles the total time).
+    SelfTest {
+        #[arg(short, long, default_value = "/etc/mlvpn/mlvpn.toml")]
+        config: PathBuf,
+        /// Test only this link (matching a [[links]] `name`). Omit to
+        /// test every configured link with a currently-known peer
+        /// address, one at a time.
+        #[arg(short, long)]
+        link: Option<String>,
+        /// How long to run each direction's stream, in seconds.
+        #[arg(short, long, default_value_t = 10)]
+        duration: u32,
+        /// Also measure the reverse direction (the peer sends to us) --
+        /// runs after the forward direction completes, not
+        /// concurrently, so this roughly doubles the total time per
+        /// link tested.
+        #[arg(short, long)]
+        bidirectional: bool,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -111,15 +136,25 @@ fn main() -> anyhow::Result<()> {
             link,
             state,
         } => set_link(&config, &link, matches!(state, LinkEnableState::Enable)),
+        Command::SelfTest {
+            config,
+            link,
+            duration,
+            bidirectional,
+        } => run_throughput_selftest(&config, link, duration, bidirectional),
     }
 }
 
-/// Send a `SetLinkEnabled` command to a running daemon's command socket
-/// and print the result. Plain blocking `std` I/O rather than spinning
-/// up a tokio runtime for it -- this is a one-shot request/reply over
-/// an already-local Unix socket, not something that benefits from
-/// async.
-fn set_link(config_path: &Path, link: &str, enabled: bool) -> anyhow::Result<()> {
+/// Connects to `config_path`'s command socket and sends `cmd`, returning
+/// the daemon's `CommandResult` reply. Shared by `set_link` and
+/// `run_throughput_selftest` -- plain blocking `std` I/O rather than
+/// spinning up a tokio runtime for it, since this is a one-shot
+/// request/reply over an already-local Unix socket, not something that
+/// benefits from async (true even for `RunThroughputTest`, whose reply
+/// can take many seconds: `read_line` below just blocks for however
+/// long that takes, no different in kind from any other slow blocking
+/// call this CLI could make).
+fn send_command(config_path: &Path, cmd: &SocketCommand) -> anyhow::Result<CommandResult> {
     let cfg = Config::load(config_path)?;
     if !cfg.command.enabled {
         anyhow::bail!(
@@ -142,11 +177,7 @@ fn set_link(config_path: &Path, link: &str, enabled: bool) -> anyhow::Result<()>
         )
     })?;
 
-    let cmd = SocketCommand::SetLinkEnabled {
-        link: link.to_string(),
-        enabled,
-    };
-    let mut line = serde_json::to_vec(&cmd)?;
+    let mut line = serde_json::to_vec(cmd)?;
     line.push(b'\n');
     stream.write_all(&line)?;
     // Half-close our write side so the server's read loop sees EOF after
@@ -157,7 +188,17 @@ fn set_link(config_path: &Path, link: &str, enabled: bool) -> anyhow::Result<()>
 
     let mut reply = String::new();
     BufReader::new(&stream).read_line(&mut reply)?;
-    let result: CommandResult = serde_json::from_str(reply.trim_end())?;
+    Ok(serde_json::from_str(reply.trim_end())?)
+}
+
+/// Send a `SetLinkEnabled` command to a running daemon's command socket
+/// and print the result.
+fn set_link(config_path: &Path, link: &str, enabled: bool) -> anyhow::Result<()> {
+    let cmd = SocketCommand::SetLinkEnabled {
+        link: link.to_string(),
+        enabled,
+    };
+    let result = send_command(config_path, &cmd)?;
 
     if result.ok {
         println!(
@@ -173,6 +214,60 @@ fn set_link(config_path: &Path, link: &str, enabled: bool) -> anyhow::Result<()>
                 .unwrap_or_else(|| "(no error detail)".to_string())
         );
     }
+}
+
+/// Send a `RunThroughputTest` command to a running daemon's command
+/// socket and print each tested link's result. See `send_command`'s
+/// doc comment for why this stays plain blocking I/O even though the
+/// reply can take many seconds to arrive.
+fn run_throughput_selftest(
+    config_path: &Path,
+    link: Option<String>,
+    duration_secs: u32,
+    bidirectional: bool,
+) -> anyhow::Result<()> {
+    println!(
+        "running throughput self-test ({duration_secs}s per direction{}) -- this will take a \
+         while...",
+        if bidirectional { ", bidirectional" } else { "" }
+    );
+    let cmd = SocketCommand::RunThroughputTest {
+        link,
+        duration_secs,
+        bidirectional,
+    };
+    let result = send_command(config_path, &cmd)?;
+
+    if !result.ok {
+        anyhow::bail!(
+            "mlvpnd rejected the command: {}",
+            result
+                .error
+                .unwrap_or_else(|| "(no error detail)".to_string())
+        );
+    }
+    if result.throughput_results.is_empty() {
+        println!("no links were tested");
+        return Ok(());
+    }
+    for r in &result.throughput_results {
+        let upload = r
+            .upload_mbps
+            .map(|v| format!("{v:.1} Mbps"))
+            .unwrap_or_else(|| "no result (timed out or peer doesn't support this)".to_string());
+        if bidirectional {
+            let download = r
+                .download_mbps
+                .map(|v| format!("{v:.1} Mbps"))
+                .unwrap_or_else(|| {
+                    "no result (timed out or peer doesn't support this)".to_string()
+                });
+            println!("{}: upload {upload}, download {download}", r.link);
+        } else {
+            println!("{}: upload {upload}", r.link);
+        }
+    }
+    Ok(())
 }
 
 /// Builds the process-wide `tracing` subscriber as a `Registry` of two

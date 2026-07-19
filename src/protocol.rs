@@ -73,6 +73,25 @@ pub enum PacketType {
     /// achieved throughput the receiver measured. See
     /// `BandwidthProbeResultPayload`.
     BandwidthProbeResult = 10,
+    /// One packet of an on-demand throughput self-test stream, triggered
+    /// via `ipc::Command::RunThroughputTest` on the command socket (see
+    /// `tunnel::send_throughput_test_stream`,
+    /// `tunnel::handle_incoming`'s handling of this variant). Unlike
+    /// `BandwidthProbeBurst` (a short, fixed-packet-count burst on a
+    /// slow periodic timer), this is a *time-bounded* continuous stream
+    /// -- the total packet count isn't known ahead of time, so
+    /// `ThroughputTestDataPayload` carries a `done` flag on its final
+    /// packet(s) instead of a `total_packets` field.
+    ThroughputTestData = 11,
+    /// The receiver's measured achieved throughput for a just-completed
+    /// `ThroughputTestData` stream, sent back to whichever address the
+    /// stream actually came from. See `ThroughputTestResultPayload`.
+    ThroughputTestResult = 12,
+    /// Sent by whichever side triggered a bidirectional throughput test
+    /// (`Command::RunThroughputTest { bidirectional: true, .. }`), asking
+    /// the peer to run its own `ThroughputTestData` stream back for the
+    /// reverse-direction leg. See `ThroughputTestReverseRequestPayload`.
+    ThroughputTestReverseRequest = 13,
 }
 
 impl PacketType {
@@ -88,6 +107,9 @@ impl PacketType {
             8 => Self::StatsShare,
             9 => Self::BandwidthProbeBurst,
             10 => Self::BandwidthProbeResult,
+            11 => Self::ThroughputTestData,
+            12 => Self::ThroughputTestResult,
+            13 => Self::ThroughputTestReverseRequest,
             other => {
                 return Err(MlvpnError::Protocol(format!(
                     "unknown packet type byte {other}"
@@ -364,6 +386,121 @@ impl BandwidthProbeResultPayload {
     }
 }
 
+/// Payload of one packet in a `ThroughputTestData` stream (see
+/// `tunnel::send_throughput_test_stream`). The header is fixed at
+/// `HEADER_LEN` bytes; callers pad the remainder out to the tunnel's
+/// MTU with zero bytes, same reasoning as `BandwidthProbeBurstPayload`.
+#[derive(Debug, Clone, Copy)]
+pub struct ThroughputTestDataPayload {
+    /// Identifies one test run; freshly randomized per test (per
+    /// direction -- a bidirectional test uses two distinct `test_id`s,
+    /// one per leg) so a stray late packet from an earlier run can never
+    /// be mistaken for part of a new one.
+    pub test_id: u32,
+    /// Set on the final packet(s) of the stream -- the sender's
+    /// duration timer has elapsed and this is the last one it's
+    /// sending. Repeated a couple of extra times as cheap insurance
+    /// against exactly one final packet getting lost, same reasoning
+    /// (and same receive-side last-completed-test-id guard) as
+    /// `active_bandwidth_prober`'s own final-packet redundancy.
+    pub done: bool,
+}
+
+impl ThroughputTestDataPayload {
+    pub const HEADER_LEN: usize = 4 + 1;
+
+    pub fn encode_padded(&self, total_len: usize) -> Vec<u8> {
+        let mut out = vec![0u8; total_len.max(Self::HEADER_LEN)];
+        out[0..4].copy_from_slice(&self.test_id.to_be_bytes());
+        out[4] = self.done as u8;
+        out
+    }
+
+    pub fn decode(buf: &[u8]) -> Result<Self> {
+        if buf.len() < Self::HEADER_LEN {
+            return Err(MlvpnError::Protocol(
+                "throughput test data payload too short".into(),
+            ));
+        }
+        Ok(Self {
+            test_id: u32::from_be_bytes(buf[0..4].try_into().unwrap()),
+            done: buf[4] != 0,
+        })
+    }
+}
+
+/// Payload of a `ThroughputTestResult` frame: the receiver's measured
+/// achieved throughput for a just-completed `ThroughputTestData`
+/// stream, sent back to whichever address the stream actually arrived
+/// from. See `tunnel::handle_incoming`'s handling of this variant for
+/// why this is delivered both back over the wire *and* to a locally
+/// registered waiter, if one exists, in the same step.
+#[derive(Debug, Clone, Copy)]
+pub struct ThroughputTestResultPayload {
+    pub test_id: u32,
+    pub achieved_mbps: f32,
+}
+
+impl ThroughputTestResultPayload {
+    pub const LEN: usize = 4 + 4;
+
+    pub fn encode(&self) -> [u8; Self::LEN] {
+        let mut out = [0u8; Self::LEN];
+        out[0..4].copy_from_slice(&self.test_id.to_be_bytes());
+        out[4..8].copy_from_slice(&self.achieved_mbps.to_be_bytes());
+        out
+    }
+
+    pub fn decode(buf: &[u8]) -> Result<Self> {
+        if buf.len() < Self::LEN {
+            return Err(MlvpnError::Protocol(
+                "throughput test result payload too short".into(),
+            ));
+        }
+        Ok(Self {
+            test_id: u32::from_be_bytes(buf[0..4].try_into().unwrap()),
+            achieved_mbps: f32::from_be_bytes(buf[4..8].try_into().unwrap()),
+        })
+    }
+}
+
+/// Payload of a `ThroughputTestReverseRequest` frame: asks the peer to
+/// run its own `ThroughputTestData` stream back to us, for the
+/// reverse-direction leg of a bidirectional throughput test. See
+/// `tunnel::handle_incoming`'s handling of this variant.
+#[derive(Debug, Clone, Copy)]
+pub struct ThroughputTestReverseRequestPayload {
+    /// The `test_id` to tag the reverse stream with -- distinct from
+    /// the forward leg's own `test_id`, so the two legs' measurements
+    /// (and any stray late packets from either) can never be confused
+    /// with each other.
+    pub test_id: u32,
+    pub duration_secs: u32,
+}
+
+impl ThroughputTestReverseRequestPayload {
+    pub const LEN: usize = 4 + 4;
+
+    pub fn encode(&self) -> [u8; Self::LEN] {
+        let mut out = [0u8; Self::LEN];
+        out[0..4].copy_from_slice(&self.test_id.to_be_bytes());
+        out[4..8].copy_from_slice(&self.duration_secs.to_be_bytes());
+        out
+    }
+
+    pub fn decode(buf: &[u8]) -> Result<Self> {
+        if buf.len() < Self::LEN {
+            return Err(MlvpnError::Protocol(
+                "throughput test reverse request payload too short".into(),
+            ));
+        }
+        Ok(Self {
+            test_id: u32::from_be_bytes(buf[0..4].try_into().unwrap()),
+            duration_secs: u32::from_be_bytes(buf[4..8].try_into().unwrap()),
+        })
+    }
+}
+
 #[cfg(test)]
 mod bandwidth_probe_payload_tests {
     use super::*;
@@ -417,5 +554,87 @@ mod bandwidth_probe_payload_tests {
     fn result_payload_decode_rejects_short_buffer() {
         let buf = [0u8; 4];
         assert!(BandwidthProbeResultPayload::decode(&buf).is_err());
+    }
+}
+
+#[cfg(test)]
+mod throughput_test_payload_tests {
+    use super::*;
+
+    #[test]
+    fn data_payload_round_trips_through_padding_not_done() {
+        let payload = ThroughputTestDataPayload {
+            test_id: 0xdead_beef,
+            done: false,
+        };
+        let encoded = payload.encode_padded(1400);
+        assert_eq!(encoded.len(), 1400);
+        let decoded = ThroughputTestDataPayload::decode(&encoded).unwrap();
+        assert_eq!(decoded.test_id, payload.test_id);
+        assert!(!decoded.done);
+    }
+
+    #[test]
+    fn data_payload_round_trips_done_flag() {
+        let payload = ThroughputTestDataPayload {
+            test_id: 7,
+            done: true,
+        };
+        let encoded = payload.encode_padded(64);
+        let decoded = ThroughputTestDataPayload::decode(&encoded).unwrap();
+        assert!(decoded.done);
+    }
+
+    #[test]
+    fn data_payload_encode_padded_never_truncates_header() {
+        let payload = ThroughputTestDataPayload {
+            test_id: 1,
+            done: false,
+        };
+        let encoded = payload.encode_padded(0);
+        assert_eq!(encoded.len(), ThroughputTestDataPayload::HEADER_LEN);
+        assert!(ThroughputTestDataPayload::decode(&encoded).is_ok());
+    }
+
+    #[test]
+    fn data_payload_decode_rejects_short_buffer() {
+        let buf = [0u8; 3];
+        assert!(ThroughputTestDataPayload::decode(&buf).is_err());
+    }
+
+    #[test]
+    fn result_payload_round_trips() {
+        let payload = ThroughputTestResultPayload {
+            test_id: 99,
+            achieved_mbps: 941.3,
+        };
+        let encoded = payload.encode();
+        let decoded = ThroughputTestResultPayload::decode(&encoded).unwrap();
+        assert_eq!(decoded.test_id, payload.test_id);
+        assert!((decoded.achieved_mbps - payload.achieved_mbps).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn result_payload_decode_rejects_short_buffer() {
+        let buf = [0u8; 4];
+        assert!(ThroughputTestResultPayload::decode(&buf).is_err());
+    }
+
+    #[test]
+    fn reverse_request_payload_round_trips() {
+        let payload = ThroughputTestReverseRequestPayload {
+            test_id: 123,
+            duration_secs: 10,
+        };
+        let encoded = payload.encode();
+        let decoded = ThroughputTestReverseRequestPayload::decode(&encoded).unwrap();
+        assert_eq!(decoded.test_id, payload.test_id);
+        assert_eq!(decoded.duration_secs, payload.duration_secs);
+    }
+
+    #[test]
+    fn reverse_request_payload_decode_rejects_short_buffer() {
+        let buf = [0u8; 4];
+        assert!(ThroughputTestReverseRequestPayload::decode(&buf).is_err());
     }
 }

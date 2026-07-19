@@ -241,7 +241,8 @@ use crate::monitor::{self, ProbeTracker};
 use crate::peerstats::PeerStatsTable;
 use crate::protocol::{
     BandwidthProbeBurstPayload, BandwidthProbeResultPayload, Header, PacketType, ProbePayload,
-    StatsPayload, HEADER_LEN,
+    StatsPayload, ThroughputTestDataPayload, ThroughputTestResultPayload,
+    ThroughputTestReverseRequestPayload, HEADER_LEN,
 };
 use crate::scheduler::Scheduler;
 use std::collections::BTreeMap;
@@ -490,6 +491,60 @@ impl RekeyContext {
     }
 }
 
+/// Correlates an in-flight `ipc::Command::RunThroughputTest` with its
+/// eventual result. A result can arrive by either of two paths, both
+/// delivered through this same registry (see `handle_incoming`'s
+/// `ThroughputTestData`/`ThroughputTestResult` arms):
+///
+/// - A remote `ThroughputTestResult` frame: the peer measured a stream
+///   *we* sent them (the forward/upload leg).
+/// - A local measurement: we just finished receiving a stream the peer
+///   sent back to us after we asked them to (`ThroughputTestReverseRequest`
+///   -- the reverse/download leg of a bidirectional test). There's
+///   nothing to send *over the wire* for this case; the result is ready
+///   the instant `handle_incoming` finishes computing it.
+///
+/// Single-slot, same reasoning as `RekeyContext::rekey_reply_tx`: this
+/// project's `control::apply_command` runs a throughput test's legs (and
+/// every targeted link's own test, if more than one) strictly
+/// sequentially, so only one `test_id` is ever actually awaited at a
+/// time -- a fresh registration simply overwrites whatever the previous
+/// one was.
+pub(crate) struct ThroughputTestContext {
+    reply_tx: std::sync::Mutex<Option<(u32, mpsc::UnboundedSender<f64>)>>,
+}
+
+impl ThroughputTestContext {
+    pub(crate) fn new() -> Self {
+        Self {
+            reply_tx: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Registers interest in a result for `test_id`, returning the
+    /// receiving half. Called once per leg, before that leg's stream
+    /// (or reverse-request) goes out, so there's somewhere to route the
+    /// eventual result from the moment it could possibly arrive.
+    pub(crate) fn register_wait(&self, test_id: u32) -> mpsc::UnboundedReceiver<f64> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        *self.reply_tx.lock().unwrap() = Some((test_id, tx));
+        rx
+    }
+
+    /// Forwards `achieved_mbps` to the waiting leg only if `test_id`
+    /// matches what's currently registered; anything else (a stray late
+    /// result from a leg that already timed out and gave up, or plain
+    /// noise) is silently ignored.
+    fn forward_result(&self, test_id: u32, achieved_mbps: f64) {
+        let guard = self.reply_tx.lock().unwrap();
+        if let Some((want_id, tx)) = guard.as_ref() {
+            if *want_id == test_id {
+                let _ = tx.send(achieved_mbps);
+            }
+        }
+    }
+}
+
 /// Why `run()`'s tail is unblocking: either a local shutdown signal
 /// (SIGINT/SIGTERM) or an authenticated `Disconnect` frame from the
 /// peer (`handle_incoming`). Only the reason matters once triggered --
@@ -698,6 +753,18 @@ pub async fn run(
         .map(|_| Arc::new(AsyncMutex::new(BandwidthProbeReceiveState::new())))
         .collect();
 
+    // Same one-per-link pattern again, this time for a possibly-in-
+    // progress incoming `ThroughputTestData` stream -- see
+    // `ThroughputTestReceiveState`'s doc comment. `throughput_test_ctx`
+    // is the single shared registry `control::serve_commands`'s
+    // `Command::RunThroughputTest` handler waits on for a result, from
+    // either direction -- see `ThroughputTestContext`'s doc comment.
+    let throughput_test_states: Vec<Arc<AsyncMutex<ThroughputTestReceiveState>>> = (0..trackers
+        .len())
+        .map(|_| Arc::new(AsyncMutex::new(ThroughputTestReceiveState::new())))
+        .collect();
+    let throughput_test_ctx = Arc::new(ThroughputTestContext::new());
+
     let mut handles = Vec::new();
 
     // Bounded outbound queue between tun_reader (producer) and
@@ -708,7 +775,12 @@ pub async fn run(
     let (outbound_tx, outbound_rx) = mpsc::channel::<OutboundFrame>(OUTBOUND_QUEUE_CAPACITY);
     let outbound_dropped_total = Arc::new(AtomicU64::new(0));
 
-    for (idx, (tracker, bw_state)) in trackers.iter().zip(bw_probe_states.iter()).enumerate() {
+    for (idx, ((tracker, bw_state), throughput_test_state)) in trackers
+        .iter()
+        .zip(bw_probe_states.iter())
+        .zip(throughput_test_states.iter())
+        .enumerate()
+    {
         let tracker = tracker.clone();
         {
             let links = links.clone();
@@ -723,6 +795,9 @@ pub async fn run(
             let shutdown = shutdown.clone();
             let bw_state = bw_state.clone();
             let session_meta = session_meta.clone();
+            let mtu = params.mtu as usize;
+            let throughput_test_state = throughput_test_state.clone();
+            let throughput_test_ctx = throughput_test_ctx.clone();
             handles.push(tokio::spawn(async move {
                 // link_receiver never returns under normal operation --
                 // see its doc comment: socket errors are retried/
@@ -743,6 +818,9 @@ pub async fn run(
                     shutdown,
                     bw_state,
                     session_meta,
+                    mtu,
+                    throughput_test_state,
+                    throughput_test_ctx,
                 )
                 .await;
             }));
@@ -798,8 +876,11 @@ pub async fn run(
 
     if let Some(path) = params.command_socket.clone() {
         let links = links.clone();
+        let session = session.clone();
+        let throughput_test_ctx = throughput_test_ctx.clone();
+        let mtu = params.mtu as usize;
         handles.push(tokio::spawn(async move {
-            control::serve_commands(path, links).await;
+            control::serve_commands(path, links, session, throughput_test_ctx, mtu).await;
         }));
     }
 
@@ -1910,6 +1991,9 @@ async fn link_receiver(
     shutdown: Arc<Shutdown>,
     bw_probe_state: Arc<AsyncMutex<BandwidthProbeReceiveState>>,
     session_meta: Arc<SessionMeta>,
+    mtu: usize,
+    throughput_test_state: Arc<AsyncMutex<ThroughputTestReceiveState>>,
+    throughput_test_ctx: Arc<ThroughputTestContext>,
 ) {
     let (handle, link_id, link_name) = {
         let link = links[idx].lock().await;
@@ -1942,6 +2026,9 @@ async fn link_receiver(
                     &shutdown,
                     &bw_probe_state,
                     &session_meta,
+                    mtu,
+                    &throughput_test_state,
+                    &throughput_test_ctx,
                 )
                 .await;
             }
@@ -2312,6 +2399,35 @@ impl BandwidthProbeReceiveState {
     }
 }
 
+/// One per link (same one-per-link pattern as `BandwidthProbeReceiveState`,
+/// its closest relative), tracking a possibly-in-progress incoming
+/// `ThroughputTestData` stream for `ipc::Command::RunThroughputTest`.
+/// Time-bounded rather than packet-count-bounded (the sender doesn't
+/// know its own final packet count ahead of time -- it's stopping on a
+/// duration timer, not after N packets), so this watches
+/// `ThroughputTestDataPayload::done` instead of comparing
+/// `packet_index + 1 == total_packets`; otherwise the exact same shape
+/// and reasoning as `BandwidthProbeReceiveState`, including
+/// `last_completed_test_id`'s guard against the sender's redundant
+/// final-packet copies being misread as a fresh one-packet stream.
+struct ThroughputTestReceiveState {
+    test_id: Option<u32>,
+    first_seen: Instant,
+    bytes_seen: u64,
+    last_completed_test_id: Option<u32>,
+}
+
+impl ThroughputTestReceiveState {
+    fn new() -> Self {
+        Self {
+            test_id: None,
+            first_seen: Instant::now(),
+            bytes_seen: 0,
+            last_completed_test_id: None,
+        }
+    }
+}
+
 /// Pure throughput calculation shared by `handle_incoming`'s
 /// `BandwidthProbeBurst` handling and its own unit tests below: bytes
 /// carried by a completed burst, divided by how long the burst took to
@@ -2493,6 +2609,142 @@ async fn active_bandwidth_prober(
     }
 }
 
+/// Sends a continuous, MTU-padded `ThroughputTestData` stream to
+/// `remote` for `duration`, then a couple of redundant final ("done")
+/// packets -- same insurance-against-losing-exactly-the-last-packet
+/// reasoning as `active_bandwidth_prober`'s own final-packet redundancy.
+///
+/// Used for both legs of a throughput self-test: the forward/upload leg
+/// (`control::apply_command`'s `Command::RunThroughputTest` handler
+/// calls this directly) and the reverse/download leg (`handle_incoming`'s
+/// `ThroughputTestReverseRequest` arm spawns this in response to a
+/// peer's request, entirely autonomously -- no local command-socket
+/// trigger involved on that side).
+///
+/// Deliberately does *not* batch every packet's encrypt under one lock
+/// acquisition the way `active_bandwidth_prober`'s tiny burst now does:
+/// that trade only makes sense for a burst so short (a handful of
+/// packets, sub-millisecond to low-millisecond total) that ordinary
+/// per-packet lock contention with `tun_reader` could dominate the
+/// measurement itself. A multi-second throughput test is the opposite
+/// case -- it's specifically trying to measure "how fast can this link
+/// actually go under realistic conditions," which means competing
+/// fairly with real Data traffic for the shared session lock is exactly
+/// correct, not a bug to route around. Holding the lock for the entire
+/// stream's duration would instead starve `tun_reader` (and therefore
+/// all real traffic on every link, not just this one) for the whole
+/// multi-second window, which is a far worse trade than the brief,
+/// bounded blip `active_bandwidth_prober`'s batching causes.
+pub(crate) async fn send_throughput_test_stream(
+    socket: Arc<UdpSocket>,
+    remote: SocketAddr,
+    link_id: u8,
+    session: Arc<AsyncMutex<SessionState>>,
+    test_id: u32,
+    duration: Duration,
+    mtu: usize,
+) -> Result<()> {
+    let payload_len = mtu.max(ThroughputTestDataPayload::HEADER_LEN);
+    let deadline = Instant::now() + duration;
+
+    async fn send_one(
+        socket: &Arc<UdpSocket>,
+        remote: SocketAddr,
+        link_id: u8,
+        session: &Arc<AsyncMutex<SessionState>>,
+        test_id: u32,
+        done: bool,
+        payload_len: usize,
+    ) -> Result<()> {
+        let payload = ThroughputTestDataPayload { test_id, done }.encode_padded(payload_len);
+        let (session_id, seq, ct) = {
+            let s = session.lock().await;
+            s.encrypt(&payload)?
+        };
+        let mut out = Vec::with_capacity(HEADER_LEN + ct.len());
+        Header {
+            ptype: PacketType::ThroughputTestData,
+            link_id,
+            session_id,
+            seq,
+        }
+        .encode(&mut out);
+        out.extend_from_slice(&ct);
+        // Best-effort, same as active_bandwidth_prober's burst: a single
+        // dropped packet mid-stream just means a slightly smaller
+        // bytes_seen on the receiver, not a fatal error for the whole
+        // test.
+        let _ = socket.send_to(&out, remote).await;
+        Ok(())
+    }
+
+    loop {
+        let done = Instant::now() >= deadline;
+        send_one(
+            &socket,
+            remote,
+            link_id,
+            &session,
+            test_id,
+            done,
+            payload_len,
+        )
+        .await?;
+        if done {
+            for _ in 0..2 {
+                send_one(
+                    &socket,
+                    remote,
+                    link_id,
+                    &session,
+                    test_id,
+                    true,
+                    payload_len,
+                )
+                .await?;
+            }
+            return Ok(());
+        }
+    }
+}
+
+/// Sends one `ThroughputTestReverseRequest` frame, asking the peer to
+/// start sending `ThroughputTestData` back to us for the reverse leg of
+/// a bidirectional throughput test. Called once by
+/// `control::apply_command`'s `Command::RunThroughputTest` handler,
+/// before it starts waiting (via a `ThroughputTestContext` registration
+/// made just ahead of this call) for that reverse stream to arrive and
+/// complete.
+pub(crate) async fn send_throughput_test_reverse_request(
+    socket: &Arc<UdpSocket>,
+    remote: SocketAddr,
+    link_id: u8,
+    session: &Arc<AsyncMutex<SessionState>>,
+    test_id: u32,
+    duration_secs: u32,
+) -> Result<()> {
+    let payload = ThroughputTestReverseRequestPayload {
+        test_id,
+        duration_secs,
+    }
+    .encode();
+    let (session_id, seq, ct) = {
+        let s = session.lock().await;
+        s.encrypt(&payload)?
+    };
+    let mut out = Vec::with_capacity(HEADER_LEN + ct.len());
+    Header {
+        ptype: PacketType::ThroughputTestReverseRequest,
+        link_id,
+        session_id,
+        seq,
+    }
+    .encode(&mut out);
+    out.extend_from_slice(&ct);
+    socket.send_to(&out, remote).await.map_err(MlvpnError::Io)?;
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_incoming(
     idx: usize,
@@ -2512,6 +2764,9 @@ async fn handle_incoming(
     shutdown: &Arc<Shutdown>,
     bw_probe_state: &Arc<AsyncMutex<BandwidthProbeReceiveState>>,
     session_meta: &Arc<SessionMeta>,
+    mtu: usize,
+    throughput_test_state: &Arc<AsyncMutex<ThroughputTestReceiveState>>,
+    throughput_test_ctx: &Arc<ThroughputTestContext>,
 ) {
     let Ok((hdr, ciphertext)) = Header::decode(frame) else {
         return;
@@ -2794,6 +3049,113 @@ async fn handle_incoming(
                     "active bandwidth probe result"
                 );
             }
+        }
+        PacketType::ThroughputTestData => {
+            let Ok(data) = ThroughputTestDataPayload::decode(&plaintext) else {
+                return;
+            };
+            let mut state = throughput_test_state.lock().await;
+            // Same redundant-final-packet guard as `BandwidthProbeBurst`
+            // above -- see `ThroughputTestReceiveState`'s doc comment.
+            if state.last_completed_test_id == Some(data.test_id) {
+                return;
+            }
+            if state.test_id != Some(data.test_id) {
+                state.test_id = Some(data.test_id);
+                state.first_seen = Instant::now();
+                state.bytes_seen = 0;
+            }
+            state.bytes_seen += frame.len() as u64;
+            if data.done {
+                let elapsed_secs = state.first_seen.elapsed().as_secs_f64();
+                let achieved_mbps = compute_achieved_mbps(state.bytes_seen, elapsed_secs);
+                state.test_id = None;
+                state.last_completed_test_id = Some(data.test_id);
+                drop(state);
+
+                // Always reply to whoever actually sent this stream --
+                // that's the normal case, a peer running
+                // Command::RunThroughputTest against us and waiting for
+                // this exact reply.
+                let result_payload = ThroughputTestResultPayload {
+                    test_id: data.test_id,
+                    achieved_mbps: achieved_mbps as f32,
+                };
+                let encrypted = {
+                    let s = session.lock().await;
+                    s.encrypt(&result_payload.encode())
+                };
+                if let Ok((reply_session_id, reply_seq, reply_ct)) = encrypted {
+                    let mut out = Vec::with_capacity(HEADER_LEN + reply_ct.len());
+                    Header {
+                        ptype: PacketType::ThroughputTestResult,
+                        link_id,
+                        session_id: reply_session_id,
+                        seq: reply_seq,
+                    }
+                    .encode(&mut out);
+                    out.extend_from_slice(&reply_ct);
+                    let _ = socket.send_to(&out, from).await;
+                }
+
+                // Also deliver locally: if *we* are the one waiting on
+                // this exact test_id (the reverse leg of our own
+                // bidirectional test -- see `ThroughputTestContext`'s
+                // doc comment), this is how that result actually
+                // reaches the waiting command handler. A no-op if
+                // nothing's registered for it.
+                throughput_test_ctx.forward_result(data.test_id, achieved_mbps);
+
+                tracing::info!(
+                    link_id,
+                    achieved_mbps,
+                    "throughput self-test stream received"
+                );
+            }
+        }
+        PacketType::ThroughputTestResult => {
+            let Ok(result) = ThroughputTestResultPayload::decode(&plaintext) else {
+                return;
+            };
+            // The peer measuring a stream *we* sent them -- deliver to
+            // whichever local command invocation is waiting on this
+            // test_id. A no-op if nothing's registered (e.g. this
+            // arrived after the waiting command already timed out and
+            // gave up).
+            throughput_test_ctx.forward_result(result.test_id, result.achieved_mbps as f64);
+        }
+        PacketType::ThroughputTestReverseRequest => {
+            let Ok(req) = ThroughputTestReverseRequestPayload::decode(&plaintext) else {
+                return;
+            };
+            // Autonomously start sending a stream back, without any
+            // local command-socket trigger -- this is what makes a
+            // bidirectional throughput test work without needing the
+            // operator to separately run a command on *both* ends. See
+            // `send_throughput_test_stream`'s doc comment for why this
+            // deliberately does not batch its encrypts the way
+            // `active_bandwidth_prober`'s tiny burst does.
+            let socket = socket.clone();
+            let session = session.clone();
+            let duration = Duration::from_secs(req.duration_secs as u64);
+            tokio::spawn(async move {
+                if let Err(e) = send_throughput_test_stream(
+                    socket,
+                    from,
+                    link_id,
+                    session,
+                    req.test_id,
+                    duration,
+                    mtu,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        error = %e,
+                        "throughput self-test reverse-direction stream failed to send"
+                    );
+                }
+            });
         }
         PacketType::Keepalive => {
             // No action beyond having been received -- the socket read

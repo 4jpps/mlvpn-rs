@@ -30,23 +30,29 @@
 //! or out, the same guarantee any other 0600 Unix socket or file
 //! provides.
 
+use crate::crypto::{random_session_id, SessionState};
 use crate::ipc::{
-    Command, CommandResult, DaemonSnapshot, LinkSnapshot, Snapshot, SystemSnapshot, TunSnapshot,
+    Command, CommandResult, DaemonSnapshot, LinkSnapshot, Snapshot, SystemSnapshot,
+    ThroughputTestLinkResult, TunSnapshot,
 };
 use crate::link::{self, LinkState, Links};
 use crate::logbuf::LogRing;
 use crate::peerstats::PeerStatsTable;
 use crate::procstats;
 use crate::sysfs_net;
-use crate::tunnel::{OutboundFrame, SessionMeta};
+use crate::tunnel::{
+    send_throughput_test_reverse_request, send_throughput_test_stream, OutboundFrame, SessionMeta,
+    ThroughputTestContext,
+};
+use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::mpsc;
+use tokio::net::{UdpSocket, UnixListener, UnixStream};
+use tokio::sync::{mpsc, Mutex as AsyncMutex};
 use tokio::time::interval;
 
 const SNAPSHOT_INTERVAL_MS: u64 = 500;
@@ -339,7 +345,13 @@ async fn build_snapshot(
 /// treated as "runtime link control unavailable" rather than a fatal
 /// daemon error -- this is an operator convenience, not something that
 /// should be able to take the tunnel down.
-pub async fn serve_commands(path: PathBuf, links: Links) {
+pub(crate) async fn serve_commands(
+    path: PathBuf,
+    links: Links,
+    session: Arc<AsyncMutex<SessionState>>,
+    throughput_test_ctx: Arc<ThroughputTestContext>,
+    mtu: usize,
+) {
     if let Some(parent) = path.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
             tracing::warn!(
@@ -395,8 +407,10 @@ pub async fn serve_commands(path: PathBuf, links: Links) {
             }
         };
         let links = links.clone();
+        let session = session.clone();
+        let throughput_test_ctx = throughput_test_ctx.clone();
         tokio::spawn(async move {
-            serve_command_client(stream, links).await;
+            serve_command_client(stream, links, session, throughput_test_ctx, mtu).await;
         });
     }
 }
@@ -407,7 +421,13 @@ pub async fn serve_commands(path: PathBuf, links: Links) {
 /// disconnects without sending anything, or one that disappears before
 /// the reply is written -- a raced/impatient client is not a server-side
 /// problem worth a warning.
-async fn serve_command_client(stream: UnixStream, links: Links) {
+async fn serve_command_client(
+    stream: UnixStream,
+    links: Links,
+    session: Arc<AsyncMutex<SessionState>>,
+    throughput_test_ctx: Arc<ThroughputTestContext>,
+    mtu: usize,
+) {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
 
@@ -421,10 +441,11 @@ async fn serve_command_client(stream: UnixStream, links: Links) {
     };
 
     let result = match serde_json::from_str::<Command>(&line) {
-        Ok(cmd) => apply_command(cmd, &links).await,
+        Ok(cmd) => apply_command(cmd, &links, &session, &throughput_test_ctx, mtu).await,
         Err(e) => CommandResult {
             ok: false,
             error: Some(format!("invalid command: {e}")),
+            throughput_results: Vec::new(),
         },
     };
 
@@ -438,7 +459,13 @@ async fn serve_command_client(stream: UnixStream, links: Links) {
 /// Apply one already-parsed `Command` and report the outcome. Split out
 /// from `serve_command_client` so the actual link-mutation logic is
 /// testable/readable independent of the socket I/O around it.
-async fn apply_command(cmd: Command, links: &Links) -> CommandResult {
+async fn apply_command(
+    cmd: Command,
+    links: &Links,
+    session: &Arc<AsyncMutex<SessionState>>,
+    throughput_test_ctx: &Arc<ThroughputTestContext>,
+    mtu: usize,
+) -> CommandResult {
     match cmd {
         Command::SetLinkEnabled { link, enabled } => {
             // Each link's name lives inside its own per-link mutex now
@@ -466,13 +493,211 @@ async fn apply_command(cmd: Command, links: &Links) -> CommandResult {
                 CommandResult {
                     ok: true,
                     error: None,
+                    throughput_results: Vec::new(),
                 }
             } else {
                 CommandResult {
                     ok: false,
                     error: Some(format!("no such link '{link}'")),
+                    throughput_results: Vec::new(),
                 }
             }
         }
+        Command::RunThroughputTest {
+            link,
+            duration_secs,
+            bidirectional,
+        } => {
+            run_throughput_test_command(
+                links,
+                session,
+                throughput_test_ctx,
+                mtu,
+                link,
+                duration_secs,
+                bidirectional,
+            )
+            .await
+        }
+    }
+}
+
+/// Extra time to wait, beyond a leg's own `duration_secs`, for its
+/// result to actually arrive/complete -- covers final-packet round-trip
+/// time plus normal network jitter. Generous since a throughput test is
+/// already a multi-second, deliberately-invoked operation; a few extra
+/// seconds of patience here is cheap insurance against a slow/lossy
+/// link producing a spurious `None` result instead of the number a
+/// slightly slower round trip still would have produced.
+const THROUGHPUT_TEST_RESULT_GRACE: Duration = Duration::from_secs(5);
+
+/// Implements `Command::RunThroughputTest`: runs the forward/upload leg
+/// against one named link, or every configured link with a
+/// currently-known peer address in turn if `link` is `None`, and --
+/// when `bidirectional` -- the reverse/download leg for each too. Both
+/// legs of a given link's test run strictly sequentially (see
+/// `tunnel::ThroughputTestContext`'s doc comment for why), and so does
+/// every targeted link's own test, one after another, never
+/// concurrently.
+async fn run_throughput_test_command(
+    links: &Links,
+    session: &Arc<AsyncMutex<SessionState>>,
+    throughput_test_ctx: &Arc<ThroughputTestContext>,
+    mtu: usize,
+    link: Option<String>,
+    duration_secs: u32,
+    bidirectional: bool,
+) -> CommandResult {
+    // Snapshot (name, id, remote, socket) for every candidate link up
+    // front, before running any test -- avoids holding a link's own
+    // lock for the whole multi-second test duration, and means a link
+    // that disappears or reconnects mid-run doesn't take the others
+    // down with it.
+    let mut targets: Vec<(String, u8, SocketAddr, Arc<UdpSocket>)> = Vec::new();
+    for l in links.iter() {
+        let guard = l.lock().await;
+        if let Some(name) = &link {
+            if guard.config.name != *name {
+                continue;
+            }
+        }
+        let Some(remote) = guard.remote else {
+            continue;
+        };
+        let socket = guard.handle().current_socket().await;
+        targets.push((guard.config.name.clone(), guard.id, remote, socket));
+    }
+
+    if targets.is_empty() {
+        return CommandResult {
+            ok: false,
+            error: Some(match link {
+                Some(name) => {
+                    format!("no such link '{name}', or it has no known peer address yet")
+                }
+                None => "no configured link has a known peer address yet".to_string(),
+            }),
+            throughput_results: Vec::new(),
+        };
+    }
+
+    let mut results = Vec::with_capacity(targets.len());
+    for (link_name, link_id, remote, socket) in targets {
+        let upload_mbps = run_throughput_test_leg_upload(
+            &socket,
+            remote,
+            link_id,
+            session,
+            throughput_test_ctx,
+            mtu,
+            duration_secs,
+        )
+        .await;
+
+        let download_mbps = if bidirectional {
+            run_throughput_test_leg_download(
+                &socket,
+                remote,
+                link_id,
+                session,
+                throughput_test_ctx,
+                duration_secs,
+            )
+            .await
+        } else {
+            None
+        };
+
+        tracing::info!(
+            link = %link_name,
+            ?upload_mbps,
+            ?download_mbps,
+            "throughput self-test complete"
+        );
+
+        results.push(ThroughputTestLinkResult {
+            link: link_name,
+            upload_mbps,
+            download_mbps,
+        });
+    }
+
+    CommandResult {
+        ok: true,
+        error: None,
+        throughput_results: results,
+    }
+}
+
+/// Forward/upload leg: sends a `duration_secs` stream to the peer, then
+/// waits (with `THROUGHPUT_TEST_RESULT_GRACE`'s extra timeout) for
+/// their `ThroughputTestResult` reply. `None` if the send itself failed
+/// or no reply arrived in time -- e.g. an old peer that predates this
+/// feature and silently drops the unrecognized packet type.
+#[allow(clippy::too_many_arguments)]
+async fn run_throughput_test_leg_upload(
+    socket: &Arc<UdpSocket>,
+    remote: SocketAddr,
+    link_id: u8,
+    session: &Arc<AsyncMutex<SessionState>>,
+    throughput_test_ctx: &Arc<ThroughputTestContext>,
+    mtu: usize,
+    duration_secs: u32,
+) -> Option<f64> {
+    let test_id = random_session_id();
+    let mut rx = throughput_test_ctx.register_wait(test_id);
+    if let Err(e) = send_throughput_test_stream(
+        socket.clone(),
+        remote,
+        link_id,
+        session.clone(),
+        test_id,
+        Duration::from_secs(duration_secs as u64),
+        mtu,
+    )
+    .await
+    {
+        tracing::warn!(error = %e, "throughput self-test upload stream failed to send");
+        return None;
+    }
+    match tokio::time::timeout(THROUGHPUT_TEST_RESULT_GRACE, rx.recv()).await {
+        Ok(Some(mbps)) => Some(mbps),
+        _ => None,
+    }
+}
+
+/// Reverse/download leg: asks the peer to send a `duration_secs` stream
+/// back to us, then waits (`duration_secs` plus
+/// `THROUGHPUT_TEST_RESULT_GRACE`) for our own receive side to finish
+/// measuring it -- delivered locally via `ThroughputTestContext`, not
+/// over the wire (there's nothing the *peer* needs to be told about a
+/// result *we* computed from data *they* sent).
+async fn run_throughput_test_leg_download(
+    socket: &Arc<UdpSocket>,
+    remote: SocketAddr,
+    link_id: u8,
+    session: &Arc<AsyncMutex<SessionState>>,
+    throughput_test_ctx: &Arc<ThroughputTestContext>,
+    duration_secs: u32,
+) -> Option<f64> {
+    let test_id = random_session_id();
+    let mut rx = throughput_test_ctx.register_wait(test_id);
+    if let Err(e) = send_throughput_test_reverse_request(
+        socket,
+        remote,
+        link_id,
+        session,
+        test_id,
+        duration_secs,
+    )
+    .await
+    {
+        tracing::warn!(error = %e, "throughput self-test reverse request failed to send");
+        return None;
+    }
+    let wait = Duration::from_secs(duration_secs as u64) + THROUGHPUT_TEST_RESULT_GRACE;
+    match tokio::time::timeout(wait, rx.recv()).await {
+        Ok(Some(mbps)) => Some(mbps),
+        _ => None,
     }
 }

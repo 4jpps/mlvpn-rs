@@ -207,9 +207,7 @@ pub struct LinkSnapshot {
 /// gives each variant a plain `{"command": "set_link_enabled", ...}`
 /// shape on the wire rather than the more awkward externally-tagged
 /// default, so it reads naturally from `socat`/`jq` the same way
-/// `Snapshot` already does. Currently one variant; more can be added
-/// without breaking existing callers as long as `command` stays the
-/// discriminant.
+/// `Snapshot` already does.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case")]
 pub enum Command {
@@ -217,6 +215,37 @@ pub enum Command {
     /// for scheduling, independent of its real probe-measured state --
     /// see `Link::admin_disabled`'s doc comment.
     SetLinkEnabled { link: String, enabled: bool },
+    /// Runs an on-demand throughput self-test (`mlvpnd selftest` on the
+    /// CLI) -- see `tunnel::send_throughput_test_stream`,
+    /// `control::apply_command`'s handling of this variant. `link`
+    /// selects one named link to test; `None` tests every configured
+    /// link with a `remote_addr`, one at a time. Blocks the command
+    /// connection for roughly `duration_secs` per link tested
+    /// (doubled if `bidirectional`, since the two legs run
+    /// sequentially, not concurrently) -- there is no async
+    /// "start and poll later" variant of this command.
+    RunThroughputTest {
+        link: Option<String>,
+        duration_secs: u32,
+        bidirectional: bool,
+    },
+}
+
+/// One link's result from a completed `Command::RunThroughputTest`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThroughputTestLinkResult {
+    pub link: String,
+    /// Mbps this side measured *sending* to the peer (the forward/
+    /// upload leg) -- `None` if that leg failed or timed out waiting
+    /// for the peer's `ThroughputTestResult` (e.g. an old peer that
+    /// predates this feature, silently dropping the unrecognized
+    /// packet type).
+    pub upload_mbps: Option<f64>,
+    /// Mbps this side measured *receiving* from the peer (the reverse/
+    /// download leg) -- only attempted when `bidirectional` was
+    /// requested; `None` either because it wasn't requested or because
+    /// the peer's reverse stream never arrived/completed in time.
+    pub download_mbps: Option<f64>,
 }
 
 /// Reply to exactly one `Command`, written back once before the
@@ -227,6 +256,12 @@ pub struct CommandResult {
     /// `None` when `ok` is true. Set when `ok` is false, e.g. "no such
     /// link" or a malformed request.
     pub error: Option<String>,
+    /// Populated only by `Command::RunThroughputTest` -- one entry per
+    /// link actually tested, in the order tested. Empty for every other
+    /// command (including a `RunThroughputTest` that failed before
+    /// testing anything -- see `error` in that case).
+    #[serde(default)]
+    pub throughput_results: Vec<ThroughputTestLinkResult>,
 }
 
 #[cfg(test)]
@@ -364,9 +399,33 @@ mod tests {
             r#"{"command":"set_link_enabled","link":"lte0","enabled":false}"#
         );
         let back: Command = serde_json::from_str(&json).expect("deserialize");
-        let Command::SetLinkEnabled { link, enabled } = back;
+        let Command::SetLinkEnabled { link, enabled } = back else {
+            panic!("expected SetLinkEnabled, got {back:?}");
+        };
         assert_eq!(link, "lte0");
         assert!(!enabled);
+    }
+
+    #[test]
+    fn run_throughput_test_command_json_round_trips() {
+        let cmd = Command::RunThroughputTest {
+            link: Some("lte0".to_string()),
+            duration_secs: 10,
+            bidirectional: true,
+        };
+        let json = serde_json::to_string(&cmd).expect("serialize");
+        let back: Command = serde_json::from_str(&json).expect("deserialize");
+        let Command::RunThroughputTest {
+            link,
+            duration_secs,
+            bidirectional,
+        } = back
+        else {
+            panic!("expected RunThroughputTest, got {back:?}");
+        };
+        assert_eq!(link.as_deref(), Some("lte0"));
+        assert_eq!(duration_secs, 10);
+        assert!(bidirectional);
     }
 
     #[test]
@@ -374,19 +433,30 @@ mod tests {
         let ok = CommandResult {
             ok: true,
             error: None,
+            throughput_results: vec![ThroughputTestLinkResult {
+                link: "lte0".to_string(),
+                upload_mbps: Some(94.2),
+                download_mbps: None,
+            }],
         };
         let ok_back: CommandResult =
             serde_json::from_str(&serde_json::to_string(&ok).unwrap()).unwrap();
         assert!(ok_back.ok);
         assert!(ok_back.error.is_none());
+        assert_eq!(ok_back.throughput_results.len(), 1);
+        assert_eq!(ok_back.throughput_results[0].link, "lte0");
+        assert_eq!(ok_back.throughput_results[0].upload_mbps, Some(94.2));
+        assert_eq!(ok_back.throughput_results[0].download_mbps, None);
 
         let err = CommandResult {
             ok: false,
             error: Some("no such link 'bogus'".to_string()),
+            throughput_results: Vec::new(),
         };
         let err_back: CommandResult =
             serde_json::from_str(&serde_json::to_string(&err).unwrap()).unwrap();
         assert!(!err_back.ok);
         assert_eq!(err_back.error.as_deref(), Some("no such link 'bogus'"));
+        assert!(err_back.throughput_results.is_empty());
     }
 }

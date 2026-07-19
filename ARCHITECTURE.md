@@ -346,24 +346,47 @@ independent of whatever verbosity `[logging].level` sets for the
 primary log output). Each connected client tracks its own cursor into
 the ring (`control::serve_client`'s `last_log_seq`), so the log tail
 streams as a delta over the same 500ms cadence rather than needing a
-dedicated socket. `mlvpn-tui` renders all of this as three tabs --
-Links, Daemon, Logs -- see [monitoring.md](docs/monitoring.md).
+dedicated socket. `mlvpn-tui` renders all of this as four tabs --
+Overview, Links, Daemon, Logs -- see [monitoring.md](docs/monitoring.md).
 
 **Command socket** (`[command] enabled`, off by default). A second,
 separate Unix socket -- different path
 (`/run/mlvpn/<tunnel.name>.command.sock` by default), same mode-0600
-creation as the monitoring socket above -- for runtime link control:
-currently one command, pin a link enabled/disabled
-(`ipc::Command::SetLinkEnabled`, `mlvpnd set-link` on the CLI). This
-sets `Link::admin_disabled`, which `monitor::score()` treats as an
-automatic 0 (excluded from scheduling, same as a probe-Down link),
-kept deliberately independent of the link's real `state` -- a manually
-pinned-off link still reports its true probe-measured quality, it's
-just not eligible for picking. Not persisted: a restart always starts
-every link enabled. Kept as a second socket, not a write mode bolted
-onto the monitoring one, so a client authorized only to read link/traffic
-stats (a monitoring-only account) never incidentally gains the ability
-to redirect live traffic.
+creation as the monitoring socket above -- for runtime link control,
+currently two commands:
+
+- Pin a link enabled/disabled (`ipc::Command::SetLinkEnabled`,
+  `mlvpnd set-link` on the CLI). This sets `Link::admin_disabled`,
+  which `monitor::score()` treats as an automatic 0 (excluded from
+  scheduling, same as a probe-Down link), kept deliberately
+  independent of the link's real `state` -- a manually pinned-off link
+  still reports its true probe-measured quality, it's just not
+  eligible for picking. Not persisted: a restart always starts every
+  link enabled.
+- Run an on-demand throughput self-test (`ipc::Command::RunThroughputTest`,
+  `mlvpnd self-test` on the CLI) -- three new wire packet types
+  (`ThroughputTestData`, `ThroughputTestResult`,
+  `ThroughputTestReverseRequest`, see `protocol.rs`) let one side send
+  a real, time-bounded MTU-sized stream and get the peer's measured
+  achieved rate back, with no configuration needed on the peer's end.
+  A bidirectional test additionally has the initiator ask the peer to
+  send its own stream back afterward (sequentially, via
+  `ThroughputTestReverseRequest`); the peer does this entirely
+  autonomously, so both directions can be measured by running the
+  command from just one side. `tunnel::ThroughputTestContext`
+  correlates each leg's result (arriving either as a wire reply or as
+  a local measurement of the reverse leg) back to the waiting command
+  invocation. Unlike `scheduler.active_bandwidth_probing`'s tiny,
+  lock-batched burst (see that feature's own doc comment on why
+  batching matters for a *sub-millisecond* measurement), a self-test
+  stream deliberately does *not* batch its encrypts under one lock
+  acquisition -- a multi-second stream is meant to compete fairly with
+  real Data traffic for the shared session lock, not race around it.
+
+Kept as a second socket, not a write mode bolted onto the monitoring
+one, so a client authorized only to read link/traffic stats (a
+monitoring-only account) never incidentally gains the ability to
+redirect live traffic or saturate a link on demand.
 
 ## 10. Build and deployment
 
