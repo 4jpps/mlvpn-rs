@@ -40,8 +40,21 @@ Description=mlvpn multi-link VPN bonding daemon
 Documentation=https://github.com/4jpps/mlvpn-rs/blob/main/ARCHITECTURE.md
 After=network-online.target
 Wants=network-online.target
-StartLimitIntervalSec=60
-StartLimitBurst=5
+# Loosened from the original 5/60s: a peer-initiated Disconnect makes
+# mlvpnd exit 0 by design (see Restart=always's own comment below), and
+# two hosts restarting/upgrading within moments of each other can
+# plausibly bounce a few of those back and forth while resyncing --
+# each one is a legitimate, expected restart, not a crash loop, but
+# enough of them in a tight window could still exhaust a narrow limit
+# and land the unit in `failed`, which Restart=always does *not*
+# recover from on its own (needs a manual `systemctl reset-failed` +
+# start) -- suspected, not confirmed, as the cause of a real "upgraded
+# on both hosts, service didn't come back on its own" field report.
+# More headroom here is a safe, low-risk change either way: it only
+# affects how many restarts are tolerated before giving up, not normal
+# steady-state behavior.
+StartLimitIntervalSec=120
+StartLimitBurst=10
 
 [Service]
 Type=simple
