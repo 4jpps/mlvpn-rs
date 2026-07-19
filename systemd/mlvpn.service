@@ -101,8 +101,22 @@ ProtectKernelLogs=yes
 ProtectControlGroups=yes
 ProtectClock=yes
 ProtectHostname=yes
+# ProtectProc=invisible on its own already hides every other process's
+# /proc/<PID>/ tree from mlvpnd -- the actual property this hardening
+# is after. Deliberately NOT paired with ProcSubset=pid (a natural-
+# looking companion setting, and this project's own earlier choice):
+# that additionally mounts /proc with the kernel's subset=pid option,
+# which hides every *non*-PID top-level file too -- including
+# /proc/loadavg, /proc/meminfo, and /proc/uptime, which procstats.rs
+# reads for mlvpn-tui's Daemon-tab system stats. With ProcSubset=pid
+# set, those reads fail closed (by design -- see procstats.rs's own
+# doc comment on never panicking on a failed read) and every system
+# stat silently shows as unavailable, which is exactly what surfaced
+# this: the daemon-health work was tested via manual/unprivileged
+# runs, never through this actual sandboxed unit, so the interaction
+# with an already-shipped hardening setting went uncaught until a
+# real install showed an empty System panel.
 ProtectProc=invisible
-ProcSubset=pid
 RestrictNamespaces=yes
 RestrictRealtime=yes
 RestrictSUIDSGID=yes
