@@ -10,6 +10,18 @@ For implementation detail beyond what's here, read the code -- most
 modules and non-trivial functions have doc comments explaining the
 design, and `ARCHITECTURE.md` covers the system as a whole.
 
+## [0.4.2] - 2026-07-19
+
+### Fixed
+
+- **Empty Daemon-tab System panel** (`Load: - - -`, `Mem: --`, `Uptime: --`) on systemd-managed installs. The shipped unit's `ProcSubset=pid` hid every non-PID top-level `/proc` file (`/proc/loadavg`, `/proc/meminfo`, `/proc/uptime`) that `procstats.rs` reads, even though `ProtectProc=invisible` alone already provides the isolation property actually intended (hiding other processes' `/proc/<PID>` trees). Removed `ProcSubset=pid` from `systemd/mlvpn.service`.
+- **Active-bandwidth-probe measurements deflated by per-packet session lock contention.** The probe burst previously acquired the shared Noise session lock once per packet, so real concurrent Data traffic competing for that same lock could inflate the measured burst duration and silently understate the link's true capacity -- observed in the field as a fast link (independently verified at 1.36 Gbps) reporting well under 40 Mbps. The burst is now encrypted under a single lock acquisition instead of one per packet. Verified via a real veth-pair test: an unshaped baseline jumped from ~226 Mbps to ~948 Mbps from this change alone, even with zero concurrent traffic. `active_bandwidth_mbps` feeds scheduler weight, so an artificially low reading here was causing the affected link to be systematically underweighted in bonding decisions.
+
+### Added
+
+- **`mlvpn-tui` real-time per-link and aggregate throughput display.** The existing Tx/Rx columns were cumulative lifetime totals, making it hard to watch bonding behavior live. `LinkStats` now tracks a windowed tx throughput EWMA alongside the existing rx one; the Links tab shows both live rx/tx rates per link, plus a tunnel-wide aggregate (summed across currently-up links) in the panel title.
+- **On-demand throughput self-test**: `mlvpnd self-test --config ... [--link NAME] [--duration SECS] [--bidirectional]` sends a real MTU-sized packet stream to the peer over the existing (off-by-default) command socket and reports the peer's measured achieved rate -- no configuration or command-socket access needed on the peer's end. `--bidirectional` additionally has the peer send its own stream back afterward, entirely autonomously (three new wire packet types: `ThroughputTestData`, `ThroughputTestResult`, `ThroughputTestReverseRequest`). Built to let throughput/loss issues be reproduced and measured directly against the daemon's own diagnostics, rather than only inferred from an external tool like `iperf3`.
+
 ## [0.4.1] - 2026-07-18
 
 ### Fixed

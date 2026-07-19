@@ -19,7 +19,7 @@
 %global debug_package %{nil}
 
 Name:           mlvpn
-Version:        0.4.1
+Version:        0.4.2
 Release:        1%{?dist}
 Summary:        Multi-link VPN bonding daemon
 
@@ -106,6 +106,36 @@ chmod 0750 %{_sysconfdir}/mlvpn
 %dir %attr(0750, root, mlvpn) %{_sysconfdir}/mlvpn
 
 %changelog
+* Sun Jul 19 2026 Jeff Parrish PC Services <www.jpps.us> - 0.4.2-1
+- Fix empty Daemon-tab System panel: drop ProcSubset=pid from the
+  shipped systemd unit. That option hid all non-PID top-level /proc
+  files (loadavg, meminfo, uptime) that procstats.rs needs, even
+  though ProtectProc=invisible alone already provides the isolation
+  property intended (hiding other processes' /proc/<PID> trees).
+- Fix active-bandwidth-probe measurements deflated by per-packet
+  session lock contention: the probe burst's packets are now
+  encrypted under a single lock acquisition instead of one per
+  packet, removing per-packet lock-wait time from the measured
+  duration. Verified via a real veth-pair test: an unshaped baseline
+  jumped from ~226 Mbps to ~948 Mbps from this change alone.
+  active_bandwidth_mbps feeds scheduler weight, so a link measuring
+  artificially low here was being systematically underweighted in
+  bonding decisions.
+- mlvpn-tui: real-time per-link and aggregate throughput display.
+  LinkStats now tracks a windowed tx throughput EWMA alongside the
+  existing rx one; the Links tab shows both live rx/tx rates per
+  link plus a tunnel-wide aggregate (summed across up links) in the
+  panel title, distinct from the existing cumulative Tx/Rx byte
+  totals column.
+- Add an on-demand throughput self-test (mlvpnd self-test --config
+  ... [--link NAME] [--duration SECS] [--bidirectional]): sends a
+  real MTU-sized packet stream to the peer and reports the measured
+  achieved rate, with no configuration needed on the peer's end.
+  --bidirectional additionally has the peer send its own stream
+  back afterward, entirely autonomously. Built to help reproduce
+  throughput/loss issues directly against the daemon's own
+  diagnostics instead of inferring them from an external tool.
+
 * Sat Jul 18 2026 Jeff Parrish PC Services <www.jpps.us> - 0.4.1-1
 - Fix a client-side link whose remote_addr is a hostname resolving to
   both an IPv4 and an IPv6 address being able to hang its initial
