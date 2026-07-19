@@ -10,6 +10,26 @@ For implementation detail beyond what's here, read the code -- most
 modules and non-trivial functions have doc comments explaining the
 design, and `ARCHITECTURE.md` covers the system as a whole.
 
+## [0.4.0] - 2026-07-18
+
+### Added
+
+- **`mlvpn-tui` redesigned as a tabbed Links / Daemon / Logs interface**, replacing the single always-visible link table:
+  - **Links**: existing per-link state/peer-addr/score/local-and-peer-measurement columns, now joined by "Up For" (how long the link has held its current state) and cumulative "Tx / Rx" byte totals.
+  - **Daemon** (new): session id/uptime/rekey count; the outbound queue's current depth (a fill-ratio-colored gauge) and lifetime drop count; the TUN interface's own kernel-tracked byte/error/drop counters (`/sys/class/net/<iface>/statistics/*`); and machine-wide load average/memory/uptime (`/proc`).
+  - **Logs** (new): a live tail of the daemon's own log output (INFO and above), streamed incrementally over the existing control socket rather than requiring a separate `journalctl -f` window. `Up`/`Down`/`PageUp`/`PageDown` scroll back through history; staying at the newest line auto-follows, same as `tail -f`.
+  - Switch tabs with `Tab`/`Shift+Tab` or `1`/`2`/`3`. Coloring across every tab now goes through five shared semantic constants (good/warn/bad/muted/accent) instead of scattered inline color literals.
+- New `ipc::DaemonSnapshot` (session/rekey metadata, outbound queue health, TUN sysfs counters, `/proc` system stats) and `Snapshot::new_log_lines` (a per-connection delta of new log lines since that client's last poll) on the control-socket wire format, backing the Daemon and Logs tabs above.
+- New `SessionMeta` (`tunnel.rs`): session id/uptime/rekey count now live in their own atomics-and-`Instant` struct instead of requiring a getter on the per-packet-locked `SessionState`, so reading them from the control socket adds no contention to the hot path.
+- New `logbuf::LogRing` and `LogRingLayer`: an in-memory ring of the daemon's own log lines, fed by a `tracing_subscriber::Layer` filtered to INFO+ independent of whatever verbosity `[logging].level` is actually configured to, so a debug/trace run can't flood the ring or the control socket.
+- New `sysfs_net.rs` (TUN interface kernel counters) and `procstats.rs` (`/proc/loadavg`/`meminfo`/`uptime`) modules.
+- New integration test `tests/veth_daemon_health.rs`, covering all of the above against two real `mlvpnd` processes -- including that `new_log_lines` delivers a genuine delta, never repeating a line already sent to the same connection.
+
+### Changed
+
+- **Breaking wire change**: `ipc::Snapshot` gained two required (non-`Option`) fields, `daemon` and `new_log_lines`. `mlvpnd` and `mlvpn-tui` must be upgraded together on a given host -- an old `mlvpn-tui` talking to a new `mlvpnd`, or a new `mlvpn-tui` talking to an old `mlvpnd`, will fail to parse the control socket's JSON rather than degrading gracefully.
+- The outbound-queue drop counter (`outbound_queue_drop_reporter`) is now a monotonic lifetime total (also exposed via `DaemonSnapshot::outbound_queue_dropped_total`) instead of being reset to 0 by its own periodic log line; the reporter tracks its own windowed delta locally, so its "silent unless something was actually dropped" logging behavior is unchanged.
+
 ## [0.3.7] - 2026-07-18
 
 ### Fixed
@@ -451,6 +471,7 @@ Initial implementation and first successful build.
 - Privilege dropping, a hardened systemd unit, and Debian packaging.
 - `ARCHITECTURE.md` design document and example configs.
 
+[0.4.0]: https://github.com/4jpps/mlvpn-rs/compare/v0.3.7...v0.4.0
 [0.3.7]: https://github.com/4jpps/mlvpn-rs/compare/v0.3.6...v0.3.7
 [0.3.6]: https://github.com/4jpps/mlvpn-rs/compare/v0.3.5...v0.3.6
 [0.3.5]: https://github.com/4jpps/mlvpn-rs/compare/v0.3.4...v0.3.5

@@ -6,8 +6,8 @@
 # equivalent of the user/group creation below.
 #
 # Note on %{?dist}: left in place (standard Fedora/RHEL convention) so
-# the same spec produces e.g. mlvpn-0.3.7-1.fc41.x86_64.rpm on Fedora and
-# mlvpn-0.3.7-1.el9.x86_64.rpm on RHEL/Rocky/Alma from one source tree.
+# the same spec produces e.g. mlvpn-0.4.0-1.fc41.x86_64.rpm on Fedora and
+# mlvpn-0.4.0-1.el9.x86_64.rpm on RHEL/Rocky/Alma from one source tree.
 #
 # debug_package disabled: [profile.release] in Cargo.toml sets
 # strip = true, so the compiled mlvpnd/mlvpn-tui binaries carry no
@@ -19,7 +19,7 @@
 %global debug_package %{nil}
 
 Name:           mlvpn
-Version:        0.3.7
+Version:        0.4.0
 Release:        1%{?dist}
 Summary:        Multi-link VPN bonding daemon
 
@@ -106,6 +106,28 @@ chmod 0750 %{_sysconfdir}/mlvpn
 %dir %attr(0750, root, mlvpn) %{_sysconfdir}/mlvpn
 
 %changelog
+* Sat Jul 18 2026 Jeff Parrish PC Services <www.jpps.us> - 0.4.0-1
+- mlvpn-tui: replace the single link table with a tabbed Links /
+  Daemon / Logs view. Links gains state-duration and cumulative
+  tx/rx-byte columns; Daemon shows session id/uptime/rekey count,
+  outbound queue depth and lifetime drops, the TUN interface's own
+  kernel byte/error/drop counters, and machine-wide load/memory/
+  uptime; Logs streams the daemon's own INFO+ log output live
+  (Up/Down/PageUp/PageDown to scroll, auto-follows the tail unless
+  scrolled back). Switch tabs with Tab/Shift+Tab or 1/2/3.
+- mlvpnd: the control-socket wire format (ipc::Snapshot) gained the
+  fields the above needs -- a new daemon: DaemonSnapshot and
+  new_log_lines: Vec<LogEntry>, both required (not optional), plus
+  new per-link fields on LinkSnapshot. This is a breaking wire
+  change: mlvpnd and mlvpn-tui must be upgraded together on a given
+  host, since an old mlvpn-tui talking to a new mlvpnd (or vice
+  versa) will fail to parse the control socket's JSON.
+- New in-memory log ring (logbuf.rs) feeding mlvpn-tui's Logs tab,
+  filtered to INFO+ independent of the daemon's own configured log
+  level so a debug/trace run can't flood it. Session/rekey metadata
+  moved off the per-packet session lock into its own SessionMeta to
+  avoid adding contention to that hot path.
+
 * Sat Jul 18 2026 Jeff Parrish PC Services <www.jpps.us> - 0.3.7-1
 - Fix compute_achieved_mbps's elapsed-time floor silently capping
   active-bandwidth-probe results at ~229 Mbps on fast links. The 1ms
