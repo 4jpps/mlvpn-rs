@@ -6,8 +6,8 @@
 # equivalent of the user/group creation below.
 #
 # Note on %{?dist}: left in place (standard Fedora/RHEL convention) so
-# the same spec produces e.g. mlvpn-0.4.0-1.fc41.x86_64.rpm on Fedora and
-# mlvpn-0.4.0-1.el9.x86_64.rpm on RHEL/Rocky/Alma from one source tree.
+# the same spec produces e.g. mlvpn-0.4.1-1.fc41.x86_64.rpm on Fedora and
+# mlvpn-0.4.1-1.el9.x86_64.rpm on RHEL/Rocky/Alma from one source tree.
 #
 # debug_package disabled: [profile.release] in Cargo.toml sets
 # strip = true, so the compiled mlvpnd/mlvpn-tui binaries carry no
@@ -19,7 +19,7 @@
 %global debug_package %{nil}
 
 Name:           mlvpn
-Version:        0.4.0
+Version:        0.4.1
 Release:        1%{?dist}
 Summary:        Multi-link VPN bonding daemon
 
@@ -106,6 +106,25 @@ chmod 0750 %{_sysconfdir}/mlvpn
 %dir %attr(0750, root, mlvpn) %{_sysconfdir}/mlvpn
 
 %changelog
+* Sat Jul 18 2026 Jeff Parrish PC Services <www.jpps.us> - 0.4.1-1
+- Fix a client-side link whose remote_addr is a hostname resolving to
+  both an IPv4 and an IPv6 address being able to hang its initial
+  handshake indefinitely when the IPv6 path wasn't actually reachable
+  end-to-end (a broken or absent route -- not uncommon on residential/
+  consumer ISPs, and not the same thing as the AAAA record simply
+  existing). mlvpnd previously committed to IPv6 first with no
+  fallback; both resolved candidates are now raced during the first
+  handshake attempt and whichever one actually answers wins, with a
+  log line when the fallback kicks in.
+- mlvpn-tui: new Overview tab (now the default at startup), combining
+  condensed Links/Daemon/Logs panes into one screen for an
+  at-a-glance, screenshot-friendly view. More color coding (link
+  score, loss percentage, memory-used percentage). Startup no longer
+  fails immediately when the control socket doesn't exist yet if
+  mlvpnd is running but still waiting on its peer -- it now watches
+  for the socket to appear, and offers to start the service if it
+  isn't running at all.
+
 * Sat Jul 18 2026 Jeff Parrish PC Services <www.jpps.us> - 0.4.0-1
 - mlvpn-tui: replace the single link table with a tabbed Links /
   Daemon / Logs view. Links gains state-duration and cumulative

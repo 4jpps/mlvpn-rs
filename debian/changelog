@@ -1,3 +1,25 @@
+mlvpn (0.4.1-1) unstable; urgency=medium
+
+  * Fix a client-side link whose remote_addr is a hostname resolving to
+    both an IPv4 and an IPv6 address being able to hang its initial
+    handshake indefinitely when the IPv6 path wasn't actually reachable
+    end-to-end (a broken or absent route -- not uncommon on
+    residential/consumer ISPs, and not the same thing as the AAAA
+    record simply existing). mlvpnd previously committed to IPv6 first
+    with no fallback; both resolved candidates are now raced during the
+    first handshake attempt and whichever one actually answers wins,
+    with a log line when the fallback kicks in.
+  * mlvpn-tui: new Overview tab (now the default at startup), combining
+    condensed Links/Daemon/Logs panes into one screen for an
+    at-a-glance, screenshot-friendly view. More color coding (link
+    score, loss percentage, memory-used percentage). Startup no longer
+    fails immediately when the control socket doesn't exist yet if
+    mlvpnd is running but still waiting on its peer -- it now watches
+    for the socket to appear, and offers to start the service if it
+    isn't running at all.
+
+ -- Jeff Parrish PC Services <www.jpps.us>  Sat, 18 Jul 2026 00:00:00 -0500
+
 mlvpn (0.4.0-1) unstable; urgency=medium
 
   * mlvpn-tui: replace the single link table with a tabbed Links /

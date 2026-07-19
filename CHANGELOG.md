@@ -10,6 +10,18 @@ For implementation detail beyond what's here, read the code -- most
 modules and non-trivial functions have doc comments explaining the
 design, and `ARCHITECTURE.md` covers the system as a whole.
 
+## [0.4.1] - 2026-07-18
+
+### Fixed
+
+- **A client-side link whose `remote_addr` is a hostname resolving to both an IPv4 and an IPv6 address could hang its initial handshake indefinitely** if the IPv6 path wasn't actually reachable end-to-end -- a broken or absent route, not uncommon on residential/consumer ISPs, and not the same thing as the `AAAA` record simply existing. `pick_remote_addr` previously committed to the IPv6 candidate up front with no fallback, so the daemon would retry the handshake against a dead address forever (visible as repeated "handshake attempt failed, retrying... timeout" log lines) even though the exact same peer was perfectly reachable over IPv4 the whole time. Both resolved candidates are now raced during the very first handshake attempt only (never on a later rekey), and whichever one actually answers wins -- logged at INFO when the fallback kicks in. `local_addr`, when set, still pins one family outright with no racing, unchanged.
+
+### Added
+
+- **`mlvpn-tui` gains a new Overview tab**, now the default tab at startup: condensed Links/Daemon/Logs panes stacked into one screen, for an at-a-glance and screenshot-friendly view without switching tabs. Tab keybindings shift to `1`/`2`/`3`/`4` (Overview/Links/Daemon/Logs) accordingly.
+- More color coding in `mlvpn-tui`: link score (by how much traffic share it's actually carrying), loss percentage within the Links tab's measurement text (muted uniformly when peer data is stale, rather than color-coding numbers that might be well out of date), and the Daemon tab's memory-used percentage.
+- **`mlvpn-tui` no longer fails immediately at startup if the control socket doesn't exist yet.** Previously a hard, immediate error even when `mlvpnd` was actually running and simply hadn't finished its initial handshake -- the control socket isn't created until that handshake succeeds, so a freshly (re)started daemon waiting on an unreachable peer genuinely has nothing to connect to yet. Auto-detecting with nothing found now checks whether the `mlvpn` systemd service is active: if so, it goes straight to the full-screen view (which keeps watching for the socket to appear in the background); if the service isn't running at all, it offers to start it right at the prompt.
+
 ## [0.4.0] - 2026-07-18
 
 ### Added
@@ -471,6 +483,7 @@ Initial implementation and first successful build.
 - Privilege dropping, a hardened systemd unit, and Debian packaging.
 - `ARCHITECTURE.md` design document and example configs.
 
+[0.4.1]: https://github.com/4jpps/mlvpn-rs/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/4jpps/mlvpn-rs/compare/v0.3.7...v0.4.0
 [0.3.7]: https://github.com/4jpps/mlvpn-rs/compare/v0.3.6...v0.3.7
 [0.3.6]: https://github.com/4jpps/mlvpn-rs/compare/v0.3.5...v0.3.6
