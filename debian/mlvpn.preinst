@@ -1,0 +1,37 @@
+#!/bin/sh
+set -e
+
+# Captures whether mlvpn.service was active *before* dpkg unpacks any of
+# this upgrade's new files, so postinst's own restart-after-upgrade logic
+# (see the matching read of STATE_FILE there) can restore the *true*
+# pre-upgrade state instead of whatever state the service happens to be
+# in by the time postinst itself starts running.
+#
+# Real field evidence prompted this: a genuine mlvpnd crash showed up in
+# journalctl (a "Scheduled restart job, restart counter is at 1" line --
+# systemd's own Restart=always reacting to the process exiting
+# unexpectedly, not an external stop/restart call) landing in the window
+# between dpkg unpacking this same upgrade's new files and postinst
+# running its own capture line. By the time postinst's old top-of-file
+# capture ran, the service had already gone down for a reason unrelated
+# to postinst's own restart-after-upgrade code -- so it read "not
+# active" even though the service genuinely was up until dpkg started
+# touching this package's files. preinst runs strictly *before* any of
+# that unpacking, so it's immune to whatever happens during it.
+STATE_FILE=/run/mlvpn/.preinst-was-active
+
+case "$1" in
+  upgrade)
+    # /run is a persistent (since boot) tmpfs always writable by root,
+    # regardless of whether mlvpn.service's own RuntimeDirectory=mlvpn
+    # currently exists (it only does while the unit is actually active).
+    mkdir -p /run/mlvpn
+    if systemctl is-active --quiet mlvpn.service 2>/dev/null; then
+      echo yes > "$STATE_FILE"
+    else
+      echo no > "$STATE_FILE"
+    fi
+    ;;
+esac
+
+exit 0

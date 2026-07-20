@@ -1,12 +1,20 @@
 #!/bin/sh
 set -e
 
-# Captured *before* anything below -- including debhelper's own
-# generated code, spliced in further down at the marker line by itself
-# -- can touch the service's running state. See the long comment right
-# before the matching restart, after that marker, for why this has to
-# be recorded this early and acted on this late rather than doing both
-# right here in one place.
+# Read from the state file mlvpn.preinst captured *before dpkg unpacked
+# any of this upgrade's new files* -- not a live check here anymore.
+# See mlvpn.preinst's own comment for why: a live check at the top of
+# *this* script (postinst runs after unpacking) turned out to be too
+# late in a real observed case -- a genuine mlvpnd crash during
+# unpacking (confirmed via journalctl's "Scheduled restart job" line)
+# left the service already down by the time this script's old capture
+# line ran, so it read "not active" even though the service was
+# genuinely up until dpkg started touching this package's files.
+#
+# The `MLVPN_WAS_ACTIVE=no` + live-check fallback below only matters
+# for a preinst that didn't run for some reason (a very old dpkg, or
+# some non-apt install path) -- normally the state file is always
+# there by the time this line runs.
 #
 # Deliberately described only in prose here, never written as the
 # literal marker token itself: debhelper's token substitution replaces
@@ -16,9 +24,15 @@ set -e
 # shell code into the middle of this sentence. Found the hard way: a
 # `dpkg --configure` failure quoting a mangled fragment of this very
 # comment as an unrecognized command.
-MLVPN_WAS_ACTIVE=no
-if systemctl is-active --quiet mlvpn.service 2>/dev/null; then
-  MLVPN_WAS_ACTIVE=yes
+PREINST_STATE_FILE=/run/mlvpn/.preinst-was-active
+if [ -f "$PREINST_STATE_FILE" ]; then
+  MLVPN_WAS_ACTIVE=$(cat "$PREINST_STATE_FILE")
+  rm -f "$PREINST_STATE_FILE"
+else
+  MLVPN_WAS_ACTIVE=no
+  if systemctl is-active --quiet mlvpn.service 2>/dev/null; then
+    MLVPN_WAS_ACTIVE=yes
+  fi
 fi
 
 case "$1" in
