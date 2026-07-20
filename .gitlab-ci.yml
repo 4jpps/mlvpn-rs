@@ -1,0 +1,50 @@
+# GitLab CI/CD pipeline, mirroring .github/workflows/ci.yml and
+# release.yml -- this repo's primary CI now lives here (self-hosted
+# gitlab.tech.lan); GitHub Actions stays in place for now as the
+# secondary/confirmed-working sync target's own CI, unmodified.
+#
+# Runners (see `jpps-linux-builder`, instance-wide, Docker executor,
+# tags: linux/deb/rpm): amd64-native only. arm64 legs run the same
+# images via `image: platform: linux/arm64` -- QEMU user-mode
+# emulation (multiarch/qemu-user-static, registered on the runner
+# host) makes this transparent to the job itself, at some cost in
+# build time versus a real arm64 runner.
+
+stages:
+  - test
+
+variables:
+  CARGO_HOME: ${CI_PROJECT_DIR}/.cargo
+  RUST_IMAGE: rust:1.86-bookworm
+
+.cargo_cache:
+  cache:
+    key: cargo-${CI_JOB_NAME}
+    paths:
+      - .cargo/registry/cache
+      - .cargo/registry/index
+      - target/
+
+.build_and_test:
+  stage: test
+  tags: [linux]
+  extends: .cargo_cache
+  before_script:
+    - apt-get update -qq
+    - apt-get install -y -qq build-essential pkg-config libc6-dev
+    - rustup component add rustfmt clippy
+  script:
+    - cargo build --release --locked
+    - cargo test --release --locked --lib
+    - cargo clippy --release --locked --all-targets -- -D warnings
+    - cargo fmt --check
+
+test:amd64:
+  extends: .build_and_test
+  image: ${RUST_IMAGE}
+
+test:arm64:
+  extends: .build_and_test
+  image:
+    name: ${RUST_IMAGE}
+    platform: linux/arm64
