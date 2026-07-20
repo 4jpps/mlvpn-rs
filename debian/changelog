@@ -1,3 +1,28 @@
+mlvpn (0.4.4-1) unstable; urgency=medium
+
+  * Fix mlvpnd's log ring (feeds mlvpn-tui's Logs tab and mlvpnd
+    diag-dump) dropping every structured field but the bare message --
+    found live when a real "failed to write diagnostic dump" warning
+    showed up in a diag-dump with no error/dir detail at all, even
+    though journald had the full fields the whole time.
+  * mlvpnd self-test now logs at the start of each leg (and when the
+    receiving side starts seeing a stream), not just on completion, so
+    a diagnostic dump covering that window clearly shows a deliberate
+    self-test was running rather than looking like unexplained loss.
+  * Default [diagnostics] dump_dir changed from /run/mlvpn (tmpfs,
+    cleared on stop/reboot) to /var/log/mlvpn (persistent, matches
+    where other services log to), backed by a new LogsDirectory=mlvpn
+    in the systemd unit -- no manual mkdir/chown/ReadWritePaths=
+    needed for the default case anymore.
+  * Loosened the systemd unit's restart rate limit
+    (StartLimitBurst/StartLimitIntervalSec, 5/60s -> 10/120s) as
+    headroom against two hosts restarting near-simultaneously
+    (e.g. both upgrading at once) potentially exhausting the old,
+    tighter limit and landing the service in a failed state that
+    Restart=always can't recover from on its own.
+
+ -- Jeff Parrish PC Services <www.jpps.us>  Sun, 19 Jul 2026 00:00:00 -0500
+
 mlvpn (0.4.3-1) unstable; urgency=medium
 
   * Fix a client-mode link whose remote_addr hostname resolves to both

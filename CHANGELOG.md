@@ -10,6 +10,21 @@ For implementation detail beyond what's here, read the code -- most
 modules and non-trivial functions have doc comments explaining the
 design, and `ARCHITECTURE.md` covers the system as a whole.
 
+## [0.4.4] - 2026-07-19
+
+### Fixed
+
+- **`mlvpnd`'s log ring (feeds `mlvpn-tui`'s Logs tab and `mlvpnd diag-dump`) dropped every structured field but the bare message.** This codebase's own logging convention routinely puts the actually useful diagnostic detail in named fields (`error = %e`, `dir = %path`, etc.), not the free-text message -- found live when a real `diagnostics_watch_loop` failure ("failed to write diagnostic dump") showed up in an actual `diag-dump` output with no `error`/`dir` detail at all, even though journald had the full fields the whole time. `logbuf::MessageVisitor` now captures every field and appends them as `key=value` pairs after the message.
+
+### Added
+
+- **`mlvpnd self-test` now logs at the start of each leg** (and when the receiving side starts seeing a stream), not just on completion -- a diagnostic dump covering that window now clearly shows a deliberate self-test was running, rather than looking like unexplained loss.
+
+### Changed
+
+- **Default `[diagnostics] dump_dir` changed from `/run/mlvpn` (tmpfs, cleared on stop/reboot) to `/var/log/mlvpn`** (persistent, matches where most other services log to), backed by a new `LogsDirectory=mlvpn` in the systemd unit -- no manual `mkdir`/`chown`/`ReadWritePaths=` needed for the default case anymore. A custom `dump_dir` still needs its own `ReadWritePaths=` added to the unit.
+- **Loosened the systemd unit's restart rate limit** (`StartLimitBurst`/`StartLimitIntervalSec`, 5/60s -> 10/120s) as headroom against two hosts restarting near-simultaneously (e.g. both upgrading at once) potentially exhausting the old, tighter limit and landing the service in a `failed` state that `Restart=always` can't recover from on its own -- a suspected but not confirmed cause of a real field report of the service not coming back up after a package upgrade.
+
 ## [0.4.3] - 2026-07-19
 
 ### Fixed

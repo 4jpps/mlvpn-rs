@@ -19,7 +19,7 @@
 %global debug_package %{nil}
 
 Name:           mlvpn
-Version:        0.4.3
+Version:        0.4.4
 Release:        1%{?dist}
 Summary:        Multi-link VPN bonding daemon
 
@@ -106,6 +106,28 @@ chmod 0750 %{_sysconfdir}/mlvpn
 %dir %attr(0750, root, mlvpn) %{_sysconfdir}/mlvpn
 
 %changelog
+* Sun Jul 19 2026 Jeff Parrish PC Services <www.jpps.us> - 0.4.4-1
+- Fix mlvpnd's log ring (feeds mlvpn-tui's Logs tab and mlvpnd
+  diag-dump) dropping every structured field but the bare message --
+  found live when a real "failed to write diagnostic dump" warning
+  showed up in a diag-dump with no error/dir detail at all, even
+  though journald had the full fields the whole time.
+- mlvpnd self-test now logs at the start of each leg (and when the
+  receiving side starts seeing a stream), not just on completion, so
+  a diagnostic dump covering that window clearly shows a deliberate
+  self-test was running rather than looking like unexplained loss.
+- Default [diagnostics] dump_dir changed from /run/mlvpn (tmpfs,
+  cleared on stop/reboot) to /var/log/mlvpn (persistent, matches
+  where other services log to), backed by a new LogsDirectory=mlvpn
+  in the systemd unit -- no manual mkdir/chown/ReadWritePaths=
+  needed for the default case anymore.
+- Loosened the systemd unit's restart rate limit
+  (StartLimitBurst/StartLimitIntervalSec, 5/60s -> 10/120s) as
+  headroom against two hosts restarting near-simultaneously
+  (e.g. both upgrading at once) potentially exhausting the old,
+  tighter limit and landing the service in a failed state that
+  Restart=always can't recover from on its own.
+
 * Sun Jul 19 2026 Jeff Parrish PC Services <www.jpps.us> - 0.4.3-1
 - Fix a client-mode link whose remote_addr hostname resolves to both
   an A and AAAA record getting permanently stuck trying an
