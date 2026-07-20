@@ -4,11 +4,16 @@
 # secondary/confirmed-working sync target's own CI, unmodified.
 #
 # Runners (see `jpps-linux-builder`, instance-wide, Docker executor,
-# tags: linux/deb/rpm): amd64-native only. arm64 legs run the same
-# images via `image: platform: linux/arm64` -- QEMU user-mode
-# emulation (multiarch/qemu-user-static, registered on the runner
-# host) makes this transparent to the job itself, at some cost in
-# build time versus a real arm64 runner.
+# tags: linux/deb/rpm): amd64-native only. arm64 legs use the
+# architecture-specific `arm64v8/` image namespace (Docker Official
+# Images' per-arch mirror) instead of `image: platform: linux/arm64`
+# -- this GitLab Runner version's docker executor doesn't support the
+# `platform` key under `image:` (confirmed via the CI lint API: "unknown
+# keys: platform"). An `arm64v8/...` image has only one architecture to
+# begin with, so there's no manifest-selection ambiguity for Docker to
+# get wrong -- the host kernel's registered QEMU binfmt handler
+# (multiarch/qemu-user-static) just transparently runs the foreign
+# binaries, at some cost in build time versus a real arm64 runner.
 
 stages:
   - test
@@ -16,6 +21,7 @@ stages:
 variables:
   CARGO_HOME: ${CI_PROJECT_DIR}/.cargo
   RUST_IMAGE: rust:1.86-bookworm
+  RUST_IMAGE_ARM64: arm64v8/rust:1.86-bookworm
 
 .cargo_cache:
   cache:
@@ -45,6 +51,4 @@ test:amd64:
 
 test:arm64:
   extends: .build_and_test
-  image:
-    name: ${RUST_IMAGE}
-    platform: linux/arm64
+  image: ${RUST_IMAGE_ARM64}
