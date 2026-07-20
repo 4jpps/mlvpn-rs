@@ -313,7 +313,36 @@ fn run_throughput_selftest(
             println!("{}: upload {upload}", r.link);
         }
     }
+    print_peer_version_report(&result.peer_version);
     Ok(())
+}
+
+/// Prints the peer's last-known `mlvpnd` version and flags a mismatch
+/// against this build's own `mlvpn::VERSION`. Shared by both self-test
+/// CLI paths (link-level and tunnel-level): the version comes from the
+/// periodic wire `VersionInfo` exchange (`CommandResult::peer_version`),
+/// not from the self-test's own round trip, so it's still available to
+/// report even when the test itself times out with "no result" --
+/// exactly the case where knowing whether a version skew might explain
+/// the failure is most useful.
+fn print_peer_version_report(peer_version: &Option<String>) {
+    match peer_version {
+        Some(v) if v == mlvpn::VERSION => {
+            println!("peer version: {v} (matches this host)");
+        }
+        Some(v) => {
+            println!(
+                "peer version: {v} -- WARNING: this host is running {}, versions differ",
+                mlvpn::VERSION
+            );
+        }
+        None => {
+            println!(
+                "peer version: unknown (no version info received from the peer yet -- session \
+                 may not be established, or the peer predates this feature)"
+            );
+        }
+    }
 }
 
 /// Send a `RunTunnelThroughputTest` command to a running daemon's
@@ -378,6 +407,7 @@ fn run_tunnel_throughput_selftest(
             None => println!("  peer's outbound queue drop count unavailable (no result)"),
         }
     }
+    print_peer_version_report(&result.peer_version);
     Ok(())
 }
 

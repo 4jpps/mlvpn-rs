@@ -43,7 +43,7 @@ use crate::procstats;
 use crate::sysfs_net;
 use crate::tunnel::{
     send_throughput_test_reverse_request, send_throughput_test_stream, DiagnosticsWatchParams,
-    OutboundFrame, SessionMeta, ThroughputTestContext,
+    OutboundFrame, PeerVersion, SessionMeta, ThroughputTestContext,
 };
 use crate::tunneltest;
 use std::net::SocketAddr;
@@ -76,6 +76,7 @@ pub(crate) async fn serve(
     outbound_tx: mpsc::Sender<OutboundFrame>,
     outbound_dropped_total: Arc<AtomicU64>,
     log_ring: Arc<LogRing>,
+    peer_version: PeerVersion,
 ) {
     if let Some(parent) = path.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
@@ -163,6 +164,7 @@ pub(crate) async fn serve(
         let outbound_tx = outbound_tx.clone();
         let outbound_dropped_total = outbound_dropped_total.clone();
         let log_ring = log_ring.clone();
+        let peer_version = peer_version.clone();
         tokio::spawn(async move {
             serve_client(
                 stream,
@@ -174,6 +176,7 @@ pub(crate) async fn serve(
                 outbound_tx,
                 outbound_dropped_total,
                 log_ring,
+                peer_version,
             )
             .await;
         });
@@ -191,6 +194,7 @@ async fn serve_client(
     outbound_tx: mpsc::Sender<OutboundFrame>,
     outbound_dropped_total: Arc<AtomicU64>,
     log_ring: Arc<LogRing>,
+    peer_version: PeerVersion,
 ) {
     let mut tick = interval(Duration::from_millis(SNAPSHOT_INTERVAL_MS));
     // Per-connection cursor into `log_ring` -- each connected client
@@ -211,6 +215,7 @@ async fn serve_client(
             &outbound_dropped_total,
             &log_ring,
             last_log_seq,
+            &peer_version,
         )
         .await;
         last_log_seq = new_last_log_seq;
@@ -235,6 +240,7 @@ async fn build_snapshot(
     outbound_dropped_total: &AtomicU64,
     log_ring: &LogRing,
     last_log_seq: u64,
+    peer_version: &PeerVersion,
 ) -> (Snapshot, u64) {
     let snap = link::snapshot_links(links).await;
     let link_snapshots = snap
@@ -329,6 +335,8 @@ async fn build_snapshot(
                 mem_available_kb: system_stats.mem_available_kb,
                 uptime_secs: system_stats.uptime_secs,
             },
+            local_version: crate::VERSION.to_string(),
+            peer_version: peer_version.lock().unwrap().clone(),
         },
         new_log_lines,
     };
@@ -354,6 +362,7 @@ pub(crate) struct DiagContext {
     pub(crate) outbound_tx: mpsc::Sender<OutboundFrame>,
     pub(crate) outbound_dropped_total: Arc<AtomicU64>,
     pub(crate) log_ring: Arc<LogRing>,
+    pub(crate) peer_version: PeerVersion,
 }
 
 /// Bind the command socket and serve `ipc::Command` requests until the
@@ -498,6 +507,7 @@ async fn serve_command_client(
             throughput_results: Vec::new(),
             diag_dump: None,
             tunnel_test_result: None,
+            peer_version: diag_ctx.peer_version.lock().unwrap().clone(),
         },
     };
 
@@ -551,6 +561,7 @@ async fn apply_command(
                     throughput_results: Vec::new(),
                     diag_dump: None,
                     tunnel_test_result: None,
+                    peer_version: diag_ctx.peer_version.lock().unwrap().clone(),
                 }
             } else {
                 CommandResult {
@@ -559,6 +570,7 @@ async fn apply_command(
                     throughput_results: Vec::new(),
                     diag_dump: None,
                     tunnel_test_result: None,
+                    peer_version: diag_ctx.peer_version.lock().unwrap().clone(),
                 }
             }
         }
@@ -575,6 +587,7 @@ async fn apply_command(
                 link,
                 duration_secs,
                 bidirectional,
+                &diag_ctx.peer_version,
             )
             .await
         }
@@ -591,6 +604,7 @@ async fn apply_command(
                 mtu,
                 &diag_ctx.outbound_dropped_total,
                 tunnel_test_ctx,
+                &diag_ctx.peer_version,
             )
             .await
         }
@@ -610,6 +624,7 @@ async fn run_tunnel_throughput_test_command(
     mtu: usize,
     outbound_dropped_total: &Arc<AtomicU64>,
     tunnel_test_ctx: &Arc<tunneltest::TunnelTestContext>,
+    peer_version: &PeerVersion,
 ) -> CommandResult {
     let peer_addr = match peer_addr.parse::<std::net::IpAddr>() {
         Ok(addr) => addr,
@@ -620,6 +635,7 @@ async fn run_tunnel_throughput_test_command(
                 throughput_results: Vec::new(),
                 diag_dump: None,
                 tunnel_test_result: None,
+                peer_version: peer_version.lock().unwrap().clone(),
             };
         }
     };
@@ -654,6 +670,13 @@ async fn run_tunnel_throughput_test_command(
             local_outbound_queue_dropped_delta: outcome.local_queue_drops,
             peer_outbound_queue_dropped_delta: outcome.peer_queue_drops,
         }),
+        // Read *after* the test, not before: if the peer's own
+        // `VersionInfo` broadcast happens to land during the test
+        // (same session, independent timer), this reports the freshest
+        // value available rather than a slightly-stale one -- doesn't
+        // matter in practice (the version isn't expected to change
+        // mid-test), but there's no reason to prefer the stale read.
+        peer_version: peer_version.lock().unwrap().clone(),
     }
 }
 
@@ -675,6 +698,7 @@ async fn run_diag_dump_command(links: &Links, diag_ctx: &DiagContext) -> Command
         &diag_ctx.outbound_dropped_total,
         &diag_ctx.log_ring,
         0,
+        &diag_ctx.peer_version,
     )
     .await;
     let text = diag::format_dump(&snapshot, "manual (mlvpnd diag-dump)");
@@ -685,6 +709,7 @@ async fn run_diag_dump_command(links: &Links, diag_ctx: &DiagContext) -> Command
         throughput_results: Vec::new(),
         diag_dump: Some(text),
         tunnel_test_result: None,
+        peer_version: diag_ctx.peer_version.lock().unwrap().clone(),
     }
 }
 
@@ -736,6 +761,7 @@ pub(crate) async fn diagnostics_watch_loop(
             &diag_ctx.outbound_dropped_total,
             &diag_ctx.log_ring,
             0,
+            &diag_ctx.peer_version,
         )
         .await;
 
@@ -807,6 +833,7 @@ const THROUGHPUT_TEST_RESULT_GRACE: Duration = Duration::from_secs(5);
 /// `tunnel::ThroughputTestContext`'s doc comment for why), and so does
 /// every targeted link's own test, one after another, never
 /// concurrently.
+#[allow(clippy::too_many_arguments)]
 async fn run_throughput_test_command(
     links: &Links,
     session: &Arc<AsyncMutex<SessionState>>,
@@ -815,6 +842,7 @@ async fn run_throughput_test_command(
     link: Option<String>,
     duration_secs: u32,
     bidirectional: bool,
+    peer_version: &PeerVersion,
 ) -> CommandResult {
     // Snapshot (name, id, remote, socket) for every candidate link up
     // front, before running any test -- avoids holding a link's own
@@ -848,6 +876,7 @@ async fn run_throughput_test_command(
             throughput_results: Vec::new(),
             diag_dump: None,
             tunnel_test_result: None,
+            peer_version: peer_version.lock().unwrap().clone(),
         };
     }
 
@@ -911,6 +940,7 @@ async fn run_throughput_test_command(
         throughput_results: results,
         diag_dump: None,
         tunnel_test_result: None,
+        peer_version: peer_version.lock().unwrap().clone(),
     }
 }
 

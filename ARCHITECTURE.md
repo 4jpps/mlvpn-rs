@@ -113,11 +113,11 @@ Steady state (`tunnel.rs`) is a small set of tokio tasks:
 Defined in `protocol.rs`. Every frame has a small plaintext header
 (packet type, link id, session id, sequence number) followed by a
 payload. Handshake payloads are raw Noise messages; every other frame
-type -- `Data`, `Probe`, `ProbeReply`, `StatsShare`,
+type -- `Data`, `Probe`, `ProbeReply`, `StatsShare`, `VersionInfo`,
 `ThroughputTestData`, `ThroughputTestResult`,
 `ThroughputTestReverseRequest` -- is AEAD ciphertext, so an off-path
 attacker can't inject forged probe/stats samples, forge a fake
-throughput result, or read tunnel traffic.
+throughput result, forge a fake version, or read tunnel traffic.
 
 The sequence number is global per session, not per link -- this is
 what makes replay protection and receive-side reordering work
@@ -377,6 +377,19 @@ the ring (`control::serve_client`'s `last_log_seq`), so the log tail
 streams as a delta over the same 500ms cadence rather than needing a
 dedicated socket. `mlvpn-tui` renders all of this as four tabs --
 Overview, Links, Daemon, Logs -- see [monitoring.md](docs/monitoring.md).
+
+`DaemonSnapshot` also carries `local_version` (this build's own
+`mlvpn::VERSION`, `env!("CARGO_PKG_VERSION")`) and `peer_version` --
+the peer's own version, learned from a `VersionInfo` frame sent
+alongside `StatsShare` on that same per-link timer (piggybacked rather
+than a dedicated timer/packet, for the same multi-link redundancy
+`StatsShare` already gets). `mlvpn-tui`'s Session panel and both
+`mlvpnd self-test` CLI paths (`CommandResult::peer_version`, sourced
+from the same field) flag a mismatch -- the self-test case matters
+specifically because it's still available even when the self-test's
+own on-demand round trip times out with no result, since it comes from
+an independent, already-ongoing wire exchange rather than the thing
+that just failed.
 
 **Command socket** (`[command] enabled`, off by default). A second,
 separate Unix socket -- different path

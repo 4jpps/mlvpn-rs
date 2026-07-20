@@ -866,7 +866,7 @@ fn draw_daemon_tab(f: &mut Frame, area: Rect, state: &SharedState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),
+            Constraint::Length(4),
             Constraint::Length(4),
             Constraint::Length(5),
             Constraint::Length(5),
@@ -881,7 +881,7 @@ fn draw_daemon_tab(f: &mut Frame, area: Rect, state: &SharedState) {
 }
 
 fn draw_session_panel(f: &mut Frame, area: Rect, daemon: &DaemonSnapshot) {
-    let line = Line::from(vec![
+    let session_line = Line::from(vec![
         Span::raw("Session ID: "),
         Span::styled(
             format!("{:08x}", daemon.session_id),
@@ -892,8 +892,36 @@ fn draw_session_panel(f: &mut Frame, area: Rect, daemon: &DaemonSnapshot) {
         Span::raw("   Rekeys: "),
         Span::raw(daemon.rekey_count.to_string()),
     ]);
+
+    // Peer version comes from the periodic authenticated `VersionInfo`
+    // wire exchange (`PacketType::VersionInfo`), independent of
+    // whatever self-test or diag-dump command may or may not have run
+    // -- see that packet type's doc comment. `None` just means no
+    // session has delivered one yet (e.g. right after startup).
+    let version_line = match &daemon.peer_version {
+        Some(peer) if *peer == daemon.local_version => Line::from(vec![
+            Span::raw("Version: "),
+            Span::raw(daemon.local_version.clone()),
+            Span::styled(" (peer matches)", Style::default().fg(COLOR_MUTED)),
+        ]),
+        Some(peer) => Line::from(vec![
+            Span::raw("Version: "),
+            Span::raw(daemon.local_version.clone()),
+            Span::raw("   Peer: "),
+            Span::styled(format!("{peer} (MISMATCH)"), Style::default().fg(COLOR_BAD)),
+        ]),
+        None => Line::from(vec![
+            Span::raw("Version: "),
+            Span::raw(daemon.local_version.clone()),
+            Span::styled("   Peer: unknown", Style::default().fg(COLOR_MUTED)),
+        ]),
+    };
+
     let block = Block::default().borders(Borders::ALL).title(" Session ");
-    f.render_widget(Paragraph::new(line).block(block), area);
+    f.render_widget(
+        Paragraph::new(vec![session_line, version_line]).block(block),
+        area,
+    );
 }
 
 /// A `Gauge` colored by fill ratio (good/warn/bad thresholds match the

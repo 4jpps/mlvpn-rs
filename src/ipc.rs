@@ -95,6 +95,17 @@ pub struct DaemonSnapshot {
     pub tun: TunSnapshot,
     /// Machine-wide health -- see `procstats::read_system_stats`.
     pub system: SystemSnapshot,
+    /// This daemon's own `mlvpnd` version (`env!("CARGO_PKG_VERSION")`).
+    pub local_version: String,
+    /// The peer's own last-reported version, learned from the
+    /// periodic authenticated `PacketType::VersionInfo` wire exchange
+    /// (see that variant's doc comment in `protocol.rs`) -- `None`
+    /// until the first one arrives after a session establishes, e.g.
+    /// briefly after startup or a fresh rekey. Lets `mlvpn-tui` and
+    /// `mlvpnd self-test`'s CLI output flag a version mismatch between
+    /// the two ends without needing to SSH to the peer and check by
+    /// hand.
+    pub peer_version: Option<String>,
 }
 
 /// Host-wide load/memory/uptime, independent of anything tunnel- or
@@ -296,6 +307,15 @@ pub struct CommandResult {
     /// (see `error` in that case).
     #[serde(default)]
     pub tunnel_test_result: Option<TunnelTestCommandResult>,
+    /// The peer's own last-reported version at the time this command
+    /// was answered -- same source as `DaemonSnapshot::peer_version`
+    /// (the periodic `VersionInfo` wire exchange), included on every
+    /// command reply since it's cheap and lets a self-test command's
+    /// CLI output flag a version mismatch even when the test itself
+    /// timed out with no result. `None` if no `VersionInfo` has been
+    /// received from the peer yet.
+    #[serde(default)]
+    pub peer_version: Option<String>,
 }
 
 /// Result of a completed `Command::RunTunnelThroughputTest`.
@@ -406,6 +426,8 @@ mod tests {
                 mem_available_kb: Some(8_192_000),
                 uptime_secs: Some(12_345),
             },
+            local_version: "0.4.5".to_string(),
+            peer_version: Some("0.4.5".to_string()),
         };
         let json = serde_json::to_string(&snap).expect("serialize");
         let back: DaemonSnapshot = serde_json::from_str(&json).expect("deserialize");
@@ -421,6 +443,29 @@ mod tests {
         assert_eq!(back.system.load1, Some(0.52));
         assert_eq!(back.system.load15, None);
         assert_eq!(back.system.mem_available_kb, Some(8_192_000));
+        assert_eq!(back.local_version, "0.4.5");
+        assert_eq!(back.peer_version, Some("0.4.5".to_string()));
+    }
+
+    #[test]
+    fn daemon_snapshot_peer_version_defaults_to_none_when_absent_from_the_wire() {
+        // A daemon that hasn't yet received a `VersionInfo` frame from
+        // the peer (e.g. right after startup, before the first
+        // `stats_tick`) has to serialize `peer_version: None` cleanly,
+        // not omit the field -- unlike `CommandResult`'s newer fields,
+        // `DaemonSnapshot` is always freshly constructed server-side, so
+        // there's no `#[serde(default)]` backward-compat concern here,
+        // just confirming `Option::None` itself round-trips.
+        let json = r#"{"session_id":1,"session_uptime_ms":0,"rekey_count":0,
+            "outbound_queue_len":0,"outbound_queue_capacity":256,
+            "outbound_queue_dropped_total":0,
+            "tun":{"iface":"mlvpn0","rx_bytes":null,"tx_bytes":null,
+                "rx_errors":null,"tx_errors":null,"rx_dropped":null,"tx_dropped":null},
+            "system":{"load1":null,"load5":null,"load15":null,
+                "mem_total_kb":null,"mem_available_kb":null,"uptime_secs":null},
+            "local_version":"0.4.5","peer_version":null}"#;
+        let snap: DaemonSnapshot = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(snap.peer_version, None);
     }
 
     /// `new_log_lines` is the delta-streaming mechanism the Logs tab
@@ -500,6 +545,7 @@ mod tests {
             }],
             diag_dump: None,
             tunnel_test_result: None,
+            peer_version: None,
         };
         let ok_back: CommandResult =
             serde_json::from_str(&serde_json::to_string(&ok).unwrap()).unwrap();
@@ -517,6 +563,7 @@ mod tests {
             throughput_results: Vec::new(),
             diag_dump: None,
             tunnel_test_result: None,
+            peer_version: None,
         };
         let err_back: CommandResult =
             serde_json::from_str(&serde_json::to_string(&err).unwrap()).unwrap();
@@ -543,6 +590,7 @@ mod tests {
             throughput_results: Vec::new(),
             diag_dump: Some("=== mlvpn diagnostic dump ===\n...".to_string()),
             tunnel_test_result: None,
+            peer_version: None,
         };
         let back: CommandResult =
             serde_json::from_str(&serde_json::to_string(&result).unwrap()).unwrap();
@@ -588,6 +636,7 @@ mod tests {
                 local_outbound_queue_dropped_delta: 0,
                 peer_outbound_queue_dropped_delta: Some(3),
             }),
+            peer_version: None,
         };
         let back: CommandResult =
             serde_json::from_str(&serde_json::to_string(&result).unwrap()).unwrap();
@@ -596,5 +645,35 @@ mod tests {
         assert_eq!(tt.download_mbps, Some(388.9));
         assert_eq!(tt.local_outbound_queue_dropped_delta, 0);
         assert_eq!(tt.peer_outbound_queue_dropped_delta, Some(3));
+    }
+
+    #[test]
+    fn command_result_peer_version_round_trips() {
+        let result = CommandResult {
+            ok: true,
+            error: None,
+            throughput_results: Vec::new(),
+            diag_dump: None,
+            tunnel_test_result: None,
+            peer_version: Some("0.4.4".to_string()),
+        };
+        let back: CommandResult =
+            serde_json::from_str(&serde_json::to_string(&result).unwrap()).unwrap();
+        assert_eq!(back.peer_version.as_deref(), Some("0.4.4"));
+    }
+
+    /// Mirrors `daemon_snapshot_peer_version_defaults_to_none_when_absent_from_the_wire`:
+    /// `peer_version` is `#[serde(default)]` on `CommandResult` (unlike
+    /// `DaemonSnapshot`'s copy, which has no backward-compat need since
+    /// it's always freshly constructed server-side) specifically so an
+    /// older daemon's reply -- missing this field entirely -- still
+    /// deserializes on a newer `mlvpnd`/`mlvpn-tui` CLI instead of
+    /// failing the whole command round trip.
+    #[test]
+    fn command_result_peer_version_defaults_to_none_when_absent_from_the_wire() {
+        let json = r#"{"ok":true,"error":null,"throughput_results":[],"diag_dump":null}"#;
+        let back: CommandResult = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(back.peer_version, None);
+        assert!(back.tunnel_test_result.is_none());
     }
 }

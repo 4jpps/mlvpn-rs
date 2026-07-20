@@ -114,6 +114,14 @@ A `None` result for a direction means it timed out or the peer doesn't
 support this feature yet (an older `mlvpnd` silently drops the
 unrecognized packet type) -- not necessarily that the link is down.
 
+Both this command and the tunnel-level one below print a `peer
+version: ...` line at the end, and a warning if it doesn't match the
+version you're running -- worth checking first if a result comes back
+`None` on both sides at once, before assuming the test itself found a
+problem. This comes from an independent, always-on wire exchange
+between the two daemons (not the self-test's own round trip), so it's
+still available even when the self-test result itself times out.
+
 ## Tunnel-level self-test
 
 The link-level self-test above measures each physical link's own raw
@@ -143,6 +151,7 @@ upload: 148.3 Mbps
   our own outbound queue dropped 0 packets during this leg
 download: 151.9 Mbps
   peer's outbound queue dropped 0 packets during this leg
+peer version: 0.4.5 (matches this host)
 ```
 
 Each direction reports its own outbound-queue drop count alongside the

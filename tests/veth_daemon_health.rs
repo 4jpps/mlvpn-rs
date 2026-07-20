@@ -152,6 +152,24 @@ async fn daemon_snapshot_and_log_streaming_report_real_data() {
         "nothing should have overflowed the outbound queue yet"
     );
 
+    // --- Version exchange: `local_version` is always known immediately
+    // (compiled in via `mlvpn::VERSION`); `peer_version` needs at least
+    // one `VersionInfo` frame to have round-tripped over the wire
+    // (piggybacked on the same 1s stats_tick as StatsShare -- see
+    // `PacketType::VersionInfo`'s doc comment), so poll for it rather
+    // than asserting on the very first snapshot.
+    assert_eq!(snapshot.daemon.local_version, mlvpn::VERSION);
+    let snapshot = poll_snapshot_until(&client_ctl, Duration::from_secs(10), |s| {
+        s.daemon.peer_version.is_some()
+    })
+    .await
+    .expect("peer_version never arrived via the periodic VersionInfo wire exchange");
+    assert_eq!(
+        snapshot.daemon.peer_version.as_deref(),
+        Some(mlvpn::VERSION),
+        "client and server in this test are the same build, so their versions must match"
+    );
+
     // --- new_log_lines: delta, not a replay, on a single held-open
     // connection -- see this file's module doc comment for why
     // poll_snapshot_until can't be reused for this specific assertion.

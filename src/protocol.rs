@@ -93,6 +93,17 @@ pub enum PacketType {
     /// the peer to run its own `ThroughputTestData` stream back for the
     /// reverse-direction leg. See `ThroughputTestReverseRequestPayload`.
     ThroughputTestReverseRequest = 13,
+    /// One side's own `mlvpnd` version, sent once right after the
+    /// session is established and periodically afterward (piggybacked
+    /// on the same per-link timer as `StatsShare`, for the same
+    /// multi-link redundancy). Lets `mlvpn-tui` show both sides'
+    /// versions and flag a mismatch, and lets a self-test that times
+    /// out still report the peer's last-known version instead of
+    /// leaving the caller to guess whether version skew is the cause --
+    /// the self-test's own on-demand reply can't answer that question
+    /// precisely when it's the thing failing to arrive at all. See
+    /// `VersionInfoPayload`.
+    VersionInfo = 14,
 }
 
 impl PacketType {
@@ -113,6 +124,7 @@ impl PacketType {
             11 => Self::ThroughputTestData,
             12 => Self::ThroughputTestResult,
             13 => Self::ThroughputTestReverseRequest,
+            14 => Self::VersionInfo,
             other => {
                 return Err(MlvpnError::Protocol(format!(
                     "unknown packet type byte {other}"
@@ -296,6 +308,56 @@ impl StatsPayload {
             throughput_mbps,
             state,
         })
+    }
+}
+
+/// Payload of a `VersionInfo` frame: the sender's own `mlvpnd` version
+/// (`env!("CARGO_PKG_VERSION")`), e.g. `"0.4.5"`. Fixed-size and
+/// zero-padded exactly like `StatsPayload::name` above -- same
+/// truncate-on-a-UTF-8-boundary encoding, same null-terminated
+/// decoding -- there's no realistic version string anywhere close to
+/// `VERSION_LEN` bytes, so truncation is a non-issue in practice.
+#[derive(Debug, Clone)]
+pub struct VersionInfoPayload {
+    pub version: [u8; Self::VERSION_LEN],
+}
+
+impl VersionInfoPayload {
+    pub const VERSION_LEN: usize = 16;
+    pub const LEN: usize = Self::VERSION_LEN;
+
+    pub fn encode_version(version: &str) -> [u8; Self::VERSION_LEN] {
+        let mut out = [0u8; Self::VERSION_LEN];
+        let mut end = version.len().min(Self::VERSION_LEN);
+        while end > 0 && !version.is_char_boundary(end) {
+            end -= 1;
+        }
+        out[..end].copy_from_slice(&version.as_bytes()[..end]);
+        out
+    }
+
+    pub fn version_str(&self) -> String {
+        let end = self
+            .version
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(Self::VERSION_LEN);
+        String::from_utf8_lossy(&self.version[..end]).into_owned()
+    }
+
+    pub fn encode(&self) -> [u8; Self::LEN] {
+        self.version
+    }
+
+    pub fn decode(buf: &[u8]) -> Result<Self> {
+        if buf.len() < Self::LEN {
+            return Err(MlvpnError::Protocol(
+                "version info payload too short".into(),
+            ));
+        }
+        let mut version = [0u8; Self::VERSION_LEN];
+        version.copy_from_slice(&buf[0..Self::VERSION_LEN]);
+        Ok(Self { version })
     }
 }
 
@@ -494,5 +556,33 @@ mod throughput_test_payload_tests {
     fn reverse_request_payload_decode_rejects_short_buffer() {
         let buf = [0u8; 4];
         assert!(ThroughputTestReverseRequestPayload::decode(&buf).is_err());
+    }
+}
+
+#[cfg(test)]
+mod version_info_payload_tests {
+    use super::*;
+
+    #[test]
+    fn round_trips_a_typical_version_string() {
+        let payload = VersionInfoPayload {
+            version: VersionInfoPayload::encode_version("0.4.5"),
+        };
+        let encoded = payload.encode();
+        let decoded = VersionInfoPayload::decode(&encoded).unwrap();
+        assert_eq!(decoded.version_str(), "0.4.5");
+    }
+
+    #[test]
+    fn truncates_a_version_string_longer_than_the_wire_field() {
+        let encoded = VersionInfoPayload::encode_version("0.4.5-some-very-long-prerelease-tag");
+        let payload = VersionInfoPayload { version: encoded };
+        assert_eq!(payload.version_str().len(), VersionInfoPayload::VERSION_LEN);
+    }
+
+    #[test]
+    fn decode_rejects_short_buffer() {
+        let buf = [0u8; 3];
+        assert!(VersionInfoPayload::decode(&buf).is_err());
     }
 }

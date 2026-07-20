@@ -79,6 +79,11 @@ pub fn format_dump(snapshot: &Snapshot, trigger: &str) -> String {
     let d = &snapshot.daemon;
     out.push_str("--- Daemon ---\n");
     out.push_str(&format!(
+        "version: local={} peer={}\n",
+        d.local_version,
+        d.peer_version.as_deref().unwrap_or("unknown")
+    ));
+    out.push_str(&format!(
         "session_id={} session_uptime_ms={} rekey_count={}\n",
         d.session_id, d.session_uptime_ms, d.rekey_count
     ));
@@ -231,6 +236,8 @@ mod tests {
                     mem_available_kb: Some(8_000_000),
                     uptime_secs: Some(79_200),
                 },
+                local_version: "0.4.5".to_string(),
+                peer_version: Some("0.4.5".to_string()),
             },
             new_log_lines: Vec::new(),
         }
@@ -244,6 +251,7 @@ mod tests {
         assert!(text.contains("tunnel: mlvpn0 (client)"));
         assert!(text.contains("comcast: state=up"));
         assert!(text.contains("loss=41.0%"));
+        assert!(text.contains("version: local=0.4.5 peer=0.4.5"));
         assert!(text.contains("session_id=42"));
         assert!(text.contains("outbound_queue: 0/1024"));
         assert!(text.contains("tun(mlvpn0):"));

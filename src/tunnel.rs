@@ -247,7 +247,8 @@ use crate::monitor::{self, ProbeTracker};
 use crate::peerstats::PeerStatsTable;
 use crate::protocol::{
     Header, PacketType, ProbePayload, StatsPayload, ThroughputTestDataPayload,
-    ThroughputTestResultPayload, ThroughputTestReverseRequestPayload, HEADER_LEN,
+    ThroughputTestResultPayload, ThroughputTestReverseRequestPayload, VersionInfoPayload,
+    HEADER_LEN,
 };
 use crate::scheduler::Scheduler;
 use std::collections::BTreeMap;
@@ -688,6 +689,15 @@ impl SessionMeta {
     }
 }
 
+/// Tunnel-wide storage for the peer's most recently received `mlvpnd`
+/// version (`PacketType::VersionInfo`) -- see that variant's doc
+/// comment. A bare `Option<String>` behind a `std::sync::Mutex`
+/// (touched only on receipt, at the same slow cadence as `StatsShare`)
+/// rather than anything per-link: unlike link stats, the daemon's own
+/// version isn't a per-link property, so there's exactly one value to
+/// track regardless of how many links are configured.
+pub(crate) type PeerVersion = Arc<std::sync::Mutex<Option<String>>>;
+
 pub async fn run(
     tun: AsyncDevice,
     links: Vec<Link>,
@@ -780,6 +790,10 @@ pub async fn run(
     // monitoring client.
     let peer_stats = Arc::new(PeerStatsTable::new());
 
+    // The peer's own last-reported `mlvpnd` version -- see
+    // `PeerVersion`'s doc comment.
+    let peer_version: PeerVersion = Arc::new(std::sync::Mutex::new(None));
+
     // One per link, tracking a possibly-in-progress incoming
     // `ThroughputTestData` stream -- see `ThroughputTestReceiveState`'s
     // doc comment. `throughput_test_ctx` is the shared registry both
@@ -832,6 +846,7 @@ pub async fn run(
             let mtu = params.mtu as usize;
             let throughput_test_state = throughput_test_state.clone();
             let throughput_test_ctx = throughput_test_ctx.clone();
+            let peer_version = peer_version.clone();
             handles.push(tokio::spawn(async move {
                 // link_receiver never returns under normal operation --
                 // see its doc comment: socket errors are retried/
@@ -854,6 +869,7 @@ pub async fn run(
                     mtu,
                     throughput_test_state,
                     throughput_test_ctx,
+                    peer_version,
                 )
                 .await;
             }));
@@ -892,6 +908,7 @@ pub async fn run(
         let outbound_tx = outbound_tx.clone();
         let outbound_dropped_total = outbound_dropped_total.clone();
         let log_ring = log_ring.clone();
+        let peer_version = peer_version.clone();
         handles.push(tokio::spawn(async move {
             control::serve(
                 path,
@@ -903,6 +920,7 @@ pub async fn run(
                 outbound_tx,
                 outbound_dropped_total,
                 log_ring,
+                peer_version,
             )
             .await;
         }));
@@ -922,6 +940,7 @@ pub async fn run(
             outbound_tx: outbound_tx.clone(),
             outbound_dropped_total: outbound_dropped_total.clone(),
             log_ring: log_ring.clone(),
+            peer_version: peer_version.clone(),
         };
         handles.push(tokio::spawn(async move {
             control::serve_commands(
@@ -974,6 +993,7 @@ pub async fn run(
             outbound_tx: outbound_tx.clone(),
             outbound_dropped_total: outbound_dropped_total.clone(),
             log_ring: log_ring.clone(),
+            peer_version: peer_version.clone(),
         };
         handles.push(tokio::spawn(async move {
             control::diagnostics_watch_loop(watch, links, diag_ctx).await;
@@ -2257,6 +2277,7 @@ async fn link_receiver(
     mtu: usize,
     throughput_test_state: Arc<AsyncMutex<ThroughputTestReceiveState>>,
     throughput_test_ctx: Arc<ThroughputTestContext>,
+    peer_version: PeerVersion,
 ) {
     let (handle, link_id, link_name) = {
         let link = links[idx].lock().await;
@@ -2291,6 +2312,7 @@ async fn link_receiver(
                     mtu,
                     &throughput_test_state,
                     &throughput_test_ctx,
+                    &peer_version,
                 )
                 .await;
             }
@@ -2423,6 +2445,7 @@ async fn link_prober(
             _ = stats_tick.tick() => {
                 let socket = handle.current_socket().await;
                 send_stats_share(&socket, link_id, &links, idx, &session).await;
+                send_version_info(&socket, link_id, &links, idx, &session).await;
             }
 
             _ = sweep_tick.tick() => {
@@ -2995,6 +3018,7 @@ async fn handle_incoming(
     mtu: usize,
     throughput_test_state: &Arc<AsyncMutex<ThroughputTestReceiveState>>,
     throughput_test_ctx: &Arc<ThroughputTestContext>,
+    peer_version: &PeerVersion,
 ) {
     let Ok((hdr, ciphertext)) = Header::decode(frame) else {
         return;
@@ -3198,6 +3222,11 @@ async fn handle_incoming(
                 // not anything the sender included -- see StatsPayload's
                 // doc comment for why that's the correct choice here.
                 peer_stats.update(idx as u8, &payload);
+            }
+        }
+        PacketType::VersionInfo => {
+            if let Ok(payload) = VersionInfoPayload::decode(&plaintext) {
+                *peer_version.lock().unwrap() = Some(payload.version_str());
             }
         }
         PacketType::ThroughputTestData => {
@@ -3509,6 +3538,48 @@ async fn send_stats_share(
     let mut frame = Vec::with_capacity(HEADER_LEN + ciphertext.len());
     Header {
         ptype: PacketType::StatsShare,
+        link_id,
+        session_id,
+        seq,
+    }
+    .encode(&mut frame);
+    frame.extend_from_slice(&ciphertext);
+
+    let _ = socket.send_to(&frame, remote).await;
+}
+
+/// Send our own `mlvpnd` version to the peer -- see `PacketType::VersionInfo`'s
+/// doc comment for why. Piggybacked on the same per-link timer as
+/// `send_stats_share` rather than a dedicated interval: it's small,
+/// tunnel-wide (not really per-link) information, but sending it once
+/// per link per tick costs nothing extra worth a new timer, and gives
+/// the same multi-link redundancy `StatsShare` already gets for free.
+async fn send_version_info(
+    socket: &Arc<UdpSocket>,
+    link_id: u8,
+    links: &Links,
+    idx: usize,
+    session: &Arc<AsyncMutex<SessionState>>,
+) {
+    let Some(remote) = links[idx].lock().await.remote else {
+        return;
+    };
+
+    let payload = VersionInfoPayload {
+        version: VersionInfoPayload::encode_version(crate::VERSION),
+    };
+    let plaintext = payload.encode();
+    let (session_id, seq, ciphertext) = {
+        let s = session.lock().await;
+        match s.encrypt(&plaintext) {
+            Ok(v) => v,
+            Err(_) => return,
+        }
+    };
+
+    let mut frame = Vec::with_capacity(HEADER_LEN + ciphertext.len());
+    Header {
+        ptype: PacketType::VersionInfo,
         link_id,
         session_id,
         seq,

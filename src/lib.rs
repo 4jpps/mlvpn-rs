@@ -28,3 +28,10 @@ pub mod scheduler;
 pub mod sysfs_net;
 pub mod tunnel;
 pub mod tunneltest;
+
+/// This build's own `mlvpnd`/`mlvpn-tui` version -- the single source
+/// `PacketType::VersionInfo`'s sender (`tunnel::send_version_info`),
+/// `DaemonSnapshot::local_version` (`control::build_snapshot`), and the
+/// CLI self-test commands' mismatch check (`main.rs`) all read from,
+/// rather than each calling `env!("CARGO_PKG_VERSION")` separately.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
