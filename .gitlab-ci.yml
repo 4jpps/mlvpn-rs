@@ -4,20 +4,30 @@
 # secondary/confirmed-working sync target's own CI, unmodified.
 #
 # Runners (see `jpps-linux-builder`, instance-wide, Docker executor,
-# tags: linux/deb/rpm): amd64-native only for now. arm64 coverage is
-# deliberately NOT included yet -- see the conversation/commit history
-# around this file's introduction for why: this GitLab Runner version's
-# *Docker* executor (as opposed to Kubernetes executor, which does
-# support it) has no `platform:` selection for `image:`, and the
-# Docker daemon itself requests a pull matching the *host's* own
-# platform regardless of what image is named, so even an
-# architecture-specific `arm64v8/...` image gets rejected outright
-# before a container ever starts -- confirmed by a real failed pipeline
-# job, not a guess. Getting arm64 working here for real needs either a
-# genuine arm64 runner, or restructuring these jobs around
-# Docker-in-Docker with explicit `docker run --platform linux/arm64`
-# calls (which needs a privileged runner config -- an infrastructure
-# change to confirm before making, not something to silently assume).
+# tags: linux/deb/rpm): amd64-native. arm64 has no native runner, so
+# arm64 jobs run via Docker-in-Docker (services: [docker:*-dind]) with
+# an explicit `docker run --platform linux/arm64 ...` inside the job --
+# this GitLab Runner version's own image: has no platform: selection
+# for the Docker executor (confirmed via a real failed pull: "no
+# matching manifest for linux/amd64/v2", the same error regardless of
+# which image was named -- the Docker daemon requests a pull matching
+# the *runner host's* own platform no matter what, so even a
+# single-arch arm64v8/... image was rejected before a container ever
+# started). QEMU emulation (multiarch/qemu-user-static, registered on
+# the runner host) makes the *explicit* --platform request work once
+# it's actually made via `docker run` instead. Needs the runner's own
+# config.toml to have `privileged = true` under [runners.docker] for
+# the nested daemon to work at all -- confirmed set on
+# jpps-linux-builder before this was written.
+#
+# The nested arm64 container clones the repo fresh via git rather than
+# trying to bind-mount the outer job's checkout -- Docker-in-Docker's
+# nested daemon doesn't share the outer filesystem, so a bind mount
+# would need extra volume-sharing setup for no real benefit here.
+# Expect this to be meaningfully slower than the native amd64 job:
+# QEMU user-mode emulation of a full `cargo build` is commonly an
+# order of magnitude slower than native, which is the real cost of not
+# having an actual arm64 runner.
 
 stages:
   - test
@@ -59,3 +69,31 @@ variables:
 test:amd64:
   extends: .build_and_test
   image: ${RUST_IMAGE}
+
+test:arm64:
+  stage: test
+  tags: [linux]
+  image: docker:27-cli
+  services:
+    - docker:27-dind
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+  script:
+    - >
+      docker run --rm --platform linux/arm64
+      -e CI_REPOSITORY_URL="$CI_REPOSITORY_URL"
+      -e CI_COMMIT_SHA="$CI_COMMIT_SHA"
+      ${RUST_IMAGE}
+      sh -c "
+        set -e &&
+        apt-get update -qq &&
+        apt-get install -y -qq build-essential pkg-config libc6-dev git &&
+        git clone --quiet \"\$CI_REPOSITORY_URL\" /src &&
+        cd /src && git checkout --quiet \"\$CI_COMMIT_SHA\" &&
+        rustup component add rustfmt clippy &&
+        cargo build --release --locked &&
+        cargo test --release --locked --lib &&
+        cargo clippy --release --locked --all-targets -- -D warnings &&
+        cargo fmt --check
+      "
