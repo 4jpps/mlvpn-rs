@@ -93,8 +93,28 @@ esac
 # whole explanation carefully never spells out the literal marker
 # token: debhelper's substitution matches every occurrence of it in
 # this file, comments included, not just the one intended below.)
-if [ "$1" = "configure" ] && [ "$MLVPN_WAS_ACTIVE" = "yes" ]; then
-  systemctl restart mlvpn.service || true
+if [ "$1" = "configure" ]; then
+  # Always visible in `apt`/`dpkg`'s own terminal output (stderr isn't
+  # swallowed the way a systemd-journal-only message would be), not just
+  # on failure -- a real field report ("upgraded via apt install
+  # ./mlvpn_x.y.z-1_amd64.deb, service stopped and never came back") had
+  # nothing to go on beyond "it's down now": no error during the
+  # upgrade, and the journal showed a clean stop with no restart attempt
+  # logged at all afterward, consistent with either this `if` evaluating
+  # false for an unexpected reason or `systemctl restart` itself failing
+  # silently under the old `|| true`. This line, plus turning that
+  # silent swallow into a real check below, means the next occurrence
+  # shows up directly in the upgrade's own output instead of needing
+  # journalctl archaeology after the fact.
+  echo "mlvpn.postinst: was mlvpn.service active before this upgrade? $MLVPN_WAS_ACTIVE"
+  if [ "$MLVPN_WAS_ACTIVE" = "yes" ]; then
+    if ! systemctl restart mlvpn.service; then
+      echo "mlvpn.postinst: WARNING: mlvpn.service was active before this upgrade but" \
+           "failed to restart automatically -- run 'systemctl status mlvpn.service' and" \
+           "'journalctl -u mlvpn.service' to diagnose, then 'systemctl start mlvpn.service'" \
+           "once fixed" >&2
+    fi
+  fi
 fi
 
 exit 0
