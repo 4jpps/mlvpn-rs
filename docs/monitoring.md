@@ -151,7 +151,7 @@ upload: 148.3 Mbps
   our own outbound queue dropped 0 packets during this leg
 download: 151.9 Mbps
   peer's outbound queue dropped 0 packets during this leg
-peer version: 0.4.5 (matches this host)
+peer version: 0.4.6 (matches this host)
 ```
 
 Each direction reports its own outbound-queue drop count alongside the

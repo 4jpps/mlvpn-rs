@@ -1,3 +1,29 @@
+mlvpn (0.4.6-1) unstable; urgency=medium
+
+  * Fix a peer's Disconnect (sent on any routine restart) making the
+    receiving side exit its own process too, cascading a full
+    stop-then-cold-restart onto the other end even when nothing was
+    wrong with it. A received Disconnect now just means the peer's
+    session went stale: client mode immediately attempts a fresh
+    handshake instead of waiting up to rekey_interval_secs; server
+    mode needs no extra action. Neither side's own process stops
+    running anymore just because the peer said goodbye -- reconnection
+    now happens in about a second instead of a much longer restart
+    cascade. A genuinely local systemctl stop/SIGTERM is unaffected.
+  * Fix postinst's restart-after-upgrade state capture reading the
+    wrong value if mlvpnd crashed or exited during dpkg's own
+    unpacking step, since the old capture ran too late (after
+    unpacking). New preinst script captures the pre-upgrade active
+    state before dpkg unpacks anything, immune to whatever happens
+    during unpacking.
+  * Add peer version exchange: each side now periodically broadcasts
+    its own mlvpnd version to the peer. mlvpn-tui's Session panel
+    shows both sides' versions and flags a mismatch; both mlvpnd
+    self-test commands print a peer version line, still available even
+    when a test itself times out with no result.
+
+ -- Jeff Parrish PC Services <www.jpps.us>  Mon, 20 Jul 2026 16:56:42 -0500
+
 mlvpn (0.4.5-1) unstable; urgency=medium
 
   * Add tunnel-level throughput self-test (mlvpnd self-test --tunnel

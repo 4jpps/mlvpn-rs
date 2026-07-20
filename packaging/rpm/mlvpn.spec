@@ -19,7 +19,7 @@
 %global debug_package %{nil}
 
 Name:           mlvpn
-Version:        0.4.5
+Version:        0.4.6
 Release:        1%{?dist}
 Summary:        Multi-link VPN bonding daemon
 
@@ -106,6 +106,22 @@ chmod 0750 %{_sysconfdir}/mlvpn
 %dir %attr(0750, root, mlvpn) %{_sysconfdir}/mlvpn
 
 %changelog
+* Mon Jul 20 2026 Jeff Parrish PC Services <www.jpps.us> - 0.4.6-1
+- Fix a peer's Disconnect (sent on any routine restart) making the
+  receiving side exit its own process too, cascading a full
+  stop-then-cold-restart onto the other end even when nothing was
+  wrong with it. A received Disconnect now just means the peer's
+  session went stale: client mode immediately attempts a fresh
+  handshake instead of waiting up to rekey_interval_secs; server mode
+  needs no extra action. Neither side's own process stops running
+  anymore just because the peer said goodbye. A genuinely local stop
+  is unaffected.
+- Add peer version exchange: each side now periodically broadcasts its
+  own mlvpnd version to the peer. mlvpn-tui's Session panel shows both
+  sides' versions and flags a mismatch; both mlvpnd self-test commands
+  print a peer version line, still available even when a test itself
+  times out with no result.
+
 * Mon Jul 20 2026 Jeff Parrish PC Services <www.jpps.us> - 0.4.5-1
 - Add tunnel-level throughput self-test (mlvpnd self-test --tunnel
   --peer-addr <ip>): sends real UDP through the TUN device to the

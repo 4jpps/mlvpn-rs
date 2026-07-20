@@ -10,6 +10,17 @@ For implementation detail beyond what's here, read the code -- most
 modules and non-trivial functions have doc comments explaining the
 design, and `ARCHITECTURE.md` covers the system as a whole.
 
+## [0.4.6] - 2026-07-20
+
+### Fixed
+
+- **A peer's `Disconnect` (sent on any routine restart -- a `.deb` upgrade, a manual `systemctl restart`) used to make the *receiving* side exit its own process too**, cascading a full stop-then-cold-restart onto the other end even when nothing was wrong with it -- a full `RestartSec` gap, every task (TUN device, outbound queue, control sockets, all links) rebuilt from scratch, and a fresh handshake renegotiated from zero. A real diagnostic dump showed that reconnection dance taking up to ~18 seconds of repeated handshake-timeout retries, and likely explains a false loss-threshold auto-dump trip observed in the field too (the dual-stack address-family switch right after a cold handshake losing a few in-flight probes into a freshly-initialized, not-yet-stable loss EWMA). A received `Disconnect` now just means the peer's session went stale: `mlvpnd` in client mode immediately attempts a fresh handshake instead of waiting up to `rekey_interval_secs` (which can be configured up to hours out); server mode needs no extra action, since it already accepts a handshake at any time. Neither side's own process ever stops running anymore just because the peer said goodbye -- reconnection now happens in about a second instead of a multi-second-to-tens-of-seconds full restart cascade. A genuinely local `systemctl stop`/SIGTERM is unaffected: still notifies the peer, still exits cleanly.
+- **`debian/mlvpn.postinst`'s restart-after-upgrade state capture could read the wrong value if `mlvpnd` crashed or exited during dpkg's own unpacking step**, since that capture ran at the top of `postinst`, which only starts *after* unpacking finishes -- real field evidence (a `systemd` "Scheduled restart job" line, showing `mlvpnd` exiting unexpectedly, not via an explicit stop) showed this landing in exactly that window on a real upgrade. New `debian/mlvpn.preinst` captures whether the service was active *before* dpkg unpacks anything, immune to whatever happens during unpacking; `postinst` now reads that instead of doing its own (too-late) live check.
+
+### Added
+
+- **Peer version exchange**: each side now periodically broadcasts its own `mlvpnd` version to the peer over the existing authenticated session (piggybacked on the same timer as link stats, no new socket). `mlvpn-tui`'s Session panel shows both sides' versions and flags a mismatch; both `mlvpnd self-test` commands print a `peer version: ...` line, sourced from this independent exchange rather than the self-test's own round trip -- so it's still available to help rule out version skew even when a test itself times out with no result. `mlvpnd diag-dump`'s text output picks this up for free.
+
 ## [0.4.5] - 2026-07-20
 
 ### Added
