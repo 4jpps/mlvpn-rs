@@ -63,16 +63,28 @@
 //!   transient loss event's evidence gets captured even if no one is
 //!   watching live. See `diag.rs` and `config::DiagnosticsConfig`.
 //!
-//! **Graceful shutdown.** `run()`'s tail races a local SIGINT/SIGTERM
-//! against an authenticated `Disconnect` frame arriving from the peer
-//! (`handle_incoming`, via the shared `Shutdown`/`ShutdownReason` type)
-//! -- whichever happens first. A locally requested shutdown sends a
-//! best-effort `Disconnect` to the peer on every link
-//! (`broadcast_disconnect`) before tearing its own tasks down; a
-//! peer-initiated one skips that (the peer already knows, and may
-//! already be gone). Either way `run()` aborts every spawned task and
-//! returns cleanly rather than the process only ever ending via signal
-//! or panic.
+//! **Graceful shutdown.** `run()`'s tail waits on a local SIGINT/SIGTERM,
+//! then sends a best-effort `Disconnect` to the peer on every link
+//! (`broadcast_disconnect`) before aborting every spawned task and
+//! returning cleanly, rather than the process only ever ending via
+//! signal or panic. Receiving the peer's own `Disconnect`
+//! (`handle_incoming`) deliberately does *not* trigger the same
+//! teardown on this side anymore -- it used to (through v0.4.5's
+//! `Shutdown`/`ShutdownReason::PeerInitiated`), which meant a routine
+//! restart on *either* end (a `.deb` upgrade, a manual
+//! `systemctl restart`) cascaded into a full stop-then-cold-restart on
+//! the *other* end too, even though nothing was actually wrong with it.
+//! Now a received `Disconnect` just means "the peer's session is
+//! stale" -- treated exactly like any other authenticated signal that
+//! recovery should happen fast rather than through the slow path:
+//! `Mode::Client` immediately nudges `rekey_loop` to attempt a fresh
+//! handshake right away instead of waiting up to `rekey_interval`
+//! (potentially hours); `Mode::Server` needs no extra action at all,
+//! since it already accepts a peer-initiated `HandshakeInit` at any
+//! time regardless of why (`respond_to_handshake_init`). Either way,
+//! this side's own tasks (TUN reader, outbound queue, control sockets,
+//! other links) keep running the whole time -- no process exit, no
+//! `systemd` `RestartSec` gap, no cold-boot re-bind of every socket.
 //!
 //! Locking discipline: `links: link::Links` (`Arc<Vec<AsyncMutex<Link>>>`)
 //! gives each link its own independent lock over its metadata (stats,
@@ -581,63 +593,6 @@ impl ThroughputTestContext {
     }
 }
 
-/// Why `run()`'s tail is unblocking: either a local shutdown signal
-/// (SIGINT/SIGTERM) or an authenticated `Disconnect` frame from the
-/// peer (`handle_incoming`). Only the reason matters once triggered --
-/// see `run()`'s tail for what each one does differently (a locally
-/// requested shutdown gets to notify the peer first via a `Disconnect`
-/// of its own; a peer-initiated one has nobody left worth notifying).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum ShutdownReason {
-    Local,
-    PeerInitiated,
-}
-
-/// One-shot shutdown signal shared across every `link_receiver` task and
-/// `run()`'s own tail. `Notify::notify_one` (not `notify_waiters`) is
-/// deliberate: `run()`'s tail is the *only* waiter, and it may not have
-/// reached its `wait()` call yet at the moment `trigger` is called from
-/// some other task (a `Disconnect` frame can arrive at any time relative
-/// to `run()`'s own startup sequencing) -- `notify_waiters` would simply
-/// lose a notification with no current waiter, while `notify_one` stores
-/// a permit for the next `wait()` call to consume immediately. `reason`
-/// records only the *first* trigger (a plain `Mutex<Option<_>>` rather
-/// than an atomic, since setting it and calling `notify_one` need to
-/// happen together as one step, not racily interleaved with a second
-/// caller doing the same); any later trigger (e.g. both SIGINT and a
-/// peer `Disconnect` arriving close together) is a harmless no-op.
-struct Shutdown {
-    notify: tokio::sync::Notify,
-    reason: std::sync::Mutex<Option<ShutdownReason>>,
-}
-
-impl Shutdown {
-    fn new() -> Self {
-        Self {
-            notify: tokio::sync::Notify::new(),
-            reason: std::sync::Mutex::new(None),
-        }
-    }
-
-    fn trigger(&self, reason: ShutdownReason) {
-        let mut guard = self.reason.lock().unwrap();
-        if guard.is_none() {
-            *guard = Some(reason);
-            self.notify.notify_one();
-        }
-    }
-
-    /// Resolves once `trigger` has been called (by whichever caller got
-    /// there first), returning that first reason.
-    async fn wait(&self) -> ShutdownReason {
-        self.notify.notified().await;
-        self.reason
-            .lock()
-            .unwrap()
-            .expect("trigger always sets reason before notifying")
-    }
-}
-
 /// Session identity/uptime/rekey-count, readable by `control::serve`
 /// without ever contending with `SessionState`'s own mutex -- which is
 /// locked on every single outgoing packet (`tun_reader`'s
@@ -742,7 +697,12 @@ pub async fn run(
         rekey_reply_tx: std::sync::Mutex::new(None),
     });
 
-    let shutdown = Arc::new(Shutdown::new());
+    // Client-only in practice (see `handle_incoming`'s `PacketType::Disconnect`
+    // arm and `rekey_loop`'s doc comment), but cheap enough to always
+    // create -- nudges `rekey_loop` to attempt a fresh handshake right
+    // away, rather than waiting up to `rekey_interval`, the moment an
+    // authenticated `Disconnect` arrives from the peer.
+    let reconnect = Arc::new(tokio::sync::Notify::new());
 
     let reorder = Arc::new(AsyncMutex::new(ReorderBuffer::new(
         params.scheduler_cfg.reorder_window_ms,
@@ -841,7 +801,7 @@ pub async fn run(
             let tracker = tracker.clone();
             let peer_stats = peer_stats.clone();
             let rekey_ctx = rekey_ctx.clone();
-            let shutdown = shutdown.clone();
+            let reconnect = reconnect.clone();
             let session_meta = session_meta.clone();
             let mtu = params.mtu as usize;
             let throughput_test_state = throughput_test_state.clone();
@@ -864,7 +824,7 @@ pub async fn run(
                     tracker,
                     peer_stats,
                     rekey_ctx,
-                    shutdown,
+                    reconnect,
                     session_meta,
                     mtu,
                     throughput_test_state,
@@ -1063,45 +1023,27 @@ pub async fn run(
         let session = session.clone();
         let rekey_ctx = rekey_ctx.clone();
         let session_meta = session_meta.clone();
+        let reconnect = reconnect.clone();
         handles.push(tokio::spawn(async move {
-            rekey_loop(links, params, session, rekey_ctx, session_meta).await;
+            rekey_loop(links, params, session, rekey_ctx, session_meta, reconnect).await;
         }));
     }
 
     // None of the tasks above normally return on their own (they're all
     // infinite loops or `select!` loops), so without this, `run()`
     // would never return short of the whole process being killed out
-    // from under it -- resolves on whichever comes first: a local
-    // shutdown signal, or `shutdown` already having been triggered by
-    // something else (an authenticated peer `Disconnect`, handled in
-    // `handle_incoming`). See `Shutdown`'s doc comment for why
-    // `shutdown.wait()` is one of the select arms here rather than
-    // something polled separately.
+    // from under it. Only a local signal unblocks this anymore -- see
+    // the module doc comment's "Graceful shutdown" section for why a
+    // peer's own `Disconnect` no longer does (that used to race this
+    // same select via a shared `Shutdown` signal, up through v0.4.5).
     let mut sigterm = signal(SignalKind::terminate()).map_err(MlvpnError::Io)?;
-    let reason = tokio::select! {
-        _ = tokio::signal::ctrl_c() => {
-            shutdown.trigger(ShutdownReason::Local);
-            ShutdownReason::Local
-        }
-        _ = sigterm.recv() => {
-            shutdown.trigger(ShutdownReason::Local);
-            ShutdownReason::Local
-        }
-        reason = shutdown.wait() => reason,
-    };
-
-    match reason {
-        // Only worth notifying the peer when *we* decided to leave --
-        // it already knows, and may already be gone, if this is the
-        // other half of the exact same exchange.
-        ShutdownReason::Local => {
-            tracing::info!("shutting down: notifying peer");
-            broadcast_disconnect(&links, &session).await;
-        }
-        ShutdownReason::PeerInitiated => {
-            tracing::info!("shutting down: peer disconnected");
-        }
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = sigterm.recv() => {}
     }
+
+    tracing::info!("shutting down: notifying peer");
+    broadcast_disconnect(&links, &session).await;
 
     for h in handles {
         h.abort();
@@ -2272,7 +2214,7 @@ async fn link_receiver(
     tracker: Arc<AsyncMutex<ProbeTracker>>,
     peer_stats: Arc<PeerStatsTable>,
     rekey_ctx: Arc<RekeyContext>,
-    shutdown: Arc<Shutdown>,
+    reconnect: Arc<tokio::sync::Notify>,
     session_meta: Arc<SessionMeta>,
     mtu: usize,
     throughput_test_state: Arc<AsyncMutex<ThroughputTestReceiveState>>,
@@ -2307,7 +2249,7 @@ async fn link_receiver(
                     &tracker,
                     &peer_stats,
                     &rekey_ctx,
-                    &shutdown,
+                    &reconnect,
                     &session_meta,
                     mtu,
                     &throughput_test_state,
@@ -3013,7 +2955,7 @@ async fn handle_incoming(
     tracker: &Arc<AsyncMutex<ProbeTracker>>,
     peer_stats: &Arc<PeerStatsTable>,
     rekey_ctx: &Arc<RekeyContext>,
-    shutdown: &Arc<Shutdown>,
+    reconnect: &Arc<tokio::sync::Notify>,
     session_meta: &Arc<SessionMeta>,
     mtu: usize,
     throughput_test_state: &Arc<AsyncMutex<ThroughputTestReceiveState>>,
@@ -3359,14 +3301,26 @@ async fn handle_incoming(
             // the earlier `match hdr.ptype`, same as Data/Probe/
             // StatsShare) -- a forged Disconnect can't reach here
             // without holding the session's keys, so this is a
-            // trustworthy signal that the peer is shutting down on
-            // purpose. Tear this side down the same way rather than
-            // waiting for every link to grind through the probe
-            // hysteresis and eventually report Down on its own --
-            // `run()`'s tail does the actual work once `shutdown` is
-            // triggered.
-            tracing::info!(%from, "peer sent Disconnect; shutting down");
-            shutdown.trigger(ShutdownReason::PeerInitiated);
+            // trustworthy signal that the peer's session just went
+            // stale (it's shutting down, or restarting). Does *not*
+            // shut this side down too anymore (see the module doc
+            // comment's "Graceful shutdown" section for why that was
+            // actively harmful -- it made a routine restart on either
+            // end cascade into a full stop-then-cold-restart on the
+            // other end as well). Only `Mode::Client` needs to do
+            // anything at all: nudge `rekey_loop` to attempt a fresh
+            // handshake right away instead of waiting up to
+            // `rekey_interval`. `Mode::Server` already accepts a
+            // peer-initiated `HandshakeInit` at any time regardless of
+            // why (`respond_to_handshake_init`), so there's nothing
+            // extra for it to do here -- it'll just see one once the
+            // client reconnects, exactly like any other rekey.
+            if rekey_ctx.mode == Mode::Client {
+                tracing::info!(%from, "peer sent Disconnect; attempting an immediate reconnect");
+                reconnect.notify_one();
+            } else {
+                tracing::info!(%from, "peer sent Disconnect");
+            }
         }
         PacketType::HandshakeInit | PacketType::HandshakeResp => unreachable!("handled above"),
     }
@@ -3598,12 +3552,23 @@ async fn send_version_info(
 /// passively accepts a peer-initiated rekey via `handle_incoming`,
 /// mirroring how it already passively accepts the very first handshake
 /// pre-session.
+///
+/// Also races its own periodic `tick` against `reconnect` -- notified
+/// by `handle_incoming`'s `PacketType::Disconnect` arm the moment the
+/// peer's own session goes stale, so this doesn't sit waiting for the
+/// next scheduled `rekey_interval` tick (which can be configured
+/// hours out) before noticing the peer is gone and reconnecting.
+/// Either wakeup runs the exact same attempt below; `tick.reset()`
+/// after an out-of-band wakeup just restarts the normal periodic
+/// clock from now, so a fresh reconnect doesn't get immediately
+/// followed by a redundant scheduled rekey a moment later.
 async fn rekey_loop(
     links: Links,
     params: Arc<TunnelParams>,
     session: Arc<AsyncMutex<SessionState>>,
     rekey_ctx: Arc<RekeyContext>,
     session_meta: Arc<SessionMeta>,
+    reconnect: Arc<tokio::sync::Notify>,
 ) {
     let mut tick = interval(params.rekey_interval);
     // tokio::time::interval's first tick fires immediately; skip it so
@@ -3611,7 +3576,16 @@ async fn rekey_loop(
     // handshake that just established this session.
     tick.tick().await;
     loop {
-        tick.tick().await;
+        tokio::select! {
+            _ = tick.tick() => {}
+            _ = reconnect.notified() => {
+                tracing::info!(
+                    "peer disconnected; attempting an immediate reconnect rather than \
+                     waiting for the next scheduled rekey"
+                );
+                tick.reset();
+            }
+        }
         // `Some(&rekey_ctx)`: routes this attempt's `HandshakeResp`
         // through `rekey_ctx`'s forwarding channel instead of reading
         // the link sockets directly -- see `perform_client_handshake`'s

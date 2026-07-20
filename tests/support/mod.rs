@@ -638,9 +638,9 @@ impl MlvpnProcess {
     /// dependency this test harness doesn't otherwise need -- consistent
     /// with `run_ok`/`run_in_ns_ok` already shelling out for everything
     /// else here), the same signal `systemctl stop` sends. Used to
-    /// exercise the graceful-shutdown path (`tunnel::run`'s `Shutdown`
-    /// handling, `tests/veth_disconnect.rs`) rather than `Drop`'s
-    /// `SIGKILL`, which bypasses it entirely.
+    /// exercise the graceful-shutdown path (`tunnel::run`'s local
+    /// SIGINT/SIGTERM handling, `tests/veth_disconnect.rs`) rather than
+    /// `Drop`'s `SIGKILL`, which bypasses it entirely.
     pub fn terminate(&self) -> io::Result<()> {
         let pid = self.child.id().to_string();
         let status = Command::new("kill").args(["-TERM", &pid]).status()?;
