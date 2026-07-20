@@ -4,24 +4,35 @@
 # secondary/confirmed-working sync target's own CI, unmodified.
 #
 # Runners (see `jpps-linux-builder`, instance-wide, Docker executor,
-# tags: linux/deb/rpm): amd64-native only. arm64 legs use the
-# architecture-specific `arm64v8/` image namespace (Docker Official
-# Images' per-arch mirror) instead of `image: platform: linux/arm64`
-# -- this GitLab Runner version's docker executor doesn't support the
-# `platform` key under `image:` (confirmed via the CI lint API: "unknown
-# keys: platform"). An `arm64v8/...` image has only one architecture to
-# begin with, so there's no manifest-selection ambiguity for Docker to
-# get wrong -- the host kernel's registered QEMU binfmt handler
-# (multiarch/qemu-user-static) just transparently runs the foreign
-# binaries, at some cost in build time versus a real arm64 runner.
+# tags: linux/deb/rpm): amd64-native only for now. arm64 coverage is
+# deliberately NOT included yet -- see the conversation/commit history
+# around this file's introduction for why: this GitLab Runner version's
+# *Docker* executor (as opposed to Kubernetes executor, which does
+# support it) has no `platform:` selection for `image:`, and the
+# Docker daemon itself requests a pull matching the *host's* own
+# platform regardless of what image is named, so even an
+# architecture-specific `arm64v8/...` image gets rejected outright
+# before a container ever starts -- confirmed by a real failed pipeline
+# job, not a guess. Getting arm64 working here for real needs either a
+# genuine arm64 runner, or restructuring these jobs around
+# Docker-in-Docker with explicit `docker run --platform linux/arm64`
+# calls (which needs a privileged runner config -- an infrastructure
+# change to confirm before making, not something to silently assume).
 
 stages:
   - test
 
 variables:
   CARGO_HOME: ${CI_PROJECT_DIR}/.cargo
-  RUST_IMAGE: rust:1.86-bookworm
-  RUST_IMAGE_ARM64: arm64v8/rust:1.86-bookworm
+  # Latest stable, not the literal `rust-version = "1.86"` pinned in
+  # Cargo.toml -- matches what .github/workflows/ci.yml's
+  # dtolnay/rust-toolchain@stable actually resolves to (always current
+  # stable, not literally 1.86). Confirmed 1.86 itself is now too old
+  # for this project's current Cargo.lock: darling 0.23.0, ratatui
+  # 0.30.2, and instability 0.3.12 all require rustc 1.88+. GitHub
+  # Actions never caught this drift because it never tests the
+  # literally-declared MSRV either.
+  RUST_IMAGE: rust:bookworm
 
 .cargo_cache:
   cache:
@@ -48,7 +59,3 @@ variables:
 test:amd64:
   extends: .build_and_test
   image: ${RUST_IMAGE}
-
-test:arm64:
-  extends: .build_and_test
-  image: ${RUST_IMAGE_ARM64}
