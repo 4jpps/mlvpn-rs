@@ -165,7 +165,7 @@ dpkg-buildpackage -us -uc -b -d
 
 # .rpm (needs rpm-build, rpmdevtools, systemd-rpm-macros, gcc, pkgconf-pkg-config)
 rpmdev-setuptree
-git archive --prefix=mlvpn-0.4.4/ -o ~/rpmbuild/SOURCES/mlvpn-0.4.4.tar.gz HEAD
+git archive --prefix=mlvpn-0.4.5/ -o ~/rpmbuild/SOURCES/mlvpn-0.4.5.tar.gz HEAD
 cp packaging/rpm/mlvpn.spec ~/rpmbuild/SPECS/
 rpmbuild -ba ~/rpmbuild/SPECS/mlvpn.spec
 ```
@@ -179,7 +179,7 @@ docker run --rm -v "$PWD":/src -w /src fedora:latest bash -c '
   dnf -y install git tar rust cargo gcc pkgconf-pkg-config systemd-rpm-macros rpm-build rpmdevtools &&
   git config --global --add safe.directory /src &&
   rpmdev-setuptree &&
-  git archive --prefix=mlvpn-0.4.4/ -o ~/rpmbuild/SOURCES/mlvpn-0.4.4.tar.gz HEAD &&
+  git archive --prefix=mlvpn-0.4.5/ -o ~/rpmbuild/SOURCES/mlvpn-0.4.5.tar.gz HEAD &&
   cp packaging/rpm/mlvpn.spec ~/rpmbuild/SPECS/ &&
   rpmbuild -ba ~/rpmbuild/SPECS/mlvpn.spec &&
   find ~/rpmbuild/RPMS -name "*.rpm" -exec cp {} /src/ \;

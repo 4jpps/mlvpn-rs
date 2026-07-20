@@ -19,7 +19,7 @@
 %global debug_package %{nil}
 
 Name:           mlvpn
-Version:        0.4.4
+Version:        0.4.5
 Release:        1%{?dist}
 Summary:        Multi-link VPN bonding daemon
 
@@ -106,6 +106,22 @@ chmod 0750 %{_sysconfdir}/mlvpn
 %dir %attr(0750, root, mlvpn) %{_sysconfdir}/mlvpn
 
 %changelog
+* Mon Jul 20 2026 Jeff Parrish PC Services <www.jpps.us> - 0.4.5-1
+- Add tunnel-level throughput self-test (mlvpnd self-test --tunnel
+  --peer-addr <ip>): sends real UDP through the TUN device to the
+  peer's tunnel-internal address, exercising the real outbound queue
+  and scheduler, unlike the existing link-level self-test which
+  bypasses them. Reports each direction's own outbound-queue drop
+  count, to help distinguish "never left our own queue" from loss
+  elsewhere on the path.
+- Fix active bandwidth probing badly underreporting fast links: a
+  real 688 Mbps link was measured at just 56.7 Mbps by the old
+  fixed-packet-count burst, which completes in well under one round
+  trip on a fast link and mostly measures local overhead. Replaced
+  active_bandwidth_probe_packets with
+  active_bandwidth_probe_duration_secs (default 2s) and reused
+  mlvpnd self-test's own duration-based streaming code.
+
 * Sun Jul 19 2026 Jeff Parrish PC Services <www.jpps.us> - 0.4.4-1
 - Fix mlvpnd's log ring (feeds mlvpn-tui's Logs tab and mlvpnd
   diag-dump) dropping every structured field but the bare message --

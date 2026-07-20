@@ -10,6 +10,16 @@ For implementation detail beyond what's here, read the code -- most
 modules and non-trivial functions have doc comments explaining the
 design, and `ARCHITECTURE.md` covers the system as a whole.
 
+## [0.4.5] - 2026-07-20
+
+### Added
+
+- **New tunnel-level throughput self-test**: `mlvpnd self-test --tunnel --peer-addr <tunnel-internal ip>` (new `ipc::Command::RunTunnelThroughputTest`). The existing self-test sends raw UDP directly on a link's own socket, bypassing the TUN device, outbound queue, and scheduler -- useful for characterizing one physical link, but blind to buffering/queueing problems in the real bonded path. This one sends real UDP addressed to the peer's tunnel-internal IP, so the kernel genuinely routes it through the TUN device end to end, exercising the real pipeline. `--bidirectional` has the peer autonomously send its own stream back; each direction's report includes that leg's own outbound-queue-drop count, so loss can be narrowed down to "never left our own queue" versus loss elsewhere on the path -- directly aimed at the still-open field mystery of real UDP loss with mlvpn's own drop counters reading zero. The server side's listener runs unconditionally regardless of its own `[command]` config, matching the existing self-test's "any daemon can be the target" precedent. See `docs/monitoring.md`'s new "Tunnel-level self-test" section.
+
+### Fixed
+
+- **Active bandwidth probing (`scheduler.active_bandwidth_probing`) badly underreported fast links.** The old mechanism sent a small fixed-size burst (`active_bandwidth_probe_packets`, 2-100 packets) and timed it -- accurate for a slow link, but wrong for a fast one: a real 688 Mbps link that `mlvpnd self-test` measured correctly was reported by the probe as just 56.7 Mbps, because a ~28KB burst completes in a fraction of one round trip on a fast link and mostly measures local send-side overhead, not the path's real sustained capacity. Replaced `active_bandwidth_probe_packets` with `active_bandwidth_probe_duration_secs` (default 2s, 1-30s) and switched to reusing `mlvpnd self-test`'s own duration-based streaming code, so the probe scales naturally to whatever the link can actually do. **Config change**: `active_bandwidth_probe_packets` is removed; set `active_bandwidth_probe_duration_secs` instead if you had customized the old field (most deployments use the default and need no config change).
+
 ## [0.4.4] - 2026-07-19
 
 ### Fixed
