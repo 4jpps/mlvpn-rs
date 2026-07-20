@@ -246,9 +246,8 @@ use crate::link::{self, is_interface_gone_error, Link, LinkHandle, LinkState, Li
 use crate::monitor::{self, ProbeTracker};
 use crate::peerstats::PeerStatsTable;
 use crate::protocol::{
-    BandwidthProbeBurstPayload, BandwidthProbeResultPayload, Header, PacketType, ProbePayload,
-    StatsPayload, ThroughputTestDataPayload, ThroughputTestResultPayload,
-    ThroughputTestReverseRequestPayload, HEADER_LEN,
+    Header, PacketType, ProbePayload, StatsPayload, ThroughputTestDataPayload,
+    ThroughputTestResultPayload, ThroughputTestReverseRequestPayload, HEADER_LEN,
 };
 use crate::scheduler::Scheduler;
 use std::collections::BTreeMap;
@@ -369,6 +368,13 @@ pub struct TunnelParams {
     /// diagnostic-dump watcher entirely -- see
     /// `config::DiagnosticsConfig::auto_dump_enabled`'s doc comment.
     pub diagnostics_watch: Option<DiagnosticsWatchParams>,
+    /// This tunnel's own local IP (parsed from `tunnel.address`, the
+    /// same string `main.rs::open_tun` already parses to build the TUN
+    /// device) -- used only to bind the tunnel-level throughput
+    /// self-test's persistent listener (`tunneltest::run_listener`) to
+    /// the TUN device's own address rather than every interface. See
+    /// `tunneltest.rs`'s module doc comment.
+    pub tunnel_local_addr: std::net::IpAddr,
 }
 
 /// Config for `control::diagnostics_watch_loop`, threaded from
@@ -524,43 +530,52 @@ impl RekeyContext {
 ///   nothing to send *over the wire* for this case; the result is ready
 ///   the instant `handle_incoming` finishes computing it.
 ///
-/// Single-slot, same reasoning as `RekeyContext::rekey_reply_tx`: this
-/// project's `control::apply_command` runs a throughput test's legs (and
-/// every targeted link's own test, if more than one) strictly
-/// sequentially, so only one `test_id` is ever actually awaited at a
-/// time -- a fresh registration simply overwrites whatever the previous
-/// one was.
+/// Keyed by `test_id`, not single-slot: originally only
+/// `control::apply_command` ever awaited a throughput test (its own
+/// legs, and every targeted link's own test if more than one, strictly
+/// sequentially -- so a single-slot registry was correct then). Now
+/// `active_bandwidth_prober` also registers waits here, one independent
+/// task per link, on its own periodic timer -- entirely possible for
+/// two links' probes (or a probe and a manually-triggered
+/// `mlvpnd self-test`) to be in flight at the same moment, which a
+/// single-slot registry would silently break (a second registration
+/// would overwrite the first's slot, permanently orphaning its result).
 pub(crate) struct ThroughputTestContext {
-    reply_tx: std::sync::Mutex<Option<(u32, mpsc::UnboundedSender<f64>)>>,
+    waiters: std::sync::Mutex<std::collections::HashMap<u32, mpsc::UnboundedSender<f64>>>,
 }
 
 impl ThroughputTestContext {
     pub(crate) fn new() -> Self {
         Self {
-            reply_tx: std::sync::Mutex::new(None),
+            waiters: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
     /// Registers interest in a result for `test_id`, returning the
-    /// receiving half. Called once per leg, before that leg's stream
-    /// (or reverse-request) goes out, so there's somewhere to route the
-    /// eventual result from the moment it could possibly arrive.
+    /// receiving half. Called once per leg (or per probe), before that
+    /// leg's stream (or reverse-request) goes out, so there's somewhere
+    /// to route the eventual result from the moment it could possibly
+    /// arrive. Opportunistically prunes any previously-registered entry
+    /// whose receiver has already been dropped (a caller that gave up
+    /// waiting, e.g. via a `tokio::time::timeout`, without ever getting a
+    /// result) -- otherwise a `test_id` whose result genuinely never
+    /// arrives would leak its entry in the map forever.
     pub(crate) fn register_wait(&self, test_id: u32) -> mpsc::UnboundedReceiver<f64> {
         let (tx, rx) = mpsc::unbounded_channel();
-        *self.reply_tx.lock().unwrap() = Some((test_id, tx));
+        let mut waiters = self.waiters.lock().unwrap();
+        waiters.retain(|_, tx| !tx.is_closed());
+        waiters.insert(test_id, tx);
         rx
     }
 
-    /// Forwards `achieved_mbps` to the waiting leg only if `test_id`
-    /// matches what's currently registered; anything else (a stray late
+    /// Forwards `achieved_mbps` to the waiter registered for `test_id`,
+    /// if any -- removed on delivery, since a `test_id` is only ever
+    /// used once. Anything with no matching registration (a stray late
     /// result from a leg that already timed out and gave up, or plain
     /// noise) is silently ignored.
     fn forward_result(&self, test_id: u32, achieved_mbps: f64) {
-        let guard = self.reply_tx.lock().unwrap();
-        if let Some((want_id, tx)) = guard.as_ref() {
-            if *want_id == test_id {
-                let _ = tx.send(achieved_mbps);
-            }
+        if let Some(tx) = self.waiters.lock().unwrap().remove(&test_id) {
+            let _ = tx.send(achieved_mbps);
         }
     }
 }
@@ -765,25 +780,26 @@ pub async fn run(
     // monitoring client.
     let peer_stats = Arc::new(PeerStatsTable::new());
 
-    // One `BandwidthProbeReceiveState` per link, same one-per-link
-    // pattern as `trackers` above, tracking a possibly-in-progress
-    // incoming `BandwidthProbeBurst` for `scheduler.active_bandwidth_probing`
-    // (off by default) -- see that struct's doc comment.
-    let bw_probe_states: Vec<Arc<AsyncMutex<BandwidthProbeReceiveState>>> = (0..trackers.len())
-        .map(|_| Arc::new(AsyncMutex::new(BandwidthProbeReceiveState::new())))
-        .collect();
-
-    // Same one-per-link pattern again, this time for a possibly-in-
-    // progress incoming `ThroughputTestData` stream -- see
-    // `ThroughputTestReceiveState`'s doc comment. `throughput_test_ctx`
-    // is the single shared registry `control::serve_commands`'s
-    // `Command::RunThroughputTest` handler waits on for a result, from
+    // One per link, tracking a possibly-in-progress incoming
+    // `ThroughputTestData` stream -- see `ThroughputTestReceiveState`'s
+    // doc comment. `throughput_test_ctx` is the shared registry both
+    // `control::serve_commands`'s `Command::RunThroughputTest` handler
+    // and `active_bandwidth_prober` (below) wait on for a result, from
     // either direction -- see `ThroughputTestContext`'s doc comment.
     let throughput_test_states: Vec<Arc<AsyncMutex<ThroughputTestReceiveState>>> = (0..trackers
         .len())
         .map(|_| Arc::new(AsyncMutex::new(ThroughputTestReceiveState::new())))
         .collect();
     let throughput_test_ctx = Arc::new(ThroughputTestContext::new());
+
+    // Shared between `control::serve_commands`'s
+    // `Command::RunTunnelThroughputTest` handler (which registers a
+    // wait before sending the upload leg) and
+    // `tunneltest::run_listener` (which delivers a result into it when
+    // an incoming stream turns out to be this daemon's own reverse leg
+    // completing, rather than someone else testing it fresh) -- see
+    // `tunneltest::TunnelTestContext`'s doc comment.
+    let tunnel_test_ctx = Arc::new(crate::tunneltest::TunnelTestContext::new());
 
     let mut handles = Vec::new();
 
@@ -795,9 +811,8 @@ pub async fn run(
     let (outbound_tx, outbound_rx) = mpsc::channel::<OutboundFrame>(OUTBOUND_QUEUE_CAPACITY);
     let outbound_dropped_total = Arc::new(AtomicU64::new(0));
 
-    for (idx, ((tracker, bw_state), throughput_test_state)) in trackers
+    for (idx, (tracker, throughput_test_state)) in trackers
         .iter()
-        .zip(bw_probe_states.iter())
         .zip(throughput_test_states.iter())
         .enumerate()
     {
@@ -813,7 +828,6 @@ pub async fn run(
             let peer_stats = peer_stats.clone();
             let rekey_ctx = rekey_ctx.clone();
             let shutdown = shutdown.clone();
-            let bw_state = bw_state.clone();
             let session_meta = session_meta.clone();
             let mtu = params.mtu as usize;
             let throughput_test_state = throughput_test_state.clone();
@@ -836,7 +850,6 @@ pub async fn run(
                     peer_stats,
                     rekey_ctx,
                     shutdown,
-                    bw_state,
                     session_meta,
                     mtu,
                     throughput_test_state,
@@ -859,12 +872,13 @@ pub async fn run(
             let session = session.clone();
             let cfg = params.scheduler_cfg.clone();
             let mtu = params.mtu as usize;
+            let throughput_test_ctx = throughput_test_ctx.clone();
             handles.push(tokio::spawn(async move {
                 // No-op and returns immediately unless
                 // active_bandwidth_probing is on -- see the function's
                 // own doc comment, same "spawn unconditionally, check
                 // inside" pattern as reorder_tuning_loop below.
-                active_bandwidth_prober(idx, links, session, cfg, mtu).await;
+                active_bandwidth_prober(idx, links, session, cfg, mtu, throughput_test_ctx).await;
             }));
         }
     }
@@ -898,6 +912,7 @@ pub async fn run(
         let links = links.clone();
         let session = session.clone();
         let throughput_test_ctx = throughput_test_ctx.clone();
+        let tunnel_test_ctx_for_commands = tunnel_test_ctx.clone();
         let mtu = params.mtu as usize;
         let diag_ctx = control::DiagContext {
             peer_stats: peer_stats.clone(),
@@ -909,7 +924,43 @@ pub async fn run(
             log_ring: log_ring.clone(),
         };
         handles.push(tokio::spawn(async move {
-            control::serve_commands(path, links, session, throughput_test_ctx, mtu, diag_ctx).await;
+            control::serve_commands(
+                path,
+                links,
+                session,
+                throughput_test_ctx,
+                tunnel_test_ctx_for_commands,
+                mtu,
+                diag_ctx,
+            )
+            .await;
+        }));
+    }
+
+    // The tunnel-level self-test's persistent listener -- see
+    // `tunneltest.rs`'s module doc comment. Deliberately *not* gated on
+    // `[command] enabled`: matching the existing per-link self-test's
+    // own precedent, any daemon can be the *target* of a test regardless
+    // of its own command-socket config (`handle_incoming` already
+    // processes an incoming `ThroughputTestData` stream unconditionally)
+    // -- only the *initiating* side needs `[command] enabled`, to accept
+    // the CLI's command-socket connection in the first place. Requiring
+    // it here too would mean a server that never intends to run its own
+    // self-test commands still couldn't be *tested by* a client that
+    // does.
+    {
+        let tunnel_local_addr = params.tunnel_local_addr;
+        let outbound_dropped_total = outbound_dropped_total.clone();
+        let tunnel_test_ctx = tunnel_test_ctx.clone();
+        let mtu = params.mtu as usize;
+        handles.push(tokio::spawn(async move {
+            crate::tunneltest::run_listener(
+                tunnel_local_addr,
+                outbound_dropped_total,
+                tunnel_test_ctx,
+                mtu,
+            )
+            .await;
         }));
     }
 
@@ -2202,7 +2253,6 @@ async fn link_receiver(
     peer_stats: Arc<PeerStatsTable>,
     rekey_ctx: Arc<RekeyContext>,
     shutdown: Arc<Shutdown>,
-    bw_probe_state: Arc<AsyncMutex<BandwidthProbeReceiveState>>,
     session_meta: Arc<SessionMeta>,
     mtu: usize,
     throughput_test_state: Arc<AsyncMutex<ThroughputTestReceiveState>>,
@@ -2237,7 +2287,6 @@ async fn link_receiver(
                     &peer_stats,
                     &rekey_ctx,
                     &shutdown,
-                    &bw_probe_state,
                     &session_meta,
                     mtu,
                     &throughput_test_state,
@@ -2572,56 +2621,15 @@ fn suggest_probe_interval_ms(
     current_ms.clamp(floor_ms, max_ms)
 }
 
-/// Per-link receive-side bookkeeping for an in-progress
-/// `PacketType::BandwidthProbeBurst` (see `active_bandwidth_prober` below
-/// and the `BandwidthProbeBurst` arm of `handle_incoming`'s match). One
-/// of these lives per link, built alongside `trackers` in `run()`.
-/// Unlike `monitor::ProbeTracker`, nothing outside `link_receiver`/
-/// `handle_incoming` ever needs to read this, but it's still wrapped in
-/// `Arc<AsyncMutex<_>>` to match the rest of this module's per-link
-/// state-sharing pattern.
-struct BandwidthProbeReceiveState {
-    /// `probe_id` of the burst currently being accumulated, or `None`
-    /// between bursts (including before the very first one has ever
-    /// arrived).
-    probe_id: Option<u32>,
-    first_seen: Instant,
-    bytes_seen: u64,
-    /// `probe_id` of the most recently *completed* burst (one that
-    /// already triggered a reply), or `None` if none has completed
-    /// yet. Needed because `active_bandwidth_prober` redundantly
-    /// resends the final packet of a burst a couple of extra times
-    /// (see that function's doc comment for why) -- without this,
-    /// a second copy of that final packet arriving after the burst
-    /// already completed and reset `probe_id` to `None` would look
-    /// exactly like the start of a brand new one-packet burst, and
-    /// immediately "complete" again with a bogus near-zero elapsed
-    /// time (and therefore a wildly inflated achieved_mbps). Checked
-    /// before the normal reset-on-new-probe_id logic below.
-    last_completed_probe_id: Option<u32>,
-}
-
-impl BandwidthProbeReceiveState {
-    fn new() -> Self {
-        Self {
-            probe_id: None,
-            first_seen: Instant::now(),
-            bytes_seen: 0,
-            last_completed_probe_id: None,
-        }
-    }
-}
-
-/// One per link (same one-per-link pattern as `BandwidthProbeReceiveState`,
-/// its closest relative), tracking a possibly-in-progress incoming
-/// `ThroughputTestData` stream for `ipc::Command::RunThroughputTest`.
-/// Time-bounded rather than packet-count-bounded (the sender doesn't
-/// know its own final packet count ahead of time -- it's stopping on a
-/// duration timer, not after N packets), so this watches
-/// `ThroughputTestDataPayload::done` instead of comparing
-/// `packet_index + 1 == total_packets`; otherwise the exact same shape
-/// and reasoning as `BandwidthProbeReceiveState`, including
-/// `last_completed_test_id`'s guard against the sender's redundant
+/// One per link, same one-per-link pattern as `trackers` in `run()`,
+/// tracking a possibly-in-progress incoming `ThroughputTestData` stream
+/// -- shared by both `ipc::Command::RunThroughputTest` (`mlvpnd
+/// self-test`) and the periodic `active_bandwidth_prober`, since both
+/// send the exact same wire packet type. Time-bounded rather than
+/// packet-count-bounded (the sender doesn't know its own final packet
+/// count ahead of time -- it's stopping on a duration timer, not after N
+/// packets), so this watches `ThroughputTestDataPayload::done`.
+/// `last_completed_test_id` guards against the sender's redundant
 /// final-packet copies being misread as a fresh one-packet stream.
 struct ThroughputTestReceiveState {
     test_id: Option<u32>,
@@ -2642,18 +2650,20 @@ impl ThroughputTestReceiveState {
 }
 
 /// Pure throughput calculation shared by `handle_incoming`'s
-/// `BandwidthProbeBurst` handling and its own unit tests below: bytes
-/// carried by a completed burst, divided by how long the burst took to
+/// `ThroughputTestData` handling (used by both `mlvpnd self-test` and
+/// the periodic `active_bandwidth_prober` below) and its own unit tests:
+/// bytes carried by a completed stream, divided by how long it took to
 /// arrive. `elapsed_secs` is clamped to a small positive floor so a
-/// (practically impossible, but not unrepresentable) zero-duration burst
-/// can't divide by zero or report an infinite/nonsensical rate.
+/// (practically impossible, but not unrepresentable) zero-duration
+/// stream can't divide by zero or report an infinite/nonsensical rate.
 ///
 /// The floor used to be `0.001` (1ms), which sounded conservative but
-/// wasn't: a ~28KB probe burst (`active_bandwidth_probe_packets` packets
-/// padded to `mtu`) only needs to sustain ~229 Mbps to be delivered in
-/// under a millisecond, which any modern broadband link can do. Once a
-/// burst legitimately completed that fast, `Instant::elapsed()` measured
-/// it correctly but this clamp overrode the real (smaller) duration with
+/// wasn't: back when `active_bandwidth_prober` sent a small fixed-count
+/// packet burst rather than today's duration-bounded stream, a ~28KB
+/// burst only needed to sustain ~229 Mbps to be delivered in under a
+/// millisecond, which any modern broadband link can do. Once a burst
+/// legitimately completed that fast, `Instant::elapsed()` measured it
+/// correctly but this clamp overrode the real (smaller) duration with
 /// 1ms, silently ceiling `achieved_mbps` at ~229 regardless of how much
 /// faster the link actually was -- observed in production as the exact
 /// same `achieved_mbps` value recurring over and over for a fast link,
@@ -2664,22 +2674,16 @@ impl ThroughputTestReceiveState {
 /// true capacity. `Instant` has nanosecond resolution, so the floor only
 /// needs to guard against a literal zero/negative duration -- 1
 /// microsecond is plenty, and still lets `achieved_mbps` run up into the
-/// tens-of-Gbps range before clamping, far outside what a burst this
-/// size could plausibly produce.
+/// tens-of-Gbps range before clamping, far outside what any real stream
+/// could plausibly produce.
 fn compute_achieved_mbps(bytes: u64, elapsed_secs: f64) -> f64 {
     let elapsed_secs = elapsed_secs.max(0.000_001);
     (bytes as f64 * 8.0) / elapsed_secs / 1_000_000.0
 }
 
-/// How many packets make up one active-bandwidth-probe burst is bounded
-/// to `u16::MAX` by the wire format (`BandwidthProbeBurstPayload::total_packets`);
-/// `Config::validate` already caps `active_bandwidth_probe_packets` far
-/// below that (2..=100), so this is only a defensive final clamp.
-const ACTIVE_BANDWIDTH_PROBE_MAX_PACKETS: u32 = u16::MAX as u32;
-
 /// Sender side of `scheduler.active_bandwidth_probing` (off by default):
-/// periodically sends one MTU-sized burst of dummy packets down this
-/// link and lets the receiver's `BandwidthProbeBurst` handling in
+/// periodically sends a real throughput-measurement stream down this
+/// link and lets the receiver's `ThroughputTestData` handling in
 /// `handle_incoming` measure and report back the achieved throughput.
 /// Spawned unconditionally per link in `run()` (same pattern as
 /// `reorder_tuning_loop`) but returns immediately as a no-op unless the
@@ -2688,57 +2692,36 @@ const ACTIVE_BANDWIDTH_PROBE_MAX_PACKETS: u32 = u16::MAX as u32;
 ///
 /// Deliberately its own task rather than folded into `link_prober`:
 /// `link_prober`'s timing is latency-sensitive (its own probe cadence
-/// directly feeds the Up/Down hysteresis), and a burst of `send_to`
-/// calls -- even a small one -- risks momentarily delaying the next
-/// scheduled latency probe if they shared a task. Best-effort throughout:
-/// a burst that fails partway through (a send error, or the peer never
-/// finishing decoding it) just means no result for that attempt: the
-/// next scheduled burst tries again, so there's no separate retry logic
-/// here.
+/// directly feeds the Up/Down hysteresis), and a multi-second stream --
+/// even a short one -- risks momentarily delaying the next scheduled
+/// latency probe if they shared a task.
 ///
-/// One deliberate exception to "no retry logic": the very last packet
-/// of the burst is what triggers the receiver to actually compute and
-/// reply with a result (see `handle_incoming`'s `BandwidthProbeBurst`
-/// handling) -- losing *that one specific packet* silently discards
-/// the entire burst's measurement even though every other packet
-/// arrived fine, which in testing turned out to be a real, if
-/// occasional, failure mode: an unshaped/fast link delivers its whole
-/// burst in a handful of milliseconds with no pacing at all, which is
-/// exactly the traffic pattern most likely to hit a transient
-/// receive-side drop. So the final packet is sent a couple of extra
-/// times as cheap insurance -- the receiver-side
-/// `BandwidthProbeReceiveState::last_completed_probe_id` guard makes
-/// redundant copies of an already-completed burst's final packet a
-/// harmless no-op rather than a spurious second (near-instant, wildly
-/// inflated) result.
+/// Reuses `send_throughput_test_stream`/`ThroughputTestContext` --
+/// exactly the mechanism `mlvpnd self-test` uses -- rather than a
+/// separate fixed-packet-count burst mechanism (removed, along with the
+/// `BandwidthProbeBurst`/`BandwidthProbeResult` wire types it used).
+/// That old approach completed a fast link's burst in well under one
+/// round trip, which measured local send-side overhead more than the
+/// path's real sustained capacity -- the faster the link, the worse
+/// that got (a real-world 688 Mbps link measured at just 56.7 Mbps by
+/// the old 20-packet burst is what prompted this change; see
+/// `config::SchedulerConfig::active_bandwidth_probe_duration_secs`'s
+/// doc comment for the bandwidth-delay-product math behind why). A
+/// duration-based stream naturally scales instead: a fast link moves
+/// more bytes in the same window, a slow link moves fewer, and both
+/// produce an accurate `achieved_mbps`.
 ///
-/// Every packet in a burst is encrypted under a single `session.lock()`
-/// acquisition, not one lock acquisition per packet -- this used to be
-/// a real, if subtle, measurement bug, not just a latency concern:
-/// `tun_reader` locks this exact same `SessionState` mutex for every
-/// single outgoing Data packet, so under real concurrent traffic (the
-/// same condition this probe exists to measure the throughput of), a
-/// per-packet lock acquisition here got interleaved with that Data
-/// traffic's own encrypts and had to wait its turn, unpredictably
-/// stretching out how long it took the *sender* to get the whole burst
-/// out the door. `compute_achieved_mbps` (receiver side) has no way to
-/// tell that apart from genuine network transit time -- it just clocks
-/// from the burst's first packet arriving to its last -- so that
-/// sender-side dispatch delay directly deflated the reported
-/// `achieved_mbps`, worse the busier the link actually was. Holding the
-/// lock for the whole burst means every packet's encrypt happens
-/// back-to-back as one atomic unit, immune to that interleaving, at the
-/// cost of briefly blocking `tun_reader`'s own encrypts for that same
-/// short window -- bounded (`active_bandwidth_probe_packets` is capped
-/// at 100) and infrequent (`active_bandwidth_probe_interval_secs` has a
-/// 30s floor), a clearly worthwhile trade for a probe whose entire
-/// purpose is producing an accurate number.
+/// Best-effort throughout: a send failure, or a result that never
+/// arrives within `ACTIVE_BANDWIDTH_PROBE_RESULT_GRACE` of the stream's
+/// own duration, just means no result for that attempt -- the next
+/// scheduled probe tries again, so there's no separate retry logic here.
 async fn active_bandwidth_prober(
     idx: usize,
     links: Links,
     session: Arc<AsyncMutex<SessionState>>,
     cfg: SchedulerConfig,
     mtu: usize,
+    throughput_test_ctx: Arc<ThroughputTestContext>,
 ) {
     if !cfg.active_bandwidth_probing {
         return;
@@ -2749,14 +2732,10 @@ async fn active_bandwidth_prober(
         (link.handle(), link.id)
     };
 
-    let packet_count = cfg
-        .active_bandwidth_probe_packets
-        .clamp(2, ACTIVE_BANDWIDTH_PROBE_MAX_PACKETS) as u16;
-    let payload_len = mtu.max(BandwidthProbeBurstPayload::HEADER_LEN);
+    let duration = Duration::from_secs(cfg.active_bandwidth_probe_duration_secs);
     let mut tick = interval(Duration::from_secs(
         cfg.active_bandwidth_probe_interval_secs,
     ));
-    let mut probe_id: u32 = 0;
 
     loop {
         tick.tick().await;
@@ -2770,84 +2749,88 @@ async fn active_bandwidth_prober(
             continue;
         };
 
-        probe_id = probe_id.wrapping_add(1);
         let socket = handle.current_socket().await;
-        // Two extra copies of the final packet, after the main
-        // 0..packet_count run -- see this function's doc comment for
-        // why the last packet specifically gets this redundancy.
-        // `packet_indices` holds every index once, then the last index
-        // twice more; collected up front (small, at most
-        // `ACTIVE_BANDWIDTH_PROBE_MAX_PACKETS + 2`) so it can be walked
-        // twice below -- once to encrypt, once to send.
-        let packet_indices: Vec<u16> = (0..packet_count)
-            .chain(std::iter::repeat_n(packet_count.saturating_sub(1), 2))
-            .collect();
-
-        // See this function's doc comment for why every packet in the
-        // burst is encrypted under one lock acquisition rather than one
-        // per packet.
-        let mut frames: Vec<Vec<u8>> = Vec::with_capacity(packet_indices.len());
+        let test_id = crypto::random_session_id();
+        let mut rx = throughput_test_ctx.register_wait(test_id);
+        if send_throughput_test_stream(
+            socket,
+            remote,
+            link_id,
+            session.clone(),
+            test_id,
+            duration,
+            mtu,
+        )
+        .await
+        .is_err()
         {
-            let s = session.lock().await;
-            for &packet_index in &packet_indices {
-                let burst_payload = BandwidthProbeBurstPayload {
-                    probe_id,
-                    packet_index,
-                    total_packets: packet_count,
-                }
-                .encode_padded(payload_len);
-                let Ok((session_id, seq, ct)) = s.encrypt(&burst_payload) else {
-                    break;
-                };
-                let mut out = Vec::with_capacity(HEADER_LEN + ct.len());
-                Header {
-                    ptype: PacketType::BandwidthProbeBurst,
-                    link_id,
-                    session_id,
-                    seq,
-                }
-                .encode(&mut out);
-                out.extend_from_slice(&ct);
-                frames.push(out);
-            }
+            // Best-effort, as documented above: abandon this attempt
+            // and let the next scheduled tick try again.
+            continue;
         }
 
-        for frame in &frames {
-            if socket.send_to(frame, remote).await.is_err() {
-                // Best-effort, as documented above: abandon this burst
-                // attempt and let the next scheduled tick try again.
-                break;
-            }
+        let achieved_mbps =
+            match tokio::time::timeout(duration + ACTIVE_BANDWIDTH_PROBE_RESULT_GRACE, rx.recv())
+                .await
+            {
+                Ok(Some(mbps)) => mbps,
+                _ => continue,
+            };
+
+        if let Some(link) = links.get(idx) {
+            let mut link = link.lock().await;
+            link.stats.active_bandwidth_mbps.update(achieved_mbps);
+            tracing::info!(
+                link = %link.config.name,
+                achieved_mbps,
+                "active bandwidth probe result"
+            );
         }
     }
 }
 
+/// Extra time to wait, beyond the probe stream's own duration, for the
+/// peer's measured result to come back -- same reasoning as
+/// `control::THROUGHPUT_TEST_RESULT_GRACE`, just local to this module
+/// since `active_bandwidth_prober` runs entirely within `tunnel.rs`.
+const ACTIVE_BANDWIDTH_PROBE_RESULT_GRACE: Duration = Duration::from_secs(5);
+
 /// Sends a continuous, MTU-padded `ThroughputTestData` stream to
 /// `remote` for `duration`, then a couple of redundant final ("done")
-/// packets -- same insurance-against-losing-exactly-the-last-packet
-/// reasoning as `active_bandwidth_prober`'s own final-packet redundancy.
+/// packets as insurance against losing exactly the last one.
 ///
-/// Used for both legs of a throughput self-test: the forward/upload leg
-/// (`control::apply_command`'s `Command::RunThroughputTest` handler
-/// calls this directly) and the reverse/download leg (`handle_incoming`'s
-/// `ThroughputTestReverseRequest` arm spawns this in response to a
-/// peer's request, entirely autonomously -- no local command-socket
-/// trigger involved on that side).
+/// Used by three callers, all sharing this one implementation rather
+/// than each maintaining their own: the on-demand `mlvpnd self-test`'s
+/// forward/upload leg (`control::apply_command`'s
+/// `Command::RunThroughputTest` handler calls this directly), its
+/// reverse/download leg (`handle_incoming`'s `ThroughputTestReverseRequest`
+/// arm spawns this in response to a peer's request, entirely
+/// autonomously -- no local command-socket trigger involved on that
+/// side), and the periodic `active_bandwidth_prober` (off by default).
 ///
 /// Deliberately does *not* batch every packet's encrypt under one lock
-/// acquisition the way `active_bandwidth_prober`'s tiny burst now does:
-/// that trade only makes sense for a burst so short (a handful of
-/// packets, sub-millisecond to low-millisecond total) that ordinary
-/// per-packet lock contention with `tun_reader` could dominate the
-/// measurement itself. A multi-second throughput test is the opposite
-/// case -- it's specifically trying to measure "how fast can this link
-/// actually go under realistic conditions," which means competing
-/// fairly with real Data traffic for the shared session lock is exactly
-/// correct, not a bug to route around. Holding the lock for the entire
-/// stream's duration would instead starve `tun_reader` (and therefore
-/// all real traffic on every link, not just this one) for the whole
-/// multi-second window, which is a far worse trade than the brief,
-/// bounded blip `active_bandwidth_prober`'s batching causes.
+/// acquisition the way `active_bandwidth_prober`'s old fixed-packet-count
+/// burst mechanism used to (removed -- see that function's doc comment
+/// for why a short burst was the wrong tool for measuring a fast link's
+/// real capacity in the first place): a multi-second stream is
+/// specifically trying to measure "how fast can this link actually go
+/// under realistic conditions," which means competing fairly with real
+/// Data traffic for the shared session lock is exactly correct, not a
+/// bug to route around. Holding the lock for the entire stream's
+/// duration would instead starve `tun_reader` (and therefore all real
+/// traffic on every link, not just this one) for the whole window --
+/// acceptable for a handful of packets over a few milliseconds, not for
+/// a stream that can run for seconds.
+///
+/// Pause between each redundant final ("done") packet -- see the loop
+/// below for why this needs to be a real pause, not just back-to-back
+/// insurance copies. Small relative to the `THROUGHPUT_TEST_RESULT_GRACE`/
+/// `ACTIVE_BANDWIDTH_PROBE_RESULT_GRACE` a caller waits beyond the
+/// stream's own duration for a result (two of these add well under a
+/// second total), but meaningful relative to how fast a shaper actually
+/// drains once this function's own sending stops adding to its queue.
+const THROUGHPUT_TEST_DONE_RETRY_DELAY: Duration = Duration::from_millis(250);
+
 pub(crate) async fn send_throughput_test_stream(
     socket: Arc<UdpSocket>,
     remote: SocketAddr,
@@ -2920,6 +2903,24 @@ pub(crate) async fn send_throughput_test_stream(
         .await?;
         if done {
             for _ in 0..2 {
+                // A real, if brief, pause -- not just insurance against a
+                // one-off dropped packet. This loop has been sending as
+                // fast as it can for the entire stream duration, which on
+                // a heavily bandwidth-constrained or already-congested
+                // link means any downstream queue (a shaper, a
+                // bottleneck hop) is likely still full at the exact
+                // moment the main loop stops. Sending all the redundant
+                // copies back-to-back right then just re-rolls the same
+                // bad odds instantly -- none of them get a materially
+                // better chance than the first. Pausing between copies
+                // gives the queue a real window to drain (at whatever
+                // the link's actual rate is) before the next attempt,
+                // which is what actually improves the odds. Confirmed
+                // necessary, not just theoretical: a real veth test
+                // shaped to 2mbit lost every unspaced copy of the final
+                // packet, and production logs showed the same "no
+                // result" pattern on a real, heavily loss-laden link.
+                tokio::time::sleep(THROUGHPUT_TEST_DONE_RETRY_DELAY).await;
                 send_one(
                     &socket,
                     remote,
@@ -2990,7 +2991,6 @@ async fn handle_incoming(
     peer_stats: &Arc<PeerStatsTable>,
     rekey_ctx: &Arc<RekeyContext>,
     shutdown: &Arc<Shutdown>,
-    bw_probe_state: &Arc<AsyncMutex<BandwidthProbeReceiveState>>,
     session_meta: &Arc<SessionMeta>,
     mtu: usize,
     throughput_test_state: &Arc<AsyncMutex<ThroughputTestReceiveState>>,
@@ -3200,91 +3200,15 @@ async fn handle_incoming(
                 peer_stats.update(idx as u8, &payload);
             }
         }
-        PacketType::BandwidthProbeBurst => {
-            let Ok(burst) = BandwidthProbeBurstPayload::decode(&plaintext) else {
-                return;
-            };
-            let mut state = bw_probe_state.lock().await;
-            // `active_bandwidth_prober` sends the burst's final packet a
-            // couple of extra times as insurance against losing exactly
-            // that one packet (see its doc comment) -- if this is a
-            // redundant copy of a burst we already completed and replied
-            // to, ignore it outright rather than letting it fall through
-            // to the "fresh probe_id" branch below, which would
-            // otherwise misread it as the start of a brand new
-            // one-packet burst and immediately "complete" it with a
-            // bogus near-zero elapsed time.
-            if state.last_completed_probe_id == Some(burst.probe_id) {
-                return;
-            }
-            // A fresh `probe_id` means a new burst is starting -- either
-            // the very first one ever, or the sender's previous attempt
-            // never fully arrived (a dropped final packet just means no
-            // result got sent for it; see this struct's doc comment).
-            // Either way, restart accounting from this packet rather
-            // than mixing bytes from two different bursts together.
-            if state.probe_id != Some(burst.probe_id) {
-                state.probe_id = Some(burst.probe_id);
-                state.first_seen = Instant::now();
-                state.bytes_seen = 0;
-            }
-            state.bytes_seen += frame.len() as u64;
-            if burst.packet_index + 1 == burst.total_packets {
-                let elapsed_secs = state.first_seen.elapsed().as_secs_f64();
-                let achieved_mbps = compute_achieved_mbps(state.bytes_seen, elapsed_secs);
-                // Ready for the next burst; `last_completed_probe_id` is
-                // what makes any further redundant copy of this same
-                // final packet a harmless no-op above instead of a
-                // spurious second result.
-                state.probe_id = None;
-                state.last_completed_probe_id = Some(burst.probe_id);
-                drop(state);
-
-                let result_payload = BandwidthProbeResultPayload {
-                    probe_id: burst.probe_id,
-                    achieved_mbps: achieved_mbps as f32,
-                };
-                let encrypted = {
-                    let s = session.lock().await;
-                    s.encrypt(&result_payload.encode())
-                };
-                if let Ok((reply_session_id, reply_seq, reply_ct)) = encrypted {
-                    let mut out = Vec::with_capacity(HEADER_LEN + reply_ct.len());
-                    Header {
-                        ptype: PacketType::BandwidthProbeResult,
-                        link_id,
-                        session_id: reply_session_id,
-                        seq: reply_seq,
-                    }
-                    .encode(&mut out);
-                    out.extend_from_slice(&reply_ct);
-                    let _ = socket.send_to(&out, from).await;
-                }
-            }
-        }
-        PacketType::BandwidthProbeResult => {
-            let Ok(result) = BandwidthProbeResultPayload::decode(&plaintext) else {
-                return;
-            };
-            if let Some(l) = links.get(idx) {
-                let mut link = l.lock().await;
-                link.stats
-                    .active_bandwidth_mbps
-                    .update(result.achieved_mbps as f64);
-                tracing::info!(
-                    link = %link.config.name,
-                    achieved_mbps = result.achieved_mbps,
-                    "active bandwidth probe result"
-                );
-            }
-        }
         PacketType::ThroughputTestData => {
             let Ok(data) = ThroughputTestDataPayload::decode(&plaintext) else {
                 return;
             };
             let mut state = throughput_test_state.lock().await;
-            // Same redundant-final-packet guard as `BandwidthProbeBurst`
-            // above -- see `ThroughputTestReceiveState`'s doc comment.
+            // Guards against a redundant copy of an already-completed
+            // stream's final packet(s) being misread as the start of a
+            // fresh one -- see `ThroughputTestReceiveState`'s doc
+            // comment.
             if state.last_completed_test_id == Some(data.test_id) {
                 return;
             }
@@ -3373,8 +3297,7 @@ async fn handle_incoming(
             // bidirectional throughput test work without needing the
             // operator to separately run a command on *both* ends. See
             // `send_throughput_test_stream`'s doc comment for why this
-            // deliberately does not batch its encrypts the way
-            // `active_bandwidth_prober`'s tiny burst does.
+            // deliberately does not batch its encrypts.
             let socket = socket.clone();
             let session = session.clone();
             let duration = Duration::from_secs(req.duration_secs as u64);
@@ -3998,23 +3921,6 @@ mod active_bandwidth_probe_tests {
     }
 
     #[test]
-    fn receive_state_resets_on_a_new_probe_id() {
-        let mut state = BandwidthProbeReceiveState::new();
-        state.probe_id = Some(1);
-        state.bytes_seen = 500;
-
-        // Simulate handle_incoming's reset check for a fresh burst
-        // starting mid-way through (or right after) a previous one.
-        let incoming_probe_id = 2u32;
-        if state.probe_id != Some(incoming_probe_id) {
-            state.probe_id = Some(incoming_probe_id);
-            state.bytes_seen = 0;
-        }
-        assert_eq!(state.probe_id, Some(2));
-        assert_eq!(state.bytes_seen, 0);
-    }
-
-    #[test]
     fn active_bandwidth_probing_is_off_by_default() {
         // `run()` spawns `active_bandwidth_prober` unconditionally for
         // every link (same "spawn unconditionally, check inside"
@@ -4024,60 +3930,5 @@ mod active_bandwidth_probe_tests {
         // every tunnel would start sending synthetic probe traffic
         // with no explicit opt-in.
         assert!(!SchedulerConfig::default().active_bandwidth_probing);
-    }
-
-    #[test]
-    fn active_bandwidth_probe_packet_count_is_clamped_to_the_wire_format_limit() {
-        // Defensive: Config::validate already restricts
-        // active_bandwidth_probe_packets to 2..=100, but
-        // active_bandwidth_prober itself clamps again to
-        // ACTIVE_BANDWIDTH_PROBE_MAX_PACKETS (u16::MAX) before casting
-        // to u16, so a future change to the config-level bound alone
-        // can't reintroduce a silent truncation.
-        let clamped = 1_000_000u32.clamp(2, ACTIVE_BANDWIDTH_PROBE_MAX_PACKETS);
-        assert!(clamped <= u16::MAX as u32);
-    }
-
-    #[test]
-    fn burst_send_sequence_resends_the_final_packet_twice() {
-        // Mirrors active_bandwidth_prober's packets_to_send construction
-        // for a small packet_count, confirming every index 0..count is
-        // sent once and the last index is sent two additional times --
-        // the redundancy that closes the "lost final packet silently
-        // discards the whole measurement" gap. See this module's
-        // BandwidthProbeReceiveState::last_completed_probe_id doc
-        // comment for the receive-side half of this fix.
-        let packet_count: u16 = 5;
-        let packets_to_send: Vec<u16> = (0..packet_count)
-            .chain(std::iter::repeat_n(packet_count - 1, 2))
-            .collect();
-        assert_eq!(packets_to_send, vec![0, 1, 2, 3, 4, 4, 4]);
-    }
-
-    #[test]
-    fn redundant_final_packet_after_completion_is_ignored_not_a_new_burst() {
-        // Simulates handle_incoming's guard: a second (or third) copy of
-        // an already-completed burst's final packet must be dropped
-        // outright, not misread as the start of a fresh one-packet
-        // burst that would immediately "complete" again with a bogus,
-        // near-instant (and therefore wildly inflated) achieved_mbps.
-        let mut state = BandwidthProbeReceiveState::new();
-        let probe_id = 7u32;
-
-        // First (real) copy of the final packet completes the burst.
-        state.probe_id = Some(probe_id);
-        state.bytes_seen = 28_000;
-        state.probe_id = None;
-        state.last_completed_probe_id = Some(probe_id);
-
-        // A redundant second copy of that same final packet arrives
-        // afterward: the completed-probe_id guard must fire before any
-        // reset-on-new-probe_id logic runs.
-        let ignored = state.last_completed_probe_id == Some(probe_id);
-        assert!(
-            ignored,
-            "a redundant copy of an already-completed burst's final \
-             packet must be recognized and ignored"
-        );
     }
 }

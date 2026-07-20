@@ -76,6 +76,7 @@ sudo env "PATH=$PATH" HOME="$HOME" cargo test --release --locked --test veth_ewm
 sudo env "PATH=$PATH" HOME="$HOME" cargo test --release --locked --test veth_active_bandwidth_probing -- --ignored --nocapture
 sudo env "PATH=$PATH" HOME="$HOME" cargo test --release --locked --test veth_daemon_health -- --ignored --nocapture
 sudo env "PATH=$PATH" HOME="$HOME" cargo test --release --locked --test veth_throughput_selftest -- --ignored --nocapture
+sudo env "PATH=$PATH" HOME="$HOME" cargo test --release --locked --test veth_tunnel_selftest -- --ignored --nocapture
 sudo env "PATH=$PATH" HOME="$HOME" cargo test --release --locked --test veth_diag_dump -- --ignored --nocapture
 sudo env "PATH=$PATH" HOME="$HOME" cargo test --release --locked --test veth_dualstack_alternate_failover -- --ignored --nocapture
 ```

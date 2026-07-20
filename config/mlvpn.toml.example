@@ -65,20 +65,24 @@ ewma_alpha = 0.2         # smoothing factor for latency/jitter/loss/throughput s
                            # clean streak smooths it back toward the min.
 # ewma_alpha_min = 0.05     # bounds the auto-tuner above; only consulted
 # ewma_alpha_max = 0.5      # when auto_tune_ewma_alpha is true
-# active_bandwidth_probing = false   # opt-in: periodically send a short,
-                           # rate-limited burst of MTU-sized dummy packets on
-                           # each link purely to measure achieved throughput,
-                           # instead of only inferring it from real traffic
-                           # that happens to be flowing. Injects real (if
-                           # small and infrequent) extra traffic onto the
-                           # wire, so this needs a stronger opt-in than the
-                           # other auto-tuning knobs above -- leave off on a
-                           # metered/bandwidth-constrained link.
+# active_bandwidth_probing = false   # opt-in: periodically run a short, real
+                           # throughput stream on each link purely to measure
+                           # achieved throughput, instead of only inferring it
+                           # from real traffic that happens to be flowing.
+                           # Injects real (if brief and infrequent) extra
+                           # traffic onto the wire, so this needs a stronger
+                           # opt-in than the other auto-tuning knobs above --
+                           # leave off on a metered/bandwidth-constrained link.
 # active_bandwidth_probe_interval_secs = 300   # how often each link runs one
-                           # burst; validated to be >= 30s (this is an
-                           # injected burst, not a single latency probe).
-# active_bandwidth_probe_packets = 20   # packets per burst; validated to be
-                           # between 2 and 100.
+                           # probe; validated to be >= 30s (this is an
+                           # injected stream, not a single latency probe).
+# active_bandwidth_probe_duration_secs = 2   # how long each probe's stream
+                           # runs; validated to be between 1 and 30. Sized by
+                           # duration, not a fixed packet count, so it scales
+                           # to whatever the link can actually do -- a fixed
+                           # small packet count would complete a fast link's
+                           # burst in well under one round trip, measuring
+                           # local overhead more than real sustained capacity.
 
 [logging]
 level = "info"           # tracing-subscriber EnvFilter directive, e.g. "info" or "mlvpn=debug"

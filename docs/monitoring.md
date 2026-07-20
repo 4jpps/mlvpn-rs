@@ -114,6 +114,48 @@ A `None` result for a direction means it timed out or the peer doesn't
 support this feature yet (an older `mlvpnd` silently drops the
 unrecognized packet type) -- not necessarily that the link is down.
 
+## Tunnel-level self-test
+
+The link-level self-test above measures each physical link's own raw
+UDP capacity, bypassing the TUN device, the outbound queue, and the
+scheduler entirely. To instead measure the *whole bonded path* --
+real IP/UDP traffic actually routed through the tunnel, exercising the
+same queue and scheduler real Data traffic uses -- run:
+
+```sh
+mlvpnd self-test --config /etc/mlvpn/mlvpn.toml --tunnel --peer-addr 10.200.0.2                # upload only
+mlvpnd self-test --config /etc/mlvpn/mlvpn.toml --tunnel --peer-addr 10.200.0.2 --duration 15   # longer stream
+mlvpnd self-test --config /etc/mlvpn/mlvpn.toml --tunnel --peer-addr 10.200.0.2 --bidirectional # also measure the reverse direction
+```
+
+`--peer-addr` is the peer's *tunnel-internal* IP (the `tunnel.address`
+on the other end, without the `/<prefix>`), not a link's physical
+address. Only the initiating side needs `[command]` enabled -- the
+target's listener runs unconditionally, same as the link-level
+self-test's own "any daemon can be the target" precedent, so nothing
+needs to be enabled ahead of time on the far end.
+
+Sample output:
+
+```
+running tunnel-level self-test against 10.200.0.2 (10s per direction, bidirectional) -- this will take a while...
+upload: 148.3 Mbps
+  our own outbound queue dropped 0 packets during this leg
+download: 151.9 Mbps
+  peer's outbound queue dropped 0 packets during this leg
+```
+
+Each direction reports its own outbound-queue drop count alongside the
+achieved rate. A non-zero count on the *sender's own* leg means the
+traffic never even made it out of that host's outbound queue -- a
+locally-observable cause, not something that requires guessing about
+what happened on the wire or at the peer. A clean queue on both legs
+combined with real measured loss (compare against `iperf3`, or the
+link-level self-test above) narrows the search to somewhere between
+the outbound queue and the peer's own application -- the kernel UDP
+socket buffers, most likely (see `mlvpnd diag-dump`'s kernel-level UDP
+diagnostics, below).
+
 ## Diagnostic dump
 
 Also over the command socket: capture a single text bundle of every

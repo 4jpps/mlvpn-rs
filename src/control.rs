@@ -34,7 +34,7 @@ use crate::crypto::{random_session_id, SessionState};
 use crate::diag;
 use crate::ipc::{
     Command, CommandResult, DaemonSnapshot, LinkSnapshot, Snapshot, SystemSnapshot,
-    ThroughputTestLinkResult, TunSnapshot,
+    ThroughputTestLinkResult, TunSnapshot, TunnelTestCommandResult,
 };
 use crate::link::{self, LinkState, Links};
 use crate::logbuf::LogRing;
@@ -45,6 +45,7 @@ use crate::tunnel::{
     send_throughput_test_reverse_request, send_throughput_test_stream, DiagnosticsWatchParams,
     OutboundFrame, SessionMeta, ThroughputTestContext,
 };
+use crate::tunneltest;
 use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -372,6 +373,7 @@ pub(crate) async fn serve_commands(
     links: Links,
     session: Arc<AsyncMutex<SessionState>>,
     throughput_test_ctx: Arc<ThroughputTestContext>,
+    tunnel_test_ctx: Arc<tunneltest::TunnelTestContext>,
     mtu: usize,
     diag_ctx: DiagContext,
 ) {
@@ -432,9 +434,19 @@ pub(crate) async fn serve_commands(
         let links = links.clone();
         let session = session.clone();
         let throughput_test_ctx = throughput_test_ctx.clone();
+        let tunnel_test_ctx = tunnel_test_ctx.clone();
         let diag_ctx = diag_ctx.clone();
         tokio::spawn(async move {
-            serve_command_client(stream, links, session, throughput_test_ctx, mtu, diag_ctx).await;
+            serve_command_client(
+                stream,
+                links,
+                session,
+                throughput_test_ctx,
+                tunnel_test_ctx,
+                mtu,
+                diag_ctx,
+            )
+            .await;
         });
     }
 }
@@ -451,6 +463,7 @@ async fn serve_command_client(
     links: Links,
     session: Arc<AsyncMutex<SessionState>>,
     throughput_test_ctx: Arc<ThroughputTestContext>,
+    tunnel_test_ctx: Arc<tunneltest::TunnelTestContext>,
     mtu: usize,
     diag_ctx: DiagContext,
 ) {
@@ -467,12 +480,24 @@ async fn serve_command_client(
     };
 
     let result = match serde_json::from_str::<Command>(&line) {
-        Ok(cmd) => apply_command(cmd, &links, &session, &throughput_test_ctx, mtu, &diag_ctx).await,
+        Ok(cmd) => {
+            apply_command(
+                cmd,
+                &links,
+                &session,
+                &throughput_test_ctx,
+                &tunnel_test_ctx,
+                mtu,
+                &diag_ctx,
+            )
+            .await
+        }
         Err(e) => CommandResult {
             ok: false,
             error: Some(format!("invalid command: {e}")),
             throughput_results: Vec::new(),
             diag_dump: None,
+            tunnel_test_result: None,
         },
     };
 
@@ -492,6 +517,7 @@ async fn apply_command(
     links: &Links,
     session: &Arc<AsyncMutex<SessionState>>,
     throughput_test_ctx: &Arc<ThroughputTestContext>,
+    tunnel_test_ctx: &Arc<tunneltest::TunnelTestContext>,
     mtu: usize,
     diag_ctx: &DiagContext,
 ) -> CommandResult {
@@ -524,6 +550,7 @@ async fn apply_command(
                     error: None,
                     throughput_results: Vec::new(),
                     diag_dump: None,
+                    tunnel_test_result: None,
                 }
             } else {
                 CommandResult {
@@ -531,6 +558,7 @@ async fn apply_command(
                     error: Some(format!("no such link '{link}'")),
                     throughput_results: Vec::new(),
                     diag_dump: None,
+                    tunnel_test_result: None,
                 }
             }
         }
@@ -551,6 +579,81 @@ async fn apply_command(
             .await
         }
         Command::DiagDump => run_diag_dump_command(links, diag_ctx).await,
+        Command::RunTunnelThroughputTest {
+            peer_addr,
+            duration_secs,
+            bidirectional,
+        } => {
+            run_tunnel_throughput_test_command(
+                &peer_addr,
+                duration_secs,
+                bidirectional,
+                mtu,
+                &diag_ctx.outbound_dropped_total,
+                tunnel_test_ctx,
+            )
+            .await
+        }
+    }
+}
+
+/// Implements `Command::RunTunnelThroughputTest`: parses `peer_addr`
+/// (the peer's tunnel-internal address, e.g. `"10.200.0.2"`) and hands
+/// off to `tunneltest::run_test` -- see that module's doc comment for
+/// why this is a genuinely different mechanism from
+/// `run_throughput_test_command` above (real UDP through the TUN
+/// device/outbound queue/scheduler, not a link's own raw socket).
+async fn run_tunnel_throughput_test_command(
+    peer_addr: &str,
+    duration_secs: u32,
+    bidirectional: bool,
+    mtu: usize,
+    outbound_dropped_total: &Arc<AtomicU64>,
+    tunnel_test_ctx: &Arc<tunneltest::TunnelTestContext>,
+) -> CommandResult {
+    let peer_addr = match peer_addr.parse::<std::net::IpAddr>() {
+        Ok(addr) => addr,
+        Err(e) => {
+            return CommandResult {
+                ok: false,
+                error: Some(format!("invalid peer_addr '{peer_addr}': {e}")),
+                throughput_results: Vec::new(),
+                diag_dump: None,
+                tunnel_test_result: None,
+            };
+        }
+    };
+
+    let outcome = tunneltest::run_test(
+        peer_addr,
+        duration_secs,
+        bidirectional,
+        mtu,
+        outbound_dropped_total,
+        tunnel_test_ctx,
+    )
+    .await;
+
+    tracing::info!(
+        %peer_addr,
+        upload_mbps = ?outcome.upload_mbps,
+        download_mbps = ?outcome.download_mbps,
+        local_queue_drops = outcome.local_queue_drops,
+        peer_queue_drops = ?outcome.peer_queue_drops,
+        "tunnel-level throughput self-test complete"
+    );
+
+    CommandResult {
+        ok: true,
+        error: None,
+        throughput_results: Vec::new(),
+        diag_dump: None,
+        tunnel_test_result: Some(TunnelTestCommandResult {
+            upload_mbps: outcome.upload_mbps,
+            download_mbps: outcome.download_mbps,
+            local_outbound_queue_dropped_delta: outcome.local_queue_drops,
+            peer_outbound_queue_dropped_delta: outcome.peer_queue_drops,
+        }),
     }
 }
 
@@ -581,6 +684,7 @@ async fn run_diag_dump_command(links: &Links, diag_ctx: &DiagContext) -> Command
         error: None,
         throughput_results: Vec::new(),
         diag_dump: Some(text),
+        tunnel_test_result: None,
     }
 }
 
@@ -743,6 +847,7 @@ async fn run_throughput_test_command(
             }),
             throughput_results: Vec::new(),
             diag_dump: None,
+            tunnel_test_result: None,
         };
     }
 
@@ -805,6 +910,7 @@ async fn run_throughput_test_command(
         error: None,
         throughput_results: results,
         diag_dump: None,
+        tunnel_test_result: None,
     }
 }
 

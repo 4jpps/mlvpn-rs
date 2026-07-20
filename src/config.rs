@@ -221,8 +221,8 @@ pub struct SchedulerConfig {
     /// the min above.
     #[serde(default = "default_ewma_alpha_max")]
     pub ewma_alpha_max: f64,
-    /// Opt-in: periodically send a short, rate-limited burst of MTU-sized
-    /// dummy packets on each link purely to measure achieved throughput
+    /// Opt-in: periodically run a short, real throughput stream on each
+    /// link purely to measure achieved throughput
     /// (`tunnel::active_bandwidth_prober`), feeding
     /// `link::LinkStats::active_bandwidth_mbps` -- see that field's doc
     /// comment and `monitor::score`. Unlike the other three auto-tuning
@@ -234,24 +234,35 @@ pub struct SchedulerConfig {
     /// deployments are unaffected either way.
     #[serde(default)]
     pub active_bandwidth_probing: bool,
-    /// How often each link runs one probe burst, in seconds. Only
-    /// consulted when `active_bandwidth_probing` is true. Validated
+    /// How often each link runs one probe, in seconds. Only consulted
+    /// when `active_bandwidth_probing` is true. Validated
     /// (`Config::validate`) to be at least 30 seconds: this is a
-    /// deliberate, injected burst of traffic rather than the tiny
+    /// deliberate, injected stream of traffic rather than the tiny
     /// single-packet Probe/ProbeReply exchange used for latency, so a
     /// too-short interval would start to look like a self-inflicted
     /// bandwidth-flood/DoS pattern rather than an occasional
     /// measurement.
     #[serde(default = "default_active_bandwidth_probe_interval_secs")]
     pub active_bandwidth_probe_interval_secs: u64,
-    /// How many MTU-sized packets make up one probe burst. Only
-    /// consulted when `active_bandwidth_probing` is true. Validated to be
-    /// between 2 (need at least a first and last packet to time an
-    /// interval) and 100 (an upper sanity bound, so a misconfigured
-    /// value can't turn "an occasional measurement" into a sustained
-    /// flood every interval).
-    #[serde(default = "default_active_bandwidth_probe_packets")]
-    pub active_bandwidth_probe_packets: u32,
+    /// How long each probe's stream runs, in seconds. Only consulted
+    /// when `active_bandwidth_probing` is true. Sized by duration, not a
+    /// fixed packet count (this field's predecessor,
+    /// `active_bandwidth_probe_packets`, removed): a small fixed packet
+    /// count completes a fast link's burst in well under one round trip
+    /// -- measuring local send-side overhead more than the path's real
+    /// sustained capacity, and the faster the link, the worse that gets
+    /// (a real-world 688 Mbps link measured at just 56.7 Mbps by the old
+    /// 20-packet burst is what prompted this change). A duration-based
+    /// stream naturally scales instead: a fast link moves more bytes in
+    /// the same window, a slow link moves fewer, and both produce an
+    /// accurate `achieved_mbps`. Reuses the same send/receive code as
+    /// `mlvpnd self-test` (`tunnel::send_throughput_test_stream`).
+    /// Validated to be between 1 and 30 seconds: long enough to move a
+    /// meaningful amount of data even on a fast link, short enough to
+    /// stay a bounded, occasional measurement rather than a sustained
+    /// flood every interval.
+    #[serde(default = "default_active_bandwidth_probe_duration_secs")]
+    pub active_bandwidth_probe_duration_secs: u64,
 }
 
 fn default_down_threshold() -> u32 {
@@ -284,8 +295,8 @@ fn default_ewma_alpha_max() -> f64 {
 fn default_active_bandwidth_probe_interval_secs() -> u64 {
     300
 }
-fn default_active_bandwidth_probe_packets() -> u32 {
-    20
+fn default_active_bandwidth_probe_duration_secs() -> u64 {
+    2
 }
 
 impl Default for SchedulerConfig {
@@ -306,7 +317,7 @@ impl Default for SchedulerConfig {
             ewma_alpha_max: default_ewma_alpha_max(),
             active_bandwidth_probing: false,
             active_bandwidth_probe_interval_secs: default_active_bandwidth_probe_interval_secs(),
-            active_bandwidth_probe_packets: default_active_bandwidth_probe_packets(),
+            active_bandwidth_probe_duration_secs: default_active_bandwidth_probe_duration_secs(),
         }
     }
 }
@@ -619,10 +630,10 @@ impl Config {
                 self.scheduler.active_bandwidth_probe_interval_secs
             )));
         }
-        if !(2..=100).contains(&self.scheduler.active_bandwidth_probe_packets) {
+        if !(1..=30).contains(&self.scheduler.active_bandwidth_probe_duration_secs) {
             return Err(MlvpnError::Config(format!(
-                "scheduler.active_bandwidth_probe_packets ({}) must be between 2 and 100",
-                self.scheduler.active_bandwidth_probe_packets
+                "scheduler.active_bandwidth_probe_duration_secs ({}) must be between 1 and 30",
+                self.scheduler.active_bandwidth_probe_duration_secs
             )));
         }
 

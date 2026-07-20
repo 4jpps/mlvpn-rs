@@ -76,13 +76,20 @@ enum Command {
     /// required first). Sends a real, MTU-sized packet stream for
     /// `--duration` seconds and reports the achieved rate; add
     /// `--bidirectional` to also measure the reverse direction
-    /// (sequentially, so this roughly doubles the total time).
+    /// (sequentially, so this roughly doubles the total time). By
+    /// default this tests each configured link's own raw capacity
+    /// directly, bypassing the TUN device/outbound queue/scheduler
+    /// entirely -- pass `--tunnel --peer-addr <IP>` instead to test the
+    /// real bonded tunnel (real UDP through the TUN device, the actual
+    /// outbound queue, and the real scheduler splitting traffic across
+    /// links), which can also help diagnose queue/buffer issues the
+    /// per-link mode can't see.
     SelfTest {
         #[arg(short, long, default_value = "/etc/mlvpn/mlvpn.toml")]
         config: PathBuf,
         /// Test only this link (matching a [[links]] `name`). Omit to
         /// test every configured link with a currently-known peer
-        /// address, one at a time.
+        /// address, one at a time. Ignored when `--tunnel` is set.
         #[arg(short, long)]
         link: Option<String>,
         /// How long to run each direction's stream, in seconds.
@@ -94,6 +101,16 @@ enum Command {
         /// link tested.
         #[arg(short, long)]
         bidirectional: bool,
+        /// Test the real bonded tunnel (TUN device/outbound queue/
+        /// scheduler) instead of one link's own raw capacity -- requires
+        /// `--peer-addr`. See this command's own doc comment.
+        #[arg(short, long)]
+        tunnel: bool,
+        /// The peer's tunnel-internal address (e.g. "10.200.0.2", not a
+        /// link's WAN address) -- required, and only meaningful, when
+        /// `--tunnel` is set.
+        #[arg(short, long)]
+        peer_addr: Option<String>,
     },
     /// Capture a diagnostic dump for a running mlvpnd: every link's
     /// health, daemon/session state, and recent log lines (via the
@@ -158,7 +175,18 @@ fn main() -> anyhow::Result<()> {
             link,
             duration,
             bidirectional,
-        } => run_throughput_selftest(&config, link, duration, bidirectional),
+            tunnel,
+            peer_addr,
+        } => {
+            if tunnel {
+                let Some(peer_addr) = peer_addr else {
+                    anyhow::bail!("--tunnel requires --peer-addr <the peer's tunnel-internal IP>");
+                };
+                run_tunnel_throughput_selftest(&config, &peer_addr, duration, bidirectional)
+            } else {
+                run_throughput_selftest(&config, link, duration, bidirectional)
+            }
+        }
         Command::DiagDump { config, output } => run_diag_dump(&config, output),
     }
 }
@@ -283,6 +311,71 @@ fn run_throughput_selftest(
             println!("{}: upload {upload}, download {download}", r.link);
         } else {
             println!("{}: upload {upload}", r.link);
+        }
+    }
+    Ok(())
+}
+
+/// Send a `RunTunnelThroughputTest` command to a running daemon's
+/// command socket and print the result -- see `tunneltest.rs`'s module
+/// doc comment for what makes this different from
+/// `run_throughput_selftest` above (real UDP through the TUN device,
+/// outbound queue, and scheduler, not one link's own raw socket).
+fn run_tunnel_throughput_selftest(
+    config_path: &Path,
+    peer_addr: &str,
+    duration_secs: u32,
+    bidirectional: bool,
+) -> anyhow::Result<()> {
+    println!(
+        "running tunnel-level self-test against {peer_addr} ({duration_secs}s per direction{}) \
+         -- this will take a while...",
+        if bidirectional { ", bidirectional" } else { "" }
+    );
+    let cmd = SocketCommand::RunTunnelThroughputTest {
+        peer_addr: peer_addr.to_string(),
+        duration_secs,
+        bidirectional,
+    };
+    let result = send_command(config_path, &cmd)?;
+
+    if !result.ok {
+        anyhow::bail!(
+            "mlvpnd rejected the command: {}",
+            result
+                .error
+                .unwrap_or_else(|| "(no error detail)".to_string())
+        );
+    }
+    let Some(tt) = result.tunnel_test_result else {
+        anyhow::bail!("mlvpnd accepted the command but returned no result");
+    };
+
+    let no_result = || "no result (timed out or peer doesn't support this)".to_string();
+    let upload = tt
+        .upload_mbps
+        .map(|v| format!("{v:.1} Mbps"))
+        .unwrap_or_else(no_result);
+    println!("upload: {upload}");
+    if tt.local_outbound_queue_dropped_delta > 0 {
+        println!(
+            "  our own outbound queue dropped {} packet(s) during this leg",
+            tt.local_outbound_queue_dropped_delta
+        );
+    } else {
+        println!("  our own outbound queue dropped 0 packets during this leg");
+    }
+
+    if bidirectional {
+        let download = tt
+            .download_mbps
+            .map(|v| format!("{v:.1} Mbps"))
+            .unwrap_or_else(no_result);
+        println!("download: {download}");
+        match tt.peer_outbound_queue_dropped_delta {
+            Some(0) => println!("  peer's outbound queue dropped 0 packets during this leg"),
+            Some(n) => println!("  peer's outbound queue dropped {n} packet(s) during this leg"),
+            None => println!("  peer's outbound queue drop count unavailable (no result)"),
         }
     }
     Ok(())
@@ -547,6 +640,17 @@ async fn run(cfg: Config, log_ring: Arc<LogRing>) -> anyhow::Result<()> {
         None
     };
 
+    // Same string `open_tun` above already parsed to build the TUN
+    // device itself -- see `TunnelParams::tunnel_local_addr`'s doc
+    // comment for why the tunnel-level self-test listener needs it.
+    let (tunnel_local_addr_str, _) = parse_cidr(&cfg.tunnel.address)?;
+    let tunnel_local_addr: std::net::IpAddr = tunnel_local_addr_str.parse().map_err(|e| {
+        MlvpnError::Config(format!(
+            "tunnel.address '{}' has an unparseable address: {e}",
+            cfg.tunnel.address
+        ))
+    })?;
+
     let params = tunnel::TunnelParams {
         mode: cfg.mode,
         mtu: effective_mtu,
@@ -559,6 +663,7 @@ async fn run(cfg: Config, log_ring: Arc<LogRing>) -> anyhow::Result<()> {
         control_socket,
         command_socket,
         diagnostics_watch,
+        tunnel_local_addr,
     };
 
     // `tunnel::run` races SIGINT/SIGTERM against the tunnel's own tasks

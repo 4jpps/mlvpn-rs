@@ -237,6 +237,21 @@ pub enum Command {
     /// (see `config::DiagnosticsConfig`): this is always the operator
     /// asking for one right now, unconditionally.
     DiagDump,
+    /// Runs an on-demand *tunnel-level* throughput self-test
+    /// (`mlvpnd self-test --tunnel` on the CLI) -- unlike
+    /// `RunThroughputTest` above (raw UDP directly on one link's own
+    /// socket, bypassing the TUN device/outbound queue/scheduler
+    /// entirely), this sends real UDP packets to `peer_addr` (the
+    /// peer's tunnel-internal address, e.g. `"10.200.0.2"`) that
+    /// genuinely transit the whole real pipeline -- see
+    /// `tunneltest.rs`'s module doc comment. Blocks the command
+    /// connection for roughly `duration_secs` (doubled, sequentially,
+    /// if `bidirectional`) plus a grace period.
+    RunTunnelThroughputTest {
+        peer_addr: String,
+        duration_secs: u32,
+        bidirectional: bool,
+    },
 }
 
 /// One link's result from a completed `Command::RunThroughputTest`.
@@ -276,6 +291,37 @@ pub struct CommandResult {
     /// (see `error` in that case).
     #[serde(default)]
     pub diag_dump: Option<String>,
+    /// Populated only by `Command::RunTunnelThroughputTest`. `None` for
+    /// every other command, and for one that failed before running
+    /// (see `error` in that case).
+    #[serde(default)]
+    pub tunnel_test_result: Option<TunnelTestCommandResult>,
+}
+
+/// Result of a completed `Command::RunTunnelThroughputTest`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TunnelTestCommandResult {
+    /// Mbps the peer measured receiving our upload stream. `None` if
+    /// that leg never produced a result in time (e.g. real loss severe
+    /// enough that even the redundant "done" copies never arrived).
+    pub upload_mbps: Option<f64>,
+    /// Mbps we measured receiving the peer's autonomous reverse stream
+    /// -- only attempted when `bidirectional` was requested.
+    pub download_mbps: Option<f64>,
+    /// This side's own `outbound_queue_dropped_total` delta observed
+    /// while sending the upload leg -- direct evidence of whether the
+    /// real outbound queue dropped anything during this test, not an
+    /// inference from external loss measurements. Always present (0 if
+    /// nothing dropped), unlike the peer-side figure below, since this
+    /// side always knows it regardless of whether the upload leg
+    /// otherwise succeeded.
+    pub local_outbound_queue_dropped_delta: u64,
+    /// The *peer's* own `outbound_queue_dropped_total` delta while it
+    /// sent the reverse leg back to us -- `None` unless `bidirectional`
+    /// was requested and that leg actually completed (this figure rides
+    /// on the reverse stream itself, so it's unavailable if that leg
+    /// never arrived).
+    pub peer_outbound_queue_dropped_delta: Option<u64>,
 }
 
 #[cfg(test)]
@@ -453,6 +499,7 @@ mod tests {
                 download_mbps: None,
             }],
             diag_dump: None,
+            tunnel_test_result: None,
         };
         let ok_back: CommandResult =
             serde_json::from_str(&serde_json::to_string(&ok).unwrap()).unwrap();
@@ -469,6 +516,7 @@ mod tests {
             error: Some("no such link 'bogus'".to_string()),
             throughput_results: Vec::new(),
             diag_dump: None,
+            tunnel_test_result: None,
         };
         let err_back: CommandResult =
             serde_json::from_str(&serde_json::to_string(&err).unwrap()).unwrap();
@@ -494,6 +542,7 @@ mod tests {
             error: None,
             throughput_results: Vec::new(),
             diag_dump: Some("=== mlvpn diagnostic dump ===\n...".to_string()),
+            tunnel_test_result: None,
         };
         let back: CommandResult =
             serde_json::from_str(&serde_json::to_string(&result).unwrap()).unwrap();
@@ -502,5 +551,50 @@ mod tests {
             back.diag_dump.as_deref(),
             Some("=== mlvpn diagnostic dump ===\n...")
         );
+    }
+
+    #[test]
+    fn run_tunnel_throughput_test_command_json_round_trips() {
+        let cmd = Command::RunTunnelThroughputTest {
+            peer_addr: "10.200.0.2".to_string(),
+            duration_secs: 10,
+            bidirectional: true,
+        };
+        let json = serde_json::to_string(&cmd).expect("serialize");
+        let back: Command = serde_json::from_str(&json).expect("deserialize");
+        let Command::RunTunnelThroughputTest {
+            peer_addr,
+            duration_secs,
+            bidirectional,
+        } = back
+        else {
+            panic!("expected RunTunnelThroughputTest, got {back:?}");
+        };
+        assert_eq!(peer_addr, "10.200.0.2");
+        assert_eq!(duration_secs, 10);
+        assert!(bidirectional);
+    }
+
+    #[test]
+    fn command_result_tunnel_test_result_round_trips() {
+        let result = CommandResult {
+            ok: true,
+            error: None,
+            throughput_results: Vec::new(),
+            diag_dump: None,
+            tunnel_test_result: Some(TunnelTestCommandResult {
+                upload_mbps: Some(412.3),
+                download_mbps: Some(388.9),
+                local_outbound_queue_dropped_delta: 0,
+                peer_outbound_queue_dropped_delta: Some(3),
+            }),
+        };
+        let back: CommandResult =
+            serde_json::from_str(&serde_json::to_string(&result).unwrap()).unwrap();
+        let tt = back.tunnel_test_result.expect("tunnel_test_result");
+        assert_eq!(tt.upload_mbps, Some(412.3));
+        assert_eq!(tt.download_mbps, Some(388.9));
+        assert_eq!(tt.local_outbound_queue_dropped_delta, 0);
+        assert_eq!(tt.peer_outbound_queue_dropped_delta, Some(3));
     }
 }

@@ -1,6 +1,7 @@
 //! End-to-end test of `scheduler.active_bandwidth_probing`
-//! (`tunnel::active_bandwidth_prober`, the `BandwidthProbeBurst`/
-//! `BandwidthProbeResult` handling in `tunnel::handle_incoming`, and
+//! (`tunnel::active_bandwidth_prober`, which reuses
+//! `tunnel::send_throughput_test_stream` and the `ThroughputTestData`/
+//! `ThroughputTestResult` handling in `tunnel::handle_incoming`, and
 //! `link::LinkStats::active_bandwidth_mbps` -- see `ARCHITECTURE.md` §5).
 //!
 //! Uses `tc qdisc ... tbf` to cap the client's link1 veth interface to a
@@ -14,12 +15,12 @@
 //! control socket) actually reflects that cap, and comes in meaningfully
 //! lower than link0's.
 //!
-//! **What this does not assert**: an exact achieved_mbps value. A tiny
-//! 20-packet burst against a token-bucket shaper is inherently noisy
+//! **What this does not assert**: an exact achieved_mbps value. A
+//! stream against a token-bucket shaper is inherently a little noisy
 //! (initial burst credit, timer granularity), so this only checks that
 //! link1's measured rate is capped to a sane ballpark and is clearly
 //! lower than link0's unshaped measurement -- proving the whole path
-//! (burst send, burst receive/accumulate, result reply, EWMA update,
+//! (stream send, stream receive/accumulate, result reply, EWMA update,
 //! log) fires and reacts to real network conditions, which is this
 //! test's actual job.
 //!
@@ -96,9 +97,10 @@ async fn active_bandwidth_probing_discovers_a_real_rate_cap() {
     // Cap link1's egress rate on the client side only -- link0 stays
     // unshaped, same near-line-rate baseline every other veth pair in
     // this harness uses. `burst` is set just above the tunnel's packet
-    // size so the token bucket can't front-load the whole small probe
-    // burst as one free chunk; `latency` bounds how long tbf will queue
-    // (rather than drop) a packet waiting for tokens.
+    // size so the token bucket can't front-load an outsized chunk of
+    // the probe stream as one free burst credit; `latency` bounds how
+    // long tbf will queue (rather than drop) a packet waiting for
+    // tokens.
     ns_client
         .exec(
             "tc",
@@ -204,7 +206,10 @@ async fn active_bandwidth_probing_discovers_a_real_rate_cap() {
     // period), then every `active_bandwidth_probe_interval_secs`
     // (the 30s config floor used above) after that -- so this doesn't
     // actually need to wait out a full interval, but the timeout below
-    // still gives it a generous margin regardless.
+    // still gives it a generous margin regardless. Each probe now runs
+    // for a real `active_bandwidth_probe_duration_secs` (default 2s,
+    // not overridden here) rather than completing near-instantly, so
+    // the margin also covers that plus the reply's own round trip.
     //
     // `tracing_subscriber`'s default formatter writes an event's
     // fields, in declaration order, right after its message --

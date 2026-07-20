@@ -114,9 +114,10 @@ Defined in `protocol.rs`. Every frame has a small plaintext header
 (packet type, link id, session id, sequence number) followed by a
 payload. Handshake payloads are raw Noise messages; every other frame
 type -- `Data`, `Probe`, `ProbeReply`, `StatsShare`,
-`BandwidthProbeBurst`, `BandwidthProbeResult` -- is AEAD ciphertext, so
-an off-path attacker can't inject forged probe/stats samples, forge a
-fake bandwidth result, or read tunnel traffic.
+`ThroughputTestData`, `ThroughputTestResult`,
+`ThroughputTestReverseRequest` -- is AEAD ciphertext, so an off-path
+attacker can't inject forged probe/stats samples, forge a fake
+throughput result, or read tunnel traffic.
 
 The sequence number is global per session, not per link -- this is
 what makes replay protection and receive-side reordering work
@@ -176,36 +177,41 @@ smooths it back toward the min instead (less noise-sensitive on a
 stable link). See `tunnel::suggest_ewma_alpha`.
 
 **Active bandwidth probing (opt-in).** `scheduler.active_bandwidth_probing`
-(off by default) has `tunnel::active_bandwidth_prober` periodically send
-a short, rate-limited burst of MTU-sized dummy packets
-(`active_bandwidth_probe_packets`, default 20) down each link on a slow
-timer (`active_bandwidth_probe_interval_secs`, default 300s, validated
-floor of 30s -- this is injected traffic, not a single latency probe, so
-it needs a much lower ceiling on frequency than `Probe`/`ProbeReply`).
-The receiver times how long the whole burst took to arrive and reports
-the achieved rate back (`BandwidthProbeResult`), which feeds a separate
+(off by default) has `tunnel::active_bandwidth_prober` periodically run
+a real throughput stream down each link on a slow timer
+(`active_bandwidth_probe_interval_secs`, default 300s, validated floor
+of 30s -- this is injected traffic, not a single latency probe, so it
+needs a much lower ceiling on frequency than `Probe`/`ProbeReply`), for
+`active_bandwidth_probe_duration_secs` (default 2s, validated to be
+1-30s). The receiver times how long the stream took to arrive and
+reports the achieved rate back, which feeds a separate
 `link::LinkStats::active_bandwidth_mbps` EWMA -- kept distinct from the
-passive `throughput_mbps` above, since a deliberate burst and organic
+passive `throughput_mbps` above, since a deliberate stream and organic
 traffic measure genuinely different things. This is what lets an
 under-used link (one whose current low score means real traffic rarely
 saturates it) still get judged on its true capacity rather than looking
 artificially slow. Off by default for a stronger reason than the other
-three auto-tuning knobs: unlike those, this one puts real (if small and
+three auto-tuning knobs: unlike those, this one puts real (if brief and
 infrequent) extra traffic on the wire, which isn't appropriate for every
 link (e.g. a metered connection).
 
-An unshaped/fast link delivers its whole burst in a handful of
-milliseconds with no pacing at all -- exactly the traffic pattern most
-likely to hit a transient receive-side drop, and losing specifically
-the *final* packet (the one that triggers the receiver to compute and
-reply with a result) would otherwise silently discard the entire
-measurement even though every other packet arrived fine. `tunnel::active_bandwidth_prober`
-sends the final packet a couple of extra times as cheap insurance
-against exactly that; the receiver-side
-`tunnel::BandwidthProbeReceiveState::last_completed_probe_id` guard
-makes a redundant copy of an already-completed burst's final packet a
-harmless no-op instead of a spurious second (near-instant, wildly
-inflated) result.
+Sized by duration, not a fixed packet count -- an earlier version used a
+small (2-100 packet) fixed-size burst instead, which turned out to be a
+real measurement bug on a fast link: a ~28KB burst completes in well
+under one round trip on any modern broadband connection, so the
+"measurement" was really just local send-side dispatch overhead, not
+the path's actual sustained capacity -- confirmed against a real
+688 Mbps link that the old burst measured at just 56.7 Mbps (its
+bandwidth-delay product at that rate and a ~34ms RTT is ~2.9MB; a 28KB
+burst is about 1% of that, nowhere near enough data in flight to
+characterize the path). A duration-based stream scales naturally
+instead: a fast link moves more bytes in the same window, a slow link
+moves fewer, and both produce an accurate `achieved_mbps`. This also
+means `active_bandwidth_prober` no longer needs its own wire mechanism
+at all -- it reuses `tunnel::send_throughput_test_stream` and the
+`ThroughputTestData`/`ThroughputTestResult` frames `mlvpnd self-test`
+already uses (§9), including that stream's own redundant final-packet
+insurance against a fast/unshaped link's transient receive-side drops.
 
 `monitor::score()` combines these into one number per link, weighted
 by an operator-configured static bias (`[[links]] weight`). Throughput
@@ -405,6 +411,32 @@ currently three commands:
   stream deliberately does *not* batch its encrypts under one lock
   acquisition -- a multi-second stream is meant to compete fairly with
   real Data traffic for the shared session lock, not race around it.
+- Run an on-demand **tunnel-level** throughput self-test
+  (`ipc::Command::RunTunnelThroughputTest`, `mlvpnd self-test --tunnel
+  --peer-addr <ip>` on the CLI) -- distinct from the link-level self-test
+  above, which sends raw UDP directly on a link's own socket, bypassing
+  `tun_reader`/the outbound queue/the scheduler entirely. This one sends
+  real UDP packets addressed to the peer's *tunnel-internal* IP, so the
+  OS kernel genuinely routes them through the TUN device, exercising the
+  real pipeline end to end (`tunneltest.rs`). It's a self-contained
+  app-level protocol, not `protocol.rs`'s Header/PacketType/Noise --
+  the traffic gets authentication "for free" by virtue of actually
+  transiting the tunnel, so there's no need to duplicate the wire
+  crypto for it. The server side's listener (`tunneltest::run_listener`,
+  well-known `TUNNEL_TEST_PORT`) runs unconditionally, matching the
+  link-level self-test's "any daemon can be the target regardless of its
+  own `[command]` config" precedent -- only the initiating side needs
+  the command socket enabled. A bidirectional test's reverse leg is
+  triggered autonomously by the receiving side (same pattern as the
+  link-level test's `ThroughputTestReverseRequest`), and must be sent
+  back to the client's own persistent listener address, not the
+  ephemeral source port the request happened to arrive from. Each
+  leg's queue-drop delta rides along on its own "done" packet(s) so the
+  initiator can report both its own and the peer's outbound-queue drops
+  for that leg, distinguishing "traffic never made it into our own
+  queue" from externally-observed loss -- the open mystery this tool
+  exists to help isolate (real UDP loss with mlvpn's own counters
+  reading zero, see `docs/monitoring.md`).
 - Capture a diagnostic dump right now (`ipc::Command::DiagDump`,
   `mlvpnd diag-dump` on the CLI) -- builds a fresh `ipc::Snapshot` the
   same way the monitoring socket does (link/session/queue/tun/system
