@@ -80,6 +80,16 @@ test:arm64:
     DOCKER_HOST: tcp://docker:2375
     DOCKER_TLS_CERTDIR: ""
   script:
+    # Registers QEMU's binfmt_misc handlers inside *this* nested DinD
+    # daemon specifically -- a host-level `qemu-user-static` registration
+    # (already done on the runner host) isn't guaranteed visible to a
+    # daemon running inside a Docker-in-Docker service container.
+    # Confirmed necessary, not just theoretical: the very first working
+    # DinD service still failed the actual arm64 run with
+    # `exec /usr/bin/sh: exec format error` -- the image pulled fine
+    # (proving --platform itself works), but nothing could execute the
+    # arm64 binaries inside it until this ran.
+    - docker run --rm --privileged multiarch/qemu-user-static --reset -p yes
     - >
       docker run --rm --platform linux/arm64
       -e CI_REPOSITORY_URL="$CI_REPOSITORY_URL"
