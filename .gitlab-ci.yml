@@ -217,7 +217,12 @@ package:rpm:fedora:arm64:
 # `variables:` above) so rustup-init installs straight into the cached
 # .cargo/ directory rather than the default ~/.cargo.
 .rockylinux9_rust: &rockylinux9_rust
-  - dnf -y install gcc pkgconf-pkg-config systemd-rpm-macros rpm-build rpmdevtools git curl
+  # --allowerasing: rockylinux:9's base image ships curl-minimal, which
+  # conflicts with the full curl package (both provide /usr/bin/curl) --
+  # confirmed via a real failed run ("package curl-minimal ... conflicts
+  # with curl"). --allowerasing lets dnf swap it for the full curl
+  # rather than erroring out.
+  - dnf -y install --allowerasing gcc pkgconf-pkg-config systemd-rpm-macros rpm-build rpmdevtools git curl
   - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
   - export PATH="${CARGO_HOME}/bin:${PATH}"
 
