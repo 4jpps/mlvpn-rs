@@ -44,7 +44,15 @@ variables:
 
 .cargo_cache:
   cache:
-    key: cargo-${CI_JOB_NAME}
+    # Branch-scoped *and* per-job: target/ holds architecture-specific
+    # compiled artifacts, so test:amd64 and test:arm64 must never share
+    # a cache entry -- they'd stomp on each other's build output every
+    # run (wrong-arch binaries reused, wasted rebuilds, possibly subtle
+    # incremental-compile corruption). CI_JOB_NAME alone (the previous
+    # key) already gave that separation; adding CI_COMMIT_REF_SLUG on
+    # top means different branches stop sharing/evicting each other's
+    # cache too.
+    key: rust-cache-${CI_COMMIT_REF_SLUG}-${CI_JOB_NAME}
     paths:
       - .cargo/registry/cache
       - .cargo/registry/index
