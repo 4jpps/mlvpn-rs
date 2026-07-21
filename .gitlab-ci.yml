@@ -32,6 +32,39 @@ stages:
   - package
   - release
 
+# Throwaway: confirms what's really on jpps-linux-builder now that it's
+# been switched to the shell executor, before the rest of this file gets
+# rewritten around it. Delete once that rewrite lands.
+diagnose:runner:
+  stage: test
+  tags: [linux]
+  rules:
+    - when: manual
+      allow_failure: true
+  script:
+    - echo "--- whoami/pwd/uname ---"
+    - whoami
+    - pwd
+    - uname -a
+    - echo "--- rustc/cargo ---"
+    - rustc --version
+    - cargo --version
+    - rustup target list --installed
+    - echo "--- cross toolchain ---"
+    - which aarch64-linux-gnu-gcc gcc g++ || true
+    - echo "--- linker/cache ---"
+    - which mold sccache || true
+    - sccache --version || true
+    - ls -la /var/cache/sccache 2>&1 || true
+    - echo "--- cargo plugins ---"
+    - cargo deb --version || true
+    - cargo generate-rpm --version || true
+    - cargo nextest --version || true
+    - cargo binstall --version || true
+    - echo "--- docker (should still be present, just not primary) ---"
+    - which docker || true
+    - docker --version || true
+
 variables:
   CARGO_HOME: ${CI_PROJECT_DIR}/.cargo
   # Latest stable, not the literal `rust-version = "1.86"` pinned in
