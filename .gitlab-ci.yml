@@ -164,6 +164,14 @@ package:rpm:amd64:
   script:
     - !reference [.testing_build_suffix, script]
     - cargo build --release --locked
+    # Unlike cargo-deb, cargo-generate-rpm doesn't clean its own output
+    # dir -- a stale .rpm from an earlier cached run on this same ref
+    # (e.g. an un-suffixed one from before this version-suffix feature
+    # existed, or from a previous testing build) would otherwise sit
+    # alongside the new one and both get copied to dist/ below.
+    # Confirmed via a real run: rpm:amd64 shipped two files until this
+    # rm was added.
+    - rm -f target/generate-rpm/*.rpm
     - |
       if [ -n "${RPM_RELEASE_OVERRIDE}" ]; then
         cargo generate-rpm -s "release = \"${RPM_RELEASE_OVERRIDE}\""
@@ -187,6 +195,9 @@ package:rpm:arm64:
   script:
     - !reference [.testing_build_suffix, script]
     - cargo build --release --locked --target aarch64-unknown-linux-gnu
+    # See package:rpm:amd64's own comment on this same line -- same
+    # stale-output reasoning, cross-compiled output directory.
+    - rm -f target/aarch64-unknown-linux-gnu/generate-rpm/*.rpm
     - |
       if [ -n "${RPM_RELEASE_OVERRIDE}" ]; then
         cargo generate-rpm --target aarch64-unknown-linux-gnu -s "release = \"${RPM_RELEASE_OVERRIDE}\""
