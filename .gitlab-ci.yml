@@ -5,29 +5,27 @@
 #
 # Runners (see `jpps-linux-builder`, instance-wide, Docker executor,
 # tags: linux/deb/rpm): amd64-native. arm64 has no native runner, so
-# arm64 jobs run via Docker-in-Docker (services: [docker:*-dind]) with
-# an explicit `docker run --platform linux/arm64 ...` inside the job --
-# this GitLab Runner version's own image: has no platform: selection
-# for the Docker executor (confirmed via a real failed pull: "no
-# matching manifest for linux/amd64/v2", the same error regardless of
-# which image was named -- the Docker daemon requests a pull matching
-# the *runner host's* own platform no matter what, so even a
-# single-arch arm64v8/... image was rejected before a container ever
-# started). QEMU emulation (multiarch/qemu-user-static, registered on
-# the runner host) makes the *explicit* --platform request work once
-# it's actually made via `docker run` instead. Needs the runner's own
-# config.toml to have `privileged = true` under [runners.docker] for
-# the nested daemon to work at all -- confirmed set on
-# jpps-linux-builder before this was written.
+# arm64 jobs pin `image: docker: platform: linux/arm64` -- the Docker
+# executor's own native per-job platform selection, requesting that
+# exact platform from the registry and letting the runner host's own
+# Docker daemon run it directly via QEMU emulation
+# (multiarch/qemu-user-static, already registered there). No nested
+# Docker-in-Docker needed: that was this file's first working
+# approach, but doubles the virtualization overhead (a nested daemon,
+# itself needing its own QEMU registration -- confirmed a real
+# `exec format error` the host-level registration didn't clear on its
+# own) for no benefit once the correct native syntax was found. Get
+# the nesting exactly right: `platform` sits under a `docker:` sub-key
+# *inside* `image:`, not as a sibling of `name:` -- the latter is
+# rejected outright by this GitLab version's CI lint as an unknown
+# key (confirmed), which is what led to the DinD detour in the first
+# place.
 #
-# The nested arm64 container clones the repo fresh via git rather than
-# trying to bind-mount the outer job's checkout -- Docker-in-Docker's
-# nested daemon doesn't share the outer filesystem, so a bind mount
-# would need extra volume-sharing setup for no real benefit here.
-# Expect this to be meaningfully slower than the native amd64 job:
-# QEMU user-mode emulation of a full `cargo build` is commonly an
+# Expect this to still be meaningfully slower than the native amd64
+# job: QEMU user-mode emulation of a full `cargo build` is commonly an
 # order of magnitude slower than native, which is the real cost of not
-# having an actual arm64 runner.
+# having an actual arm64 runner -- just without DinD's extra layer on
+# top of that cost.
 
 stages:
   - test
@@ -71,39 +69,8 @@ test:amd64:
   image: ${RUST_IMAGE}
 
 test:arm64:
-  stage: test
-  tags: [linux]
-  image: docker:27-cli
-  services:
-    - docker:27-dind
-  variables:
-    DOCKER_HOST: tcp://docker:2375
-    DOCKER_TLS_CERTDIR: ""
-  script:
-    # Registers QEMU's binfmt_misc handlers inside *this* nested DinD
-    # daemon specifically -- a host-level `qemu-user-static` registration
-    # (already done on the runner host) isn't guaranteed visible to a
-    # daemon running inside a Docker-in-Docker service container.
-    # Confirmed necessary, not just theoretical: the very first working
-    # DinD service still failed the actual arm64 run with
-    # `exec /usr/bin/sh: exec format error` -- the image pulled fine
-    # (proving --platform itself works), but nothing could execute the
-    # arm64 binaries inside it until this ran.
-    - docker run --rm --privileged multiarch/qemu-user-static --reset -p yes
-    - >
-      docker run --rm --platform linux/arm64
-      -e CI_REPOSITORY_URL="$CI_REPOSITORY_URL"
-      -e CI_COMMIT_SHA="$CI_COMMIT_SHA"
-      ${RUST_IMAGE}
-      sh -c "
-        set -e &&
-        apt-get update -qq &&
-        apt-get install -y -qq build-essential pkg-config libc6-dev git &&
-        git clone --quiet \"\$CI_REPOSITORY_URL\" /src &&
-        cd /src && git checkout --quiet \"\$CI_COMMIT_SHA\" &&
-        rustup component add rustfmt clippy &&
-        cargo build --release --locked &&
-        cargo test --release --locked --lib &&
-        cargo clippy --release --locked --all-targets -- -D warnings &&
-        cargo fmt --check
-      "
+  extends: .build_and_test
+  image:
+    name: ${RUST_IMAGE}
+    docker:
+      platform: linux/arm64
