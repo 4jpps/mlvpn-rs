@@ -1,0 +1,82 @@
+#!/bin/sh
+set -e
+
+# cargo-deb's twin of debian/mlvpn.postinst -- see that file for the
+# full history of why this logic looks the way it does (the
+# MLVPN_WAS_ACTIVE capture-before-unpack fix, and the 0.3.6 bug where
+# debhelper's #DEBHELPER# token substitution matched this file's own
+# prose, not just the intended marker). Kept as a separate file, not a
+# symlink, for the same plain-vs-prefixed-filename reason described in
+# this directory's preinst. If you change one, change both.
+#
+# Two real differences from debian/mlvpn.postinst, both because
+# cargo-deb copies maintainer scripts byte-for-byte with no debhelper
+# post-processing at all:
+#   1. No #DEBHELPER# marker -- there is nothing here to substitute it,
+#      so it would just ship as dead text. The daemon-reload it would
+#      otherwise have injected is done explicitly below instead.
+#   2. mkdir -p /etc/mlvpn -- debian/rules' dpkg-buildpackage path ships
+#      that directory as an empty asset in the .deb itself
+#      (`install -d -m0750 debian/mlvpn/etc/mlvpn`); cargo-deb's
+#      file-based assets list has no equivalent for an empty directory,
+#      so this script creates it itself instead. Harmless no-op on the
+#      dpkg-buildpackage path too, if this same logic is ever reused
+#      there.
+PREINST_STATE_FILE=/run/mlvpn/.preinst-was-active
+if [ -f "$PREINST_STATE_FILE" ]; then
+  MLVPN_WAS_ACTIVE=$(cat "$PREINST_STATE_FILE")
+  rm -f "$PREINST_STATE_FILE"
+else
+  MLVPN_WAS_ACTIVE=no
+  if systemctl is-active --quiet mlvpn.service 2>/dev/null; then
+    MLVPN_WAS_ACTIVE=yes
+  fi
+fi
+
+case "$1" in
+  configure)
+    if ! getent group mlvpn >/dev/null; then
+      addgroup --system mlvpn
+    fi
+    if ! getent passwd mlvpn >/dev/null; then
+      adduser --system --ingroup mlvpn --no-create-home \
+        --home /nonexistent --shell /usr/sbin/nologin \
+        --gecos "mlvpn daemon" mlvpn
+    fi
+    # Enforce the primary group even when the mlvpn user already existed,
+    # same reasoning as debian/mlvpn.postinst. No-op, and silent, if
+    # it's already mlvpn.
+    usermod -g mlvpn mlvpn
+    mkdir -p /etc/mlvpn
+    chown root:mlvpn /etc/mlvpn
+    chmod 0750 /etc/mlvpn
+    if [ -f /etc/mlvpn/mlvpn.toml ]; then
+      chown mlvpn:mlvpn /etc/mlvpn/mlvpn.toml
+      chmod 0600 /etc/mlvpn/mlvpn.toml
+    fi
+    if [ -f /etc/mlvpn/private.key ]; then
+      chown mlvpn:mlvpn /etc/mlvpn/private.key
+      chmod 0600 /etc/mlvpn/private.key
+    fi
+    ;;
+esac
+
+if [ "$1" = "configure" ]; then
+  # Picks up a changed unit file before the restart below applies it --
+  # debhelper's own dh_installsystemd-generated code would normally do
+  # this as part of its #DEBHELPER# splice; there is no such splice
+  # here, so it's explicit.
+  systemctl daemon-reload || true
+
+  echo "mlvpn.postinst: was mlvpn.service active before this upgrade? $MLVPN_WAS_ACTIVE"
+  if [ "$MLVPN_WAS_ACTIVE" = "yes" ]; then
+    if ! systemctl restart mlvpn.service; then
+      echo "mlvpn.postinst: WARNING: mlvpn.service was active before this upgrade but" \
+           "failed to restart automatically -- run 'systemctl status mlvpn.service' and" \
+           "'journalctl -u mlvpn.service' to diagnose, then 'systemctl start mlvpn.service'" \
+           "once fixed" >&2
+    fi
+  fi
+fi
+
+exit 0

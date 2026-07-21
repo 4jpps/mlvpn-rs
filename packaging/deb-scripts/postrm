@@ -1,0 +1,20 @@
+#!/bin/sh
+set -e
+
+# cargo-deb's twin of debian/mlvpn.postrm -- same plain-vs-prefixed-
+# filename reason as this directory's preinst/postinst. If you change
+# one, change both. No #DEBHELPER# marker here either, same reasoning
+# as postinst -- nothing substitutes it under cargo-deb, so it's
+# omitted rather than shipped as dead text.
+case "$1" in
+  purge)
+    if getent passwd mlvpn >/dev/null; then
+      deluser mlvpn >/dev/null || true
+    fi
+    if getent group mlvpn >/dev/null; then
+      delgroup mlvpn >/dev/null || true
+    fi
+    ;;
+esac
+
+exit 0

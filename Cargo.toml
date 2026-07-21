@@ -81,3 +81,72 @@ crossterm = "0.28"
 
 [dev-dependencies]
 proptest = "1"
+
+# cargo-deb metadata -- built by the GitLab CI `package:deb:*` jobs
+# (.gitlab-ci.yml). Maintainer scripts live in packaging/deb-scripts/
+# rather than debian/, which stays as-is for the dpkg-buildpackage path
+# .github/workflows/release.yml still uses -- see packaging/deb-scripts/
+# postinst's own comment for why these can't just be the same files
+# (cargo-deb needs plain "postinst", debhelper needs "mlvpn.postinst").
+# If you change one script, change its twin too.
+[package.metadata.deb]
+maintainer = "Jeff Parrish PC Services <www.jpps.us>"
+copyright = "2026, Jeff Parrish PC Services <www.jpps.us>"
+license-file = ["LICENSE", "0"]
+section = "net"
+priority = "optional"
+# $auto: shlibs-style auto-detected shared library deps (ldd against
+# the built binaries), same as debian/control's ${shlibs:Depends}.
+# adduser: same as debian/control's explicit Depends -- postinst calls
+# addgroup/adduser directly, matching debian/mlvpn.postinst.
+depends = "$auto, adduser"
+extended-description = """\
+mlvpn bonds several physical network uplinks (e.g. fiber + LTE) into a \
+single encrypted tunnel, load-balancing and failing over between them \
+based on continuously measured latency, jitter, loss and throughput.
+.
+This is a Rust rewrite built on the Noise Protocol Framework \
+(Noise_IK, the same family WireGuard uses) for a single-round-trip, \
+mutually authenticated, forward-secret handshake.
+.
+Includes mlvpn-tui, a terminal monitoring view that shows every bonded \
+link's state, peer address, and both sides' measured RTT/jitter/loss/ \
+throughput side by side, without needing to compare logs on both ends \
+by hand.\
+"""
+maintainer-scripts = "packaging/deb-scripts"
+# Always target/release/... even when cross-compiling -- cargo-deb
+# substitutes the real target/<triple>/release/ path itself based on
+# whether --target was passed to `cargo deb`.
+assets = [
+    ["target/release/mlvpnd", "usr/bin/mlvpnd", "755"],
+    ["target/release/mlvpn-tui", "usr/bin/mlvpn-tui", "755"],
+    ["systemd/mlvpn.service", "lib/systemd/system/mlvpn.service", "644"],
+    ["config/mlvpn.toml.example", "usr/share/doc/mlvpn/mlvpn.toml.example", "644"],
+    ["config/mlvpn-server.toml.example", "usr/share/doc/mlvpn/mlvpn-server.toml.example", "644"],
+]
+
+# cargo-generate-rpm metadata -- built by the GitLab CI
+# `package:rpm:*` jobs. Replaces packaging/rpm/mlvpn.spec's own
+# rpmbuild-based build for the GitLab pipeline; that spec file stays
+# as-is for the .github/workflows/release.yml path. Produces one
+# generic .rpm per architecture (no %{?dist} fedora/rhel split -- there
+# is no rpmbuild spec-file processing in this path to generate that
+# from), unlike the two dist-tagged variants release.yml's build-rpm
+# matrix produces.
+[package.metadata.generate-rpm]
+license = "AGPL-3.0-only"
+assets = [
+    { source = "target/release/mlvpnd", dest = "/usr/bin/mlvpnd", mode = "755" },
+    { source = "target/release/mlvpn-tui", dest = "/usr/bin/mlvpn-tui", mode = "755" },
+    { source = "systemd/mlvpn.service", dest = "/usr/lib/systemd/system/mlvpn.service", mode = "644" },
+    { source = "config/mlvpn.toml.example", dest = "/usr/share/doc/mlvpn/mlvpn.toml.example", mode = "644", doc = true },
+    { source = "config/mlvpn-server.toml.example", dest = "/usr/share/doc/mlvpn/mlvpn-server.toml.example", mode = "644", doc = true },
+    { source = "LICENSE", dest = "/usr/share/licenses/mlvpn/LICENSE", mode = "644", doc = true },
+]
+pre_install_script = "packaging/rpm-scripts/pre_install.sh"
+post_install_script = "packaging/rpm-scripts/post_install.sh"
+pre_uninstall_script = "packaging/rpm-scripts/pre_uninstall.sh"
+
+[package.metadata.generate-rpm.requires]
+shadow-utils = "*"

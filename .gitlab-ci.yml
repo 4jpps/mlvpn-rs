@@ -1,147 +1,80 @@
-# GitLab CI/CD pipeline, mirroring .github/workflows/ci.yml and
-# release.yml -- this repo's primary CI now lives here (self-hosted
-# gitlab.tech.lan); GitHub Actions stays in place for now as the
-# secondary/confirmed-working sync target's own CI, unmodified.
+# GitLab CI/CD pipeline for mlvpn-rs, running on jpps-linux-builder's
+# shell executor.
 #
-# Runners (see `jpps-linux-builder`, instance-wide, Docker executor,
-# tags: linux/deb/rpm): amd64-native. arm64 has no native runner, so
-# arm64 jobs pin `image: docker: platform: linux/arm64` -- the Docker
-# executor's own native per-job platform selection, requesting that
-# exact platform from the registry and letting the runner host's own
-# Docker daemon run it directly via QEMU emulation
-# (multiarch/qemu-user-static, already registered there). No nested
-# Docker-in-Docker needed: that was this file's first working
-# approach, but doubles the virtualization overhead (a nested daemon,
-# itself needing its own QEMU registration -- confirmed a real
-# `exec format error` the host-level registration didn't clear on its
-# own) for no benefit once the correct native syntax was found. Get
-# the nesting exactly right: `platform` sits under a `docker:` sub-key
-# *inside* `image:`, not as a sibling of `name:` -- the latter is
-# rejected outright by this GitLab version's CI lint as an unknown
-# key (confirmed), which is what led to the DinD detour in the first
-# place.
+# History: earlier revisions of this file used the Docker executor,
+# QEMU-emulating an entire arm64 container per job (image.docker.platform)
+# since there was no native arm64 runner. That worked (confirmed via
+# real pipeline runs) but was slow -- QEMU was emulating the compiler
+# itself, not just the final binary, so an arm64 leg routinely took
+# 40-50 minutes. jpps-linux-builder was then given a real cross-compiler
+# toolchain (gcc-aarch64-linux-gnu/libc6-dev-arm64-cross), mold, and
+# sccache, and switched to the shell executor as its primary mode
+# (Docker is still installed on the host but is no longer primary).
+# arm64 coverage is now genuine cross-compilation: only the linker
+# frontend runs cross, rustc itself always runs natively as amd64,
+# which is why this is dramatically faster than emulating a whole
+# container.
 #
-# Expect this to still be meaningfully slower than the native amd64
-# job: QEMU user-mode emulation of a full `cargo build` is commonly an
-# order of magnitude slower than native, which is the real cost of not
-# having an actual arm64 runner -- just without DinD's extra layer on
-# top of that cost.
+# Packaging also switched tools: cargo-deb/cargo-generate-rpm instead
+# of dpkg-buildpackage/rpmbuild, metadata in Cargo.toml's
+# [package.metadata.deb]/[package.metadata.generate-rpm]. This produces
+# one generic .rpm per arch (no fedora/rhel %{?dist} split -- there's no
+# rpmbuild spec-file processing in this path to generate that from).
+#
+# .github/workflows/{ci,release}.yml are UNCHANGED: they still use the
+# original debian/rules + packaging/rpm/mlvpn.spec + Docker-based
+# per-distro containers on GitHub-hosted runners. The two pipelines are
+# now genuinely different packaging implementations of the same
+# maintainer-script logic -- see packaging/deb-scripts/ and
+# packaging/rpm-scripts/'s own comments for why those scripts are
+# separate files from debian/ and packaging/rpm/mlvpn.spec, not shared.
 
 stages:
   - test
   - package
   - release
 
-# Throwaway: confirms what's really on jpps-linux-builder now that it's
-# been switched to the shell executor, before the rest of this file gets
-# rewritten around it. Delete once that rewrite lands.
-diagnose:runner:
-  stage: test
-  tags: [linux]
-  rules:
-    - when: manual
-      allow_failure: true
-  script:
-    - echo "--- whoami/pwd/uname ---"
-    - whoami
-    - pwd
-    - uname -a
-    - echo "--- rustc/cargo ---"
-    - rustc --version
-    - cargo --version
-    - rustup target list --installed
-    - echo "--- cross toolchain ---"
-    - which aarch64-linux-gnu-gcc gcc g++ || true
-    - echo "--- linker/cache ---"
-    - which mold sccache || true
-    - sccache --version || true
-    - ls -la /var/cache/sccache 2>&1 || true
-    - echo "--- cargo plugins ---"
-    - cargo deb --version || true
-    - cargo generate-rpm --version || true
-    - cargo nextest --version || true
-    - cargo binstall --version || true
-    - echo "--- docker (should still be present, just not primary) ---"
-    - which docker || true
-    - docker --version || true
-
 variables:
   CARGO_HOME: ${CI_PROJECT_DIR}/.cargo
-  # Latest stable, not the literal `rust-version = "1.86"` pinned in
-  # Cargo.toml -- matches what .github/workflows/ci.yml's
-  # dtolnay/rust-toolchain@stable actually resolves to (always current
-  # stable, not literally 1.86). Confirmed 1.86 itself is now too old
-  # for this project's current Cargo.lock: darling 0.23.0, ratatui
-  # 0.30.2, and instability 0.3.12 all require rustc 1.88+. GitHub
-  # Actions never caught this drift because it never tests the
-  # literally-declared MSRV either.
-  RUST_IMAGE: rust:bookworm
+  RUSTC_WRAPPER: sccache
+  SCCACHE_DIR: /var/cache/sccache
+  # Scoped per-target rather than a global RUSTFLAGS, so this only ever
+  # touches the actual build target -- not host-side build-script/
+  # proc-macro compilation, which cargo always does for the host
+  # architecture regardless of --target.
+  CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+  CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+  CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
 
 .cargo_cache:
   cache:
-    # Branch-scoped *and* per-job: target/ holds architecture-specific
-    # compiled artifacts, so test:amd64 and test:arm64 must never share
-    # a cache entry -- they'd stomp on each other's build output every
-    # run (wrong-arch binaries reused, wasted rebuilds, possibly subtle
-    # incremental-compile corruption). CI_JOB_NAME alone (the previous
-    # key) already gave that separation; adding CI_COMMIT_REF_SLUG on
-    # top means different branches stop sharing/evicting each other's
-    # cache too.
     key: rust-cache-${CI_COMMIT_REF_SLUG}-${CI_JOB_NAME}
     paths:
       - .cargo/registry/cache
       - .cargo/registry/index
       - target/
 
-.build_and_test:
+test:
   stage: test
   tags: [linux]
   extends: .cargo_cache
-  before_script:
-    - apt-get update -qq
-    - apt-get install -y -qq build-essential pkg-config libc6-dev
-    - rustup component add rustfmt clippy
   script:
     - cargo build --release --locked
-    - cargo test --release --locked --lib
+    - cargo nextest run --release --locked --lib
     - cargo clippy --release --locked --all-targets -- -D warnings
     - cargo fmt --check
 
-test:amd64:
-  extends: .build_and_test
-  image: ${RUST_IMAGE}
-
-test:arm64:
-  extends: .build_and_test
-  image:
-    name: ${RUST_IMAGE}
-    docker:
-      platform: linux/arm64
-
-# --- Packaging + release, mirroring release.yml -------------------------
+# --- Packaging + release --------------------------------------------
 #
-# Runs automatically on a version tag push (v1.0.0, v0.2.1, ...); also
-# exposed as a manual job on every other pipeline (GitLab's equivalent
-# of workflow_dispatch) so packaging changes can be test-built on a
+# Runs automatically on a version tag push; also exposed as a manual
+# job on other pipelines (packaging changes can be test-built on a
 # branch, downloaded from the job's own artifacts, without cutting a
-# release. `allow_failure: true` on the manual rule so an un-clicked
+# release). allow_failure: true on the manual rule so an un-clicked
 # manual job never shows as blocking/red on branch pipelines.
 #
-# arm64 legs reuse the same native `image.docker.platform` QEMU
-# emulation as test:arm64 above -- expect each one to take a similar
-# order of magnitude longer than its amd64 sibling. This only runs at
-# tag-push (i.e. actual release-cut) time, not on every push, so the
-# cost is paid rarely rather than on every commit.
-#
 # Packages are uploaded to this project's own Generic Package Registry
-# (only when $CI_COMMIT_TAG is set -- the manual/branch-testing path
-# skips this and relies on the job's own pipeline artifacts instead),
-# then the `release` job below attaches those uploaded files as asset
-# links on a real GitLab Release. This is the GitLab-native equivalent
-# of release.yml's upload-artifact + softprops/action-gh-release pair --
-# there's no direct GitLab analogue of "upload to a GitHub Release",
-# so a Generic Package Registry entry + Release asset link stands in
-# for it.
+# (only when $CI_COMMIT_TAG is set), then the `release` job attaches
+# those uploads as asset links on a real GitLab Release.
 
 .package_rules: &package_rules
   rules:
@@ -162,25 +95,16 @@ test:arm64:
         done
       fi
 
-.deb_build:
+package:deb:amd64:
   stage: package
   tags: [linux]
   extends: .cargo_cache
   <<: *package_rules
-  before_script:
-    - apt-get update -qq
-    - apt-get install -y -qq debhelper dpkg-dev build-essential pkg-config libc6-dev
   script:
-    # -d: skip dpkg-buildpackage's own dpkg-checkbuilddeps step, same
-    # reasoning as release.yml's build-deb job -- it only knows about
-    # apt-installed packages, so it can't see the rust:bookworm image's
-    # own cargo/rustc and would otherwise fail on an "Unmet build
-    # dependencies" false positive.
-    - dpkg-buildpackage -us -uc -b -d
+    - cargo build --release --locked
+    - cargo deb --no-build
     - mkdir -p dist
-    - mv ../*.deb dist/
-    - mv ../*.changes dist/ || true
-    - mv ../*.buildinfo dist/ || true
+    - cp target/debian/*.deb dist/
     - ls -la dist/
     - !reference [.upload_generic_package, script]
   artifacts:
@@ -188,40 +112,33 @@ test:arm64:
       - dist/*.deb
     expire_in: 30 days
 
-package:deb:amd64:
-  extends: .deb_build
-  image: ${RUST_IMAGE}
-
 package:deb:arm64:
-  extends: .deb_build
-  image:
-    name: ${RUST_IMAGE}
-    docker:
-      platform: linux/arm64
-
-.rpm_build:
   stage: package
   tags: [linux]
   extends: .cargo_cache
   <<: *package_rules
   script:
-    - mkdir -p ~/rpmbuild/SOURCES
-    - git config --global --add safe.directory "$CI_PROJECT_DIR"
-    # Derived from Cargo.toml rather than hardcoded (release.yml's own
-    # build-rpm job hardcodes this per-release, one of the ~7 files
-    # docs/development.md's release checklist has to bump by hand) --
-    # this file is new, so there's no established hardcoding precedent
-    # to mirror, and deriving it removes one gotcha for future releases.
-    - PKG_VERSION=$(grep -m1 '^version' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
-    - git archive --prefix=mlvpn-${PKG_VERSION}/ -o ~/rpmbuild/SOURCES/mlvpn-${PKG_VERSION}.tar.gz HEAD
-    - rpmdev-setuptree
-    - cp packaging/rpm/mlvpn.spec ~/rpmbuild/SPECS/
-    # --nodeps: same reasoning as -d above, for rpmbuild's own
-    # BuildRequires check -- it can't see a rustup-installed toolchain
-    # either (rockylinux9 legs, below).
-    - rpmbuild -ba --nodeps ~/rpmbuild/SPECS/mlvpn.spec
+    - cargo build --release --locked --target aarch64-unknown-linux-gnu
+    - cargo deb --target aarch64-unknown-linux-gnu --no-build
     - mkdir -p dist
-    - find ~/rpmbuild/RPMS -name '*.rpm' -exec cp {} dist/ \;
+    - cp target/aarch64-unknown-linux-gnu/debian/*.deb dist/
+    - ls -la dist/
+    - !reference [.upload_generic_package, script]
+  artifacts:
+    paths:
+      - dist/*.deb
+    expire_in: 30 days
+
+package:rpm:amd64:
+  stage: package
+  tags: [linux]
+  extends: .cargo_cache
+  <<: *package_rules
+  script:
+    - cargo build --release --locked
+    - cargo generate-rpm
+    - mkdir -p dist
+    - cp target/generate-rpm/*.rpm dist/
     - ls -la dist/
     - !reference [.upload_generic_package, script]
   artifacts:
@@ -229,65 +146,32 @@ package:deb:arm64:
       - dist/*.rpm
     expire_in: 30 days
 
-package:rpm:fedora:amd64:
-  extends: .rpm_build
-  image: fedora:latest
-  before_script:
-    - dnf -y install rust cargo gcc pkgconf-pkg-config systemd-rpm-macros rpm-build rpmdevtools git
-
-package:rpm:fedora:arm64:
-  extends: .rpm_build
-  image:
-    name: fedora:latest
-    docker:
-      platform: linux/arm64
-  before_script:
-    - dnf -y install rust cargo gcc pkgconf-pkg-config systemd-rpm-macros rpm-build rpmdevtools git
-
-# RHEL-family base repos lag this project's MSRV, same as release.yml's
-# build-rpm reasoning -- no dnf-packaged rust new enough, so install a
-# real toolchain via rustup instead. $CARGO_HOME is already set (see
-# `variables:` above) so rustup-init installs straight into the cached
-# .cargo/ directory rather than the default ~/.cargo.
-.rockylinux9_rust: &rockylinux9_rust
-  # --allowerasing: rockylinux:9's base image ships curl-minimal, which
-  # conflicts with the full curl package (both provide /usr/bin/curl) --
-  # confirmed via a real failed run ("package curl-minimal ... conflicts
-  # with curl"). --allowerasing lets dnf swap it for the full curl
-  # rather than erroring out.
-  - dnf -y install --allowerasing gcc pkgconf-pkg-config systemd-rpm-macros rpm-build rpmdevtools git curl
-  - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
-  - export PATH="${CARGO_HOME}/bin:${PATH}"
-
-package:rpm:rockylinux9:amd64:
-  extends: .rpm_build
-  image: rockylinux:9
-  before_script: *rockylinux9_rust
-
-package:rpm:rockylinux9:arm64:
-  extends: .rpm_build
-  image:
-    name: rockylinux:9
-    docker:
-      platform: linux/arm64
-  before_script: *rockylinux9_rust
+package:rpm:arm64:
+  stage: package
+  tags: [linux]
+  extends: .cargo_cache
+  <<: *package_rules
+  script:
+    - cargo build --release --locked --target aarch64-unknown-linux-gnu
+    - cargo generate-rpm --target aarch64-unknown-linux-gnu
+    - mkdir -p dist
+    - cp target/aarch64-unknown-linux-gnu/generate-rpm/*.rpm dist/
+    - ls -la dist/
+    - !reference [.upload_generic_package, script]
+  artifacts:
+    paths:
+      - dist/*.rpm
+    expire_in: 30 days
 
 release:
   stage: release
   tags: [linux]
-  image:
-    name: registry.gitlab.com/gitlab-org/release-cli:latest
-    entrypoint: [""]
   rules:
     - if: '$CI_COMMIT_TAG'
   needs:
     - package:deb:amd64
     - package:deb:arm64
-    - package:rpm:fedora:amd64
-    - package:rpm:fedora:arm64
-    - package:rpm:rockylinux9:amd64
-    - package:rpm:rockylinux9:arm64
-  before_script:
-    - apk add --no-cache bash
+    - package:rpm:amd64
+    - package:rpm:arm64
   script:
     - bash scripts/gitlab-release.sh

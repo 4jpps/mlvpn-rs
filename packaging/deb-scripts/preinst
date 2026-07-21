@@ -1,0 +1,28 @@
+#!/bin/sh
+set -e
+
+# cargo-deb's twin of debian/mlvpn.preinst -- same logic, kept as a
+# separate file (not a symlink) because cargo-deb's maintainer-scripts
+# convention needs the plain "preinst" filename, while debhelper's
+# convention (used by the dpkg-buildpackage/debian/rules path, still
+# what .github/workflows/release.yml builds) needs the package-prefixed
+# "mlvpn.preinst" filename. If you change one, change both -- see
+# debian/mlvpn.preinst for the full rationale (a real field bug: a
+# genuine mlvpnd crash during dpkg's own unpacking step landed in the
+# window before a live is-active check could see it, reading "not
+# active" even though the service was up until dpkg started touching
+# this package's files).
+STATE_FILE=/run/mlvpn/.preinst-was-active
+
+case "$1" in
+  upgrade)
+    mkdir -p /run/mlvpn
+    if systemctl is-active --quiet mlvpn.service 2>/dev/null; then
+      echo yes > "$STATE_FILE"
+    else
+      echo no > "$STATE_FILE"
+    fi
+    ;;
+esac
+
+exit 0

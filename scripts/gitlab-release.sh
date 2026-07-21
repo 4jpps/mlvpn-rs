@@ -1,16 +1,22 @@
 #!/usr/bin/env bash
 # Creates the GitLab Release for a tag pipeline, run by the `release`
 # job in .gitlab-ci.yml. Pulled out of the YAML (rather than an inline
-# script: block) because building the dynamic --assets-link list needs
-# a real bash array -- awkward to express safely as an inline one-liner
-# without risking word-splitting/quoting bugs on filenames that vary
-# per rpmbuild %{?dist} tag (fc41 today, fc42 next Fedora bump, etc.).
+# script: block) for the same reason as before -- readable JSON
+# construction, not a giant one-liner.
 #
-# Expects: CHANGELOG.md and dist/*.deb, dist/*.rpm (from the six
-# package:* jobs' artifacts, pulled in via `needs:`) present in the
-# working directory; release-cli on PATH (the release-cli image this
-# job runs in); CI_COMMIT_TAG/CI_API_V4_URL/CI_PROJECT_ID/CI_JOB_TOKEN
-# set (standard GitLab CI predefined variables).
+# Posts directly to the GitLab Releases API (POST /projects/:id/releases)
+# instead of shelling out to the release-cli tool. release-cli only
+# ships as a Docker image, and jpps-linux-builder's primary executor is
+# now shell, not Docker -- there's no other Docker-image-dependent step
+# left in this pipeline, so it wasn't worth keeping just for this one
+# job when the same result is a single curl POST.
+#
+# Expects: CHANGELOG.md and dist/*.deb, dist/*.rpm (from the package:*
+# jobs' artifacts, pulled in via `needs:`) present in the working
+# directory; python3 on PATH (for JSON construction -- safer than
+# hand-escaping the changelog body into a shell string);
+# CI_COMMIT_TAG/CI_API_V4_URL/CI_PROJECT_ID/CI_JOB_TOKEN set (standard
+# GitLab CI predefined variables).
 
 set -euo pipefail
 
@@ -37,21 +43,44 @@ fi
 echo "--- release-notes.md ---"
 cat release-notes.md
 
-assets_link_args=()
-for f in dist/*.deb dist/*.rpm; do
-    [ -e "$f" ] || continue
-    name="$(basename "$f")"
-    url="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/mlvpn/${CI_COMMIT_TAG}/${name}"
-    assets_link_args+=(--assets-link "{\"name\":\"${name}\",\"url\":\"${url}\"}")
-done
+shopt -s nullglob
+assets=(dist/*.deb dist/*.rpm)
+shopt -u nullglob
 
-if [ "${#assets_link_args[@]}" -eq 0 ]; then
+if [ "${#assets[@]}" -eq 0 ]; then
     echo "error: no dist/*.deb or dist/*.rpm files found -- package jobs may have failed to produce artifacts" >&2
     exit 1
 fi
 
-release-cli create \
-    --name "mlvpn ${CI_COMMIT_TAG}" \
-    --tag-name "${CI_COMMIT_TAG}" \
-    --description "$(cat release-notes.md)" \
-    "${assets_link_args[@]}"
+echo "--- assets ---"
+printf '%s\n' "${assets[@]}"
+
+python3 - "${CI_COMMIT_TAG}" "${CI_API_V4_URL}" "${CI_PROJECT_ID}" "${assets[@]}" <<'PYEOF' > release-payload.json
+import json
+import sys
+
+tag, api_url, project_id, *asset_paths = sys.argv[1:]
+description = open("release-notes.md", encoding="utf-8").read()
+
+payload = {
+    "name": f"mlvpn {tag}",
+    "tag_name": tag,
+    "description": description,
+    "assets": {
+        "links": [
+            {
+                "name": path.split("/")[-1],
+                "url": f"{api_url}/projects/{project_id}/packages/generic/mlvpn/{tag}/{path.split('/')[-1]}",
+            }
+            for path in asset_paths
+        ]
+    },
+}
+print(json.dumps(payload))
+PYEOF
+
+curl --fail --request POST \
+    --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
+    --header "Content-Type: application/json" \
+    --data @release-payload.json \
+    "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/releases"
