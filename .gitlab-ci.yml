@@ -82,6 +82,31 @@ test:
     - when: manual
       allow_failure: true
 
+# Only a clean vX.Y.Z tag is a real release -- everything else (a
+# throwaway test tag, or a manual run with no tag at all) gets a
+# package version apt/dnf will recognize as a new build without
+# actually bumping Cargo.toml, so it installs over a previous test
+# build on request. `~testingN` (.deb) / `0.testingN` (.rpm) are each
+# format's own convention for "sorts *before* the eventual real
+# release with the same base version" -- dpkg's tilde is defined to
+# sort earlier than nothing at all, and rpm has no tilde equivalent,
+# so a leading "0." on the Release field is the standard substitute
+# (rpmvercmp compares Release segment-by-segment, and "0" always loses
+# to "1"). Get this backwards and a real release could look *older*
+# than a leftover test build already installed on a target system,
+# which is exactly the failure mode this exists to avoid.
+.testing_build_suffix:
+  script:
+    - |
+      if echo "${CI_COMMIT_TAG:-}" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+        DEB_REVISION_ARG=""
+        RPM_RELEASE_OVERRIDE=""
+      else
+        echo "not a clean vX.Y.Z release tag -- building as a throwaway testing build (suffix: testing${CI_PIPELINE_IID})"
+        DEB_REVISION_ARG="--deb-revision=~testing${CI_PIPELINE_IID}"
+        RPM_RELEASE_OVERRIDE="0.testing${CI_PIPELINE_IID}"
+      fi
+
 .upload_generic_package:
   script:
     - |
@@ -101,8 +126,9 @@ package:deb:amd64:
   extends: .cargo_cache
   <<: *package_rules
   script:
+    - !reference [.testing_build_suffix, script]
     - cargo build --release --locked
-    - cargo deb --no-build
+    - cargo deb --no-build ${DEB_REVISION_ARG}
     - mkdir -p dist
     - cp target/debian/*.deb dist/
     - ls -la dist/
@@ -118,8 +144,9 @@ package:deb:arm64:
   extends: .cargo_cache
   <<: *package_rules
   script:
+    - !reference [.testing_build_suffix, script]
     - cargo build --release --locked --target aarch64-unknown-linux-gnu
-    - cargo deb --target aarch64-unknown-linux-gnu --no-build
+    - cargo deb --target aarch64-unknown-linux-gnu --no-build ${DEB_REVISION_ARG}
     - mkdir -p dist
     - cp target/aarch64-unknown-linux-gnu/debian/*.deb dist/
     - ls -la dist/
@@ -135,8 +162,14 @@ package:rpm:amd64:
   extends: .cargo_cache
   <<: *package_rules
   script:
+    - !reference [.testing_build_suffix, script]
     - cargo build --release --locked
-    - cargo generate-rpm
+    - |
+      if [ -n "${RPM_RELEASE_OVERRIDE}" ]; then
+        cargo generate-rpm -s "release = \"${RPM_RELEASE_OVERRIDE}\""
+      else
+        cargo generate-rpm
+      fi
     - mkdir -p dist
     - cp target/generate-rpm/*.rpm dist/
     - ls -la dist/
@@ -152,8 +185,14 @@ package:rpm:arm64:
   extends: .cargo_cache
   <<: *package_rules
   script:
+    - !reference [.testing_build_suffix, script]
     - cargo build --release --locked --target aarch64-unknown-linux-gnu
-    - cargo generate-rpm --target aarch64-unknown-linux-gnu
+    - |
+      if [ -n "${RPM_RELEASE_OVERRIDE}" ]; then
+        cargo generate-rpm --target aarch64-unknown-linux-gnu -s "release = \"${RPM_RELEASE_OVERRIDE}\""
+      else
+        cargo generate-rpm --target aarch64-unknown-linux-gnu
+      fi
     - mkdir -p dist
     - cp target/aarch64-unknown-linux-gnu/generate-rpm/*.rpm dist/
     - ls -la dist/
