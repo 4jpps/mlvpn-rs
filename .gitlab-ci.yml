@@ -122,11 +122,23 @@ test:
 
 # Publishes to this project's native Debian package registry (an
 # actual apt-installable repo, not just a downloadable file like the
-# generic registry above) -- runs on every package job, tag or manual,
-# unlike .upload_generic_package: there's no per-tag path segment here
-# to gate on, and this is exactly what Jeff's "throwaway builds I can
-# pull to my systems" workflow wants (apt install/upgrade directly,
-# no manual download step).
+# generic registry above) -- exactly what Jeff's "throwaway builds I
+# can pull to my systems" workflow wants (apt install/upgrade
+# directly, no manual download step).
+#
+# NOT CURRENTLY WIRED IN to either deb job -- confirmed via a real
+# pipeline run that this project has no Debian distribution named
+# "debian" configured yet (GET/POST .../debian_distributions both 404
+# with GitLab's generic route-not-found body, unlike the structured
+# API error the packages/rpm/incoming endpoint returns -- meaning the
+# Distribution management API itself isn't routed on this instance,
+# not just "empty, needs one created"). The upload endpoint below is
+# reachable (it reads the whole uploaded file before 404ing, rather
+# than rejecting immediately), it just has nowhere valid to route the
+# file without a real distribution to receive it. This looks like an
+# instance-level configuration gap, not something fixable via the
+# public API -- left here, ready to reference from the deb jobs' own
+# script lists, once that's sorted out on the instance side.
 .upload_debian_registry:
   script:
     - |
@@ -149,7 +161,6 @@ package:deb:amd64:
     - cp target/debian/*.deb dist/
     - ls -la dist/
     - !reference [.upload_generic_package, script]
-    - !reference [.upload_debian_registry, script]
   artifacts:
     paths:
       - dist/*.deb
@@ -168,7 +179,6 @@ package:deb:arm64:
     - cp target/aarch64-unknown-linux-gnu/debian/*.deb dist/
     - ls -la dist/
     - !reference [.upload_generic_package, script]
-    - !reference [.upload_debian_registry, script]
   artifacts:
     paths:
       - dist/*.deb
