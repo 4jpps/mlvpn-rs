@@ -122,48 +122,39 @@ test:
         done
       fi
 
-# Publishes to this project's native Debian package registry (an
-# actual apt-installable repo, not just a downloadable file like the
-# generic registry above) -- exactly what Jeff's "throwaway builds I
-# can pull to my systems" workflow wants (apt install/upgrade
-# directly, no manual download step).
+# Publishes to both this project's AND its group's (jpps,
+# CI_PROJECT_NAMESPACE_ID) native Debian package registries -- real
+# apt-installable repos, not just a downloadable file like the generic
+# registry above. Exactly what Jeff's "throwaway builds I can pull to
+# my systems" workflow wants (apt install/upgrade directly, no manual
+# download step); publishing to both lets him point systems at either
+# the per-project repo or a shared group-wide one.
 #
-# NOT CURRENTLY WIRED IN to either deb job. Two endpoint shapes tried,
-# both confirmed broken via real pipeline runs against this instance:
-#   1. `packages/debian/debian/incoming/<file>` (mirroring Jeff's first
-#      example) -- 404ed after reading the whole uploaded file.
-#   2. `packages/debian/<file>?distribution=X&component=main` (the
-#      shape GitLab's own package registry UI generated for this
-#      project) -- also 404s, even with a clean (no version-suffix)
-#      filename and a maintainer-level PRIVATE-TOKEN instead of
-#      JOB-TOKEN, ruling out both the throwaway-build filename and the
-#      auth method as the cause.
-# Also checked: `packages?package_type=debian` returns `[]` (valid
-# empty list -- the type is recognized, nothing's ever landed);
-# `/api/v4/features` returns `[]` (no flags overridden either way, not
-# informative on its own). This looks like a genuine instance-side gap
-# rather than a CI-file/syntax problem -- GitLab's Debian/RPM
-# registries need additional Workhorse-routing/object-storage setup at
-# the Omnibus config level beyond what the simpler "generic" registry
-# (already working here) requires. Diagnosing further needs the
-# instance's own production log
-# (/var/log/gitlab/gitlab-rails/production.log around a failed
-# request's timestamp), which isn't visible from the CI/API side.
-#
-# `stable` vs `testing` reuses .testing_build_suffix's own tag check
-# (PKG_DISTRIBUTION) so a real vX.Y.Z release always lands in `stable`
-# and every throwaway/manual build lands in `testing` -- matches this
-# file's whole "real release always supersedes a test build" design
-# already applied to the version-suffix logic above.
+# Getting here took real back-and-forth: two wrong endpoint shapes
+# (`packages/debian/debian/incoming/<file>`, then
+# `packages/debian/<file>?distribution=X&component=main` without a
+# distribution to receive it) both 404ed. The real fix was creating the
+# distributions first -- `POST .../debian_distributions?codename=X`
+# (project) and `POST .../-/debian_distributions?codename=X` (group,
+# note the `-/` and no `packages/` segment) -- plus something Jeff
+# fixed on the GitLab instance itself (unspecified) before uploads
+# would route at all. `stable`/`testing` reuses
+# .testing_build_suffix's own tag check (PKG_DISTRIBUTION) so a real
+# vX.Y.Z release always lands in `stable` and every throwaway/manual
+# build lands in `testing`.
 .upload_debian_registry:
   script:
     - |
       PACKAGE_FILE=$(ls dist/*.deb)
       FILENAME=$(basename "$PACKAGE_FILE")
-      echo "Uploading ${FILENAME} to the Debian package registry (distribution=${PKG_DISTRIBUTION})..."
+      echo "Uploading ${FILENAME} to the project Debian registry (distribution=${PKG_DISTRIBUTION})..."
       curl --fail --request PUT --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
            --upload-file "$PACKAGE_FILE" \
            "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/debian/${FILENAME}?distribution=${PKG_DISTRIBUTION}&component=main"
+      echo "Uploading ${FILENAME} to the group Debian registry (distribution=${PKG_DISTRIBUTION})..."
+      curl --fail --request PUT --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
+           --upload-file "$PACKAGE_FILE" \
+           "${CI_API_V4_URL}/groups/${CI_PROJECT_NAMESPACE_ID}/-/packages/debian/${FILENAME}?distribution=${PKG_DISTRIBUTION}&component=main"
 
 package:deb:amd64:
   stage: package
@@ -178,6 +169,7 @@ package:deb:amd64:
     - cp target/debian/*.deb dist/
     - ls -la dist/
     - !reference [.upload_generic_package, script]
+    - !reference [.upload_debian_registry, script]
   artifacts:
     paths:
       - dist/*.deb
@@ -196,6 +188,7 @@ package:deb:arm64:
     - cp target/aarch64-unknown-linux-gnu/debian/*.deb dist/
     - ls -la dist/
     - !reference [.upload_generic_package, script]
+    - !reference [.upload_debian_registry, script]
   artifacts:
     paths:
       - dist/*.deb
