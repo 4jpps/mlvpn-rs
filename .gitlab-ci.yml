@@ -120,6 +120,22 @@ test:
         done
       fi
 
+# Publishes to this project's native Debian package registry (an
+# actual apt-installable repo, not just a downloadable file like the
+# generic registry above) -- runs on every package job, tag or manual,
+# unlike .upload_generic_package: there's no per-tag path segment here
+# to gate on, and this is exactly what Jeff's "throwaway builds I can
+# pull to my systems" workflow wants (apt install/upgrade directly,
+# no manual download step).
+.upload_debian_registry:
+  script:
+    - |
+      PACKAGE_FILE=$(ls dist/*.deb)
+      echo "Uploading ${PACKAGE_FILE##*/} to the Debian package registry..."
+      curl --fail --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
+           --upload-file "$PACKAGE_FILE" \
+           "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/debian/debian/incoming/${PACKAGE_FILE##*/}"
+
 package:deb:amd64:
   stage: package
   tags: [linux]
@@ -133,6 +149,7 @@ package:deb:amd64:
     - cp target/debian/*.deb dist/
     - ls -la dist/
     - !reference [.upload_generic_package, script]
+    - !reference [.upload_debian_registry, script]
   artifacts:
     paths:
       - dist/*.deb
@@ -151,6 +168,7 @@ package:deb:arm64:
     - cp target/aarch64-unknown-linux-gnu/debian/*.deb dist/
     - ls -la dist/
     - !reference [.upload_generic_package, script]
+    - !reference [.upload_debian_registry, script]
   artifacts:
     paths:
       - dist/*.deb
