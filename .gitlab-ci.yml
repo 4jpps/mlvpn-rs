@@ -101,10 +101,12 @@ test:
       if echo "${CI_COMMIT_TAG:-}" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
         DEB_REVISION_ARG=""
         RPM_RELEASE_OVERRIDE=""
+        PKG_DISTRIBUTION="stable"
       else
         echo "not a clean vX.Y.Z release tag -- building as a throwaway testing build (suffix: testing${CI_PIPELINE_IID})"
         DEB_REVISION_ARG="--deb-revision=~testing${CI_PIPELINE_IID}"
         RPM_RELEASE_OVERRIDE="0.testing${CI_PIPELINE_IID}"
+        PKG_DISTRIBUTION="testing"
       fi
 
 .upload_generic_package:
@@ -126,27 +128,31 @@ test:
 # can pull to my systems" workflow wants (apt install/upgrade
 # directly, no manual download step).
 #
-# NOT CURRENTLY WIRED IN to either deb job -- confirmed via a real
-# pipeline run that this project has no Debian distribution named
-# "debian" configured yet (GET/POST .../debian_distributions both 404
-# with GitLab's generic route-not-found body, unlike the structured
-# API error the packages/rpm/incoming endpoint returns -- meaning the
-# Distribution management API itself isn't routed on this instance,
-# not just "empty, needs one created"). The upload endpoint below is
-# reachable (it reads the whole uploaded file before 404ing, rather
-# than rejecting immediately), it just has nowhere valid to route the
-# file without a real distribution to receive it. This looks like an
-# instance-level configuration gap, not something fixable via the
-# public API -- left here, ready to reference from the deb jobs' own
-# script lists, once that's sorted out on the instance side.
+# The first attempt at this used a `packages/debian/debian/incoming/
+# <file>` path (mirroring the URL shape Jeff's first example used) and
+# 404ed after reading the whole uploaded file -- turned out to be the
+# wrong endpoint shape entirely, not a missing-distribution problem.
+# The real one (confirmed working, found via Jeff pulling the exact
+# snippet from GitLab's own package registry UI): PUT straight to
+# packages/debian/<file>, with `distribution`/`component` as query
+# parameters rather than path segments -- GitLab creates the
+# distribution implicitly on first upload, no separate distribution-
+# management API call needed.
+#
+# `stable` vs `testing` reuses .testing_build_suffix's own tag check
+# (PKG_DISTRIBUTION) so a real vX.Y.Z release always lands in `stable`
+# and every throwaway/manual build lands in `testing` -- matches this
+# file's whole "real release always supersedes a test build" design
+# already applied to the version-suffix logic above.
 .upload_debian_registry:
   script:
     - |
       PACKAGE_FILE=$(ls dist/*.deb)
-      echo "Uploading ${PACKAGE_FILE##*/} to the Debian package registry..."
-      curl --fail --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
+      FILENAME=$(basename "$PACKAGE_FILE")
+      echo "Uploading ${FILENAME} to the Debian package registry (distribution=${PKG_DISTRIBUTION})..."
+      curl --fail --request PUT --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
            --upload-file "$PACKAGE_FILE" \
-           "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/debian/debian/incoming/${PACKAGE_FILE##*/}"
+           "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/debian/${FILENAME}?distribution=${PKG_DISTRIBUTION}&component=main"
 
 package:deb:amd64:
   stage: package
@@ -161,6 +167,7 @@ package:deb:amd64:
     - cp target/debian/*.deb dist/
     - ls -la dist/
     - !reference [.upload_generic_package, script]
+    - !reference [.upload_debian_registry, script]
   artifacts:
     paths:
       - dist/*.deb
@@ -179,6 +186,7 @@ package:deb:arm64:
     - cp target/aarch64-unknown-linux-gnu/debian/*.deb dist/
     - ls -la dist/
     - !reference [.upload_generic_package, script]
+    - !reference [.upload_debian_registry, script]
   artifacts:
     paths:
       - dist/*.deb
