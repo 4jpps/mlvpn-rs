@@ -172,13 +172,19 @@ test:
       PACKAGE_FILE=$(ls dist/*.deb)
       FILENAME=$(basename "$PACKAGE_FILE")
       mkdir -p ~/.ssh
+      # GitLab writes file-type CI/CD variables at 0664 -- SSH refuses
+      # to use a private key that permissive ("bad permissions",
+      # confirmed via a real failed run), so copy it somewhere we
+      # control the mode on rather than using $APT_REPO_SSH_KEY directly.
+      cp "${APT_REPO_SSH_KEY}" ~/.ssh/apt_repo_key
+      chmod 600 ~/.ssh/apt_repo_key
       # Idempotent: shell-executor jobs reuse the same $HOME across
       # runs on this runner, so this must not grow known_hosts forever.
       grep -qF "172.16.61.177 ssh-ed25519" ~/.ssh/known_hosts 2>/dev/null || \
         echo "172.16.61.177 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJgzIRW9s8JQothWIuOYQ5XUrkNWsSeUiuzM473YswnW" >> ~/.ssh/known_hosts
       echo "Publishing ${FILENAME} to the self-hosted apt repo (distribution=${PKG_DISTRIBUTION})..."
-      scp -i "${APT_REPO_SSH_KEY}" "$PACKAGE_FILE" "apt-publish@172.16.61.177:/tmp/${FILENAME}"
-      ssh -i "${APT_REPO_SSH_KEY}" apt-publish@172.16.61.177 \
+      scp -i ~/.ssh/apt_repo_key "$PACKAGE_FILE" "apt-publish@172.16.61.177:/tmp/${FILENAME}"
+      ssh -i ~/.ssh/apt_repo_key apt-publish@172.16.61.177 \
         "/home/apt-publish/publish-to-apt-repo ${PKG_DISTRIBUTION} /tmp/${FILENAME} && rm -f /tmp/${FILENAME}"
 
 package:deb:amd64:
