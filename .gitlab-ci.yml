@@ -133,15 +133,16 @@ test:
 # Getting here took real back-and-forth: two wrong endpoint shapes
 # (`packages/debian/debian/incoming/<file>`, then
 # `packages/debian/<file>?distribution=X&component=main` without a
-# distribution to receive it) both 404ed. The real fix was creating the
-# distributions first -- `POST .../debian_distributions?codename=X`
-# (project) and `POST .../-/debian_distributions?codename=X` (group,
-# note the `-/` and no `packages/` segment) -- plus something Jeff
-# fixed on the GitLab instance itself (unspecified) before uploads
-# would route at all. `stable`/`testing` reuses
-# .testing_build_suffix's own tag check (PKG_DISTRIBUTION) so a real
-# vX.Y.Z release always lands in `stable` and every throwaway/manual
-# build lands in `testing`.
+# distribution to receive it) both 404ed. Creating the distributions
+# (`POST .../debian_distributions?codename=X`) got past that, but a
+# 401 remains even with route_authentication_setting confirmed correct
+# on the live route, a valid non-expired non-revoked token, and every
+# relevant ability check returning true -- traced all the way through
+# Gitlab::Auth::AuthFinders, PersonalAccessToken lookup, and
+# AccessTokenValidationService with no exception logged anywhere, in
+# process via Rack::MockRequest against the live app. Genuinely
+# unresolved. NOT CURRENTLY WIRED IN to either deb job -- see
+# .publish_to_apt_repo below for what actually ships packages now.
 .upload_debian_registry:
   script:
     - |
@@ -156,6 +157,30 @@ test:
            --upload-file "$PACKAGE_FILE" \
            "${CI_API_V4_URL}/groups/${CI_PROJECT_NAMESPACE_ID}/-/packages/debian/${FILENAME}?distribution=${PKG_DISTRIBUTION}&component=main"
 
+# Publishes to the self-hosted apt repo on 172.16.61.177 (jpps/
+# apt-repo-server project) instead -- built as a fallback once the
+# native GitLab Debian registry's unresolved 401 (see
+# .upload_debian_registry above) made it clear that path wasn't
+# reliable yet. Flat apt repo format, stable/testing sub-repos
+# matching PKG_DISTRIBUTION. APT_REPO_SSH_KEY is a group-level
+# (jpps) file-type CI/CD variable holding a dedicated key for the
+# restricted `apt-publish` user on that host -- scoped to just
+# /srv/apt-repo, not a general-purpose credential.
+.publish_to_apt_repo:
+  script:
+    - |
+      PACKAGE_FILE=$(ls dist/*.deb)
+      FILENAME=$(basename "$PACKAGE_FILE")
+      mkdir -p ~/.ssh
+      # Idempotent: shell-executor jobs reuse the same $HOME across
+      # runs on this runner, so this must not grow known_hosts forever.
+      grep -qF "172.16.61.177 ssh-ed25519" ~/.ssh/known_hosts 2>/dev/null || \
+        echo "172.16.61.177 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJgzIRW9s8JQothWIuOYQ5XUrkNWsSeUiuzM473YswnW" >> ~/.ssh/known_hosts
+      echo "Publishing ${FILENAME} to the self-hosted apt repo (distribution=${PKG_DISTRIBUTION})..."
+      scp -i "${APT_REPO_SSH_KEY}" "$PACKAGE_FILE" "apt-publish@172.16.61.177:/tmp/${FILENAME}"
+      ssh -i "${APT_REPO_SSH_KEY}" apt-publish@172.16.61.177 \
+        "/home/apt-publish/publish-to-apt-repo ${PKG_DISTRIBUTION} /tmp/${FILENAME} && rm -f /tmp/${FILENAME}"
+
 package:deb:amd64:
   stage: package
   tags: [linux]
@@ -169,7 +194,7 @@ package:deb:amd64:
     - cp target/debian/*.deb dist/
     - ls -la dist/
     - !reference [.upload_generic_package, script]
-    - !reference [.upload_debian_registry, script]
+    - !reference [.publish_to_apt_repo, script]
   artifacts:
     paths:
       - dist/*.deb
@@ -188,7 +213,7 @@ package:deb:arm64:
     - cp target/aarch64-unknown-linux-gnu/debian/*.deb dist/
     - ls -la dist/
     - !reference [.upload_generic_package, script]
-    - !reference [.upload_debian_registry, script]
+    - !reference [.publish_to_apt_repo, script]
   artifacts:
     paths:
       - dist/*.deb
