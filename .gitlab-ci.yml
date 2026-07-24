@@ -195,6 +195,12 @@ package:deb:amd64:
   script:
     - !reference [.testing_build_suffix, script]
     - cargo build --release --locked
+    # Same stale-output issue as cargo-generate-rpm: a leftover .deb
+    # from an earlier cached run on this ref (different version
+    # suffix) sits alongside the new one otherwise, and dist/ ends up
+    # with two files -- confirmed via a real run breaking the
+    # PACKAGE_FILE=$(ls dist/*.deb) pattern downstream.
+    - rm -f target/debian/*.deb
     - cargo deb --no-build ${DEB_REVISION_ARG}
     - mkdir -p dist
     - cp target/debian/*.deb dist/
@@ -214,6 +220,8 @@ package:deb:arm64:
   script:
     - !reference [.testing_build_suffix, script]
     - cargo build --release --locked --target aarch64-unknown-linux-gnu
+    # See package:deb:amd64's own comment on this same line.
+    - rm -f target/aarch64-unknown-linux-gnu/debian/*.deb
     - cargo deb --target aarch64-unknown-linux-gnu --no-build ${DEB_REVISION_ARG}
     - mkdir -p dist
     - cp target/aarch64-unknown-linux-gnu/debian/*.deb dist/
