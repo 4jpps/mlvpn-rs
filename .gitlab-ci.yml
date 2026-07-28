@@ -109,16 +109,39 @@ test:
         PKG_DISTRIBUTION="testing"
       fi
 
+# gitlab.jpps.us is Cloudflare-tunnel-fronted, and that tunnel path
+# stalls/corrupts uploads above a few MB (see the global CLAUDE.md's
+# "Bypassing the Cloudflare tunnel" section -- confirmed on srt-matrix
+# by hitting nginx on the GitLab VM directly and getting an instant
+# clean response vs. a multi-minute hang + Cloudflare 524). Route
+# through ci-relay's SSH port-forward straight to the VM's local
+# nginx instead of over the public URL. GITLAB_RELAY_SSH_KEY is a
+# group-level file variable for a dedicated `ci-relay` user whose
+# authorized_keys entry is locked to `permitopen="127.0.0.1:80"` with
+# no shell -- it can only relay to nginx, nothing else on the host.
+.setup_relay_tunnel:
+  script:
+    - |
+      mkdir -p ~/.ssh
+      grep -qF "172.16.60.141 ssh-ed25519" ~/.ssh/known_hosts 2>/dev/null || \
+        echo "172.16.60.141 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMhN9SFlktJjOM7IVr0gfTPTug9OCbfcqt983cHwn5Hh" >> ~/.ssh/known_hosts
+      cp "${GITLAB_RELAY_SSH_KEY}" ~/.ssh/ci_relay_key
+      chmod 600 ~/.ssh/ci_relay_key
+      pgrep -f "ci_relay_key -L 18080" > /dev/null || \
+        ssh -o BatchMode=yes -i ~/.ssh/ci_relay_key -L 18080:127.0.0.1:80 -N -f ci-relay@172.16.60.141
+      export RELAY_API_URL="http://127.0.0.1:18080/api/v4"
+
 .upload_generic_package:
   script:
+    - !reference [.setup_relay_tunnel, script]
     - |
       if [ -n "${CI_COMMIT_TAG:-}" ]; then
         for f in dist/*.deb dist/*.rpm; do
           [ -e "$f" ] || continue
           name=$(basename "$f")
           echo "Uploading ${name} to the generic package registry..."
-          curl --fail --header "JOB-TOKEN: ${CI_JOB_TOKEN}" --upload-file "$f" \
-            "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/mlvpn/${CI_COMMIT_TAG}/${name}"
+          curl --fail --header "Host: gitlab.jpps.us" --header "JOB-TOKEN: ${CI_JOB_TOKEN}" --upload-file "$f" \
+            "${RELAY_API_URL}/projects/${CI_PROJECT_ID}/packages/generic/mlvpn/${CI_COMMIT_TAG}/${name}"
         done
       fi
 
@@ -301,4 +324,5 @@ release:
     - package:rpm:amd64
     - package:rpm:arm64
   script:
+    - !reference [.setup_relay_tunnel, script]
     - bash scripts/gitlab-release.sh

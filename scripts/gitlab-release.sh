@@ -79,8 +79,16 @@ payload = {
 print(json.dumps(payload))
 PYEOF
 
+# RELAY_API_URL (set by .setup_relay_tunnel in .gitlab-ci.yml) routes
+# this through an SSH tunnel straight to the GitLab VM's local nginx
+# instead of over the public, Cloudflare-tunnel-fronted gitlab.jpps.us
+# -- that path stalls/corrupts slow POSTs (see the global CLAUDE.md's
+# "Bypassing the Cloudflare tunnel" section). Asset link URLs above
+# still use CI_API_V4_URL (the real public address) since those are
+# what a user clicks on the Release page, not this control-plane call.
 curl --fail --request POST \
+    --header "Host: gitlab.jpps.us" \
     --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
     --header "Content-Type: application/json" \
     --data @release-payload.json \
-    "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/releases"
+    "${RELAY_API_URL:-$CI_API_V4_URL}/projects/${CI_PROJECT_ID}/releases"
