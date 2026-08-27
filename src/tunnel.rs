@@ -250,6 +250,7 @@
 //! comment for the full rationale and `LinkHandle::reconnect`'s doc
 //! comment for the one deployment-model caveat.
 
+use crate::config;
 use crate::config::{Mode, SchedulerConfig};
 use crate::control;
 use crate::crypto::{self, Handshake, LocalPrivateKey, Session, SessionState};
@@ -388,6 +389,16 @@ pub struct TunnelParams {
     /// the TUN device's own address rather than every interface. See
     /// `tunneltest.rs`'s module doc comment.
     pub tunnel_local_addr: std::net::IpAddr,
+    /// The tunnel-specific config, threaded through only for
+    /// `control::mtu_monitor_loop`'s periodic recomputation -- every
+    /// other tunnel-level field on this struct is already flattened
+    /// from it for direct use elsewhere in `tunnel::run`.
+    pub tunnel_cfg: config::TunnelConfig,
+    /// Every configured link's `bind_interface` name, for
+    /// `control::mtu_monitor_loop` to re-query physical MTUs from
+    /// directly -- see that function's doc comment for why it can't
+    /// use `Link.physical_mtu` instead.
+    pub bind_interfaces: Vec<String>,
 }
 
 /// Config for `control::diagnostics_watch_loop`, threaded from
@@ -778,6 +789,12 @@ pub async fn run(
 
     let mut handles = Vec::new();
 
+    // Shared live tunnel MTU: seeded with the startup-time
+    // `effective_tunnel_mtu` result, kept current afterward by
+    // `control::mtu_monitor_loop` and read fresh on every packet by
+    // `tun_reader`'s MSS-clamping.
+    let live_mtu = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(params.mtu));
+
     // Bounded outbound queue between tun_reader (producer) and
     // outbound_sender (consumer) -- see OUTBOUND_QUEUE_CAPACITY's doc
     // comment. Built here, ahead of the control-socket spawn below, so
@@ -962,6 +979,16 @@ pub async fn run(
     }
 
     {
+        let tunnel_cfg = params.tunnel_cfg.clone();
+        let tun_ifname = params.tunnel_name.clone();
+        let bind_interfaces = params.bind_interfaces.clone();
+        let live_mtu = live_mtu.clone();
+        handles.push(tokio::spawn(async move {
+            control::mtu_monitor_loop(tunnel_cfg, tun_ifname, bind_interfaces, live_mtu).await;
+        }));
+    }
+
+    {
         let links = links.clone();
         let scheduler = scheduler.clone();
         let redundant_mode = params.scheduler_cfg.redundant_mode;
@@ -980,7 +1007,7 @@ pub async fn run(
     {
         let session = session.clone();
         let tun = tun.clone();
-        let mtu = params.mtu as usize;
+        let mtu = live_mtu.clone();
         let clamp_mss = params.clamp_mss;
         let tx = outbound_tx.clone();
         let dropped_total = outbound_dropped_total.clone();
@@ -1919,12 +1946,17 @@ pub(crate) struct OutboundFrame {
 async fn tun_reader(
     tun: Arc<AsyncDevice>,
     session: Arc<AsyncMutex<SessionState>>,
-    mtu: usize,
+    mtu: std::sync::Arc<std::sync::atomic::AtomicU16>,
     clamp_mss: bool,
     tx: mpsc::Sender<OutboundFrame>,
     dropped_total: Arc<AtomicU64>,
 ) -> Result<()> {
-    let mut buf = vec![0u8; mtu + 64];
+    // Sized once from the startup MTU rather than tracking the live
+    // atomic: `mtu_monitor_loop` only ever narrows the tunnel MTU down
+    // from what the bonded links can safely carry (see
+    // `effective_tunnel_mtu`), so a buffer sized generously above the
+    // startup value has ample headroom for the lifetime of this reader.
+    let mut buf = vec![0u8; mtu.load(std::sync::atomic::Ordering::Relaxed) as usize + 64];
     loop {
         let n = tun.recv(&mut buf).await.map_err(MlvpnError::Io)?;
         let mut plaintext = buf[..n].to_vec();
@@ -1933,8 +1965,14 @@ async fn tun_reader(
         // larger than what `mtu` can carry -- see mss.rs for why this
         // matters more than relying on Path MTU Discovery alone, and for
         // the IPv4/IPv6 parsing and checksum recompute this performs.
+        // Loaded fresh on every packet (rather than once outside the
+        // loop) so a live resize from `mtu_monitor_loop` takes effect
+        // immediately, not only after this task restarts.
         if clamp_mss {
-            crate::mss::clamp_if_tcp_syn(&mut plaintext, mtu as u16);
+            crate::mss::clamp_if_tcp_syn(
+                &mut plaintext,
+                mtu.load(std::sync::atomic::Ordering::Relaxed),
+            );
         }
 
         // `session_id` comes back from `encrypt` itself rather than a

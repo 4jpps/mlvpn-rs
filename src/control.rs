@@ -713,6 +713,159 @@ async fn run_diag_dump_command(links: &Links, diag_ctx: &DiagContext) -> Command
     }
 }
 
+/// Conservative built-in floor used only when there's no configured
+/// ceiling *and* nothing at all was detected (e.g. no links yet, every
+/// link is on a non-Linux platform, or every query failed). Not the
+/// field's declared default any more -- `tunnel.mtu` itself defaults to
+/// `None` -- just a last-resort value for this one corner case.
+// `pub`, not `pub(crate)`: `main.rs` (the `mlvpnd` binary crate) is a
+// separate crate from this `mlvpn` library crate and needs to call
+// `effective_tunnel_mtu` at startup, before `mtu_monitor_loop` exists to
+// call it periodically -- `pub(crate)` would only be visible within this
+// library crate, not from its own binary crate (dependency direction
+// only goes the other way).
+pub const FALLBACK_MTU_WHEN_NOTHING_DETECTED: u16 = 1400;
+
+/// Picks the MTU actually used for the TUN device and outgoing packet
+/// sizing: when `tunnel.mtu` is configured, the smaller of that ceiling
+/// and a safe value derived from every bonded link's real physical
+/// interface MTU; when `tunnel.mtu` is left unset, the full
+/// detected-safe value is used directly -- including upward, so a link
+/// whose physical MTU is actually 1500 bytes gets the tunnel MTU it can
+/// carry rather than being silently capped at some hardcoded default.
+/// This turns the previously advisory-only startup warning (still in
+/// `config.rs`'s `validate()`, checked against a generic 1500-byte
+/// assumption before any link exists to ask) into a real, self-correcting
+/// default: a configured `tunnel.mtu` that would actually fragment
+/// against this deployment's hardware gets clamped down automatically
+/// instead of just logging a warning and fragmenting anyway. Links
+/// whose physical MTU couldn't be determined (non-Linux, insufficient
+/// permissions, a transient ioctl failure) simply don't participate in
+/// the minimum -- if *no* link's MTU is known, this falls back to the
+/// configured ceiling if one is set, or a conservative built-in default
+/// (`FALLBACK_MTU_WHEN_NOTHING_DETECTED`) if not, rather than refusing
+/// to start.
+///
+/// Takes raw MTU readings (`detected_mtus: &[Option<u32>]`) rather than
+/// `&[link::Link]`: `link::Link::physical_mtu` is a one-shot value never
+/// refreshed by `LinkHandle::reconnect`, so callers with only a frozen
+/// `Link` snapshot (the startup call site, once, at bind time) and
+/// callers with live re-queried readings (the continuous MTU monitor
+/// loop, which calls `link::query_interface_mtu` directly) can both
+/// funnel their readings through the same formula here.
+///
+/// `outer_overhead` deliberately assumes the *larger* of the two
+/// possible outer-transport combinations (IPv6/UDP, 48 bytes) rather
+/// than IPv4/UDP (28 bytes): which one a given link actually dials over
+/// depends on `remote_addr`'s address family per-link, and this
+/// function has no per-link visibility into that -- one tunnel-wide MTU
+/// is picked for all of them. Assuming the larger overhead errs toward
+/// "possibly slightly conservative" rather than "possibly still
+/// fragments on an IPv6 link," which is the correct direction to be
+/// wrong in given the user asked for this to auto-adjust for
+/// *throughput*, not just raw MTU size: a black-holed PMTUD stall costs
+/// far more throughput than a few bytes of headroom ever would.
+pub fn effective_tunnel_mtu(
+    cfg: &crate::config::TunnelConfig,
+    detected_mtus: &[Option<u32>],
+) -> u16 {
+    let outer_overhead = crate::protocol::HEADER_LEN as u32 + crate::crypto::TAG_LEN as u32 + 48;
+
+    let Some(detected_min) = detected_mtus.iter().filter_map(|m| *m).min() else {
+        return cfg.mtu.unwrap_or(FALLBACK_MTU_WHEN_NOTHING_DETECTED);
+    };
+
+    let safe_mtu = detected_min
+        .saturating_sub(outer_overhead)
+        .min(u16::MAX as u32) as u16;
+
+    match cfg.mtu {
+        Some(ceiling) if ceiling <= safe_mtu => ceiling,
+        Some(ceiling) => {
+            // Never clamp below the config-time floor already enforced
+            // in config.rs's validate() (>= 576, the IPv6 minimum-MTU
+            // guarantee) -- an unusually small detected physical MTU
+            // should surface as a visible problem, not silently produce
+            // a tunnel MTU so small it can't carry a minimum-size IPv6
+            // packet at all.
+            let clamped = safe_mtu.max(576);
+            tracing::warn!(
+                configured = ceiling,
+                detected_min_physical_mtu = detected_min,
+                clamped_to = clamped,
+                "tunnel.mtu exceeds what the bonded links' physical interfaces can carry \
+                 without fragmentation; auto-clamping down for this run (edit tunnel.mtu \
+                 in the config to make this permanent and silence this warning)"
+            );
+            clamped
+        }
+        // No configured ceiling: use the full detected-safe value
+        // directly, including upward from any previous run -- this is
+        // the actual fix for the reported throughput regression (the
+        // old code's `cfg.mtu` defaulted to 1400 and this branch never
+        // existed, so a real 1500-MTU link was never used past 1400).
+        None => safe_mtu.max(576),
+    }
+}
+
+/// How often `mtu_monitor_loop` re-checks whether the live TUN device's
+/// MTU still matches what the bonded links can actually carry. A
+/// separate knob from `DIAGNOSTICS_WATCH_INTERVAL_SECS` -- the two
+/// concerns are unrelated and shouldn't share a setting just because
+/// both are periodic background checks.
+const MTU_MONITOR_INTERVAL_SECS: u64 = 30;
+
+fn mtu_resize_needed(current: u16, recomputed: u16) -> bool {
+    current != recomputed
+}
+
+/// Periodically re-queries every configured link's real physical
+/// interface MTU directly (bypassing `Link.physical_mtu`, which is a
+/// one-shot value never refreshed by `LinkHandle::reconnect` -- see
+/// `effective_tunnel_mtu`'s own doc history for why) and resizes the
+/// running TUN device if the safe tunnel MTU has changed, e.g. because
+/// a link reconnected on different hardware with a different physical
+/// MTU. Tunnel-wide, not per-link (unlike `tunnel::link_prober`): the
+/// tunnel MTU is one value derived from the minimum across all links,
+/// so one task owns resizing it rather than each link's own prober
+/// racing to do so.
+pub(crate) async fn mtu_monitor_loop(
+    tunnel_cfg: crate::config::TunnelConfig,
+    tun_ifname: String,
+    bind_interfaces: Vec<String>,
+    live_mtu: std::sync::Arc<std::sync::atomic::AtomicU16>,
+) {
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(MTU_MONITOR_INTERVAL_SECS));
+    loop {
+        tick.tick().await;
+
+        let detected: Vec<Option<u32>> = bind_interfaces
+            .iter()
+            .map(|ifname| crate::link::query_interface_mtu(ifname))
+            .collect();
+        let recomputed = effective_tunnel_mtu(&tunnel_cfg, &detected);
+        let current = live_mtu.load(std::sync::atomic::Ordering::Relaxed);
+
+        if !mtu_resize_needed(current, recomputed) {
+            continue;
+        }
+
+        match crate::link::set_interface_mtu(&tun_ifname, recomputed) {
+            Ok(()) => {
+                live_mtu.store(recomputed, std::sync::atomic::Ordering::Relaxed);
+                tracing::info!(
+                    old_mtu = current,
+                    new_mtu = recomputed,
+                    "resized tunnel MTU to match currently detected link capacity"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, attempted_mtu = recomputed, "failed to resize tunnel MTU");
+            }
+        }
+    }
+}
+
 /// How often `diagnostics_watch_loop` re-checks every link's loss
 /// against `DiagnosticsWatchParams::loss_threshold_pct`. Frequent enough
 /// to catch a loss event not long after it starts (loss itself is a
@@ -1025,5 +1178,54 @@ async fn run_throughput_test_leg_download(
     match tokio::time::timeout(wait, rx.recv()).await {
         Ok(Some(mbps)) => Some(mbps),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_tunnel_config(mtu: Option<u16>) -> crate::config::TunnelConfig {
+        crate::config::TunnelConfig {
+            name: "mlvpn-test0".to_string(),
+            address: "10.200.0.1/30".to_string(),
+            address6: None,
+            mtu,
+            clamp_mss: true,
+        }
+    }
+
+    #[test]
+    fn no_configured_ceiling_uses_full_detected_value() {
+        let cfg = test_tunnel_config(None);
+        let detected = [Some(1500u32)];
+        // outer_overhead for IPv6/UDP framing is protocol::HEADER_LEN +
+        // crypto::TAG_LEN + 48 -- assert the result equals
+        // 1500 - that overhead, NOT the old hardcoded 1400.
+        let expected = 1500u32
+            .saturating_sub(crate::protocol::HEADER_LEN as u32 + crate::crypto::TAG_LEN as u32 + 48)
+            as u16;
+        assert_eq!(effective_tunnel_mtu(&cfg, &detected), expected);
+    }
+
+    #[test]
+    fn no_configured_ceiling_and_nothing_detected_falls_back_to_a_conservative_default() {
+        let cfg = test_tunnel_config(None);
+        assert_eq!(effective_tunnel_mtu(&cfg, &[]), 1400);
+        assert_eq!(effective_tunnel_mtu(&cfg, &[None]), 1400);
+    }
+
+    #[test]
+    fn configured_ceiling_still_clamps_down() {
+        let cfg = test_tunnel_config(Some(1400));
+        let detected = [Some(1300u32)];
+        assert!(effective_tunnel_mtu(&cfg, &detected) < 1400);
+    }
+
+    #[test]
+    fn resize_triggers_only_on_a_real_change() {
+        assert!(mtu_resize_needed(1400, 1452));
+        assert!(mtu_resize_needed(1452, 1400));
+        assert!(!mtu_resize_needed(1400, 1400));
     }
 }

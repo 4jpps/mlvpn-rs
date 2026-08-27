@@ -1061,7 +1061,7 @@ fn bind_socket(
 /// optimization input, not a correctness requirement, so callers must
 /// always have a sane fallback rather than treating `None` as fatal.
 #[cfg(target_os = "linux")]
-fn query_interface_mtu(ifname: &str) -> Option<u32> {
+pub(crate) fn query_interface_mtu(ifname: &str) -> Option<u32> {
     // Any datagram socket works as the ioctl handle -- it's never bound,
     // connected, or used for actual I/O, just as a file descriptor the
     // kernel will accept SIOCGIFMTU on. AF_INET is used here purely by
@@ -1102,7 +1102,7 @@ fn query_interface_mtu(ifname: &str) -> Option<u32> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn query_interface_mtu(_ifname: &str) -> Option<u32> {
+pub(crate) fn query_interface_mtu(_ifname: &str) -> Option<u32> {
     None
 }
 

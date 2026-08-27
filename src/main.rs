@@ -4,7 +4,7 @@ use mlvpn::error::{MlvpnError, Result};
 use mlvpn::firewall;
 use mlvpn::ipc::{Command as SocketCommand, CommandResult};
 use mlvpn::logbuf::{LogRing, LogRingLayer};
-use mlvpn::{crypto, link, privilege, tunnel};
+use mlvpn::{control, crypto, link, privilege, tunnel};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -662,7 +662,7 @@ async fn run(cfg: Config, log_ring: Arc<LogRing>) -> anyhow::Result<()> {
         links.push(link);
     }
 
-    let effective_mtu = effective_tunnel_mtu(
+    let effective_mtu = control::effective_tunnel_mtu(
         &cfg.tunnel,
         &links.iter().map(|l| l.physical_mtu).collect::<Vec<_>>(),
     );
@@ -755,6 +755,8 @@ async fn run(cfg: Config, log_ring: Arc<LogRing>) -> anyhow::Result<()> {
         command_socket,
         diagnostics_watch,
         tunnel_local_addr,
+        tunnel_cfg: cfg.tunnel.clone(),
+        bind_interfaces: cfg.links.iter().map(|l| l.bind_interface.clone()).collect(),
     };
 
     // `tunnel::run` races SIGINT/SIGTERM against the tunnel's own tasks
@@ -766,92 +768,6 @@ async fn run(cfg: Config, log_ring: Arc<LogRing>) -> anyhow::Result<()> {
     tunnel::run(tun, links, params, log_ring)
         .await
         .map_err(anyhow::Error::from)
-}
-
-/// Conservative built-in floor used only when there's no configured
-/// ceiling *and* nothing at all was detected (e.g. no links yet, every
-/// link is on a non-Linux platform, or every query failed). Not the
-/// field's declared default any more -- `tunnel.mtu` itself defaults to
-/// `None` -- just a last-resort value for this one corner case.
-const FALLBACK_MTU_WHEN_NOTHING_DETECTED: u16 = 1400;
-
-/// Picks the MTU actually used for the TUN device and outgoing packet
-/// sizing: when `tunnel.mtu` is configured, the smaller of that ceiling
-/// and a safe value derived from every bonded link's real physical
-/// interface MTU; when `tunnel.mtu` is left unset, the full
-/// detected-safe value is used directly -- including upward, so a link
-/// whose physical MTU is actually 1500 bytes gets the tunnel MTU it can
-/// carry rather than being silently capped at some hardcoded default.
-/// This turns the previously advisory-only startup warning (still in
-/// `config.rs`'s `validate()`, checked against a generic 1500-byte
-/// assumption before any link exists to ask) into a real, self-correcting
-/// default: a configured `tunnel.mtu` that would actually fragment
-/// against this deployment's hardware gets clamped down automatically
-/// instead of just logging a warning and fragmenting anyway. Links
-/// whose physical MTU couldn't be determined (non-Linux, insufficient
-/// permissions, a transient ioctl failure) simply don't participate in
-/// the minimum -- if *no* link's MTU is known, this falls back to the
-/// configured ceiling if one is set, or a conservative built-in default
-/// (`FALLBACK_MTU_WHEN_NOTHING_DETECTED`) if not, rather than refusing
-/// to start.
-///
-/// Takes raw MTU readings (`detected_mtus: &[Option<u32>]`) rather than
-/// `&[link::Link]`: `link::Link::physical_mtu` is a one-shot value never
-/// refreshed by `LinkHandle::reconnect`, so callers with only a frozen
-/// `Link` snapshot (the startup call site, once, at bind time) and
-/// callers with live re-queried readings (the continuous MTU monitor
-/// loop, which calls `link::query_interface_mtu` directly) can both
-/// funnel their readings through the same formula here.
-///
-/// `outer_overhead` deliberately assumes the *larger* of the two
-/// possible outer-transport combinations (IPv6/UDP, 48 bytes) rather
-/// than IPv4/UDP (28 bytes): which one a given link actually dials over
-/// depends on `remote_addr`'s address family per-link, and this
-/// function has no per-link visibility into that -- one tunnel-wide MTU
-/// is picked for all of them. Assuming the larger overhead errs toward
-/// "possibly slightly conservative" rather than "possibly still
-/// fragments on an IPv6 link," which is the correct direction to be
-/// wrong in given the user asked for this to auto-adjust for
-/// *throughput*, not just raw MTU size: a black-holed PMTUD stall costs
-/// far more throughput than a few bytes of headroom ever would.
-fn effective_tunnel_mtu(cfg: &config::TunnelConfig, detected_mtus: &[Option<u32>]) -> u16 {
-    let outer_overhead = mlvpn::protocol::HEADER_LEN as u32 + mlvpn::crypto::TAG_LEN as u32 + 48;
-
-    let Some(detected_min) = detected_mtus.iter().filter_map(|m| *m).min() else {
-        return cfg.mtu.unwrap_or(FALLBACK_MTU_WHEN_NOTHING_DETECTED);
-    };
-
-    let safe_mtu = detected_min
-        .saturating_sub(outer_overhead)
-        .min(u16::MAX as u32) as u16;
-
-    match cfg.mtu {
-        Some(ceiling) if ceiling <= safe_mtu => ceiling,
-        Some(ceiling) => {
-            // Never clamp below the config-time floor already enforced
-            // in config.rs's validate() (>= 576, the IPv6 minimum-MTU
-            // guarantee) -- an unusually small detected physical MTU
-            // should surface as a visible problem, not silently produce
-            // a tunnel MTU so small it can't carry a minimum-size IPv6
-            // packet at all.
-            let clamped = safe_mtu.max(576);
-            tracing::warn!(
-                configured = ceiling,
-                detected_min_physical_mtu = detected_min,
-                clamped_to = clamped,
-                "tunnel.mtu exceeds what the bonded links' physical interfaces can carry \
-                 without fragmentation; auto-clamping down for this run (edit tunnel.mtu \
-                 in the config to make this permanent and silence this warning)"
-            );
-            clamped
-        }
-        // No configured ceiling: use the full detected-safe value
-        // directly, including upward from any previous run -- this is
-        // the actual fix for the reported throughput regression (the
-        // old code's `cfg.mtu` defaulted to 1400 and this branch never
-        // existed, so a real 1500-MTU link was never used past 1400).
-        None => safe_mtu.max(576),
-    }
 }
 
 fn open_tun(cfg: &config::TunnelConfig, mtu: u16) -> Result<tun_rs::AsyncDevice> {
@@ -891,44 +807,3 @@ fn parse_cidr(s: &str) -> Result<(String, u8)> {
     Ok((addr.to_string(), prefix))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn test_tunnel_config(mtu: Option<u16>) -> config::TunnelConfig {
-        config::TunnelConfig {
-            name: "mlvpn-test0".to_string(),
-            address: "10.200.0.1/30".to_string(),
-            address6: None,
-            mtu,
-            clamp_mss: true,
-        }
-    }
-
-    #[test]
-    fn no_configured_ceiling_uses_full_detected_value() {
-        let cfg = test_tunnel_config(None);
-        let detected = [Some(1500u32)];
-        // outer_overhead for IPv6/UDP framing is protocol::HEADER_LEN +
-        // crypto::TAG_LEN + 48 -- assert the result equals
-        // 1500 - that overhead, NOT the old hardcoded 1400.
-        let expected = 1500u32
-            .saturating_sub(mlvpn::protocol::HEADER_LEN as u32 + mlvpn::crypto::TAG_LEN as u32 + 48)
-            as u16;
-        assert_eq!(effective_tunnel_mtu(&cfg, &detected), expected);
-    }
-
-    #[test]
-    fn no_configured_ceiling_and_nothing_detected_falls_back_to_a_conservative_default() {
-        let cfg = test_tunnel_config(None);
-        assert_eq!(effective_tunnel_mtu(&cfg, &[]), 1400);
-        assert_eq!(effective_tunnel_mtu(&cfg, &[None]), 1400);
-    }
-
-    #[test]
-    fn configured_ceiling_still_clamps_down() {
-        let cfg = test_tunnel_config(Some(1400));
-        let detected = [Some(1300u32)];
-        assert!(effective_tunnel_mtu(&cfg, &detected) < 1400);
-    }
-}
