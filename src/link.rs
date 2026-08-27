@@ -1106,6 +1106,49 @@ fn query_interface_mtu(_ifname: &str) -> Option<u32> {
     None
 }
 
+/// Sets a network interface's kernel-reported MTU via the `SIOCSIFMTU`
+/// ioctl -- the write-side counterpart to `query_interface_mtu` above,
+/// used by `control::mtu_monitor_loop` to resize the running TUN device
+/// live, without a restart. Bypasses `tun_rs` entirely: its `AsyncDevice`
+/// (the type this codebase actually holds) has no public accessor to
+/// the underlying platform `Device` that owns `set_mtu` -- that
+/// accessor is `pub(crate)` inside the `tun_rs` crate itself (confirmed
+/// by reading its source during design), so a direct ioctl on the
+/// interface name is the only option from outside that crate.
+#[cfg(target_os = "linux")]
+pub fn set_interface_mtu(ifname: &str, mtu: u16) -> std::io::Result<()> {
+    let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+
+    let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
+    let name_bytes = ifname.as_bytes();
+    if name_bytes.len() >= ifr.ifr_name.len() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "interface name too long",
+        ));
+    }
+    for (dst, src) in ifr.ifr_name.iter_mut().zip(name_bytes.iter()) {
+        *dst = *src as libc::c_char;
+    }
+    ifr.ifr_ifru.ifru_mtu = mtu as libc::c_int;
+
+    // SAFETY: `ifr` is a valid, zero-initialized `ifreq` with `ifr_name`
+    // and `ifr_ifru.ifru_mtu` populated above, both within the struct's
+    // allocation; SIOCSIFMTU reads both fields and writes nothing back
+    // (see netdevice(7)). `sock`'s file descriptor is valid for the
+    // duration of this call.
+    let ret = unsafe { libc::ioctl(sock.as_raw_fd(), libc::SIOCSIFMTU, &ifr) };
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn set_interface_mtu(_ifname: &str, _mtu: u16) -> std::io::Result<()> {
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1121,6 +1164,30 @@ mod tests {
         // doesn't, to exercise the ioctl-failure path without requiring
         // any particular network configuration in CI.
         assert_eq!(query_interface_mtu("mlvpn-test-nonexistent-if0"), None);
+    }
+
+    #[test]
+    #[ignore] // needs root and a real interface -- run with --ignored
+    fn set_interface_mtu_on_loopback_round_trips() {
+        // Loopback's MTU is safe to change and change back on any
+        // Linux test runner without affecting other interfaces.
+        let original = query_interface_mtu("lo").expect("lo should always be queryable");
+        set_interface_mtu("lo", 1400).unwrap();
+        assert_eq!(query_interface_mtu("lo"), Some(1400));
+        // Restore, since this mutates real host state. Loopback's own
+        // real-world default MTU is 65536 -- one past u16::MAX, unlike
+        // any real physical or VPN link this crate ever resizes -- so
+        // `original as u16` would silently wrap it to 0 and leave `lo`
+        // corrupted instead of restored (confirmed live while writing
+        // this test: it zeroed out `lo`'s MTU on the dev box). Restore
+        // through the `ip` CLI instead of round-tripping back through
+        // `set_interface_mtu` to avoid that truncation.
+        let status = std::process::Command::new("ip")
+            .args(["link", "set", "dev", "lo", "mtu", &original.to_string()])
+            .status()
+            .expect("failed to run `ip link set` to restore lo's MTU");
+        assert!(status.success(), "failed to restore lo's original MTU");
+        assert_eq!(query_interface_mtu("lo"), Some(original));
     }
 
     /// `record_tx`/`record_rx` each update a lifetime counter *and* feed
