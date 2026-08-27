@@ -34,6 +34,7 @@
 mod support;
 
 use std::process::Command;
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 use support::{
     create_scratch_dir, ensure_mlvpn_system_user, generate_test_keypair, link_is_up,
@@ -42,6 +43,40 @@ use support::{
     NetNs, SchedulerOverrides, VethPair, CLIENT_TUNNEL_ADDR, SERVER_TUNNEL_ADDR,
     SERVER_TUNNEL_HOST,
 };
+
+/// Guards concurrent mutation of the process-global `MLVPN_DIAGNOSTICS_URL`
+/// env var across tests in this file. Mirrors the `ENV_LOCK` pattern
+/// `src/diagnostics.rs`'s own unit tests already established for this
+/// exact env var (Task 3 hit this same race and fixed it the same way) --
+/// this file's documented invocation doesn't pass `--test-threads=1`, and
+/// other tests in this file spawn `mlvpnd` child processes concurrently,
+/// so an unguarded `std::env::set_var`/`remove_var` pair here would
+/// reintroduce that exact class of bug.
+static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+/// RAII guard: holds `ENV_LOCK` and unsets `MLVPN_DIAGNOSTICS_URL` on
+/// drop, so a panicking `.expect()`/`assert!` anywhere after `set` is
+/// called still can't leak the mutation (or the lock) into whatever test
+/// runs after this one -- normal Rust test-harness unwinding runs `Drop`
+/// impls for a panicking test's still-live locals same as any other
+/// early return.
+struct DiagnosticsUrlGuard {
+    _lock: MutexGuard<'static, ()>,
+}
+
+impl DiagnosticsUrlGuard {
+    fn set(url: &str) -> Self {
+        let lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        std::env::set_var("MLVPN_DIAGNOSTICS_URL", url);
+        Self { _lock: lock }
+    }
+}
+
+impl Drop for DiagnosticsUrlGuard {
+    fn drop(&mut self) {
+        std::env::remove_var("MLVPN_DIAGNOSTICS_URL");
+    }
+}
 
 #[tokio::test]
 #[ignore = "needs root, iproute2 (incl. tc), and network namespaces -- see module doc comment"]
@@ -340,7 +375,9 @@ async fn diag_dump_auto_watch_submits_report_when_auto_submit_enabled() {
     // process's environment (it never clears/replaces it), so setting
     // this here before spawning the client is enough for the child
     // `mlvpnd` process to pick it up via `diagnostics::diagnostics_url`.
-    std::env::set_var("MLVPN_DIAGNOSTICS_URL", &mock_url);
+    // Held for the rest of the test's scope; `Drop` unsets it and
+    // releases `ENV_LOCK` even if something below panics.
+    let _diagnostics_url_guard = DiagnosticsUrlGuard::set(&mock_url);
 
     let id = unique_id();
     let ns_client = NetNs::create(&format!("mdsc{id}")).expect("create client netns");
@@ -443,8 +480,6 @@ async fn diag_dump_auto_watch_submits_report_when_auto_submit_enabled() {
     let request = mock_rx
         .recv_timeout(Duration::from_secs(60))
         .expect("mock software-support server never received a POST within 60s of real 60% loss");
-
-    std::env::remove_var("MLVPN_DIAGNOSTICS_URL");
 
     assert!(
         request.starts_with("POST /api/v1/reports"),
