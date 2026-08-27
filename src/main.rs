@@ -480,19 +480,23 @@ fn run_diag_dump(
 
 /// Installs a panic hook that best-effort-submits a crash report to
 /// software-support before the default hook prints its usual backtrace
-/// to stderr. Fire-and-forget: the spawned thread's handle is dropped,
-/// so nothing here can delay the process's actual panic/exit sequence.
-/// No config snapshot is gathered -- reaching into shared daemon state
-/// from a panic hook risks a second panic instead of this best-effort
-/// send; the log lines are what actually explain a crash anyway.
+/// to stderr. Blocks briefly (bounded by `submit_report_blocking`'s own
+/// ~10s client timeout, `SUBMIT_TIMEOUT` in diagnostics.rs) to give the
+/// crash report a real chance to actually leave the process before it
+/// exits -- a detached, unjoined thread here loses the race against
+/// process exit in practice and the report never leaves. No config
+/// snapshot is gathered -- reaching into shared daemon state from a
+/// panic hook risks a second panic instead of this best-effort send;
+/// the log lines are what actually explain a crash anyway.
 fn install_crash_report_hook(log_ring: Arc<LogRing>) {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let message = info.to_string();
         let logs = log_ring.recent_lines_snapshot();
-        std::thread::spawn(move || {
+        let handle = std::thread::spawn(move || {
             let _ = mlvpn::diagnostics::submit_report_blocking(&logs, "crash", Some(&message));
         });
+        let _ = handle.join();
         default_hook(info);
     }));
 }
