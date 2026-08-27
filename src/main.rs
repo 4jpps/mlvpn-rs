@@ -128,6 +128,15 @@ enum Command {
         /// directory.
         #[arg(short, long)]
         output: Option<PathBuf>,
+        /// Also submit this dump to https://software-support.jpps.us
+        /// as a real, trackable support ticket. The local file is
+        /// still written either way.
+        #[arg(long)]
+        submit: bool,
+        /// Optional note to attach to the submitted report. Only
+        /// meaningful alongside --submit.
+        #[arg(long)]
+        message: Option<String>,
     },
 }
 
@@ -187,7 +196,12 @@ fn main() -> anyhow::Result<()> {
                 run_throughput_selftest(&config, link, duration, bidirectional)
             }
         }
-        Command::DiagDump { config, output } => run_diag_dump(&config, output),
+        Command::DiagDump {
+            config,
+            output,
+            submit,
+            message,
+        } => run_diag_dump(&config, output, submit, message.as_deref()),
     }
 }
 
@@ -415,7 +429,12 @@ fn run_tunnel_throughput_selftest(
 /// own text, plus this CLI process's own kernel-level UDP diagnostics --
 /// see `capture_kernel_udp_diagnostics`) to `output`, or an auto-named
 /// file in the current directory when `output` is `None`.
-fn run_diag_dump(config_path: &Path, output: Option<PathBuf>) -> anyhow::Result<()> {
+fn run_diag_dump(
+    config_path: &Path,
+    output: Option<PathBuf>,
+    submit: bool,
+    message: Option<&str>,
+) -> anyhow::Result<()> {
     let cfg = Config::load(config_path)?;
     let result = send_command(config_path, &SocketCommand::DiagDump)?;
 
@@ -431,6 +450,7 @@ fn run_diag_dump(config_path: &Path, output: Option<PathBuf>) -> anyhow::Result<
         .diag_dump
         .unwrap_or_else(|| "(daemon returned no dump text)".to_string());
     let kernel_dump = capture_kernel_udp_diagnostics();
+    let combined = format!("{daemon_dump}\n{kernel_dump}");
 
     let path = output.unwrap_or_else(|| {
         let unix_secs = std::time::SystemTime::now()
@@ -439,8 +459,21 @@ fn run_diag_dump(config_path: &Path, output: Option<PathBuf>) -> anyhow::Result<
             .as_secs();
         PathBuf::from(format!("mlvpn-diag-{}-{unix_secs}.txt", cfg.tunnel.name))
     });
-    std::fs::write(&path, format!("{daemon_dump}\n{kernel_dump}"))?;
+    std::fs::write(&path, &combined)?;
     println!("wrote diagnostic dump to {}", path.display());
+
+    if submit {
+        match mlvpn::diagnostics::submit_report_blocking(&combined, "manual", message) {
+            Ok(ticket_id) => {
+                println!("submitted to software-support: ticket {ticket_id}");
+                println!("status: https://software-support.jpps.us/status/{ticket_id}");
+            }
+            Err(e) => {
+                eprintln!("warning: could not submit report to software-support: {e}");
+            }
+        }
+    }
+
     Ok(())
 }
 
