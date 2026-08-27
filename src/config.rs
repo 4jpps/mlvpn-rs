@@ -73,16 +73,15 @@ pub struct TunnelConfig {
     /// it's the same tun_reader path in tunnel.rs handling whichever
     /// address family the kernel happens to hand it a packet for.
     pub address6: Option<String>,
-    /// Requested tunnel MTU. Treated as an upper bound, not a fixed
-    /// value: at startup this is automatically clamped down (with a
-    /// warning) if it would exceed what the bonded links' actual
-    /// physical interface MTUs can carry without fragmentation -- see
-    /// `main.rs`'s `effective_tunnel_mtu()`. The static warning below
-    /// in `validate()` is a config-time-only sanity check against a
-    /// generic 1500-byte assumption; the real, link-aware clamp happens
-    /// later once links are bound and their true MTUs are known.
-    #[serde(default = "default_mtu")]
-    pub mtu: u16,
+    /// Optional hard ceiling on the tunnel MTU. Leave unset (the
+    /// default) to let mlvpn-rs pick the tunnel MTU entirely from
+    /// live-detected physical link MTUs, adjusting automatically --
+    /// including upward, unlike the old fixed-1400 default -- as links
+    /// connect, reconnect, or change. Set this only to impose an
+    /// explicit operator ceiling (detection can still clamp further
+    /// down from it, never up past it).
+    #[serde(default)]
+    pub mtu: Option<u16>,
     /// Rewrite the MSS option of TCP SYN/SYN-ACK segments passing
     /// through the tunnel so TCP flows negotiate a segment size that
     /// already fits the effective tunnel MTU, rather than relying on
@@ -94,10 +93,6 @@ pub struct TunnelConfig {
     /// doing MSS clamping and doing it twice would be redundant.
     #[serde(default = "default_clamp_mss")]
     pub clamp_mss: bool,
-}
-
-fn default_mtu() -> u16 {
-    1400
 }
 
 fn default_clamp_mss() -> bool {
@@ -491,6 +486,16 @@ pub struct CommandConfig {
 pub struct DiagnosticsConfig {
     #[serde(default)]
     pub auto_dump_enabled: bool,
+    /// Also submit an automatic dump to https://software-support.jpps.us
+    /// (as a real, findable support ticket) in addition to writing it
+    /// to `dump_dir`. Off by default -- writing a local file is silent
+    /// and inspectable by the operator at their leisure; submitting one
+    /// is an outbound network call this daemon makes on its own, which
+    /// needs explicit opt-in regardless of whether `auto_dump_enabled`
+    /// itself is already on. Has no effect unless `auto_dump_enabled`
+    /// is also true.
+    #[serde(default)]
+    pub auto_submit_enabled: bool,
     /// A link's `local_loss_pct` (same figure `mlvpn-tui`'s Links tab
     /// shows) has to exceed this before a dump fires.
     #[serde(default = "default_diag_loss_threshold_pct")]
@@ -530,6 +535,7 @@ impl Default for DiagnosticsConfig {
     fn default() -> Self {
         Self {
             auto_dump_enabled: false,
+            auto_submit_enabled: false,
             loss_threshold_pct: default_diag_loss_threshold_pct(),
             cooldown_secs: default_diag_cooldown_secs(),
             dump_dir: None,
@@ -591,10 +597,12 @@ impl Config {
 
         check_permissions(&self.crypto.private_key_file)?;
 
-        if self.tunnel.mtu < 576 {
-            return Err(MlvpnError::Config(
-                "tunnel MTU must be at least 576 bytes".into(),
-            ));
+        if let Some(mtu) = self.tunnel.mtu {
+            if mtu < 576 {
+                return Err(MlvpnError::Config(
+                    "tunnel MTU must be at least 576 bytes".into(),
+                ));
+            }
         }
 
         if self.crypto.rekey_interval_secs == 0 {
@@ -650,19 +658,21 @@ impl Config {
         // uses eprintln! rather than tracing::warn! because it runs
         // during config validation, before logging is initialized (see
         // main.rs) -- stderr is the only channel guaranteed visible here.
-        let outer_overhead = crate::protocol::HEADER_LEN as u32 + crate::crypto::TAG_LEN as u32
-            + 28 /* IPv4(20) + UDP(8); +20 more if the outer transport ends up on IPv6 */;
-        const TYPICAL_PHYSICAL_MTU: u32 = 1500;
-        if self.tunnel.mtu as u32 + outer_overhead > TYPICAL_PHYSICAL_MTU {
-            eprintln!(
-                "warning: tunnel.mtu = {} plus ~{outer_overhead} bytes of tunnel overhead \
-                 exceeds the typical 1500-byte physical link MTU; outer packets may be \
-                 IP-fragmented or silently dropped by firewalls that block fragments. \
-                 Consider tunnel.mtu <= {} unless every bonded link's physical MTU is \
-                 confirmed higher.",
-                self.tunnel.mtu,
-                TYPICAL_PHYSICAL_MTU.saturating_sub(outer_overhead)
-            );
+        if let Some(mtu) = self.tunnel.mtu {
+            let outer_overhead = crate::protocol::HEADER_LEN as u32
+                + crate::crypto::TAG_LEN as u32
+                + 28 /* IPv4(20) + UDP(8); +20 more if the outer transport ends up on IPv6 */;
+            const TYPICAL_PHYSICAL_MTU: u32 = 1500;
+            if mtu as u32 + outer_overhead > TYPICAL_PHYSICAL_MTU {
+                eprintln!(
+                    "warning: tunnel.mtu = {mtu} plus ~{outer_overhead} bytes of tunnel \
+                     overhead exceeds the typical 1500-byte physical link MTU; outer packets \
+                     may be IP-fragmented or silently dropped by firewalls that block \
+                     fragments. Consider tunnel.mtu <= {} unless every bonded link's physical \
+                     MTU is confirmed higher.",
+                    TYPICAL_PHYSICAL_MTU.saturating_sub(outer_overhead)
+                );
+            }
         }
 
         Ok(())
@@ -682,4 +692,95 @@ fn check_permissions(path: &Path) -> Result<()> {
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// `validate()` calls `check_permissions` on `crypto.private_key_file`,
+    /// which does a real `fs::metadata` stat -- a missing path errors,
+    /// not just a wrong-permission one -- so this fixture needs a real
+    /// 0600 file on disk, not just a plausible-looking path. Leaves the
+    /// file in place after the test (harmless, tiny, in the OS temp
+    /// dir) rather than adding cleanup machinery for a handful of
+    /// zero-byte files.
+    ///
+    /// Deviates from the brief's fixture in one respect: `validate()`
+    /// requires at least one `[[links]] entry (checked directly at
+    /// src/config.rs's `if self.links.is_empty()` early in `validate()`),
+    /// so an empty `links: vec![]` as the brief originally sketched would
+    /// fail every one of these tests for an unrelated reason. This
+    /// fixture includes one minimal, valid `LinkConfig` instead.
+    fn minimal_valid_config() -> Config {
+        let key_path = std::env::temp_dir().join(format!(
+            "mlvpn-test-key-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&key_path, b"test-key-material").unwrap();
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        Config {
+            mode: Mode::Client,
+            tunnel: TunnelConfig {
+                name: "mlvpn-test0".to_string(),
+                address: "10.200.0.1/30".to_string(),
+                address6: None,
+                mtu: Some(1400),
+                clamp_mss: true,
+            },
+            crypto: CryptoConfig {
+                private_key_file: key_path,
+                peer_public_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string(),
+                rekey_interval_secs: 120,
+            },
+            scheduler: SchedulerConfig::default(),
+            links: vec![LinkConfig {
+                name: "link0".to_string(),
+                bind_interface: "eth0".to_string(),
+                local_addr: None,
+                remote_addr: Some("198.51.100.1:51000".to_string()),
+                local_port: 51000,
+                weight: 1.0,
+                bandwidth_cap_mbps: None,
+                probe_interval_ms: default_probe_interval_ms(),
+            }],
+            logging: LoggingConfig::default(),
+            control: ControlConfig::default(),
+            command: CommandConfig::default(),
+            diagnostics: DiagnosticsConfig {
+                auto_dump_enabled: false,
+                loss_threshold_pct: 10.0,
+                cooldown_secs: 60,
+                dump_dir: None,
+                auto_submit_enabled: false,
+            },
+        }
+    }
+
+    #[test]
+    fn mtu_none_passes_validation_regardless_of_link_count() {
+        let mut cfg = minimal_valid_config();
+        cfg.tunnel.mtu = None;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn mtu_some_below_576_is_rejected() {
+        let mut cfg = minimal_valid_config();
+        cfg.tunnel.mtu = Some(500);
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn mtu_some_576_or_above_is_accepted() {
+        let mut cfg = minimal_valid_config();
+        cfg.tunnel.mtu = Some(1400);
+        assert!(cfg.validate().is_ok());
+    }
 }

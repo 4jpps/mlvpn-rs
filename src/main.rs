@@ -792,17 +792,25 @@ async fn run(cfg: Config, log_ring: Arc<LogRing>) -> anyhow::Result<()> {
 /// *throughput*, not just raw MTU size: a black-holed PMTUD stall costs
 /// far more throughput than a few bytes of headroom ever would.
 fn effective_tunnel_mtu(cfg: &config::TunnelConfig, links: &[link::Link]) -> u16 {
+    // TODO(task 8): `cfg.mtu` is now `Option<u16>` -- absence means "no
+    // operator ceiling, pick entirely from detected physical link MTUs."
+    // This interim `unwrap_or(1400)` only preserves the old fixed-default
+    // behavior so the type change compiles; it does not yet implement
+    // the real detection-driven default. Task 8 replaces this function's
+    // logic properly.
+    let configured_mtu = cfg.mtu.unwrap_or(1400);
+
     let outer_overhead = mlvpn::protocol::HEADER_LEN as u32 + mlvpn::crypto::TAG_LEN as u32 + 48;
 
     let Some(detected_min) = links.iter().filter_map(|l| l.physical_mtu).min() else {
-        return cfg.mtu;
+        return configured_mtu;
     };
 
     let safe_mtu = detected_min
         .saturating_sub(outer_overhead)
         .min(u16::MAX as u32) as u16;
 
-    if cfg.mtu > safe_mtu {
+    if configured_mtu > safe_mtu {
         // Never clamp below the config-time floor already enforced in
         // config.rs's validate() (>= 576, the IPv6 minimum-MTU
         // guarantee) -- an unusually small detected physical MTU should
@@ -811,7 +819,7 @@ fn effective_tunnel_mtu(cfg: &config::TunnelConfig, links: &[link::Link]) -> u16
         // all.
         let clamped = safe_mtu.max(576);
         tracing::warn!(
-            configured = cfg.mtu,
+            configured = configured_mtu,
             detected_min_physical_mtu = detected_min,
             clamped_to = clamped,
             "tunnel.mtu exceeds what the bonded links' physical interfaces can carry \
@@ -820,7 +828,7 @@ fn effective_tunnel_mtu(cfg: &config::TunnelConfig, links: &[link::Link]) -> u16
         );
         clamped
     } else {
-        cfg.mtu
+        configured_mtu
     }
 }
 
