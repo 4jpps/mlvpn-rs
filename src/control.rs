@@ -786,6 +786,17 @@ pub(crate) async fn diagnostics_watch_loop(
                     "loss threshold exceeded; wrote automatic diagnostic dump"
                 );
                 last_dump_at = Some(Instant::now());
+
+                if watch.auto_submit {
+                    let text = text.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) =
+                            crate::diagnostics::submit_report_async(&text, "auto", None).await
+                        {
+                            tracing::warn!(error = %e, "failed to submit automatic diagnostic report to software-support");
+                        }
+                    });
+                }
             }
             Err(e) => {
                 tracing::warn!(

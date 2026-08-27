@@ -398,6 +398,7 @@ pub struct DiagnosticsWatchParams {
     pub loss_threshold_pct: f64,
     pub cooldown: Duration,
     pub dump_dir: PathBuf,
+    pub auto_submit: bool,
 }
 
 /// How long a retired ("previous") session's keys remain able to

@@ -771,3 +771,68 @@ pub fn link_score(snapshot: &mlvpn::ipc::Snapshot, link_name: &str) -> Option<f6
         .find(|l| l.name == link_name)
         .map(|l| l.score)
 }
+
+/// A minimal single-request HTTP server that captures the full raw
+/// request (headers + body) it receives and hands it back over a
+/// channel, for tests that need to assert on what was actually POSTed --
+/// e.g. `veth_diag_dump.rs`'s automatic-submission test, checking the
+/// `trigger` field the daemon's `diagnostics::submit_report_async` sent.
+///
+/// This is a capturing sibling of `diagnostics.rs`'s unit-test-local
+/// `spawn_mock_server`, which is fire-and-forget (it never needed to
+/// inspect what was sent, only to return a canned response). This is the
+/// second place a mock diagnostics-intake server is needed, and the
+/// first that needs to see the request body, so it lives here in the
+/// shared support module rather than being duplicated test-file-local
+/// again.
+pub fn spawn_capturing_mock_server(
+    status_line: &'static str,
+    json_body: &'static str,
+) -> (String, std::sync::mpsc::Receiver<String>) {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let n = stream.read(&mut chunk).unwrap_or(0);
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            let Some(header_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&buf[..header_end]);
+            let content_length: usize = headers
+                .lines()
+                .find_map(|l| {
+                    l.split_once(':').and_then(|(k, v)| {
+                        k.trim()
+                            .eq_ignore_ascii_case("content-length")
+                            .then(|| v.trim().parse().ok())
+                            .flatten()
+                    })
+                })
+                .unwrap_or(0);
+            let body_so_far = buf.len().saturating_sub(header_end + 4);
+            if body_so_far >= content_length {
+                break;
+            }
+        }
+        let request = String::from_utf8_lossy(&buf).into_owned();
+        let _ = tx.send(request);
+        let response = format!(
+            "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{json_body}",
+            json_body.len()
+        );
+        let _ = stream.write_all(response.as_bytes());
+    });
+    std::thread::sleep(Duration::from_millis(50)); // allow server to accept
+    (format!("http://{addr}"), rx)
+}

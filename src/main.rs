@@ -725,6 +725,7 @@ async fn run(cfg: Config, log_ring: Arc<LogRing>) -> anyhow::Result<()> {
                 .clone()
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("/var/log/mlvpn")),
+            auto_submit: cfg.diagnostics.auto_submit_enabled,
         })
     } else {
         None

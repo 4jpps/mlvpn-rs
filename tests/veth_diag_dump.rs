@@ -37,9 +37,10 @@ use std::process::Command;
 use std::time::Duration;
 use support::{
     create_scratch_dir, ensure_mlvpn_system_user, generate_test_keypair, link_is_up,
-    poll_snapshot_until, require_ip_command, require_root, require_tc_command, unique_id,
-    veth_link_addrs, write_config, LinkSpec, MlvpnProcess, NetNs, SchedulerOverrides, VethPair,
-    CLIENT_TUNNEL_ADDR, SERVER_TUNNEL_ADDR, SERVER_TUNNEL_HOST,
+    poll_snapshot_until, require_ip_command, require_root, require_tc_command,
+    spawn_capturing_mock_server, unique_id, veth_link_addrs, write_config, LinkSpec, MlvpnProcess,
+    NetNs, SchedulerOverrides, VethPair, CLIENT_TUNNEL_ADDR, SERVER_TUNNEL_ADDR,
+    SERVER_TUNNEL_HOST,
 };
 
 #[tokio::test]
@@ -313,5 +314,148 @@ async fn diag_dump_auto_watch_fires_on_real_loss() {
     assert!(
         dump.contains("exceeded threshold 5.0%"),
         "missing threshold detail in trigger line, got:\n{dump}"
+    );
+}
+
+/// Same real-loss setup as `diag_dump_auto_watch_fires_on_real_loss`, but
+/// with `auto_submit_enabled = true` and `MLVPN_DIAGNOSTICS_URL` pointed
+/// at a local mock server (see `support::spawn_capturing_mock_server`)
+/// standing in for `jpps/software-support`. Confirms
+/// `control::diagnostics_watch_loop` doesn't just write the local dump
+/// file (already covered above) but also actually submits it, with
+/// `trigger: "auto"` in the POST body -- the new behavior added in this
+/// task (see `src/control.rs`'s call to
+/// `diagnostics::submit_report_async` right after the local write).
+#[tokio::test]
+#[ignore = "needs root, iproute2 (incl. tc), and network namespaces -- see module doc comment"]
+async fn diag_dump_auto_watch_submits_report_when_auto_submit_enabled() {
+    require_root();
+    require_ip_command();
+    require_tc_command();
+    ensure_mlvpn_system_user().expect("ensure mlvpn system user/group exists");
+
+    let (mock_url, mock_rx) =
+        spawn_capturing_mock_server("HTTP/1.1 201 Created", r#"{"ticket_id":"test-ticket-1"}"#);
+    // `MlvpnProcess::spawn_with_log_capture` inherits the current
+    // process's environment (it never clears/replaces it), so setting
+    // this here before spawning the client is enough for the child
+    // `mlvpnd` process to pick it up via `diagnostics::diagnostics_url`.
+    std::env::set_var("MLVPN_DIAGNOSTICS_URL", &mock_url);
+
+    let id = unique_id();
+    let ns_client = NetNs::create(&format!("mdsc{id}")).expect("create client netns");
+    let ns_server = NetNs::create(&format!("mdss{id}")).expect("create server netns");
+
+    let vc0 = format!("mds0c{id}");
+    let vs0 = format!("mds0s{id}");
+    let (addr_c0, addr_s0) = veth_link_addrs(0);
+
+    let _veth0 = VethPair::create(&vc0, &ns_client, &addr_c0, &vs0, &ns_server, &addr_s0)
+        .expect("create veth pair");
+
+    // Real, substantial loss on the client's own interface, same as the
+    // plain automatic-dump test above, to push measured loss past the
+    // low threshold configured below.
+    ns_client
+        .exec(
+            "tc",
+            &["qdisc", "add", "dev", &vc0, "root", "netem", "loss", "60%"],
+        )
+        .expect("add netem loss to client's veth");
+
+    let tmp = create_scratch_dir("diagdumpsubmit", &id).expect("create scratch dir");
+    let dump_dir = tmp.join("auto-dumps");
+
+    let (client_key_path, client_pub) =
+        generate_test_keypair(&tmp, "client").expect("generate client keypair");
+    let (server_key_path, server_pub) =
+        generate_test_keypair(&tmp, "server").expect("generate server keypair");
+
+    let server_ctl = tmp.join("server.sock");
+    let client_ctl = tmp.join("client.sock");
+
+    let server_addr_0 = addr_s0.split('/').next().unwrap();
+
+    let server_cfg = write_config(
+        &tmp,
+        "server",
+        "mdssrv0",
+        SERVER_TUNNEL_ADDR,
+        &server_key_path,
+        &client_pub,
+        None,
+        SchedulerOverrides::default(),
+        &[LinkSpec {
+            name: "link0",
+            bind_interface: &vs0,
+            local_port: 6912,
+            local_addr: None,
+            remote_addr: None,
+        }],
+        &server_ctl,
+        None,
+    )
+    .expect("write server config");
+
+    let client_cfg = write_config(
+        &tmp,
+        "client",
+        "mdscli0",
+        CLIENT_TUNNEL_ADDR,
+        &client_key_path,
+        &server_pub,
+        None,
+        SchedulerOverrides::default(),
+        &[LinkSpec {
+            name: "link0",
+            bind_interface: &vc0,
+            local_port: 6912,
+            local_addr: None,
+            remote_addr: Some(format!("{server_addr_0}:6912")),
+        }],
+        &client_ctl,
+        None,
+    )
+    .expect("write client config");
+
+    let mut toml = std::fs::read_to_string(&client_cfg).expect("read client config back");
+    toml.push_str(&format!(
+        "[diagnostics]\nauto_dump_enabled = true\nauto_submit_enabled = true\n\
+         loss_threshold_pct = 5.0\ncooldown_secs = 1\ndump_dir = \"{}\"\n",
+        dump_dir.display()
+    ));
+    std::fs::write(&client_cfg, toml).expect("append [diagnostics] to client config");
+
+    let (_server, _server_logs) =
+        MlvpnProcess::spawn_with_log_capture(&ns_server.name, &server_cfg).expect("spawn server");
+    let (_client, _client_logs) =
+        MlvpnProcess::spawn_with_log_capture(&ns_client.name, &client_cfg).expect("spawn client");
+
+    poll_snapshot_until(&client_ctl, Duration::from_secs(20), |s| {
+        s.links.iter().any(|l| l.name == "link0")
+    })
+    .await
+    .expect("client never produced a snapshot with link0 at all");
+
+    // Wait for the mock server to actually receive the automatic
+    // submission's POST -- this is the new behavior under test, distinct
+    // from the local dump file also covered by the sibling test above.
+    let request = mock_rx
+        .recv_timeout(Duration::from_secs(60))
+        .expect("mock software-support server never received a POST within 60s of real 60% loss");
+
+    std::env::remove_var("MLVPN_DIAGNOSTICS_URL");
+
+    assert!(
+        request.starts_with("POST /api/v1/reports"),
+        "expected a POST to /api/v1/reports, got request:\n{request}"
+    );
+    assert!(
+        request.contains("\"trigger\":\"auto\""),
+        "expected trigger:\"auto\" in the submitted body, got request:\n{request}"
+    );
+    assert!(
+        request.contains("\"product\":\"mlvpn-rs\""),
+        "expected product:\"mlvpn-rs\" in the submitted body, got request:\n{request}"
     );
 }
