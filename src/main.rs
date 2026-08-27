@@ -154,6 +154,7 @@ fn main() -> anyhow::Result<()> {
         Command::Run { config } => {
             let cfg = Config::load(&config)?;
             let log_ring = init_logging(&cfg.logging.level);
+            install_crash_report_hook(log_ring.clone());
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
@@ -475,6 +476,25 @@ fn run_diag_dump(
     }
 
     Ok(())
+}
+
+/// Installs a panic hook that best-effort-submits a crash report to
+/// software-support before the default hook prints its usual backtrace
+/// to stderr. Fire-and-forget: the spawned thread's handle is dropped,
+/// so nothing here can delay the process's actual panic/exit sequence.
+/// No config snapshot is gathered -- reaching into shared daemon state
+/// from a panic hook risks a second panic instead of this best-effort
+/// send; the log lines are what actually explain a crash anyway.
+fn install_crash_report_hook(log_ring: Arc<LogRing>) {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let message = info.to_string();
+        let logs = log_ring.recent_lines_snapshot();
+        std::thread::spawn(move || {
+            let _ = mlvpn::diagnostics::submit_report_blocking(&logs, "crash", Some(&message));
+        });
+        default_hook(info);
+    }));
 }
 
 /// Captures kernel-level UDP diagnostics from *this* CLI process --
