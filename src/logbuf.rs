@@ -84,6 +84,19 @@ impl LogRing {
         let entries = self.entries.lock().unwrap();
         entries.iter().filter(|e| e.seq > since).cloned().collect()
     }
+
+    /// All current entries' messages, oldest first, newline-joined --
+    /// the crash-report path's `logs` field. Deliberately simpler than
+    /// `diag::format_dump`'s full bundle (no link table/daemon-health
+    /// section): that data isn't reliably readable from a panic hook,
+    /// and the log lines are what actually explain a crash anyway.
+    pub fn recent_lines_snapshot(&self) -> String {
+        self.entries_since(0)
+            .into_iter()
+            .map(|e| e.message)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 }
 
 impl Default for LogRing {
@@ -284,5 +297,19 @@ mod tests {
             "loss threshold exceeded but failed to write diagnostic dump \
              error=Permission denied (os error 13) dir=/var/log/mlvpn"
         );
+    }
+
+    #[test]
+    fn recent_lines_snapshot_joins_messages_in_order() {
+        let ring = LogRing::new();
+        ring.push("INFO", None, "first".to_string());
+        ring.push("WARN", None, "second".to_string());
+        assert_eq!(ring.recent_lines_snapshot(), "first\nsecond");
+    }
+
+    #[test]
+    fn recent_lines_snapshot_empty_ring_is_empty_string() {
+        let ring = LogRing::new();
+        assert_eq!(ring.recent_lines_snapshot(), "");
     }
 }
