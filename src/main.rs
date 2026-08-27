@@ -767,6 +767,13 @@ async fn run(cfg: Config, log_ring: Arc<LogRing>) -> anyhow::Result<()> {
         .map_err(anyhow::Error::from)
 }
 
+/// Conservative built-in floor used only when there's no configured
+/// ceiling *and* nothing at all was detected (e.g. no links yet, every
+/// link is on a non-Linux platform, or every query failed). Not the
+/// field's declared default any more -- `tunnel.mtu` itself defaults to
+/// `None` -- just a last-resort value for this one corner case.
+const FALLBACK_MTU_WHEN_NOTHING_DETECTED: u16 = 1400;
+
 /// Picks the MTU actually used for the TUN device and outgoing packet
 /// sizing: when `tunnel.mtu` is configured, the smaller of that ceiling
 /// and a safe value derived from every bonded link's real physical
@@ -806,14 +813,6 @@ async fn run(cfg: Config, log_ring: Arc<LogRing>) -> anyhow::Result<()> {
 /// wrong in given the user asked for this to auto-adjust for
 /// *throughput*, not just raw MTU size: a black-holed PMTUD stall costs
 /// far more throughput than a few bytes of headroom ever would.
-///
-/// Conservative built-in floor used only when there's no configured
-/// ceiling *and* nothing at all was detected (e.g. no links yet, every
-/// link is on a non-Linux platform, or every query failed). Not the
-/// field's declared default any more -- `tunnel.mtu` itself defaults to
-/// `None` -- just a last-resort value for this one corner case.
-const FALLBACK_MTU_WHEN_NOTHING_DETECTED: u16 = 1400;
-
 fn effective_tunnel_mtu(cfg: &config::TunnelConfig, detected_mtus: &[Option<u32>]) -> u16 {
     let outer_overhead = mlvpn::protocol::HEADER_LEN as u32 + mlvpn::crypto::TAG_LEN as u32 + 48;
 
