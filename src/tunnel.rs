@@ -1951,12 +1951,22 @@ async fn tun_reader(
     tx: mpsc::Sender<OutboundFrame>,
     dropped_total: Arc<AtomicU64>,
 ) -> Result<()> {
-    // Sized once from the startup MTU rather than tracking the live
-    // atomic: `mtu_monitor_loop` only ever narrows the tunnel MTU down
-    // from what the bonded links can safely carry (see
-    // `effective_tunnel_mtu`), so a buffer sized generously above the
-    // startup value has ample headroom for the lifetime of this reader.
-    let mut buf = vec![0u8; mtu.load(std::sync::atomic::Ordering::Relaxed) as usize + 64];
+    // Sized once at the theoretical maximum (`u16::MAX`, since `mtu` is
+    // itself a `u16`) rather than from the startup MTU value: unlike a
+    // per-link physical MTU, the live tunnel MTU is NOT monotonically
+    // non-increasing after startup -- `effective_tunnel_mtu`'s own `None`
+    // branch explicitly uses the full detected-safe value "including
+    // upward" (that's the actual fix for the throughput regression this
+    // whole feature exists for), and `mtu_monitor_loop` resizes upward
+    // just as readily as downward, e.g. when a link reconnects on
+    // different hardware with a higher physical MTU. A buffer sized from
+    // the startup value would silently truncate (or panic via the
+    // `buf[..n]` slice, if `tun.recv` ever reported `n` beyond the
+    // buffer's length) any packet larger than that after a live upward
+    // resize. One `u16::MAX`-sized allocation for this task's entire
+    // lifetime is negligible cost -- not worth reallocating on every
+    // resize just to save well under 64KB of memory.
+    let mut buf = vec![0u8; u16::MAX as usize + 64];
     loop {
         let n = tun.recv(&mut buf).await.map_err(MlvpnError::Io)?;
         let mut plaintext = buf[..n].to_vec();

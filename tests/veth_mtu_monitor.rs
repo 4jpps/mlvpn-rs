@@ -1,22 +1,29 @@
 //! End-to-end test of `control::mtu_monitor_loop` (Task 11): the running
 //! TUN device's live MTU should track whatever the bonded links can
-//! actually carry, continuously -- not just once at startup.
+//! actually carry, continuously -- not just once at startup, and in
+//! *both* directions.
 //!
-//! Sequence:
+//! Two cases, in `tun_device_mtu_converges_after_a_live_link_mtu_change`
+//! (downward) and `tun_device_mtu_converges_after_a_live_link_mtu_increase`
+//! (upward):
 //!
-//! 1. Bring up a tunnel over a veth pair with the default (kernel) MTU,
-//!    ~1500 bytes on each end.
+//! 1. Bring up a tunnel over a veth pair with a known starting MTU.
 //! 2. Confirm the TUN device's initial MTU (read directly via
 //!    `ip -o link show`, since `ipc::TunSnapshot` doesn't carry MTU) is
-//!    the auto-detected safe value derived from that ~1500-byte physical
+//!    the auto-detected safe value derived from that starting physical
 //!    MTU -- specifically NOT the old hardcoded 1400 fallback, which
 //!    would only apply if nothing were detected at all.
-//! 3. Lower the client's own veth interface's MTU mid-test with
-//!    `ip link set dev <veth> mtu 1300`, with no daemon restart.
+//! 3. Change the client's own veth interface's MTU mid-test with
+//!    `ip link set dev <veth> mtu <new>`, with no daemon restart -- down
+//!    in one test, up in the other. The upward case is the one that
+//!    actually exercises `effective_tunnel_mtu`'s documented "including
+//!    upward" behavior (see its doc comment in `src/control.rs`) and
+//!    `tun_reader`'s receive buffer, which must be sized to tolerate a
+//!    live MTU increase, not just the startup value.
 //! 4. Wait past `control::MTU_MONITOR_INTERVAL_SECS` (30s; not directly
 //!    importable here since `mtu_monitor_loop` is `pub(crate)` -- see
 //!    that module's doc comment) plus a safety margin, then confirm the
-//!    TUN device's live MTU has converged down to match, proving
+//!    TUN device's live MTU has converged to match, proving
 //!    `mtu_monitor_loop` re-queried the link, recomputed
 //!    `effective_tunnel_mtu`, and called `link::set_interface_mtu` on
 //!    its own.
@@ -210,6 +217,167 @@ async fn tun_device_mtu_converges_after_a_live_link_mtu_change() {
     assert!(
         converged_mtu > 1100 && converged_mtu < 1300,
         "expected the resized MTU to be derived from the new 1300-byte physical MTU minus \
+         protocol overhead, got {converged_mtu}"
+    );
+}
+
+/// Mirror of `tun_device_mtu_converges_after_a_live_link_mtu_change`
+/// above, but exercising the *upward* resize path: the client veth
+/// starts at a deliberately low MTU (1300), then gets raised to the
+/// kernel default (1500) mid-test, with no daemon restart. This is the
+/// case a fixed-size-from-startup `tun_reader` receive buffer would get
+/// wrong (see `src/tunnel.rs`'s `tun_reader` doc comment on why its
+/// buffer is sized at `u16::MAX`, not the startup MTU) -- a purely
+/// downward-resize test can't catch that class of bug, since the buffer
+/// only needs to be large enough for the *smallest* MTU it'll ever see
+/// to pass a downward-only test.
+#[tokio::test]
+#[ignore = "needs root, iproute2, and network namespaces -- see module doc comment"]
+async fn tun_device_mtu_converges_after_a_live_link_mtu_increase() {
+    require_root();
+    require_ip_command();
+    ensure_mlvpn_system_user().expect("ensure mlvpn system user/group exists");
+
+    let id = unique_id();
+    let ns_client = NetNs::create(&format!("mmiuc{id}")).expect("create client netns");
+    let ns_server = NetNs::create(&format!("mmius{id}")).expect("create server netns");
+
+    let vc0 = format!("mmiu0c{id}");
+    let vs0 = format!("mmiu0s{id}");
+    let (addr_c0, addr_s0) = veth_link_addrs(0);
+
+    let _veth0 = VethPair::create(&vc0, &ns_client, &addr_c0, &vs0, &ns_server, &addr_s0)
+        .expect("create veth pair");
+
+    // Start the client's own veth interface at a deliberately low MTU,
+    // before the daemon is ever spawned, so `effective_tunnel_mtu`
+    // computes its startup value from this low ceiling rather than the
+    // kernel default ~1500.
+    ns_client
+        .exec("ip", &["link", "set", "dev", &vc0, "mtu", "1300"])
+        .expect("set client veth MTU to 1300 before startup");
+
+    let tmp = create_scratch_dir("mtumonitorup", &id).expect("create scratch dir");
+
+    let (client_key_path, client_pub) =
+        generate_test_keypair(&tmp, "client").expect("generate client keypair");
+    let (server_key_path, server_pub) =
+        generate_test_keypair(&tmp, "server").expect("generate server keypair");
+
+    let server_ctl = tmp.join("server.sock");
+    let client_ctl = tmp.join("client.sock");
+
+    let server_addr_0 = addr_s0.split('/').next().unwrap();
+
+    let server_tun_name = "mtumonsrv1";
+    let client_tun_name = "mtumoncli1";
+
+    let server_cfg = write_config(
+        &tmp,
+        "server",
+        server_tun_name,
+        SERVER_TUNNEL_ADDR,
+        &server_key_path,
+        &client_pub,
+        None,
+        SchedulerOverrides::default(),
+        &[LinkSpec {
+            name: "link0",
+            bind_interface: &vs0,
+            local_port: 6921,
+            local_addr: None,
+            remote_addr: None,
+        }],
+        &server_ctl,
+        None,
+    )
+    .expect("write server config");
+
+    let client_cfg = write_config(
+        &tmp,
+        "client",
+        client_tun_name,
+        CLIENT_TUNNEL_ADDR,
+        &client_key_path,
+        &server_pub,
+        None,
+        SchedulerOverrides::default(),
+        &[LinkSpec {
+            name: "link0",
+            bind_interface: &vc0,
+            local_port: 6921,
+            local_addr: None,
+            remote_addr: Some(format!("{server_addr_0}:6921")),
+        }],
+        &client_ctl,
+        None,
+    )
+    .expect("write client config");
+
+    let (_server, _server_logs) =
+        MlvpnProcess::spawn_with_log_capture(&ns_server.name, &server_cfg).expect("spawn server");
+    let (_client, _client_logs) =
+        MlvpnProcess::spawn_with_log_capture(&ns_client.name, &client_cfg).expect("spawn client");
+
+    poll_snapshot_until(&client_ctl, Duration::from_secs(20), |s| {
+        link_is_up(s, "link0")
+    })
+    .await
+    .expect("link0 never reached 'up'");
+
+    // Initial MTU should be the auto-detected safe value derived from
+    // the deliberately-lowered ~1300-byte physical MTU.
+    let initial_mtu = poll_until_some(
+        Duration::from_secs(10),
+        || read_interface_mtu(&ns_client.name, client_tun_name),
+    )
+    .await
+    .expect("tun device never reported an MTU");
+    assert!(
+        initial_mtu > 1100 && initial_mtu < 1300,
+        "expected initial MTU derived from the deliberately-lowered ~1300-byte physical MTU, \
+         got {initial_mtu}"
+    );
+
+    // Raise the client's own veth interface's MTU mid-test, with no
+    // daemon restart -- the upward counterpart to the downward case
+    // above.
+    ns_client
+        .exec("ip", &["link", "set", "dev", &vc0, "mtu", "1500"])
+        .expect("raise client veth MTU to 1500");
+
+    // Wait past control::MTU_MONITOR_INTERVAL_SECS (30s) plus a safety
+    // margin, then confirm the TUN device's live MTU converged *up* to
+    // match the new, higher physical MTU. If `tun_reader`'s receive
+    // buffer were still sized from the startup (low) MTU rather than a
+    // fixed worst-case ceiling, a real packet sized for the new, larger
+    // MTU arriving after this resize would silently misbehave -- this
+    // test only checks the resize itself converges; the buffer-sizing
+    // fix is what makes it safe for `tun_reader` to actually carry
+    // packets that large afterward.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(50);
+    let mut converged_mtu = None;
+    while tokio::time::Instant::now() < deadline {
+        if let Some(mtu) = read_interface_mtu(&ns_client.name, client_tun_name) {
+            if mtu > initial_mtu {
+                converged_mtu = Some(mtu);
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+
+    let converged_mtu = converged_mtu.expect(
+        "mtu_monitor_loop never resized the tun device's MTU up within 50s of the veth MTU raise",
+    );
+    assert!(
+        converged_mtu > initial_mtu,
+        "expected the tun device's MTU to grow from {initial_mtu} after raising the veth MTU \
+         to 1500, got {converged_mtu}"
+    );
+    assert!(
+        converged_mtu > 1400 && converged_mtu < 1500,
+        "expected the resized MTU to be derived from the new 1500-byte physical MTU minus \
          protocol overhead, got {converged_mtu}"
     );
 }
