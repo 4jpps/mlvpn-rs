@@ -130,6 +130,10 @@ mod tests {
 
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::sync::Mutex;
+
+    // Shared lock to serialize env var access across all diagnostics tests
+    static ENV_LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
 
     /// A minimal, single-request raw HTTP server: reads one request off
     /// the listener, ignores its content beyond finding the end of
@@ -138,40 +142,24 @@ mod tests {
     /// for testing against real local sockets rather than pulling in a
     /// mocking framework this project has never used before.
     fn spawn_mock_server(status_line: &'static str, json_body: &'static str) -> String {
-        use std::sync::mpsc;
-        use std::sync::Arc;
-
-        let (tx, _rx) = mpsc::channel::<()>();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-
-        let listener = Arc::new(listener);
-        let listener_clone = listener.clone();
-
         std::thread::spawn(move || {
-            let _listener = listener_clone;
-            if let Ok((mut stream, _)) = _listener.accept() {
-                let mut buf = [0u8; 4096];
-                let _ = stream.read(&mut buf);
-                let response = format!(
-                    "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{json_body}",
-                    json_body.len()
-                );
-                let _ = stream.write_all(response.as_bytes());
-                let _ = stream.flush();
-            }
-            drop(tx);
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf); // don't need to parse the request
+            let response = format!(
+                "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{json_body}",
+                json_body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
         });
-
-        // Wait a tiny bit for the server to be ready
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::thread::sleep(std::time::Duration::from_millis(50)); // allow server to accept
         format!("http://{addr}")
     }
 
     #[test]
     fn submit_report_blocking_returns_ticket_id_on_201() {
-        use std::sync::Mutex;
-        static ENV_LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
         let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
 
         let url = spawn_mock_server("HTTP/1.1 201 Created", r#"{"ticket_id":"abc-123"}"#);
@@ -183,8 +171,6 @@ mod tests {
 
     #[test]
     fn submit_report_blocking_errors_on_non_2xx() {
-        use std::sync::Mutex;
-        static ENV_LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
         let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
 
         let url = spawn_mock_server("HTTP/1.1 422 Unprocessable Entity", r#"{"error":"bad"}"#);
