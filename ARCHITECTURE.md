@@ -501,12 +501,45 @@ for the full history of what and when.
 tunnel." Both address families share the one encrypted session and the
 one set of bonded links.
 
-**Adaptive MTU.** `tunnel.mtu` is an upper bound, not a fixed value:
-at startup, each link's real physical interface MTU is detected, and
-the configured value is clamped down if it would exceed what the
-smallest detected physical MTU can carry. This is a one-shot decision
-at startup, not a continuous control loop -- physical MTUs essentially
-never change while an interface stays up.
+**Adaptive MTU.** `tunnel.mtu` is optional, and leaving it unset is the
+recommended configuration. Unset, the tunnel MTU is derived entirely
+from the links themselves: each bonded link's real physical interface
+MTU is read from the kernel, and the tunnel is sized to what the
+smallest of them can carry without fragmenting (encapsulation overhead
+already subtracted). Set, it acts as an upper bound -- still clamped
+down if it would exceed what the links can actually carry, never raised
+above what the operator asked for.
+
+This is a **continuous control loop, not a one-shot startup decision**
+(it was one-shot before 0.5.0). `control::mtu_monitor_loop` re-reads
+every bind interface's MTU on a timer, recomputes what the tunnel
+should be, and resizes the live TUN device with `SIOCSIFMTU` when the
+answer changes -- up as well as down. Physical MTUs do change under a
+running daemon in practice: an LTE modem reconnecting on a different
+carrier path is the motivating case, and it is exactly the case where
+being pinned to a stale value costs the most throughput. The current
+value is shared with the data path as an atomic that every packet-sizing
+site (MSS clamping in `tun_reader`, the bandwidth prober, both
+self-tests) reads fresh, so a resize takes effect immediately rather
+than at the next restart.
+
+The resize needs `CAP_NET_ADMIN` held *at the moment it runs*, not just
+at startup. Both supported deployment models provide it: the shipped
+systemd unit grants it ambiently and never runs as root, and
+`privilege.rs`'s root-then-drop path deliberately retains that one
+capability (and only that one) across the drop. See §6 and §8.
+
+**Peer MTU is not negotiated.** Each end computes its MTU from its own
+local links, independently. Bonding genuinely asymmetric hardware (an
+LTE modem at ~1428 on one end, plain Ethernet at 1500 on the other) can
+therefore leave the two ends on different tunnel MTUs. MSS clamping
+keeps TCP correct in both directions, but UDP and ICMP large enough to
+fit the bigger side and not the smaller are silently discarded on
+arrival. Real negotiation -- each side learning the peer's MTU over the
+existing periodic peer version exchange and using `min(local, peer)`
+only where it actually needs to -- is the correct fix and is planned;
+it is deliberately not addressed by capping both ends down by hand,
+which would throw away capacity the faster link really has.
 
 **TCP MSS clamping** (on by default). Adaptive MTU alone only bounds
 the tunnel's own outer packet size; individual TCP connections

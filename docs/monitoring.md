@@ -219,3 +219,79 @@ external tools, which the daemon deliberately doesn't do on its own --
 see `diag.rs`'s module doc comment); run `mlvpnd diag-dump` by hand
 alongside it for the fuller picture while the loss condition is likely
 still reproducible.
+
+## Filing a dump as a support ticket
+
+A dump can be sent to <https://software-support.jpps.us> as a real,
+trackable ticket instead of being emailed around as a text file. Every
+path here is opt-in and best-effort: a network failure never turns into
+a harder failure than a warning, and the local file is always written
+regardless of whether the submission succeeded.
+
+**By hand.** Add `--submit` to any `diag-dump`, optionally with a note
+describing what you were doing when the problem happened:
+
+```sh
+mlvpnd diag-dump --config /etc/mlvpn/mlvpn.toml --submit
+mlvpnd diag-dump --config /etc/mlvpn/mlvpn.toml --submit \
+  --message "carrier-b drops to ~40% loss whenever the LTE modem re-registers"
+```
+
+On success the command prints a ticket ID and a status-page URL. On
+failure it warns on stderr and still exits 0 -- you keep the local file
+either way.
+
+**Automatically, on a loss event.** `[diagnostics] auto_submit_enabled
+= true` submits each automatic loss-threshold dump in addition to
+writing it to `dump_dir`. It has no effect unless `auto_dump_enabled`
+is also on, and it reuses that watcher's existing `cooldown_secs`
+rather than adding a second rate limit, so a persistently lossy link
+cannot flood the service with tickets.
+
+**Automatically, on a panic.** `[diagnostics] crash_report_enabled =
+true` installs a panic hook that submits the hostname and the tail of
+the in-memory log ring if a task panics.
+
+```toml
+[diagnostics]
+auto_dump_enabled = true
+auto_submit_enabled = true      # off by default
+crash_report_enabled = false    # off by default
+```
+
+Both automatic paths default to off deliberately, and separately from
+`auto_dump_enabled`. Writing a local file is silent and inspectable at
+your leisure; submitting one is an outbound network call the daemon
+makes on its own initiative, carrying operational detail (link names,
+bind interfaces, peer addresses and ports) off the machine. That needs
+a deliberate yes, not an inherited one -- so enabling automatic dumps
+does not enable automatic submission, and neither one enables crash
+reporting. With `crash_report_enabled` off, a panic just prints its
+backtrace as it always has.
+
+## Tunnel MTU
+
+As of 0.5.0 the tunnel MTU is not a fixed configured number. With
+`tunnel.mtu` left unset (the recommendation), `mlvpnd` sizes the tunnel
+from the physical MTUs it detects on the bonded links and keeps
+re-checking while it runs, resizing the TUN device if a link's MTU
+changes underneath it. Setting `tunnel.mtu` imposes a ceiling, which is
+still clamped further down if the links can't carry it.
+
+To see what the tunnel actually settled on:
+
+```sh
+ip -o link show mlvpn0        # the live MTU, including after any resize
+journalctl -u mlvpn | grep -i mtu   # each resize, and any resize failure
+```
+
+A resize logs at info level when it succeeds. If it fails, the most
+likely cause is a deployment that lacks `CAP_NET_ADMIN` at runtime --
+`SIOCSIFMTU` needs it held at the moment of the call, not just at
+startup. The shipped systemd unit grants it ambiently; if you run
+`mlvpnd` yourself under some other supervisor, make sure it still has
+that capability after startup. See ARCHITECTURE.md section 12.
+
+Note that the two ends pick their MTUs independently, with no
+negotiation between them -- see the same section for what that means
+when bonding hardware whose links differ substantially in MTU.
