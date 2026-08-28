@@ -22,10 +22,16 @@ address = "10.200.0.2/30"   # client and server must use addresses in the same /
                                  # mlvpn0, so it carries v4 and v6 traffic
                                  # at once. Uncomment on both ends with
                                  # addresses in the same /64.
-mtu = 1400                  # upper bound, not a fixed value: auto-clamped down at
-                             # startup if it would fragment against the bonded
-                             # links' actual detected physical MTUs (see
-                             # ARCHITECTURE.md's "MTU and MSS" section)
+# mtu = 1400                 # optional ceiling -- leaving it unset (the default,
+                             # and the recommendation) is what you want in almost
+                             # every case: mlvpnd then sizes the tunnel from the
+                             # bonded links' actual detected physical MTUs and
+                             # keeps adjusting it while it runs, so the tunnel
+                             # uses the full capacity each link really offers
+                             # instead of a number picked in advance. Set it only
+                             # to impose a hard upper bound; a configured value is
+                             # still auto-clamped down if it would fragment. See
+                             # ARCHITECTURE.md's "MTU and MSS" section.
 clamp_mss = true            # rewrite TCP SYN/SYN-ACK MSS options to fit the
                              # effective tunnel MTU instead of relying on PMTUD,
                              # which many networks silently black-hole

@@ -40,7 +40,7 @@ mode = "server"
 [tunnel]
 name = "mlvpn0"
 address = "10.200.0.1/30"
-mtu = 1400
+# mtu = 1400   # optional ceiling; leave unset to auto-detect (recommended)
 
 [crypto]
 private_key_file = "/etc/mlvpn/private.key"
@@ -68,7 +68,7 @@ mode = "client"
 [tunnel]
 name = "mlvpn0"
 address = "10.200.0.2/30"
-mtu = 1400
+# mtu = 1400   # optional ceiling; leave unset to auto-detect (recommended)
 
 [crypto]
 private_key_file = "/etc/mlvpn/private.key"
@@ -95,6 +95,18 @@ templates with `[scheduler]`/`[logging]`/`[control]` defaults spelled
 out. `[[links]]` order doesn't matter for initial connection setup -- the
 client tries every configured link at once and completes on whichever
 replies first, so a down or slow entry no longer stalls startup.
+
+Note that `tunnel.mtu` is left commented out above. That is deliberate
+and is the recommended configuration: with no value set, `mlvpnd`
+derives the tunnel MTU from the physical MTUs it actually detects on the
+bonded links, and keeps re-checking while it runs, resizing the `mlvpn0`
+device if a link's MTU changes underneath it (an LTE modem
+reconnecting on a different carrier path, for instance). Setting a
+number here instead imposes a fixed ceiling that can only ever be lower
+than what the hardware can carry. Set it only if you specifically need
+that ceiling -- a configured value is still clamped down automatically
+if it would fragment. See [ARCHITECTURE.md](../ARCHITECTURE.md)'s "MTU
+and MSS" section for the details.
 
 Then, on **both** ends:
 

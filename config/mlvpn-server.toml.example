@@ -13,8 +13,11 @@ name = "mlvpn0"
 address = "10.200.0.1/30"
 # address6 = "fd00:200::1/64"   # optional dual-stack address; see
                                  # config/mlvpn.toml.example for details
-mtu = 1400                      # upper bound, auto-clamped to the bonded links'
-                                 # real detected MTU if needed -- see ARCHITECTURE.md
+# mtu = 1400                     # optional ceiling; leave unset (recommended) to
+                                 # let mlvpnd pick the tunnel MTU from the bonded
+                                 # links' real detected capacity and keep adjusting
+                                 # it live -- see config/mlvpn.toml.example and
+                                 # ARCHITECTURE.md for the full rationale
 clamp_mss = true                # TCP MSS clamping to the effective tunnel MTU
 
 [crypto]
