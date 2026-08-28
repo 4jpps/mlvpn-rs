@@ -353,11 +353,28 @@ async fn attempt_reconnect(handle: &LinkHandle, link_name: &str, backoff_ms: &mu
     tokio::time::sleep(Duration::from_millis(*backoff_ms)).await;
 }
 
+/// The tunnel's *current* MTU, shared between every task that needs to
+/// size a packet.
+///
+/// Seeded at startup from `control::effective_tunnel_mtu` and then kept
+/// current by `control::mtu_monitor_loop`, which resizes the live TUN
+/// device whenever the detected physical link capacity changes. Every
+/// consumer loads it fresh at the moment it sizes a packet rather than
+/// caching it, so a live resize takes effect immediately instead of
+/// leaving that task pinned to whatever the value happened to be when
+/// the daemon started.
+pub type LiveMtu = std::sync::Arc<std::sync::atomic::AtomicU16>;
+
 pub struct TunnelParams {
     pub mode: Mode,
+    /// The tunnel MTU as computed once at startup. This is only the
+    /// *seed* for the shared `LiveMtu` built in `run`; nothing should
+    /// read it after that point, because it does not track the live
+    /// resizes `control::mtu_monitor_loop` performs.
     pub mtu: u16,
     /// Whether to rewrite the MSS option of TCP SYN/SYN-ACK segments
-    /// read off the TUN device so they fit `mtu`. See `mss.rs`.
+    /// read off the TUN device so they fit the *live* tunnel MTU (see
+    /// `LiveMtu`, not the `mtu` field above). See `mss.rs`.
     pub clamp_mss: bool,
     pub scheduler_cfg: SchedulerConfig,
     pub local_private: LocalPrivateKey,
@@ -793,7 +810,7 @@ pub async fn run(
     // `effective_tunnel_mtu` result, kept current afterward by
     // `control::mtu_monitor_loop` and read fresh on every packet by
     // `tun_reader`'s MSS-clamping.
-    let live_mtu = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(params.mtu));
+    let live_mtu: LiveMtu = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(params.mtu));
 
     // Bounded outbound queue between tun_reader (producer) and
     // outbound_sender (consumer) -- see OUTBOUND_QUEUE_CAPACITY's doc
@@ -821,7 +838,7 @@ pub async fn run(
             let rekey_ctx = rekey_ctx.clone();
             let reconnect = reconnect.clone();
             let session_meta = session_meta.clone();
-            let mtu = params.mtu as usize;
+            let mtu = live_mtu.clone();
             let throughput_test_state = throughput_test_state.clone();
             let throughput_test_ctx = throughput_test_ctx.clone();
             let peer_version = peer_version.clone();
@@ -865,7 +882,7 @@ pub async fn run(
             let links = links.clone();
             let session = session.clone();
             let cfg = params.scheduler_cfg.clone();
-            let mtu = params.mtu as usize;
+            let mtu = live_mtu.clone();
             let throughput_test_ctx = throughput_test_ctx.clone();
             handles.push(tokio::spawn(async move {
                 // No-op and returns immediately unless
@@ -909,7 +926,7 @@ pub async fn run(
         let session = session.clone();
         let throughput_test_ctx = throughput_test_ctx.clone();
         let tunnel_test_ctx_for_commands = tunnel_test_ctx.clone();
-        let mtu = params.mtu as usize;
+        let mtu = live_mtu.clone();
         let diag_ctx = control::DiagContext {
             peer_stats: peer_stats.clone(),
             tunnel_name: params.tunnel_name.clone(),
@@ -949,7 +966,7 @@ pub async fn run(
         let tunnel_local_addr = params.tunnel_local_addr;
         let outbound_dropped_total = outbound_dropped_total.clone();
         let tunnel_test_ctx = tunnel_test_ctx.clone();
-        let mtu = params.mtu as usize;
+        let mtu = live_mtu.clone();
         handles.push(tokio::spawn(async move {
             crate::tunneltest::run_listener(
                 tunnel_local_addr,
@@ -1946,7 +1963,7 @@ pub(crate) struct OutboundFrame {
 async fn tun_reader(
     tun: Arc<AsyncDevice>,
     session: Arc<AsyncMutex<SessionState>>,
-    mtu: std::sync::Arc<std::sync::atomic::AtomicU16>,
+    mtu: LiveMtu,
     clamp_mss: bool,
     tx: mpsc::Sender<OutboundFrame>,
     dropped_total: Arc<AtomicU64>,
@@ -2265,7 +2282,7 @@ async fn link_receiver(
     rekey_ctx: Arc<RekeyContext>,
     reconnect: Arc<tokio::sync::Notify>,
     session_meta: Arc<SessionMeta>,
-    mtu: usize,
+    mtu: LiveMtu,
     throughput_test_state: Arc<AsyncMutex<ThroughputTestReceiveState>>,
     throughput_test_ctx: Arc<ThroughputTestContext>,
     peer_version: PeerVersion,
@@ -2300,7 +2317,7 @@ async fn link_receiver(
                     &rekey_ctx,
                     &reconnect,
                     &session_meta,
-                    mtu,
+                    &mtu,
                     &throughput_test_state,
                     &throughput_test_ctx,
                     &peer_version,
@@ -2734,7 +2751,7 @@ async fn active_bandwidth_prober(
     links: Links,
     session: Arc<AsyncMutex<SessionState>>,
     cfg: SchedulerConfig,
-    mtu: usize,
+    mtu: LiveMtu,
     throughput_test_ctx: Arc<ThroughputTestContext>,
 ) {
     if !cfg.active_bandwidth_probing {
@@ -2773,7 +2790,7 @@ async fn active_bandwidth_prober(
             session.clone(),
             test_id,
             duration,
-            mtu,
+            mtu.clone(),
         )
         .await
         .is_err()
@@ -2852,7 +2869,7 @@ pub(crate) async fn send_throughput_test_stream(
     session: Arc<AsyncMutex<SessionState>>,
     test_id: u32,
     duration: Duration,
-    mtu: usize,
+    mtu: LiveMtu,
 ) -> Result<()> {
     // Logged here (not just on completion) specifically so a diagnostic
     // dump's log tail (`diag.rs`, `mlvpnd diag-dump`) makes it obvious a
@@ -2869,7 +2886,6 @@ pub(crate) async fn send_throughput_test_stream(
         "throughput self-test stream starting"
     );
 
-    let payload_len = mtu.max(ThroughputTestDataPayload::HEADER_LEN);
     let deadline = Instant::now() + duration;
 
     async fn send_one(
@@ -2904,6 +2920,14 @@ pub(crate) async fn send_throughput_test_stream(
     }
 
     loop {
+        // Re-read the live MTU on every packet rather than sizing the
+        // whole stream once up front: a self-test or bandwidth probe
+        // running across an `mtu_monitor_loop` resize should follow the
+        // link down (or up) mid-stream, not keep emitting packets sized
+        // for an MTU the link no longer has -- which is exactly when
+        // they would start fragmenting and skew the measurement.
+        let payload_len = (mtu.load(std::sync::atomic::Ordering::Relaxed) as usize)
+            .max(ThroughputTestDataPayload::HEADER_LEN);
         let done = Instant::now() >= deadline;
         send_one(
             &socket,
@@ -3006,7 +3030,7 @@ async fn handle_incoming(
     rekey_ctx: &Arc<RekeyContext>,
     reconnect: &Arc<tokio::sync::Notify>,
     session_meta: &Arc<SessionMeta>,
-    mtu: usize,
+    mtu: &LiveMtu,
     throughput_test_state: &Arc<AsyncMutex<ThroughputTestReceiveState>>,
     throughput_test_ctx: &Arc<ThroughputTestContext>,
     peer_version: &PeerVersion,
@@ -3320,6 +3344,7 @@ async fn handle_incoming(
             // deliberately does not batch its encrypts.
             let socket = socket.clone();
             let session = session.clone();
+            let mtu = mtu.clone();
             let duration = Duration::from_secs(req.duration_secs as u64);
             tokio::spawn(async move {
                 if let Err(e) = send_throughput_test_stream(

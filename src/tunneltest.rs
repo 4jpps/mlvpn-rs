@@ -281,16 +281,24 @@ async fn send_stream(
     test_id: u32,
     duration: Duration,
     bidirectional_requested: bool,
-    mtu: usize,
+    mtu: crate::tunnel::LiveMtu,
     outbound_dropped_total: &Arc<AtomicU64>,
 ) {
-    let payload_len = mtu.saturating_sub(48).max(HEADER_LEN);
     let start = Instant::now();
     let deadline = start + duration;
     let queue_drops_before = outbound_dropped_total.load(Ordering::Relaxed);
     let mut bytes_sent: u64 = 0;
 
     loop {
+        // Sized per packet from the shared live MTU rather than once for
+        // the whole stream: `control::mtu_monitor_loop` can resize the
+        // tunnel underneath a running test, and a test that kept using
+        // the pre-resize size would start fragmenting on the very link
+        // whose MTU just shrank -- skewing the number the operator is
+        // reading. See `tunnel::LiveMtu`.
+        let payload_len = (mtu.load(Ordering::Relaxed) as usize)
+            .saturating_sub(48)
+            .max(HEADER_LEN);
         let done = Instant::now() >= deadline;
         let sender_queue_drops = if done {
             outbound_dropped_total
@@ -363,7 +371,7 @@ pub(crate) async fn run_test(
     peer_addr: IpAddr,
     duration_secs: u32,
     bidirectional: bool,
-    mtu: usize,
+    mtu: crate::tunnel::LiveMtu,
     outbound_dropped_total: &Arc<AtomicU64>,
     tunnel_test_ctx: &Arc<TunnelTestContext>,
 ) -> TunnelTestOutcome {
@@ -488,7 +496,7 @@ pub(crate) async fn run_listener(
     tunnel_local_addr: IpAddr,
     outbound_dropped_total: Arc<AtomicU64>,
     tunnel_test_ctx: Arc<TunnelTestContext>,
-    mtu: usize,
+    mtu: crate::tunnel::LiveMtu,
 ) {
     let bind_addr = SocketAddr::new(tunnel_local_addr, TUNNEL_TEST_PORT);
     let socket = match UdpSocket::bind(bind_addr).await {
@@ -570,6 +578,7 @@ pub(crate) async fn run_listener(
             // (registered by `run_test` before the upload leg ever went
             // out).
             let reverse_target = SocketAddr::new(from.ip(), TUNNEL_TEST_PORT);
+            let mtu = mtu.clone();
             tokio::spawn(async move {
                 send_stream(
                     &socket,

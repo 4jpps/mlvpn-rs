@@ -383,7 +383,7 @@ pub(crate) async fn serve_commands(
     session: Arc<AsyncMutex<SessionState>>,
     throughput_test_ctx: Arc<ThroughputTestContext>,
     tunnel_test_ctx: Arc<tunneltest::TunnelTestContext>,
-    mtu: usize,
+    mtu: crate::tunnel::LiveMtu,
     diag_ctx: DiagContext,
 ) {
     if let Some(parent) = path.parent() {
@@ -445,6 +445,7 @@ pub(crate) async fn serve_commands(
         let throughput_test_ctx = throughput_test_ctx.clone();
         let tunnel_test_ctx = tunnel_test_ctx.clone();
         let diag_ctx = diag_ctx.clone();
+        let mtu = mtu.clone();
         tokio::spawn(async move {
             serve_command_client(
                 stream,
@@ -473,7 +474,7 @@ async fn serve_command_client(
     session: Arc<AsyncMutex<SessionState>>,
     throughput_test_ctx: Arc<ThroughputTestContext>,
     tunnel_test_ctx: Arc<tunneltest::TunnelTestContext>,
-    mtu: usize,
+    mtu: crate::tunnel::LiveMtu,
     diag_ctx: DiagContext,
 ) {
     let (reader, mut writer) = stream.into_split();
@@ -528,7 +529,7 @@ async fn apply_command(
     session: &Arc<AsyncMutex<SessionState>>,
     throughput_test_ctx: &Arc<ThroughputTestContext>,
     tunnel_test_ctx: &Arc<tunneltest::TunnelTestContext>,
-    mtu: usize,
+    mtu: crate::tunnel::LiveMtu,
     diag_ctx: &DiagContext,
 ) -> CommandResult {
     match cmd {
@@ -621,7 +622,7 @@ async fn run_tunnel_throughput_test_command(
     peer_addr: &str,
     duration_secs: u32,
     bidirectional: bool,
-    mtu: usize,
+    mtu: crate::tunnel::LiveMtu,
     outbound_dropped_total: &Arc<AtomicU64>,
     tunnel_test_ctx: &Arc<tunneltest::TunnelTestContext>,
     peer_version: &PeerVersion,
@@ -1002,7 +1003,7 @@ async fn run_throughput_test_command(
     links: &Links,
     session: &Arc<AsyncMutex<SessionState>>,
     throughput_test_ctx: &Arc<ThroughputTestContext>,
-    mtu: usize,
+    mtu: crate::tunnel::LiveMtu,
     link: Option<String>,
     duration_secs: u32,
     bidirectional: bool,
@@ -1065,7 +1066,7 @@ async fn run_throughput_test_command(
             link_id,
             session,
             throughput_test_ctx,
-            mtu,
+            mtu.clone(),
             duration_secs,
         )
         .await;
@@ -1120,7 +1121,7 @@ async fn run_throughput_test_leg_upload(
     link_id: u8,
     session: &Arc<AsyncMutex<SessionState>>,
     throughput_test_ctx: &Arc<ThroughputTestContext>,
-    mtu: usize,
+    mtu: crate::tunnel::LiveMtu,
     duration_secs: u32,
 ) -> Option<f64> {
     let test_id = random_session_id();
