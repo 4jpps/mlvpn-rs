@@ -416,6 +416,13 @@ pub struct TunnelParams {
     /// directly -- see that function's doc comment for why it can't
     /// use `Link.physical_mtu` instead.
     pub bind_interfaces: Vec<String>,
+    /// The one thread allowed to issue `SIOCSIFMTU`, handed to
+    /// `control::mtu_monitor_loop` in place of it calling
+    /// `link::set_interface_mtu` itself. Created in `main` immediately
+    /// after the privilege drop, because Linux capabilities are
+    /// per-thread and no tokio worker (all spawned pre-drop) holds
+    /// `CAP_NET_ADMIN` -- see `link::MtuResizer`'s doc comment.
+    pub mtu_resizer: crate::link::MtuResizer,
 }
 
 /// Config for `control::diagnostics_watch_loop`, threaded from
@@ -1000,8 +1007,16 @@ pub async fn run(
         let tun_ifname = params.tunnel_name.clone();
         let bind_interfaces = params.bind_interfaces.clone();
         let live_mtu = live_mtu.clone();
+        let mtu_resizer = params.mtu_resizer.clone();
         handles.push(tokio::spawn(async move {
-            control::mtu_monitor_loop(tunnel_cfg, tun_ifname, bind_interfaces, live_mtu).await;
+            control::mtu_monitor_loop(
+                tunnel_cfg,
+                tun_ifname,
+                bind_interfaces,
+                live_mtu,
+                mtu_resizer,
+            )
+            .await;
         }));
     }
 

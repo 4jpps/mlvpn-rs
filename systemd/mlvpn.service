@@ -19,7 +19,17 @@
 # adaptive-MTU monitor resizes the live TUN device (SIOCSIFMTU) for the
 # whole life of the process, but CAP_NET_RAW is not, which means a link
 # that later needs to reconnect under that model can't, and will log
-# why instead of silently failing. See ARCHITECTURE.md sec 6 and 8.
+# why instead of silently failing.
+#
+# One further difference between the two models, since capabilities on
+# Linux are per-thread: with AmbientCapabilities= below, every thread in
+# the process holds CAP_NET_ADMIN, because it is granted at exec before
+# any thread exists. Under the root-then-drop fallback only the dropping
+# thread (and threads created after it) holds it, so the daemon routes
+# every SIOCSIFMTU through a dedicated thread it spawns right after the
+# drop (link::MtuResizer) rather than calling it from a tokio worker.
+# That is an implementation detail here, not something to configure.
+# See ARCHITECTURE.md sec 6, 8 and 12.
 #
 # Setup (once):
 #   groupadd --system mlvpn

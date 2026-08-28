@@ -324,15 +324,20 @@ life, same as before this existed.
 Two supported deployment postures:
 
 1. **Start as root, drop after setup** -- open the TUN device and bind
-   sockets while root, then drop to an unprivileged `mlvpn` user and
-   explicitly clear every capability.
+   sockets while root, then drop to an unprivileged `mlvpn` user,
+   retaining exactly one capability -- `CAP_NET_ADMIN`, needed by the
+   adaptive-MTU resize (§12) for the process's whole life -- and
+   clearing everything else, notably `CAP_NET_RAW`. Because capabilities
+   are per-thread, only the dropping thread and threads created after it
+   hold the retained capability; see `privilege.rs`'s module doc and
+   `link::MtuResizer`.
 2. **Never be root** -- grant exactly the two needed capabilities via
    systemd `AmbientCapabilities=` and run as `mlvpn` from process
    start. This is the stronger posture and what the shipped
    `systemd/mlvpn.service` uses.
 
 This choice also determines whether self-healing reconnection (§6) can
-actually reconnect: it needs a capability held at the moment of
+actually reconnect: it needs `CAP_NET_RAW` held at the moment of
 reconnect, which model 2 keeps for the process's whole life and model
 1 deliberately clears at startup. Under model 1, a reconnect attempt
 fails cleanly with a one-time logged explanation rather than retrying
@@ -524,10 +529,20 @@ self-tests) reads fresh, so a resize takes effect immediately rather
 than at the next restart.
 
 The resize needs `CAP_NET_ADMIN` held *at the moment it runs*, not just
-at startup. Both supported deployment models provide it: the shipped
-systemd unit grants it ambiently and never runs as root, and
-`privilege.rs`'s root-then-drop path deliberately retains that one
-capability (and only that one) across the drop. See §6 and §8.
+at startup, and -- because Linux capabilities are per-thread -- held by
+the specific thread issuing the ioctl. Model 2 (the shipped systemd
+unit) grants it ambiently before any thread exists, so every thread has
+it. Model 1 (root, then `privilege.rs`'s drop) retains that one
+capability across the drop, but only on the thread that performs the
+drop: the tokio worker threads were all created earlier, while still
+root, and `setuid`'s `SIGSETXID` broadcast zeroes their capability sets.
+`control::mtu_monitor_loop` runs on one of those workers, so it does
+*not* issue the ioctl itself -- it sends the request over a channel to
+`link::MtuResizer`, a single dedicated OS thread spawned in `main`
+immediately after the drop returns, which therefore inherits the
+retained `CAP_NET_ADMIN` and performs every `SIOCSIFMTU` on the
+daemon's behalf. That indirection is unnecessary under model 2 and
+harmless there. See §6 and §8.
 
 **Peer MTU is not negotiated.** Each end computes its MTU from its own
 local links, independently. Bonding genuinely asymmetric hardware (an

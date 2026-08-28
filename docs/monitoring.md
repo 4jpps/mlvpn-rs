@@ -292,6 +292,15 @@ startup. The shipped systemd unit grants it ambiently; if you run
 `mlvpnd` yourself under some other supervisor, make sure it still has
 that capability after startup. See ARCHITECTURE.md section 12.
 
+A repeated failure is logged **once**, not on every 30-second check, so
+a persistent problem doesn't bury the rest of the log (and the diagnostic
+dump's captured log lines) under one line repeated forever. It warns
+again only if the target MTU changes, and logs a recovery line -- with a
+count of the warnings it suppressed -- once a resize succeeds again. So
+a single "failed to resize tunnel MTU" line in the log may represent a
+failure that has been ongoing for hours; check the live MTU with `ip -o
+link show` above rather than assuming it was a one-off.
+
 Note that the two ends pick their MTUs independently, with no
 negotiation between them -- see the same section for what that means
 when bonding hardware whose links differ substantially in MTU.

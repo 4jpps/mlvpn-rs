@@ -488,7 +488,9 @@ fn run_diag_dump(
 /// Only called when `[diagnostics] crash_report_enabled = true` -- the
 /// daemon never phones home about a panic unless an operator has asked
 /// it to, matching `auto_submit_enabled`'s consent reasoning. Without
-/// that flag a panic just prints its backtrace as it always did. Blocks briefly (bounded by `submit_report_blocking`'s own
+/// that flag a panic just prints its backtrace as it always did.
+///
+/// Blocks briefly (bounded by `submit_report_blocking`'s own
 /// ~10s client timeout, `SUBMIT_TIMEOUT` in diagnostics.rs) to give the
 /// crash report a real chance to actually leave the process before it
 /// exits -- a detached, unjoined thread here loses the race against
@@ -683,6 +685,17 @@ async fn run(cfg: Config, log_ring: Arc<LogRing>) -> anyhow::Result<()> {
     privilege::drop_privileges(&privilege::DropTarget::default())?;
     privilege::assert_unprivileged()?;
 
+    // Spawned *here*, and nowhere earlier, on purpose: Linux
+    // capabilities are per-thread, and only a thread created after the
+    // drop above inherits the `CAP_NET_ADMIN` that `drop_privileges`
+    // retains. Every tokio worker thread was created back at
+    // `Builder::new_multi_thread().build()` while this process was still
+    // root, so none of them holds it, and `control::mtu_monitor_loop`
+    // (which runs on one of those workers) would get EPERM on every
+    // `SIOCSIFMTU`. This thread owns that ioctl instead. See
+    // `link::MtuResizer`.
+    let mtu_resizer = link::MtuResizer::spawn()?;
+
     // The control socket exposes live link/traffic stats to `mlvpn-tui`
     // (and anything else that wants to read newline-delimited JSON off a
     // Unix socket -- see `control.rs`). `None` disables it entirely.
@@ -765,6 +778,7 @@ async fn run(cfg: Config, log_ring: Arc<LogRing>) -> anyhow::Result<()> {
         tunnel_local_addr,
         tunnel_cfg: cfg.tunnel.clone(),
         bind_interfaces: cfg.links.iter().map(|l| l.bind_interface.clone()).collect(),
+        mtu_resizer,
     };
 
     // `tunnel::run` races SIGINT/SIGTERM against the tunnel's own tasks

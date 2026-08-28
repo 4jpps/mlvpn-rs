@@ -1149,6 +1149,98 @@ pub fn set_interface_mtu(_ifname: &str, _mtu: u16) -> std::io::Result<()> {
     Ok(())
 }
 
+/// One resize request handed to the [`MtuResizer`] thread.
+struct MtuResizeRequest {
+    ifname: String,
+    mtu: u16,
+    reply: tokio::sync::oneshot::Sender<std::io::Result<()>>,
+}
+
+/// A handle to the one dedicated OS thread that performs *every*
+/// `SIOCSIFMTU` ioctl this daemon issues.
+///
+/// This exists for one reason, and it is not concurrency: **Linux
+/// capabilities are per-thread**. Under deployment model 1 (start as
+/// root, then `privilege::drop_privileges`), `CAP_NET_ADMIN` is retained
+/// only on the thread that performs the drop -- glibc's `setuid()`
+/// broadcasts the uid change to every *already-existing* thread via
+/// `SIGSETXID`, and each of those threads re-runs `setuid` without
+/// `PR_SET_KEEPCAPS` (that prctl is per-thread too), so their permitted
+/// and effective sets are zeroed and the subsequent narrowing never
+/// touches them.
+///
+/// `main` builds a multi-threaded tokio runtime *before* the drop, so
+/// every tokio worker thread is one of those already-existing threads
+/// and holds no capabilities at all. `control::mtu_monitor_loop` runs on
+/// such a worker, which is why calling `set_interface_mtu` directly from
+/// it returned `EPERM` on every tick. A thread created *after* the drop,
+/// by contrast, forks its creator's (post-narrowing) capability sets and
+/// does hold `CAP_NET_ADMIN` -- so [`MtuResizer::spawn`] is called
+/// immediately after `drop_privileges` returns, and the monitor loop
+/// sends requests to it instead of doing the ioctl itself.
+///
+/// Under deployment model 2 (systemd `AmbientCapabilities=`, the shipped
+/// default) every thread has the capability regardless, so this
+/// indirection is harmless there rather than necessary.
+///
+/// The thread parks on `recv()` for the daemon's whole lifetime and does
+/// no work between requests. It needs no explicit shutdown wiring: when
+/// the last `MtuResizer` handle is dropped the channel closes, `recv()`
+/// returns `None`, and the loop exits on its own.
+#[derive(Clone, Debug)]
+pub struct MtuResizer {
+    tx: tokio::sync::mpsc::UnboundedSender<MtuResizeRequest>,
+}
+
+impl MtuResizer {
+    /// Spawns the resize thread. **Must be called after
+    /// `privilege::drop_privileges`** -- see the type-level doc comment
+    /// for why the ordering is load-bearing rather than stylistic.
+    pub fn spawn() -> std::io::Result<Self> {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<MtuResizeRequest>();
+        std::thread::Builder::new()
+            .name("mlvpn-mtu-resize".to_string())
+            .spawn(move || {
+                // `blocking_recv` is correct here (and not a runtime
+                // misuse) precisely because this is a plain OS thread
+                // with no reactor on it.
+                while let Some(req) = rx.blocking_recv() {
+                    let result = set_interface_mtu(&req.ifname, req.mtu);
+                    // A dropped receiver just means the caller gave up;
+                    // the ioctl already happened either way.
+                    let _ = req.reply.send(result);
+                }
+            })?;
+        Ok(Self { tx })
+    }
+
+    /// Asks the resize thread to set `ifname`'s MTU, and awaits its
+    /// result. Semantically a drop-in for calling
+    /// [`set_interface_mtu`] directly, just executed on a thread that
+    /// actually holds `CAP_NET_ADMIN`.
+    pub async fn set_mtu(&self, ifname: &str, mtu: u16) -> std::io::Result<()> {
+        let (reply, wait) = tokio::sync::oneshot::channel();
+        self.tx
+            .send(MtuResizeRequest {
+                ifname: ifname.to_string(),
+                mtu,
+                reply,
+            })
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "MTU resize thread has exited",
+                )
+            })?;
+        wait.await.map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "MTU resize thread dropped the request without replying",
+            )
+        })?
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

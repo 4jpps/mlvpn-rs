@@ -29,7 +29,29 @@
 //! drop -- every resize returns `EPERM` and the daemon warns forever.
 //! Model 2 grants the same capability via the unit file's
 //! `AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW`, so both deployment
-//! models end up with `CAP_NET_ADMIN` available at runtime. Note that
+//! models end up with `CAP_NET_ADMIN` available at runtime.
+//!
+//! **Which *thread* holds it is load-bearing under model 1.** Linux
+//! capabilities are per-thread. `drop_privileges()` manipulates only the
+//! calling thread's sets (`caps::set(None, ..)` targets tid 0), and
+//! `PR_SET_KEEPCAPS` is likewise per-thread -- glibc's `setuid()`
+//! broadcasts the uid change to every already-existing thread via
+//! `SIGSETXID`, and each of those threads runs its own `setuid` *without*
+//! KEEPCAPS, so their permitted and effective sets are zeroed and the
+//! narrowing below never touches them. `main` builds its multi-threaded
+//! tokio runtime before calling this, so every tokio worker thread has no
+//! capabilities at all afterwards, and the only thread holding
+//! `CAP_NET_ADMIN` is the one that called `drop_privileges()`.
+//!
+//! Threads created *after* this function returns do fork the retained
+//! sets, and that is how the resize actually gets performed: `main`
+//! spawns `link::MtuResizer` immediately after this returns, and
+//! `control::mtu_monitor_loop` (which runs on a capability-less tokio
+//! worker) sends every `SIOCSIFMTU` request to that thread over a channel
+//! rather than issuing the ioctl itself. Anything else added later that
+//! needs a retained capability must do the same -- calling a privileged
+//! syscall directly from a tokio task will get `EPERM` under model 1
+//! while appearing to work fine under model 2. Note that
 //! model 1 deliberately does *not* retain `CAP_NET_RAW`: reconnecting a
 //! link needs it for `SO_BINDTODEVICE`, and that limitation of model 1 is
 //! pre-existing, documented in `link.rs`, and handled by `tunnel.rs`'s

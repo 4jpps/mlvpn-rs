@@ -820,6 +820,49 @@ fn mtu_resize_needed(current: u16, recomputed: u16) -> bool {
     current != recomputed
 }
 
+/// Rate limit for `mtu_monitor_loop`'s resize-failure warning.
+///
+/// A resize that fails usually fails for a *persistent* reason -- the
+/// interface genuinely won't accept the requested MTU, or the process
+/// lacks `CAP_NET_ADMIN` -- and the recomputed target doesn't change
+/// while the hardware doesn't, so an unconditional `warn!` would fire on
+/// every 30s tick for the life of the process. That floods the 500-entry
+/// `LogRing` shipped with diagnostic dumps with one repeated line,
+/// evicting everything actually useful for the support ticket the dump
+/// was filed for. So: warn on the first failure of a streak, then stay
+/// quiet until it either succeeds or starts failing at a *different*
+/// target MTU (a materially different failure worth its own line).
+#[derive(Default)]
+struct ResizeFailureLatch {
+    /// How many consecutive failures since the last success.
+    streak: u32,
+    /// The target MTU the most recent failure was attempting.
+    last_failed_mtu: Option<u16>,
+}
+
+impl ResizeFailureLatch {
+    /// Records a failure at `attempted`; returns whether it should be
+    /// logged.
+    fn record_failure(&mut self, attempted: u16) -> bool {
+        let should_warn = self.streak == 0 || self.last_failed_mtu != Some(attempted);
+        self.streak += 1;
+        self.last_failed_mtu = Some(attempted);
+        should_warn
+    }
+
+    /// Records a success, clearing the latch. Returns `Some(n)` when
+    /// failures had been suppressed, where `n` is how many warnings were
+    /// swallowed -- worth one recovery line so a dump reader can tell
+    /// "it failed once" from "it failed for six hours".
+    fn record_success(&mut self) -> Option<u32> {
+        let suppressed = self.streak.saturating_sub(1);
+        let had_failures = self.streak > 0;
+        self.streak = 0;
+        self.last_failed_mtu = None;
+        had_failures.then_some(suppressed)
+    }
+}
+
 /// Periodically re-queries every configured link's real physical
 /// interface MTU directly (bypassing `Link.physical_mtu`, which is a
 /// one-shot value never refreshed by `LinkHandle::reconnect` -- see
@@ -835,8 +878,10 @@ pub(crate) async fn mtu_monitor_loop(
     tun_ifname: String,
     bind_interfaces: Vec<String>,
     live_mtu: std::sync::Arc<std::sync::atomic::AtomicU16>,
+    mtu_resizer: crate::link::MtuResizer,
 ) {
     let mut tick = tokio::time::interval(std::time::Duration::from_secs(MTU_MONITOR_INTERVAL_SECS));
+    let mut failures = ResizeFailureLatch::default();
     loop {
         tick.tick().await;
 
@@ -851,9 +896,15 @@ pub(crate) async fn mtu_monitor_loop(
             continue;
         }
 
-        match crate::link::set_interface_mtu(&tun_ifname, recomputed) {
+        match mtu_resizer.set_mtu(&tun_ifname, recomputed).await {
             Ok(()) => {
                 live_mtu.store(recomputed, std::sync::atomic::Ordering::Relaxed);
+                if let Some(suppressed) = failures.record_success() {
+                    tracing::info!(
+                        suppressed_warnings = suppressed,
+                        "tunnel MTU resize is working again after earlier failures"
+                    );
+                }
                 tracing::info!(
                     old_mtu = current,
                     new_mtu = recomputed,
@@ -861,7 +912,14 @@ pub(crate) async fn mtu_monitor_loop(
                 );
             }
             Err(e) => {
-                tracing::warn!(error = %e, attempted_mtu = recomputed, "failed to resize tunnel MTU");
+                if failures.record_failure(recomputed) {
+                    tracing::warn!(
+                        error = %e,
+                        attempted_mtu = recomputed,
+                        "failed to resize tunnel MTU (further identical failures suppressed \
+                         until it succeeds or the target MTU changes)"
+                    );
+                }
             }
         }
     }
@@ -1228,5 +1286,34 @@ mod tests {
         assert!(mtu_resize_needed(1400, 1452));
         assert!(mtu_resize_needed(1452, 1400));
         assert!(!mtu_resize_needed(1400, 1400));
+    }
+
+    #[test]
+    fn resize_failure_warning_is_latched_to_once_per_streak() {
+        let mut latch = ResizeFailureLatch::default();
+        // First failure warns; identical repeats stay quiet, however
+        // many 30s ticks go by.
+        assert!(latch.record_failure(1452));
+        for _ in 0..100 {
+            assert!(!latch.record_failure(1452));
+        }
+        // A different target is a materially different failure.
+        assert!(latch.record_failure(1400));
+        assert!(!latch.record_failure(1400));
+    }
+
+    #[test]
+    fn resize_success_clears_the_latch_and_reports_suppressed_count() {
+        let mut latch = ResizeFailureLatch::default();
+        // A success with no prior failures says nothing at all.
+        assert_eq!(latch.record_success(), None);
+
+        latch.record_failure(1452);
+        latch.record_failure(1452);
+        latch.record_failure(1452);
+        // Three failures, one warned, two suppressed.
+        assert_eq!(latch.record_success(), Some(2));
+        // And the latch is armed again for the next streak.
+        assert!(latch.record_failure(1452));
     }
 }
