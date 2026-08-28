@@ -1445,7 +1445,7 @@ dependencies = [
 
 [[package]]
 name = "mlvpn"
-version = "0.4.6"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "base64",

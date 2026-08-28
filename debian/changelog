@@ -1,3 +1,20 @@
+mlvpn (0.5.0-1) unstable; urgency=medium
+
+  * Add software-support.jpps.us diagnostics report submission:
+    mlvpnd diag-dump --submit/--message files a real support ticket
+    from a manual dump; [diagnostics] auto_submit_enabled makes
+    automatic loss-threshold dumps do the same (off by default); a
+    new crash panic hook best-effort-submits a report before exit.
+  * Change tunnel.mtu to be optional instead of defaulting to a fixed
+    1400 -- unset (the new default) lets mlvpn-rs pick the tunnel MTU
+    entirely from live-detected physical link MTUs, adjusting
+    automatically including upward past the old hardcoded default. A
+    new mtu_monitor_loop continuously re-checks and live-resizes the
+    running TUN device (no restart) as link MTUs change. Setting
+    tunnel.mtu explicitly still works exactly as before.
+
+ -- Jeff Parrish PC Services <www.jpps.us>  Thu, 27 Aug 2026 19:00:11 -0500
+
 mlvpn (0.4.6-1) unstable; urgency=medium
 
   * Fix a peer's Disconnect (sent on any routine restart) making the

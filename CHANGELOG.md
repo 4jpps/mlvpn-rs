@@ -10,6 +10,16 @@ For implementation detail beyond what's here, read the code -- most
 modules and non-trivial functions have doc comments explaining the
 design, and `ARCHITECTURE.md` covers the system as a whole.
 
+## [0.5.0] - 2026-08-27
+
+### Added
+
+- **Diagnostics reports can now be submitted to `software-support.jpps.us` as real, trackable support tickets** instead of only ever landing as a local text file. `mlvpnd diag-dump --submit [--message "..."]` submits a manual dump and prints the ticket ID/status URL; automatic loss-threshold dumps do the same when `[diagnostics] auto_submit_enabled = true` (off by default -- this is a new outbound network call the daemon makes on its own initiative, separate consent from `auto_dump_enabled`'s own opt-in); a new crash panic hook best-effort-submits a report (recent log lines + the panic message) before the process exits. See `docs/superpowers/specs/2026-08-27-diagnostics-report-client-design.md`.
+
+### Changed
+
+- **`tunnel.mtu` is no longer a fixed default of 1400 -- it's optional, and unset (the new default) means mlvpn-rs picks the tunnel MTU entirely from live-detected physical link MTUs, adjusting automatically, including upward.** Previously, `tunnel.mtu` defaulted to a hardcoded 1400 and the existing "adaptive" MTU logic only ever clamped that number *down* further if a link's real physical MTU was smaller -- it never used the full capacity of a link whose physical MTU was actually higher (e.g. a real 1500-byte-MTU WireGuard-bonded link), silently capping throughput below what the hardware could carry. mlvpn-rs now also continuously re-checks every 30 seconds and live-resizes the running TUN device (no restart needed) if a link's detected MTU changes, e.g. on reconnect to different hardware. Setting `tunnel.mtu` explicitly in your config still works exactly as before (an operator ceiling that detection can clamp further down from, never up past) -- only the *default*, unset behavior changed. See `docs/superpowers/specs/2026-08-27-adaptive-mtu-design.md`.
+
 ## [0.4.6] - 2026-07-20
 
 ### Fixed
