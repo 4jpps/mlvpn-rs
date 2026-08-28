@@ -121,6 +121,21 @@ enabled = true           # exposes live stats to `mlvpn-tui`; see README.md "Mon
                            # one setting that has the daemon write arbitrary
                            # files to disk on its own initiative. See
                            # docs/monitoring.md "Diagnostic dump".
+# auto_submit_enabled = false  # off by default: in addition to writing the
+                           # automatic dump to disk, also submit it to
+                           # https://software-support.jpps.us as a real
+                           # support ticket. Writing a local file is silent
+                           # and inspectable at your leisure; submitting it
+                           # is an outbound network call the daemon makes on
+                           # its own, so it needs a separate opt-in. No
+                           # effect unless auto_dump_enabled is also true.
+# crash_report_enabled = false # off by default: install a panic hook that
+                           # submits a crash report (hostname + the tail of
+                           # the in-memory log ring) to the same service if
+                           # a task panics. Same consent reasoning as
+                           # auto_submit_enabled, and independent of it --
+                           # a panic isn't a loss event. With this off, a
+                           # panic just prints its backtrace as usual.
 # loss_threshold_pct = 10.0     # default
 # cooldown_secs = 300           # minimum time between auto dumps, default
 # dump_dir = "/var/log/mlvpn"   # default -- already writable under the

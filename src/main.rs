@@ -154,7 +154,10 @@ fn main() -> anyhow::Result<()> {
         Command::Run { config } => {
             let cfg = Config::load(&config)?;
             let log_ring = init_logging(&cfg.logging.level);
-            install_crash_report_hook(log_ring.clone());
+            // Opt-in only -- see `DiagnosticsConfig::crash_report_enabled`.
+            if cfg.diagnostics.crash_report_enabled {
+                install_crash_report_hook(log_ring.clone());
+            }
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
@@ -480,7 +483,12 @@ fn run_diag_dump(
 
 /// Installs a panic hook that best-effort-submits a crash report to
 /// software-support before the default hook prints its usual backtrace
-/// to stderr. Blocks briefly (bounded by `submit_report_blocking`'s own
+/// to stderr.
+///
+/// Only called when `[diagnostics] crash_report_enabled = true` -- the
+/// daemon never phones home about a panic unless an operator has asked
+/// it to, matching `auto_submit_enabled`'s consent reasoning. Without
+/// that flag a panic just prints its backtrace as it always did. Blocks briefly (bounded by `submit_report_blocking`'s own
 /// ~10s client timeout, `SUBMIT_TIMEOUT` in diagnostics.rs) to give the
 /// crash report a real chance to actually leave the process before it
 /// exits -- a detached, unjoined thread here loses the race against

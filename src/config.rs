@@ -496,6 +496,19 @@ pub struct DiagnosticsConfig {
     /// is also true.
     #[serde(default)]
     pub auto_submit_enabled: bool,
+    /// Install a panic hook that submits a crash report (hostname plus
+    /// the tail of the in-memory log ring) to
+    /// https://software-support.jpps.us when a task panics. Off by
+    /// default, for exactly the reason `auto_submit_enabled` above is:
+    /// it is an outbound network call the daemon makes on its own
+    /// initiative, carrying operational detail (link names, bind
+    /// interfaces, peer addresses and ports) off the machine, so it
+    /// needs a deliberate opt-in rather than being on because a crash
+    /// happened to occur. Independent of `auto_dump_enabled` and
+    /// `auto_submit_enabled` -- a panic is not a loss event and does not
+    /// go through the loss watcher. See `diagnostics::install_crash_report_hook`.
+    #[serde(default)]
+    pub crash_report_enabled: bool,
     /// A link's `local_loss_pct` (same figure `mlvpn-tui`'s Links tab
     /// shows) has to exceed this before a dump fires.
     #[serde(default = "default_diag_loss_threshold_pct")]
@@ -536,6 +549,7 @@ impl Default for DiagnosticsConfig {
         Self {
             auto_dump_enabled: false,
             auto_submit_enabled: false,
+            crash_report_enabled: false,
             loss_threshold_pct: default_diag_loss_threshold_pct(),
             cooldown_secs: default_diag_cooldown_secs(),
             dump_dir: None,
@@ -759,6 +773,7 @@ mod tests {
                 cooldown_secs: 60,
                 dump_dir: None,
                 auto_submit_enabled: false,
+                crash_report_enabled: false,
             },
         }
     }
