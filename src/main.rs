@@ -806,4 +806,3 @@ fn parse_cidr(s: &str) -> Result<(String, u8)> {
     })?;
     Ok((addr.to_string(), prefix))
 }
-

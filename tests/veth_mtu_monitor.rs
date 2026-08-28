@@ -57,7 +57,9 @@ use support::{
 /// being available and this is a simple, stable token to grep for.
 fn read_interface_mtu(ns: &str, ifname: &str) -> Option<u32> {
     let output = Command::new("ip")
-        .args(["netns", "exec", ns, "ip", "-o", "link", "show", "dev", ifname])
+        .args([
+            "netns", "exec", ns, "ip", "-o", "link", "show", "dev", ifname,
+        ])
         .output()
         .ok()?;
     if !output.status.success() {
@@ -168,10 +170,9 @@ async fn tun_device_mtu_converges_after_a_live_link_mtu_change() {
     // from the veth pair's real (~1500-byte) physical MTU, not the
     // hardcoded 1400 fallback -- that fallback only applies when nothing
     // at all was detected, which isn't the case here.
-    let initial_mtu = poll_until_some(
-        Duration::from_secs(10),
-        || read_interface_mtu(&ns_client.name, client_tun_name),
-    )
+    let initial_mtu = poll_until_some(Duration::from_secs(10), || {
+        read_interface_mtu(&ns_client.name, client_tun_name)
+    })
     .await
     .expect("tun device never reported an MTU");
     assert_ne!(
@@ -327,10 +328,9 @@ async fn tun_device_mtu_converges_after_a_live_link_mtu_increase() {
 
     // Initial MTU should be the auto-detected safe value derived from
     // the deliberately-lowered ~1300-byte physical MTU.
-    let initial_mtu = poll_until_some(
-        Duration::from_secs(10),
-        || read_interface_mtu(&ns_client.name, client_tun_name),
-    )
+    let initial_mtu = poll_until_some(Duration::from_secs(10), || {
+        read_interface_mtu(&ns_client.name, client_tun_name)
+    })
     .await
     .expect("tun device never reported an MTU");
     assert!(
