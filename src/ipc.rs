@@ -191,6 +191,14 @@ pub struct LinkSnapshot {
     /// `scheduler.active_bandwidth_probing` is off. See
     /// `LinkStats::active_bandwidth_mbps`'s doc comment.
     pub local_active_bandwidth_mbps: Option<f64>,
+    /// This link's `LinkStats::confirmed_ceiling_mbps` -- the rate
+    /// `adaptive_bandwidth_ramp` last fully converged on, as opposed to
+    /// `local_active_bandwidth_mbps` above (the smoothed EWMA of every
+    /// probe/verification result, ramp or single-step alike). `None`
+    /// until the first full ramp completes, or always if
+    /// `scheduler.active_bandwidth_probing` is off.
+    #[serde(default)]
+    pub local_confirmed_ceiling_mbps: Option<f64>,
     /// Consecutive successful/missed probes right now -- one of these
     /// two is always 0 (a hit resets the miss streak and vice versa).
     /// Shows a link's short-term probe health at a glance, e.g. "3
@@ -379,6 +387,7 @@ mod tests {
             local_rx_throughput_mbps: Some(93.4),
             local_tx_throughput_mbps: Some(12.1),
             local_active_bandwidth_mbps: Some(193.4),
+            local_confirmed_ceiling_mbps: Some(180.0),
             local_consecutive_hits: 12,
             local_consecutive_misses: 0,
             peer_name: None,
@@ -394,6 +403,7 @@ mod tests {
         assert_eq!(back.local_rx_throughput_mbps, Some(93.4));
         assert_eq!(back.local_tx_throughput_mbps, Some(12.1));
         assert_eq!(back.local_active_bandwidth_mbps, Some(193.4));
+        assert_eq!(back.local_confirmed_ceiling_mbps, Some(180.0));
         assert_eq!(back.local_consecutive_hits, 12);
         assert_eq!(back.local_consecutive_misses, 0);
         assert_eq!(back.state_duration_ms, 12_345);

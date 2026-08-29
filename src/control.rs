@@ -266,6 +266,7 @@ async fn build_snapshot(
                 local_rx_throughput_mbps: link.stats.rx_throughput_mbps.get(),
                 local_tx_throughput_mbps: link.stats.tx_throughput_mbps.get(),
                 local_active_bandwidth_mbps: link.stats.active_bandwidth_mbps.get(),
+                local_confirmed_ceiling_mbps: link.stats.confirmed_ceiling_mbps,
                 local_consecutive_hits: link.stats.consecutive_hits,
                 local_consecutive_misses: link.stats.consecutive_misses,
                 peer_name: peer.as_ref().map(|p| p.name.clone()),

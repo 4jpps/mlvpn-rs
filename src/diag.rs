@@ -194,6 +194,7 @@ mod tests {
             local_rx_throughput_mbps: Some(93.4),
             local_tx_throughput_mbps: Some(12.1),
             local_active_bandwidth_mbps: Some(39.4),
+            local_confirmed_ceiling_mbps: None,
             local_consecutive_hits: 0,
             local_consecutive_misses: 5,
             peer_name: Some("lte0".to_string()),

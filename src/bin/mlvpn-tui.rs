@@ -32,7 +32,7 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
-    text::{Line, Span},
+    text::{Line, Span, Text},
     widgets::{Block, Borders, Cell, Gauge, List, ListItem, Paragraph, Row, Table, Tabs},
     Frame, Terminal,
 };
@@ -719,6 +719,8 @@ fn link_row(l: &LinkSnapshot) -> Row<'static> {
         l.local_loss_pct,
         l.local_rx_throughput_mbps,
         l.local_tx_throughput_mbps,
+        l.local_active_bandwidth_mbps,
+        l.local_confirmed_ceiling_mbps,
     );
 
     let peer_line = if l.peer_rtt_ms.is_none() && l.peer_name.is_none() {
@@ -807,8 +809,10 @@ fn local_measurement_line(
     loss_pct: Option<f64>,
     rx_mbps: Option<f64>,
     tx_mbps: Option<f64>,
-) -> Line<'static> {
-    Line::from(vec![
+    active_bandwidth_mbps: Option<f64>,
+    confirmed_ceiling_mbps: Option<f64>,
+) -> Text<'static> {
+    let rtt_line = Line::from(vec![
         Span::raw(format!(
             "rtt {}  jit {}  loss ",
             fmt_ms(rtt_ms),
@@ -820,7 +824,19 @@ fn local_measurement_line(
             fmt_mbps(rx_mbps),
             fmt_mbps(tx_mbps)
         )),
-    ])
+    ]);
+    let probe_line = match (active_bandwidth_mbps, confirmed_ceiling_mbps) {
+        (None, _) => Line::from(Span::styled(
+            "probe: (active bandwidth probing off, or no result yet)",
+            Style::default().fg(COLOR_MUTED),
+        )),
+        (Some(active), ceiling) => Line::from(Span::raw(format!(
+            "probe: {} (confirmed ceiling: {})",
+            fmt_mbps(Some(active)),
+            fmt_mbps(ceiling)
+        ))),
+    };
+    Text::from(vec![rtt_line, probe_line])
 }
 
 /// Green above 0.5 (this link is carrying a healthy share of traffic),
