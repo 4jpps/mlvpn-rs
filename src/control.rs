@@ -1192,6 +1192,7 @@ async fn run_throughput_test_leg_upload(
         test_id,
         Duration::from_secs(duration_secs as u64),
         mtu,
+        20.0, // TODO(Task 3): replaced by adaptive_bandwidth_ramp
     )
     .await
     {

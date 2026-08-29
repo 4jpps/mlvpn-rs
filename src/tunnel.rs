@@ -2806,6 +2806,7 @@ async fn active_bandwidth_prober(
             test_id,
             duration,
             mtu.clone(),
+            20.0, // TODO(Task 4): replace with cached/ramped rate
         )
         .await
         .is_err()
@@ -2877,6 +2878,19 @@ const ACTIVE_BANDWIDTH_PROBE_RESULT_GRACE: Duration = Duration::from_secs(5);
 /// drains once this function's own sending stops adding to its queue.
 const THROUGHPUT_TEST_DONE_RETRY_DELAY: Duration = Duration::from_millis(250);
 
+/// The delay to sleep after sending one `payload_len`-byte packet so
+/// that, averaged over many packets, the stream's send rate converges
+/// on `target_mbps` -- see `docs/superpowers/specs/2026-08-28-adaptive-bandwidth-pacing-design.md`.
+/// `payload_len` is the *whole* UDP payload (header + ciphertext), not
+/// just the plaintext, since that's what actually goes on the wire.
+#[allow(dead_code)]
+pub(crate) fn pacing_delay(payload_len: usize, target_mbps: f64) -> Duration {
+    let bits = payload_len as f64 * 8.0;
+    let secs = bits / (target_mbps.max(0.001) * 1_000_000.0);
+    Duration::from_secs_f64(secs.max(0.0))
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn send_throughput_test_stream(
     socket: Arc<UdpSocket>,
     remote: SocketAddr,
@@ -2885,6 +2899,7 @@ pub(crate) async fn send_throughput_test_stream(
     test_id: u32,
     duration: Duration,
     mtu: LiveMtu,
+    target_mbps: f64,
 ) -> Result<()> {
     // Logged here (not just on completion) specifically so a diagnostic
     // dump's log tail (`diag.rs`, `mlvpnd diag-dump`) makes it obvious a
@@ -2934,6 +2949,9 @@ pub(crate) async fn send_throughput_test_stream(
         Ok(())
     }
 
+    let stream_start = Instant::now();
+    let mut bytes_sent: u64 = 0;
+
     loop {
         // Re-read the live MTU on every packet rather than sizing the
         // whole stream once up front: a self-test or bandwidth probe
@@ -2954,6 +2972,8 @@ pub(crate) async fn send_throughput_test_stream(
             payload_len,
         )
         .await?;
+        bytes_sent += payload_len as u64;
+
         if done {
             for _ in 0..2 {
                 // A real, if brief, pause -- not just insurance against a
@@ -2974,7 +2994,7 @@ pub(crate) async fn send_throughput_test_stream(
                 // packet, and production logs showed the same "no
                 // result" pattern on a real, heavily loss-laden link.
                 tokio::time::sleep(THROUGHPUT_TEST_DONE_RETRY_DELAY).await;
-                send_one(
+                let _ = send_one(
                     &socket,
                     remote,
                     link_id,
@@ -2983,9 +3003,23 @@ pub(crate) async fn send_throughput_test_stream(
                     true,
                     payload_len,
                 )
-                .await?;
+                .await;
             }
             return Ok(());
+        }
+
+        // Drift-corrected pacing: rather than sleeping a fixed
+        // `pacing_delay` after every packet (which would compound any
+        // scheduling/encrypt/syscall overhead into a real rate slower
+        // than `target_mbps`), compute where we *should* be by now
+        // given bytes actually sent so far, and only sleep the
+        // remaining gap -- zero if we're already behind schedule.
+        let target_elapsed = Duration::from_secs_f64(
+            (bytes_sent as f64 * 8.0) / (target_mbps.max(0.001) * 1_000_000.0),
+        );
+        let actual_elapsed = stream_start.elapsed();
+        if target_elapsed > actual_elapsed {
+            tokio::time::sleep(target_elapsed - actual_elapsed).await;
         }
     }
 }
@@ -3370,6 +3404,7 @@ async fn handle_incoming(
                     req.test_id,
                     duration,
                     mtu,
+                    20.0, // see Task 5 for the real reverse-leg pacing target
                 )
                 .await
                 {
@@ -4064,5 +4099,32 @@ mod active_bandwidth_probe_tests {
         // every tunnel would start sending synthetic probe traffic
         // with no explicit opt-in.
         assert!(!SchedulerConfig::default().active_bandwidth_probing);
+    }
+
+    #[test]
+    fn pacing_delay_matches_target_rate() {
+        // 1250 bytes = 10,000 bits. At 10 Mbps, one packet's worth of bits
+        // should take 1 millisecond to "cost" against the budget.
+        let delay = pacing_delay(1250, 10.0);
+        assert!(
+            (delay.as_secs_f64() - 0.001).abs() < 0.000_05,
+            "expected ~1ms, got {delay:?}"
+        );
+    }
+
+    #[test]
+    fn pacing_delay_zero_at_very_high_target() {
+        // A target far above what any real packet size could saturate
+        // should never produce a negative or absurd delay.
+        let delay = pacing_delay(1400, 100_000.0);
+        assert!(delay.as_secs_f64() < 0.001);
+    }
+
+    #[test]
+    fn pacing_delay_scales_inversely_with_rate() {
+        let slow = pacing_delay(1400, 5.0);
+        let fast = pacing_delay(1400, 50.0);
+        assert!(slow > fast);
+        assert!((slow.as_secs_f64() / fast.as_secs_f64() - 10.0).abs() < 0.01);
     }
 }
