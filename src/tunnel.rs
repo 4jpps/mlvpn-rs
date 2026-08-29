@@ -4086,15 +4086,20 @@ async fn session_expiry_loop(session: Arc<AsyncMutex<SessionState>>) {
 /// never arrive.
 struct ReorderBuffer {
     window: Duration,
-    next_expected: u64,
-    pending: BTreeMap<u64, (Instant, Vec<u8>)>,
+    /// Highest Data-frame `hdr.seq` delivered so far, or `None` before
+    /// the very first frame. A frame whose `seq` exceeds this can never
+    /// be "late" relative to anything already delivered -- see
+    /// `drain_ready`'s doc comment for the full reasoning behind this
+    /// model replacing the old "must equal next_expected" one.
+    high_watermark: Option<u64>,
+    pending: BTreeMap<u64, (tokio::time::Instant, Vec<u8>)>,
 }
 
 impl ReorderBuffer {
     fn new(window_ms: u64) -> Self {
         Self {
             window: Duration::from_millis(window_ms),
-            next_expected: 0,
+            high_watermark: None,
             pending: BTreeMap::new(),
         }
     }
@@ -4107,7 +4112,7 @@ impl ReorderBuffer {
     }
 
     /// Replace the window in effect from this point on. Deliberately
-    /// does not touch `pending` or `next_expected` -- a packet already
+    /// does not touch `pending` or `high_watermark` -- a packet already
     /// sitting in the buffer keeps whichever deadline it was inserted
     /// with (`drain_ready` compares each entry's own `sent_at` against
     /// `self.window` freshly on every call, so a change here applies to
@@ -4118,23 +4123,51 @@ impl ReorderBuffer {
     }
 
     fn insert(&mut self, seq: u64, payload: Vec<u8>) {
-        self.pending.insert(seq, (Instant::now(), payload));
+        self.pending
+            .insert(seq, (tokio::time::Instant::now(), payload));
     }
 
-    /// Drain everything that is now safe to deliver: a contiguous run
-    /// starting at `next_expected`, plus anything that has aged out of
-    /// the reorder window regardless of contiguity.
+    /// Drain everything now safe to deliver.
+    ///
+    /// `hdr.seq` (the value `insert` is keyed on) is not a Data-only
+    /// sequence space -- it is `Session::next_send_seq()`, a single
+    /// counter shared by every packet type sent over the session
+    /// (Data, Probe, ProbeReply, StatsShare, ThroughputTestData,
+    /// VersionInfo, and more). Periodic non-Data traffic constantly
+    /// consumes sequence numbers from that same counter, so a real
+    /// Data frame's `seq` essentially never equals "the previous
+    /// Data frame's seq, plus one" -- the numbers in between were
+    /// never going to arrive as Data. An admission test requiring
+    /// exact contiguity therefore treats nearly every Data frame as
+    /// "not next," forcing it through the slow staleness path and
+    /// adding close to the full reorder window's worth of needless
+    /// latency to almost all real traffic -- confirmed as a genuine,
+    /// severe production bug (see
+    /// `docs/superpowers/specs/2026-08-29-reorder-buffer-watermark-fix-design.md`).
+    ///
+    /// The fix: track the highest seq delivered so far
+    /// (`high_watermark`) instead of the specific next integer. A
+    /// frame whose seq exceeds the watermark represents forward
+    /// progress -- it can never be "late" relative to anything already
+    /// delivered, regardless of how large the gap from the previous
+    /// Data frame is -- so it is always immediately safe to deliver.
+    /// A frame at or below the watermark is genuine evidence of
+    /// cross-link reordering (arriving after a later-sequenced frame
+    /// already went out) -- exactly the case this buffer exists to
+    /// handle -- and is buffered until either enough of its neighbors
+    /// arrive to flush it in order, or it ages out via the existing
+    /// staleness window.
     fn drain_ready(&mut self) -> Vec<Vec<u8>> {
         let mut out = Vec::new();
-        let now = Instant::now();
+        let now = tokio::time::Instant::now();
 
         while let Some((&seq, (sent_at, _))) = self.pending.iter().next() {
-            let is_next = seq == self.next_expected;
+            let is_forward_progress = self.high_watermark.is_none_or(|wm| seq > wm);
             let is_stale = now.duration_since(*sent_at) >= self.window;
-            if is_next || is_stale {
+            if is_forward_progress || is_stale {
                 let (_sent_at, payload) = self.pending.remove(&seq).unwrap();
                 out.push(payload);
-                self.next_expected = seq.max(self.next_expected) + 1;
+                self.high_watermark = Some(self.high_watermark.map_or(seq, |wm| wm.max(seq)));
             } else {
                 break;
             }
@@ -4262,6 +4295,83 @@ mod reorder_tuning_tests {
         assert_eq!(rb.window_ms(), 50);
         rb.set_window(120);
         assert_eq!(rb.window_ms(), 120);
+    }
+
+    #[test]
+    fn reorder_buffer_delivers_non_contiguous_seqs_immediately() {
+        // The actual regression this fix targets: real Data frames never
+        // arrive with contiguous sequence numbers, because every other
+        // packet type (probes, stats, self-tests) shares the same counter.
+        // A large, irregular gap between each Data frame's seq must never
+        // cause a wait -- every one of these must come back out of
+        // drain_ready() on the very first call after insert(), with no
+        // sleep/staleness needed.
+        let mut buf = ReorderBuffer::new(50);
+        for seq in [7u64, 19, 20, 1000, 1001, 5_000_000] {
+            buf.insert(seq, vec![seq as u8]);
+            let delivered = buf.drain_ready();
+            assert_eq!(
+                delivered,
+                vec![vec![seq as u8]],
+                "seq {seq} should deliver immediately despite the gap from the previous seq"
+            );
+        }
+    }
+
+    #[test]
+    fn reorder_buffer_first_frame_of_session_delivers_immediately_regardless_of_seq() {
+        // ReorderBuffer::new's old hardcoded `next_expected: 0` meant a
+        // session's very first Data frame (whose real seq is essentially
+        // never 0, since the handshake and any probes already consumed
+        // sequence numbers) was itself misjudged as "not next" and forced
+        // through the stale-timeout path. The very first frame, at any
+        // seq value, must always take the fast path.
+        let mut buf = ReorderBuffer::new(50);
+        buf.insert(42_000, vec![1, 2, 3]);
+        assert_eq!(buf.drain_ready(), vec![vec![1, 2, 3]]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reorder_buffer_holds_genuine_reordering_until_stale() {
+        // A frame arriving at or below the current watermark is real
+        // evidence of cross-link reordering (the buffer's actual intended
+        // purpose) -- unlike the "gap" case above, this one legitimately
+        // has to wait, same as today's behavior, bounded by the window.
+        let mut buf = ReorderBuffer::new(50);
+        buf.insert(10, vec![10]);
+        assert_eq!(buf.drain_ready(), vec![vec![10]]); // advances watermark to 10
+
+        // seq 5 arrives "late" -- below the watermark. Not immediately
+        // delivered.
+        buf.insert(5, vec![5]);
+        assert_eq!(buf.drain_ready(), Vec::<Vec<u8>>::new());
+
+        // Still not stale yet.
+        tokio::time::advance(Duration::from_millis(30)).await;
+        assert_eq!(buf.drain_ready(), Vec::<Vec<u8>>::new());
+
+        // Past the 50ms window: delivered via the staleness path, same as
+        // today's existing behavior.
+        tokio::time::advance(Duration::from_millis(25)).await;
+        assert_eq!(buf.drain_ready(), vec![vec![5]]);
+    }
+
+    #[test]
+    fn reorder_buffer_preserves_order_for_buffered_frames_below_watermark() {
+        // Two frames both below/at the watermark, inserted out of order,
+        // must still be delivered in ascending seq order relative to each
+        // other once they're eligible -- ordering within the genuinely
+        // buffered set is still respected, only the "wait for an exact
+        // next integer" requirement is gone.
+        let mut buf = ReorderBuffer::new(50);
+        buf.insert(100, vec![100]);
+        assert_eq!(buf.drain_ready(), vec![vec![100]]); // watermark now 100
+
+        // Two "late" frames below the watermark, inserted in reverse order.
+        buf.insert(99, vec![99]);
+        buf.insert(98, vec![98]);
+        // Neither is a forward-progress delivery, so nothing comes out yet.
+        assert_eq!(buf.drain_ready(), Vec::<Vec<u8>>::new());
     }
 
     #[test]

@@ -82,6 +82,10 @@ crossterm = "0.28"
 
 [dev-dependencies]
 proptest = "1"
+# test-util (tokio::time::{pause,advance}, #[tokio::test(start_paused = true)])
+# is dev/test-only -- merged into the main `tokio` dependency's feature set
+# by cargo for test builds, never enabled in the real release binary.
+tokio = { version = "1", features = ["test-util"] }
 
 # cargo-deb metadata -- built by the GitLab CI `package:deb:*` jobs
 # (.gitlab-ci.yml). Maintainer scripts live in packaging/deb-scripts/
