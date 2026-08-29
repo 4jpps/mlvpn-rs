@@ -10,6 +10,12 @@ For implementation detail beyond what's here, read the code -- most
 modules and non-trivial functions have doc comments explaining the
 design, and `ARCHITECTURE.md` covers the system as a whole.
 
+## [0.5.2] - 2026-08-29
+
+### Fixed
+
+- **`ReorderBuffer` was needlessly delaying nearly every real Data packet by close to the full `reorder_window_ms`, on every default-configuration deployment.** It compared each incoming Data frame's sequence number against the exact integer it expected next -- but that sequence number is shared by every packet type sent over the session (Data, health probes, periodic stats/version broadcasts, self-test traffic), so the specific next integer a Data frame "should" have was almost always consumed by something else instead, and would never arrive as Data. A real production deployment showed this costing ~110ms of needless round-trip latency (measured via a plain ping through the tunnel against the underlying link's own ~71ms real RTT) and collapsing real end-to-end TCP throughput to a small fraction of the link's actual measured capacity (3-4.5 Mbps against a link whose real ceiling, per v0.5.1's adaptive bandwidth ramp, was 12+ Mbps upload / 400+ Mbps download) -- while every loss/drop counter available anywhere in the daemon or the OS network stack read clean throughout, since nothing was actually being dropped, only delayed. This may also be the true explanation for a previously unresolved mystery in this project's own development notes: real UDP loss observed via `iperf3` with every counter reading zero. Fixed by tracking the highest sequence number delivered so far instead of requiring exact contiguity -- any frame that represents forward progress is now delivered immediately regardless of gaps from non-Data traffic; only frames that genuinely arrive out of order (real cross-link reordering, the buffer's actual purpose) are still held, exactly as before. No configuration change needed, no wire-protocol change, safe to deploy to one end of a tunnel at a time. See `docs/superpowers/specs/2026-08-29-reorder-buffer-watermark-fix-design.md`.
+
 ## [0.5.1] - 2026-08-28
 
 ### Fixed

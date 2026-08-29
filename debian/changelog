@@ -1,3 +1,19 @@
+mlvpn (0.5.2-1) unstable; urgency=high
+
+  * Fix ReorderBuffer needlessly delaying nearly every real Data packet
+    by close to the full reorder_window_ms on every default-config
+    deployment: it compared each Data frame's sequence number against
+    the shared per-session encryption counter (also used by health
+    probes, stats/version broadcasts, self-test traffic), which almost
+    never matched the exact expected next integer. Confirmed live:
+    ~110ms of needless added round-trip latency and real TCP throughput
+    collapsing to a fraction of the link's actual measured capacity,
+    with every loss/drop counter reading clean throughout. Fixed via a
+    high-watermark delivery model; no config or wire-protocol change,
+    safe to deploy to one end of a tunnel at a time.
+
+ -- Jeff Parrish PC Services <www.jpps.us>  Sat, 29 Aug 2026 00:54:23 -0500
+
 mlvpn (0.5.1-1) unstable; urgency=medium
 
   * Fix send_throughput_test_stream (mlvpnd self-test and the background
