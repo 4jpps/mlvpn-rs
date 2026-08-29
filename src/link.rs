@@ -1261,6 +1261,42 @@ impl MtuResizer {
     }
 }
 
+/// Minimal but fully real `Link` for tests outside this module (e.g.
+/// `monitor::tests`) that need to exercise state-transition logic against
+/// a genuine `Link` -- a plain loopback-bound socket, no
+/// `SO_BINDTODEVICE`/privileged path needed, so it runs in an ordinary
+/// unprivileged `cargo test`. `pub(crate)` (not just `#[cfg(test)]`
+/// private) specifically so callers in other modules' own test modules
+/// can reach it.
+#[cfg(test)]
+pub(crate) async fn test_link_for_state_transitions(state: LinkState, stats: LinkStats) -> Link {
+    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    Link {
+        id: 0,
+        config: LinkConfig {
+            name: "test".to_string(),
+            bind_interface: "lo".to_string(),
+            local_addr: None,
+            remote_addr: None,
+            local_port: 0,
+            weight: 1.0,
+            bandwidth_cap_mbps: None,
+            probe_interval_ms: 200,
+        },
+        socket: Arc::new(AsyncRwLock::new(Arc::new(socket))),
+        reconnect_lock: Arc::new(AsyncMutex::new(())),
+        remote: None,
+        state,
+        state_since: Instant::now(),
+        stats,
+        physical_mtu: None,
+        admin_disabled: false,
+        effective_probe_interval_ms: 200,
+        effective_ewma_alpha: 0.2,
+        alternate: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

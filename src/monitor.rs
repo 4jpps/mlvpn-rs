@@ -71,6 +71,19 @@ pub fn update_link_state(link: &mut Link, cfg: &SchedulerConfig) {
     };
     if was != link.state {
         link.state_since = Instant::now();
+        if was != LinkState::Up && link.state == LinkState::Up {
+            // A link coming back Up from Down/Probing may now sit on a
+            // genuinely different physical path (e.g. failover) with a
+            // different real capacity -- drop any cached
+            // active-bandwidth-probe ceiling so `active_bandwidth_prober`'s
+            // `should_full_ramp` sees no cache on its next tick and runs a
+            // full `adaptive_bandwidth_ramp` immediately, rather than
+            // pacing/reporting against a stale pre-outage number for up to
+            // `active_bandwidth_reramp_interval_secs`.
+            link.stats.confirmed_ceiling_mbps = None;
+            link.stats.last_ramp_at = None;
+            link.stats.consecutive_verify_misses = 0;
+        }
         tracing::info!(
             link = %link.config.name,
             from = ?was,
@@ -146,5 +159,65 @@ mod tests {
         // socket and is covered by integration tests instead.
         assert_eq!(cfg.down_threshold, 3);
         assert_eq!(cfg.up_threshold, 2);
+    }
+
+    /// A link coming back Up from Down (or Probing) after an outage may now
+    /// sit on a genuinely different physical path with a different real
+    /// capacity (e.g. failover) -- `update_link_state` must drop any cached
+    /// active-bandwidth-probe ceiling on that specific transition so
+    /// `tunnel::active_bandwidth_prober`'s `should_full_ramp` sees no cache
+    /// on its next tick and re-measures immediately, rather than pacing
+    /// against a stale pre-outage number for up to
+    /// `active_bandwidth_reramp_interval_secs`.
+    #[tokio::test]
+    async fn down_to_up_transition_resets_cached_bandwidth_ceiling() {
+        use crate::link::{test_link_for_state_transitions, LinkState, LinkStats};
+
+        let cfg = SchedulerConfig {
+            up_threshold: 2,
+            ..Default::default()
+        };
+
+        let mut stats = LinkStats::new(0.2);
+        stats.confirmed_ceiling_mbps = Some(123.4);
+        stats.last_ramp_at = Some(Instant::now());
+        stats.consecutive_verify_misses = 3;
+        stats.consecutive_hits = cfg.up_threshold; // enough to trigger Down -> Up
+
+        let mut link = test_link_for_state_transitions(LinkState::Down, stats).await;
+
+        update_link_state(&mut link, &cfg);
+
+        assert_eq!(link.state, LinkState::Up);
+        assert_eq!(link.stats.confirmed_ceiling_mbps, None);
+        assert_eq!(link.stats.last_ramp_at, None);
+        assert_eq!(link.stats.consecutive_verify_misses, 0);
+    }
+
+    /// An already-Up link taking another clean probe (no state transition
+    /// at all) must NOT clobber a populated bandwidth cache -- only an
+    /// actual Down/Probing -> Up transition should reset it.
+    #[tokio::test]
+    async fn up_to_up_no_transition_does_not_reset_cached_bandwidth_ceiling() {
+        use crate::link::{test_link_for_state_transitions, LinkState, LinkStats};
+
+        let cfg = SchedulerConfig::default();
+
+        let mut stats = LinkStats::new(0.2);
+        stats.confirmed_ceiling_mbps = Some(55.5);
+        let last_ramp_at = Instant::now();
+        stats.last_ramp_at = Some(last_ramp_at);
+        stats.consecutive_verify_misses = 1;
+        stats.consecutive_hits = 0; // no bearing on an already-Up link
+        stats.consecutive_misses = 0; // below down_threshold, stays Up
+
+        let mut link = test_link_for_state_transitions(LinkState::Up, stats).await;
+
+        update_link_state(&mut link, &cfg);
+
+        assert_eq!(link.state, LinkState::Up);
+        assert_eq!(link.stats.confirmed_ceiling_mbps, Some(55.5));
+        assert_eq!(link.stats.last_ramp_at, Some(last_ramp_at));
+        assert_eq!(link.stats.consecutive_verify_misses, 1);
     }
 }
