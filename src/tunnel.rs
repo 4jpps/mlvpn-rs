@@ -3014,6 +3014,13 @@ async fn active_bandwidth_prober(
 /// since `active_bandwidth_prober` runs entirely within `tunnel.rs`.
 const ACTIVE_BANDWIDTH_PROBE_RESULT_GRACE: Duration = Duration::from_secs(5);
 
+/// Reverse/download leg's pacing target when this link has no cached
+/// `confirmed_ceiling_mbps` yet (e.g. active bandwidth probing is off,
+/// or this is the very first test against a freshly-started link) --
+/// conservative enough not to trigger the same off-host policing this
+/// whole feature exists to avoid, on essentially any real-world link.
+const REVERSE_LEG_FALLBACK_MBPS: f64 = 20.0;
+
 /// Sends a continuous, MTU-padded `ThroughputTestData` stream to
 /// `remote` for `duration`, then a couple of redundant final ("done")
 /// packets as insurance against losing exactly the last one.
@@ -3557,6 +3564,17 @@ async fn handle_incoming(
             let Ok(req) = ThroughputTestReverseRequestPayload::decode(&plaintext) else {
                 return;
             };
+            let target_mbps = {
+                // `idx` (this link's own index into `links`) and `links`
+                // are both already parameters of the enclosing
+                // `handle_incoming` function -- no need to search by id.
+                links[idx]
+                    .lock()
+                    .await
+                    .stats
+                    .confirmed_ceiling_mbps
+                    .unwrap_or(REVERSE_LEG_FALLBACK_MBPS)
+            };
             // Autonomously start sending a stream back, without any
             // local command-socket trigger -- this is what makes a
             // bidirectional throughput test work without needing the
@@ -3576,7 +3594,7 @@ async fn handle_incoming(
                     req.test_id,
                     duration,
                     mtu,
-                    20.0, // see Task 5 for the real reverse-leg pacing target
+                    target_mbps,
                 )
                 .await
                 {
