@@ -2827,6 +2827,24 @@ where
     }
 }
 
+/// True if this tick should discard the cached `confirmed_ceiling_mbps`
+/// and run a full `adaptive_bandwidth_ramp`, rather than one cheap
+/// single-step verification at the cached rate. See
+/// `config::SchedulerConfig::active_bandwidth_reramp_interval_secs`'s
+/// doc comment for the reasoning behind the two trigger conditions.
+fn should_full_ramp(stats: &link::LinkStats, reramp_interval: Duration) -> bool {
+    let Some(last_ramp_at) = stats.last_ramp_at else {
+        return true; // never ramped this link before
+    };
+    if stats.confirmed_ceiling_mbps.is_none() {
+        return true;
+    }
+    if stats.consecutive_verify_misses >= 2 {
+        return true;
+    }
+    last_ramp_at.elapsed() >= reramp_interval
+}
+
 /// Sender side of `scheduler.active_bandwidth_probing` (off by default):
 /// periodically sends a real throughput-measurement stream down this
 /// link and lets the receiver's `ThroughputTestData` handling in
@@ -2878,7 +2896,6 @@ async fn active_bandwidth_prober(
         (link.handle(), link.id)
     };
 
-    let duration = Duration::from_secs(cfg.active_bandwidth_probe_duration_secs);
     let mut tick = interval(Duration::from_secs(
         cfg.active_bandwidth_probe_interval_secs,
     ));
@@ -2896,42 +2913,97 @@ async fn active_bandwidth_prober(
         };
 
         let socket = handle.current_socket().await;
-        let test_id = crypto::random_session_id();
-        let mut rx = throughput_test_ctx.register_wait(test_id);
-        if send_throughput_test_stream(
-            socket,
-            remote,
-            link_id,
-            session.clone(),
-            test_id,
-            duration,
-            mtu.clone(),
-            20.0, // TODO(Task 4): replace with cached/ramped rate
-        )
-        .await
-        .is_err()
-        {
-            // Best-effort, as documented above: abandon this attempt
-            // and let the next scheduled tick try again.
-            continue;
-        }
+        let reramp_interval = Duration::from_secs(cfg.active_bandwidth_reramp_interval_secs);
+        let full_ramp = {
+            let link = links[idx].lock().await;
+            should_full_ramp(&link.stats, reramp_interval)
+        };
 
-        let achieved_mbps =
-            match tokio::time::timeout(duration + ACTIVE_BANDWIDTH_PROBE_RESULT_GRACE, rx.recv())
+        // Shared per-step runner: sends a paced 1-second stream at
+        // `target_mbps` and waits for the peer's result, same shape
+        // Task 3's CLI upload leg uses.
+        let run_step = |target_mbps: f64| {
+            let socket = socket.clone();
+            let session = session.clone();
+            let mtu = mtu.clone();
+            let throughput_test_ctx = throughput_test_ctx.clone();
+            async move {
+                let test_id = crypto::random_session_id();
+                let mut rx = throughput_test_ctx.register_wait(test_id);
+                if send_throughput_test_stream(
+                    socket,
+                    remote,
+                    link_id,
+                    session,
+                    test_id,
+                    Duration::from_secs(1),
+                    mtu,
+                    target_mbps,
+                )
                 .await
-            {
-                Ok(Some(mbps)) => mbps,
-                _ => continue,
-            };
+                .is_err()
+                {
+                    return None;
+                }
+                match tokio::time::timeout(
+                    Duration::from_secs(1) + ACTIVE_BANDWIDTH_PROBE_RESULT_GRACE,
+                    rx.recv(),
+                )
+                .await
+                {
+                    Ok(Some(mbps)) => Some(mbps),
+                    _ => None,
+                }
+            }
+        };
 
-        if let Some(link) = links.get(idx) {
-            let mut link = link.lock().await;
-            link.stats.active_bandwidth_mbps.update(achieved_mbps);
-            tracing::info!(
-                link = %link.config.name,
-                achieved_mbps,
-                "active bandwidth probe result"
-            );
+        if full_ramp {
+            let result = adaptive_bandwidth_ramp(run_step).await;
+            if let Some(link) = links.get(idx) {
+                let mut link = link.lock().await;
+                link.stats
+                    .active_bandwidth_mbps
+                    .update(result.confirmed_mbps);
+                link.stats.confirmed_ceiling_mbps = Some(result.confirmed_mbps);
+                link.stats.last_ramp_at = Some(Instant::now());
+                link.stats.consecutive_verify_misses = 0;
+                tracing::info!(
+                    link = %link.config.name,
+                    confirmed_mbps = result.confirmed_mbps,
+                    steps = result.steps.len(),
+                    "active bandwidth ramp complete"
+                );
+            }
+        } else {
+            let cached = {
+                let link = links[idx].lock().await;
+                link.stats.confirmed_ceiling_mbps
+            };
+            let Some(cached_mbps) = cached else {
+                continue; // shouldn't happen (should_full_ramp guards this), skip defensively
+            };
+            let achieved = run_step(cached_mbps).await;
+            let clean = achieved
+                .map(|a| a >= RAMP_SUCCESS_THRESHOLD * cached_mbps)
+                .unwrap_or(false);
+            if let Some(link) = links.get(idx) {
+                let mut link = link.lock().await;
+                if let Some(achieved_mbps) = achieved {
+                    link.stats.active_bandwidth_mbps.update(achieved_mbps);
+                }
+                link.stats.consecutive_verify_misses = if clean {
+                    0
+                } else {
+                    link.stats.consecutive_verify_misses + 1
+                };
+                tracing::info!(
+                    link = %link.config.name,
+                    cached_mbps,
+                    ?achieved,
+                    clean,
+                    "active bandwidth verification tick"
+                );
+            }
         }
     }
 }
@@ -4296,5 +4368,51 @@ mod adaptive_bandwidth_ramp_tests {
         assert!(result.steps[2].achieved_mbps.is_none());
         // Backs off from the last clean step (4 Mbps @ 0.95).
         assert!((result.confirmed_mbps - (4.0 * 0.95 * 0.8)).abs() < 0.01);
+    }
+}
+
+#[cfg(test)]
+mod active_bandwidth_prober_tick_tests {
+    use super::*;
+
+    #[test]
+    fn prober_full_ramps_when_never_ramped_before() {
+        let stats = link::LinkStats::new(0.3);
+        assert!(should_full_ramp(&stats, Duration::from_secs(1800)));
+    }
+
+    #[test]
+    fn prober_verifies_when_recently_ramped_and_no_misses() {
+        let mut stats = link::LinkStats::new(0.3);
+        stats.confirmed_ceiling_mbps = Some(42.0);
+        stats.last_ramp_at = Some(Instant::now());
+        stats.consecutive_verify_misses = 0;
+        assert!(!should_full_ramp(&stats, Duration::from_secs(1800)));
+    }
+
+    #[test]
+    fn prober_full_ramps_after_reramp_interval_elapses() {
+        let mut stats = link::LinkStats::new(0.3);
+        stats.confirmed_ceiling_mbps = Some(42.0);
+        stats.last_ramp_at = Some(Instant::now() - Duration::from_secs(2000));
+        assert!(should_full_ramp(&stats, Duration::from_secs(1800)));
+    }
+
+    #[test]
+    fn prober_full_ramps_after_two_consecutive_misses() {
+        let mut stats = link::LinkStats::new(0.3);
+        stats.confirmed_ceiling_mbps = Some(42.0);
+        stats.last_ramp_at = Some(Instant::now());
+        stats.consecutive_verify_misses = 2;
+        assert!(should_full_ramp(&stats, Duration::from_secs(1800)));
+    }
+
+    #[test]
+    fn prober_does_not_full_ramp_after_only_one_miss() {
+        let mut stats = link::LinkStats::new(0.3);
+        stats.confirmed_ceiling_mbps = Some(42.0);
+        stats.last_ramp_at = Some(Instant::now());
+        stats.consecutive_verify_misses = 1;
+        assert!(!should_full_ramp(&stats, Duration::from_secs(1800)));
     }
 }

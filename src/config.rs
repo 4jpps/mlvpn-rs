@@ -255,9 +255,29 @@ pub struct SchedulerConfig {
     /// Validated to be between 1 and 30 seconds: long enough to move a
     /// meaningful amount of data even on a fast link, short enough to
     /// stay a bounded, occasional measurement rather than a sustained
-    /// flood every interval.
+    /// flood every interval. Note: `tunnel::active_bandwidth_prober`'s
+    /// individual ramp/verification steps are now always a fixed 1
+    /// second each regardless of this setting -- duration-based scaling
+    /// for a fast link is handled by `adaptive_bandwidth_ramp`'s own
+    /// doubling step count instead of one long single stream.
     #[serde(default = "default_active_bandwidth_probe_duration_secs")]
     pub active_bandwidth_probe_duration_secs: u64,
+    /// How often `active_bandwidth_prober` discards its cached
+    /// per-link ceiling and runs a full `adaptive_bandwidth_ramp`
+    /// again from scratch, in seconds -- between re-ramps, each
+    /// scheduled probe tick (`active_bandwidth_probe_interval_secs`)
+    /// instead does one cheap single-step verification at the cached
+    /// rate. Only consulted when `active_bandwidth_probing` is true.
+    /// Deliberately defaults higher than
+    /// `active_bandwidth_probe_interval_secs`'s own 300s default (this
+    /// field defaults to 1800s, 6x that) -- setting them equal would
+    /// make every single tick a full re-ramp, which is exactly the
+    /// "cheap most of the time" behavior this field exists to avoid.
+    /// A link's first probe ever (or its first after coming back Up)
+    /// always runs a full ramp regardless of this interval, since
+    /// there's no cached rate yet to verify against.
+    #[serde(default = "default_active_bandwidth_reramp_interval_secs")]
+    pub active_bandwidth_reramp_interval_secs: u64,
 }
 
 fn default_down_threshold() -> u32 {
@@ -293,6 +313,9 @@ fn default_active_bandwidth_probe_interval_secs() -> u64 {
 fn default_active_bandwidth_probe_duration_secs() -> u64 {
     2
 }
+fn default_active_bandwidth_reramp_interval_secs() -> u64 {
+    1800
+}
 
 impl Default for SchedulerConfig {
     fn default() -> Self {
@@ -313,6 +336,7 @@ impl Default for SchedulerConfig {
             active_bandwidth_probing: false,
             active_bandwidth_probe_interval_secs: default_active_bandwidth_probe_interval_secs(),
             active_bandwidth_probe_duration_secs: default_active_bandwidth_probe_duration_secs(),
+            active_bandwidth_reramp_interval_secs: default_active_bandwidth_reramp_interval_secs(),
         }
     }
 }

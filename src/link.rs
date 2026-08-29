@@ -150,6 +150,23 @@ pub struct LinkStats {
     /// things, and conflating them would make either signal noisier.
     /// `monitor::score` prefers this one when it has a value.
     pub active_bandwidth_mbps: Ewma,
+    /// Last rate `adaptive_bandwidth_ramp` fully converged on for this
+    /// link, cached so `active_bandwidth_prober` can do a cheap
+    /// single-step verification most ticks instead of a full ramp
+    /// every time -- see `config::SchedulerConfig::active_bandwidth_reramp_interval_secs`.
+    /// `None` until the first ramp completes.
+    pub confirmed_ceiling_mbps: Option<f64>,
+    /// When the cached `confirmed_ceiling_mbps` was last established by
+    /// a full ramp (not a verification tick) -- compared against
+    /// `active_bandwidth_reramp_interval_secs` to decide when the next
+    /// tick should re-ramp instead of just verifying.
+    pub last_ramp_at: Option<Instant>,
+    /// How many verification ticks in a row have come back below the
+    /// ramp's own success threshold -- two in a row triggers an
+    /// out-of-cycle full re-ramp (see `active_bandwidth_prober`),
+    /// rather than waiting for `active_bandwidth_reramp_interval_secs`.
+    /// Reset to 0 on any clean verification or completed ramp.
+    pub consecutive_verify_misses: u32,
     last_rtt_ms: Option<f64>,
     pub consecutive_misses: u32,
     pub consecutive_hits: u32,
@@ -176,6 +193,9 @@ impl LinkStats {
             rx_throughput_mbps: Ewma::new(alpha),
             tx_throughput_mbps: Ewma::new(alpha),
             active_bandwidth_mbps: Ewma::new(alpha),
+            confirmed_ceiling_mbps: None,
+            last_ramp_at: None,
+            consecutive_verify_misses: 0,
             last_rtt_ms: None,
             consecutive_misses: 0,
             consecutive_hits: 0,
