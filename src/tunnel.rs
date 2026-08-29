@@ -2845,6 +2845,30 @@ fn should_full_ramp(stats: &link::LinkStats, reramp_interval: Duration) -> bool 
     last_ramp_at.elapsed() >= reramp_interval
 }
 
+/// True if a just-completed full ramp's result is still safe to commit
+/// for a link, given the link's state as captured *before* the ramp
+/// started (`state_since_before_ramp`) and its state *now*
+/// (`current_state`/`current_state_since`).
+///
+/// A full ramp holds no lock for its ~1-20 second duration, so the link
+/// can go Down and back Up entirely within that window --
+/// `monitor::update_link_state`'s reset on that transition already
+/// cleared any cached ceiling for exactly this reason. If the ramp then
+/// blindly writes back its pre-outage measurement, it silently
+/// reinstates the stale-cache bug that reset exists to prevent. This is
+/// a cheap approximation of "no bounce happened mid-ramp": the link must
+/// still be `Up`, and its `state_since` must be unchanged from before
+/// the ramp started (a changed `state_since` means at least one
+/// transition happened while the ramp was running, even if the link
+/// happens to be back to `Up` by the time we check).
+fn ramp_result_still_valid(
+    current_state: LinkState,
+    current_state_since: Instant,
+    state_since_before_ramp: Instant,
+) -> bool {
+    current_state == LinkState::Up && current_state_since == state_since_before_ramp
+}
+
 /// Sender side of `scheduler.active_bandwidth_probing` (off by default):
 /// periodically sends a real throughput-measurement stream down this
 /// link and lets the receiver's `ThroughputTestData` handling in
@@ -2958,9 +2982,48 @@ async fn active_bandwidth_prober(
         };
 
         if full_ramp {
+            let state_since_before_ramp = links[idx].lock().await.state_since;
             let result = adaptive_bandwidth_ramp(run_step).await;
+            let got_real_measurement = result.steps.iter().any(|s| s.achieved_mbps.is_some());
+            if !got_real_measurement {
+                // Every step failed/timed out -- e.g. an old peer that
+                // ignores `ThroughputTestData`, or a temporarily
+                // unreachable one. `result.confirmed_mbps` in this case
+                // is a fabricated fallback number
+                // (`RAMP_START_MBPS * RAMP_BACKOFF_FACTOR`), not a real
+                // measurement -- committing it would both override
+                // `monitor::score()`'s real-traffic EWMA fallback
+                // permanently and get cached into `confirmed_ceiling_mbps`,
+                // self-perpetuating via the cheap verification tick.
+                // Mirror `control.rs`'s CLI-path guard: skip committing
+                // anything and let the next scheduled tick retry.
+                let link_name = links[idx].lock().await.config.name.clone();
+                tracing::warn!(
+                    link = %link_name,
+                    steps = result.steps.len(),
+                    "active bandwidth ramp got no real measurement from any step, discarding"
+                );
+                continue;
+            }
             if let Some(link) = links.get(idx) {
                 let mut link = link.lock().await;
+                // The link may have bounced Down and back Up while this
+                // ramp was in flight (it holds no lock for its ~1-20s
+                // duration). `monitor::update_link_state`'s reset on that
+                // transition would have cleared the cache already -- if
+                // we blindly write the ramp's pre-outage measurement back
+                // now, we silently reinstate the exact stale-cache bug
+                // that reset was fixed for. Cheap approximation: discard
+                // if the link isn't still Up, or if its `state_since` has
+                // moved since before the ramp started (i.e. it bounced).
+                if !ramp_result_still_valid(link.state, link.state_since, state_since_before_ramp)
+                {
+                    tracing::warn!(
+                        link = %link.config.name,
+                        "link state changed mid-ramp, discarding ramp result"
+                    );
+                    continue;
+                }
                 link.stats
                     .active_bandwidth_mbps
                     .update(result.confirmed_mbps);
@@ -4387,6 +4450,27 @@ mod adaptive_bandwidth_ramp_tests {
         // Backs off from the last clean step (4 Mbps @ 0.95).
         assert!((result.confirmed_mbps - (4.0 * 0.95 * 0.8)).abs() < 0.01);
     }
+
+    #[tokio::test]
+    async fn ramp_reports_no_real_measurement_when_every_step_fails() {
+        // Every single step times out / gets no result back -- e.g. an
+        // old peer that ignores `ThroughputTestData` entirely, or one
+        // that's temporarily unreachable for the whole ramp. Even though
+        // `confirmed_mbps` still comes out to a (fabricated) number via
+        // the backoff-with-no-clean-step path, callers must be able to
+        // tell this apart from a real measurement by checking whether
+        // any step actually got a result -- exactly the guard
+        // `control.rs`'s CLI path already uses and
+        // `active_bandwidth_prober` now mirrors.
+        let result = adaptive_bandwidth_ramp(|_target| async move { None }).await;
+
+        assert_eq!(result.steps.len(), 1);
+        assert!(!result.steps.iter().any(|s| s.achieved_mbps.is_some()));
+        // The fabricated fallback is still there in confirmed_mbps...
+        assert!((result.confirmed_mbps - (RAMP_START_MBPS * RAMP_BACKOFF_FACTOR)).abs() < 0.01);
+        // ...but nothing in `steps` should ever be mistaken for a real
+        // measurement.
+    }
 }
 
 #[cfg(test)]
@@ -4432,5 +4516,39 @@ mod active_bandwidth_prober_tick_tests {
         stats.last_ramp_at = Some(Instant::now());
         stats.consecutive_verify_misses = 1;
         assert!(!should_full_ramp(&stats, Duration::from_secs(1800)));
+    }
+
+    #[test]
+    fn ramp_result_valid_when_link_stayed_up_the_whole_time() {
+        let state_since = Instant::now();
+        assert!(ramp_result_still_valid(
+            LinkState::Up,
+            state_since,
+            state_since
+        ));
+    }
+
+    #[test]
+    fn ramp_result_invalid_when_link_no_longer_up() {
+        let state_since = Instant::now();
+        assert!(!ramp_result_still_valid(
+            LinkState::Down,
+            state_since,
+            state_since
+        ));
+    }
+
+    #[test]
+    fn ramp_result_invalid_when_link_bounced_down_and_back_up_mid_ramp() {
+        // Back to `Up` by the time we check, but `state_since` has moved
+        // -- proof a Down/Up transition happened somewhere in the
+        // window, even though the link "looks" healthy right now.
+        let state_since_before_ramp = Instant::now();
+        let state_since_after_bounce = state_since_before_ramp + Duration::from_millis(1);
+        assert!(!ramp_result_still_valid(
+            LinkState::Up,
+            state_since_after_bounce,
+            state_since_before_ramp
+        ));
     }
 }
