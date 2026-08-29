@@ -7,7 +7,7 @@
 //! Uses `tc qdisc ... tbf` to cap the client's link1 veth interface to a
 //! known, low rate (link0 stays unshaped, same baseline every other test
 //! in this harness uses), then confirms the client's own logged
-//! `achieved_mbps` for link1 (`"active bandwidth probe result"`, the
+//! `confirmed_mbps` for link1 (`"active bandwidth ramp complete"`, the
 //! only externally observable signal for this feature -- see
 //! `veth_reorder_tuning.rs`'s module doc comment for why a handful of
 //! this project's auto-tuning-adjacent features are asserted against
@@ -15,14 +15,29 @@
 //! control socket) actually reflects that cap, and comes in meaningfully
 //! lower than link0's.
 //!
-//! **What this does not assert**: an exact achieved_mbps value. A
+//! `active_bandwidth_prober` (`src/tunnel.rs`) now runs a full paced
+//! `adaptive_bandwidth_ramp` (Task 3/4's state machine, shared with
+//! `mlvpnd self-test`'s upload leg) instead of a single fixed-count
+//! burst, and caches the confirmed ceiling between full ramps
+//! (`link.stats.confirmed_ceiling_mbps`). Since each link's
+//! `confirmed_ceiling_mbps` starts `None`, `should_full_ramp` always
+//! takes the full-ramp branch on the very first tick (which fires
+//! immediately -- see below), logging `"active bandwidth ramp
+//! complete"` with `confirmed_mbps`/`steps` fields; only a *later* tick
+//! (after `active_bandwidth_reramp_interval_secs`, not exercised by
+//! this test's short runtime) would take the cheaper cached-verify
+//! branch and log `"active bandwidth verification tick"` instead. This
+//! test only asserts against the first-tick full-ramp log line.
+//!
+//! **What this does not assert**: an exact confirmed_mbps value. A
 //! stream against a token-bucket shaper is inherently a little noisy
-//! (initial burst credit, timer granularity), so this only checks that
-//! link1's measured rate is capped to a sane ballpark and is clearly
+//! (initial burst credit, timer granularity, the ramp's own 80%
+//! backoff off of the last clean step), so this only checks that
+//! link1's confirmed rate is capped to a sane ballpark and is clearly
 //! lower than link0's unshaped measurement -- proving the whole path
-//! (stream send, stream receive/accumulate, result reply, EWMA update,
-//! log) fires and reacts to real network conditions, which is this
-//! test's actual job.
+//! (paced ramp, stream send, stream receive/accumulate, result reply,
+//! EWMA update, log) fires and reacts to real network conditions, which
+//! is this test's actual job.
 //!
 //! See `tests/support/mod.rs`'s module doc comment for what this needs
 //! (root, `iproute2`, the `mlvpn` system user) -- plus `tc` specifically
@@ -53,21 +68,24 @@ use support::{
     CLIENT_TUNNEL_ADDR, SERVER_TUNNEL_ADDR, SERVER_TUNNEL_HOST,
 };
 
-/// Pulls the `achieved_mbps=<value>` field back out of a captured log
+/// Pulls the `confirmed_mbps=<value>` field back out of a captured log
 /// line in the default `tracing_subscriber::fmt()` format (unquoted,
-/// space-delimited `key=value` fields after the message/target).
-fn parse_achieved_mbps(line: &str) -> f64 {
+/// space-delimited `key=value` fields after the message/target) --
+/// `adaptive_bandwidth_ramp`'s final backed-off/converged rate, logged
+/// by `active_bandwidth_prober`'s full-ramp branch as `"active
+/// bandwidth ramp complete"`.
+fn parse_confirmed_mbps(line: &str) -> f64 {
     let after = line
-        .split("achieved_mbps=")
+        .split("confirmed_mbps=")
         .nth(1)
-        .unwrap_or_else(|| panic!("no achieved_mbps field in line: {line}"));
+        .unwrap_or_else(|| panic!("no confirmed_mbps field in line: {line}"));
     let value: String = after
         .chars()
         .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == '-')
         .collect();
     value
         .parse()
-        .unwrap_or_else(|e| panic!("could not parse achieved_mbps {value:?} in line {line}: {e}"))
+        .unwrap_or_else(|e| panic!("could not parse confirmed_mbps {value:?} in line {line}: {e}"))
 }
 
 #[tokio::test]
@@ -213,33 +231,36 @@ async fn active_bandwidth_probing_discovers_a_real_rate_cap() {
     //
     // `tracing_subscriber`'s default formatter writes an event's
     // fields, in declaration order, right after its message --
-    // `tracing::info!(link = %link.config.name, achieved_mbps = ...,
-    // "active bandwidth probe result")` in `handle_incoming` -- and
-    // the `%` sigil means Display formatting, not Debug, so the link
-    // name appears *unquoted* (`link=link0`, not `link="link0"`). This
+    // `tracing::info!(link = %link.config.name, confirmed_mbps = ...,
+    // steps = ..., "active bandwidth ramp complete")` in
+    // `active_bandwidth_prober`'s full-ramp branch -- and the `%`
+    // sigil means Display formatting, not Debug, so the link name
+    // appears *unquoted* (`link=link0`, not `link="link0"`). This
     // combined needle pins the result to the specific link it's about,
-    // not just any bandwidth-probe-result line.
+    // not just any ramp-complete line. Each link's `confirmed_ceiling_mbps`
+    // starts `None`, so `should_full_ramp` takes the full-ramp branch
+    // (not the cheaper cached-verify one) on this first, immediate tick.
     let link0_line = client_logs
         .find_line_containing(
-            "active bandwidth probe result link=link0",
+            "active bandwidth ramp complete link=link0",
             Duration::from_secs(60),
         )
         .await
-        .expect("never saw an active bandwidth probe result for link0");
+        .expect("never saw an active bandwidth ramp complete for link0");
     let link1_line = client_logs
         .find_line_containing(
-            "active bandwidth probe result link=link1",
+            "active bandwidth ramp complete link=link1",
             Duration::from_secs(30),
         )
         .await
-        .expect("never saw an active bandwidth probe result for link1");
+        .expect("never saw an active bandwidth ramp complete for link1");
 
-    let mbps0 = parse_achieved_mbps(&link0_line);
-    let mbps1 = parse_achieved_mbps(&link1_line);
+    let mbps0 = parse_confirmed_mbps(&link0_line);
+    let mbps1 = parse_confirmed_mbps(&link1_line);
 
     assert!(
         mbps1 < 10.0,
-        "link1's achieved_mbps ({mbps1}) should reflect the 2mbit tbf cap, not an unshaped rate"
+        "link1's confirmed_mbps ({mbps1}) should reflect the 2mbit tbf cap, not an unshaped rate"
     );
     assert!(
         mbps1 < mbps0,
