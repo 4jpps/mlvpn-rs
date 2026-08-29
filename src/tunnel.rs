@@ -2775,11 +2775,20 @@ fn receive_elapsed_secs(
 /// `achieved_mbps >= RAMP_SUCCESS_THRESHOLD * target_mbps` -- see the
 /// module-level doc on `adaptive_bandwidth_ramp` for why 90%.
 #[derive(Debug, Clone, Copy)]
-#[allow(dead_code)]
 pub(crate) struct RampStep {
-    #[allow(dead_code)]
     pub target_mbps: f64,
     pub achieved_mbps: Option<f64>,
+    // Genuinely only read by this module's own `ramp_*` tests today --
+    // `adaptive_bandwidth_ramp` itself only needs the local `clean`
+    // (used to decide whether to keep doubling or back off), not this
+    // stored copy, and neither current caller (`control.rs`'s CLI path,
+    // `active_bandwidth_prober`) reads it back off `RampResult::steps`.
+    // Kept as real per-step state (not decoration left over from an
+    // earlier plan) since it's exactly what a future CLI/diagnostics
+    // display of "which step(s) failed and why" would need -- narrowly
+    // allowed here rather than treated as the same stale dead code the
+    // blanket allows on this whole module were.
+    #[allow(dead_code)]
     pub clean: bool,
 }
 
@@ -2788,21 +2797,15 @@ pub(crate) struct RampStep {
 /// `mlvpnd self-test`'s CLI output can show exactly where a real
 /// ISP-policer cliff sits, not just an opaque average.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub(crate) struct RampResult {
     pub steps: Vec<RampStep>,
     pub confirmed_mbps: f64,
 }
 
-#[allow(dead_code)]
 const RAMP_START_MBPS: f64 = 2.0;
-#[allow(dead_code)]
 const RAMP_DOUBLING_FACTOR: f64 = 2.0;
-#[allow(dead_code)]
 const RAMP_MAX_STEPS: usize = 12;
-#[allow(dead_code)]
 const RAMP_SUCCESS_THRESHOLD: f64 = 0.9;
-#[allow(dead_code)]
 const RAMP_BACKOFF_FACTOR: f64 = 0.8;
 
 /// Discovers a link's real achievable throughput by pacing successive
@@ -2824,7 +2827,6 @@ const RAMP_BACKOFF_FACTOR: f64 = 0.8;
 /// `active_bandwidth_prober` for a background re-ramp) supply a
 /// closure that calls `send_throughput_test_stream` at 1-second
 /// duration and awaits its `ThroughputTestResult`.
-#[allow(dead_code)]
 pub(crate) async fn adaptive_bandwidth_ramp<F, Fut>(mut run_step: F) -> RampResult
 where
     F: FnMut(f64) -> Fut,
@@ -3172,14 +3174,27 @@ const REVERSE_LEG_FALLBACK_MBPS: f64 = 20.0;
 /// drains once this function's own sending stops adding to its queue.
 const THROUGHPUT_TEST_DONE_RETRY_DELAY: Duration = Duration::from_millis(250);
 
-/// The delay to sleep after sending one `payload_len`-byte packet so
-/// that, averaged over many packets, the stream's send rate converges
-/// on `target_mbps` -- see `docs/superpowers/specs/2026-08-28-adaptive-bandwidth-pacing-design.md`.
-/// `payload_len` is the *whole* UDP payload (header + ciphertext), not
-/// just the plaintext, since that's what actually goes on the wire.
-#[allow(dead_code)]
-pub(crate) fn pacing_delay(payload_len: usize, target_mbps: f64) -> Duration {
-    let bits = payload_len as f64 * 8.0;
+/// How much wall-clock time should have elapsed, since a stream started,
+/// once `bytes_sent` bytes of it have gone out, in order for the
+/// stream's average send rate to converge on `target_mbps` -- see
+/// `docs/superpowers/specs/2026-08-28-adaptive-bandwidth-pacing-design.md`.
+/// Used by `send_throughput_test_stream`'s drift-corrected pacing loop
+/// below: rather than sleeping a fixed delay after every packet (which
+/// would compound scheduling/encrypt/syscall overhead into a real rate
+/// slower than `target_mbps`), the loop computes where it *should* be by
+/// now given bytes actually sent so far, and only sleeps the remaining
+/// gap. Extracted out of the loop (rather than duplicating this formula
+/// inline) so it's independently unit-testable and can't silently drift
+/// out of sync with what the loop actually does.
+///
+/// `bytes_sent` here is `payload_len`-sized units -- the plaintext
+/// length passed to `encode_padded`, *before* encryption -- not the
+/// real on-wire size, which is `HEADER_LEN + ciphertext.len()` (larger,
+/// since the AEAD ciphertext carries an authentication tag on top of the
+/// plaintext). Pacing is therefore against the plaintext size, not the
+/// true wire size.
+fn target_elapsed_for_bytes(bytes_sent: u64, target_mbps: f64) -> Duration {
+    let bits = bytes_sent as f64 * 8.0;
     let secs = bits / (target_mbps.max(0.001) * 1_000_000.0);
     Duration::from_secs_f64(secs.max(0.0))
 }
@@ -3302,15 +3317,10 @@ pub(crate) async fn send_throughput_test_stream(
             return Ok(());
         }
 
-        // Drift-corrected pacing: rather than sleeping a fixed
-        // `pacing_delay` after every packet (which would compound any
-        // scheduling/encrypt/syscall overhead into a real rate slower
-        // than `target_mbps`), compute where we *should* be by now
-        // given bytes actually sent so far, and only sleep the
-        // remaining gap -- zero if we're already behind schedule.
-        let target_elapsed = Duration::from_secs_f64(
-            (bytes_sent as f64 * 8.0) / (target_mbps.max(0.001) * 1_000_000.0),
-        );
+        // Drift-corrected pacing: see `target_elapsed_for_bytes`'s doc
+        // comment. Sleep only the remaining gap -- zero if we're already
+        // behind schedule.
+        let target_elapsed = target_elapsed_for_bytes(bytes_sent, target_mbps);
         let actual_elapsed = stream_start.elapsed();
         if target_elapsed > actual_elapsed {
             tokio::time::sleep(target_elapsed - actual_elapsed).await;
@@ -4471,10 +4481,12 @@ mod active_bandwidth_probe_tests {
     }
 
     #[test]
-    fn pacing_delay_matches_target_rate() {
-        // 1250 bytes = 10,000 bits. At 10 Mbps, one packet's worth of bits
-        // should take 1 millisecond to "cost" against the budget.
-        let delay = pacing_delay(1250, 10.0);
+    fn target_elapsed_for_bytes_matches_target_rate() {
+        // 1250 bytes = 10,000 bits. At 10 Mbps, one packet's worth of
+        // bits should take 1 millisecond to "cost" against the budget --
+        // this is the exact formula `send_throughput_test_stream`'s
+        // pacing loop uses, not a separate copy of it.
+        let delay = target_elapsed_for_bytes(1250, 10.0);
         assert!(
             (delay.as_secs_f64() - 0.001).abs() < 0.000_05,
             "expected ~1ms, got {delay:?}"
@@ -4482,17 +4494,17 @@ mod active_bandwidth_probe_tests {
     }
 
     #[test]
-    fn pacing_delay_zero_at_very_high_target() {
+    fn target_elapsed_for_bytes_zero_at_very_high_target() {
         // A target far above what any real packet size could saturate
         // should never produce a negative or absurd delay.
-        let delay = pacing_delay(1400, 100_000.0);
+        let delay = target_elapsed_for_bytes(1400, 100_000.0);
         assert!(delay.as_secs_f64() < 0.001);
     }
 
     #[test]
-    fn pacing_delay_scales_inversely_with_rate() {
-        let slow = pacing_delay(1400, 5.0);
-        let fast = pacing_delay(1400, 50.0);
+    fn target_elapsed_for_bytes_scales_inversely_with_rate() {
+        let slow = target_elapsed_for_bytes(1400, 5.0);
+        let fast = target_elapsed_for_bytes(1400, 50.0);
         assert!(slow > fast);
         assert!((slow.as_secs_f64() / fast.as_secs_f64() - 10.0).abs() < 0.01);
     }
