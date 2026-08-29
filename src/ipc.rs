@@ -280,6 +280,13 @@ pub struct ThroughputTestLinkResult {
     /// requested; `None` either because it wasn't requested or because
     /// the peer's reverse stream never arrived/completed in time.
     pub download_mbps: Option<f64>,
+    /// One `(target_mbps, achieved_mbps)` pair per step of the upload
+    /// leg's `adaptive_bandwidth_ramp` -- lets `mlvpnd self-test`'s CLI
+    /// output show exactly where a real throughput ceiling sits (e.g.
+    /// an ISP policer cliff), not just the final backed-off number.
+    /// Empty if the upload leg failed before any step ran.
+    #[serde(default)]
+    pub upload_steps: Vec<(f64, Option<f64>)>,
 }
 
 /// Reply to exactly one `Command`, written back once before the
@@ -542,6 +549,7 @@ mod tests {
                 link: "lte0".to_string(),
                 upload_mbps: Some(94.2),
                 download_mbps: None,
+                upload_steps: vec![(2.0, Some(1.9)), (4.0, Some(3.8))],
             }],
             diag_dump: None,
             tunnel_test_result: None,
@@ -555,6 +563,10 @@ mod tests {
         assert_eq!(ok_back.throughput_results[0].link, "lte0");
         assert_eq!(ok_back.throughput_results[0].upload_mbps, Some(94.2));
         assert_eq!(ok_back.throughput_results[0].download_mbps, None);
+        assert_eq!(
+            ok_back.throughput_results[0].upload_steps,
+            vec![(2.0, Some(1.9)), (4.0, Some(3.8))]
+        );
         assert!(ok_back.diag_dump.is_none());
 
         let err = CommandResult {

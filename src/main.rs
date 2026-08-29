@@ -330,6 +330,16 @@ fn run_throughput_selftest(
         } else {
             println!("{}: upload {upload}", r.link);
         }
+        if !r.upload_steps.is_empty() {
+            print!("  ramp steps:");
+            for (target, achieved) in &r.upload_steps {
+                match achieved {
+                    Some(a) => print!(" {target:.0}->{a:.1}"),
+                    None => print!(" {target:.0}->none"),
+                }
+            }
+            println!();
+        }
     }
     print_peer_version_report(&result.peer_version);
     Ok(())

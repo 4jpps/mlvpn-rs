@@ -42,8 +42,8 @@ use crate::peerstats::PeerStatsTable;
 use crate::procstats;
 use crate::sysfs_net;
 use crate::tunnel::{
-    send_throughput_test_reverse_request, send_throughput_test_stream, DiagnosticsWatchParams,
-    OutboundFrame, PeerVersion, SessionMeta, ThroughputTestContext,
+    adaptive_bandwidth_ramp, send_throughput_test_reverse_request, send_throughput_test_stream,
+    DiagnosticsWatchParams, OutboundFrame, PeerVersion, SessionMeta, ThroughputTestContext,
 };
 use crate::tunneltest;
 use std::net::SocketAddr;
@@ -1118,14 +1118,13 @@ async fn run_throughput_test_command(
             bidirectional,
             "starting throughput self-test"
         );
-        let upload_mbps = run_throughput_test_leg_upload(
+        let (upload_mbps, upload_steps) = run_throughput_test_leg_upload(
             &socket,
             remote,
             link_id,
             session,
             throughput_test_ctx,
             mtu.clone(),
-            duration_secs,
         )
         .await;
 
@@ -1154,6 +1153,7 @@ async fn run_throughput_test_command(
             link: link_name,
             upload_mbps,
             download_mbps,
+            upload_steps,
         });
     }
 
@@ -1167,12 +1167,11 @@ async fn run_throughput_test_command(
     }
 }
 
-/// Forward/upload leg: sends a `duration_secs` stream to the peer, then
-/// waits (with `THROUGHPUT_TEST_RESULT_GRACE`'s extra timeout) for
-/// their `ThroughputTestResult` reply. `None` if the send itself failed
-/// or no reply arrived in time -- e.g. an old peer that predates this
-/// feature and silently drops the unrecognized packet type.
-#[allow(clippy::too_many_arguments)]
+/// Forward/upload leg: runs `adaptive_bandwidth_ramp`, pacing each
+/// step's stream at that step's target rate and waiting (with
+/// `THROUGHPUT_TEST_RESULT_GRACE`'s extra timeout) for the peer's
+/// `ThroughputTestResult` reply per step. Returns both the ramp's
+/// final confirmed rate and its full step trace.
 async fn run_throughput_test_leg_upload(
     socket: &Arc<UdpSocket>,
     remote: SocketAddr,
@@ -1180,29 +1179,49 @@ async fn run_throughput_test_leg_upload(
     session: &Arc<AsyncMutex<SessionState>>,
     throughput_test_ctx: &Arc<ThroughputTestContext>,
     mtu: crate::tunnel::LiveMtu,
-    duration_secs: u32,
-) -> Option<f64> {
-    let test_id = random_session_id();
-    let mut rx = throughput_test_ctx.register_wait(test_id);
-    if let Err(e) = send_throughput_test_stream(
-        socket.clone(),
-        remote,
-        link_id,
-        session.clone(),
-        test_id,
-        Duration::from_secs(duration_secs as u64),
-        mtu,
-        20.0, // TODO(Task 3): replaced by adaptive_bandwidth_ramp
-    )
-    .await
-    {
-        tracing::warn!(error = %e, "throughput self-test upload stream failed to send");
-        return None;
-    }
-    match tokio::time::timeout(THROUGHPUT_TEST_RESULT_GRACE, rx.recv()).await {
-        Ok(Some(mbps)) => Some(mbps),
-        _ => None,
-    }
+) -> (Option<f64>, Vec<(f64, Option<f64>)>) {
+    let result = adaptive_bandwidth_ramp(|target_mbps| {
+        let socket = socket.clone();
+        let session = session.clone();
+        let mtu = mtu.clone();
+        let throughput_test_ctx = throughput_test_ctx.clone();
+        async move {
+            let test_id = random_session_id();
+            let mut rx = throughput_test_ctx.register_wait(test_id);
+            if send_throughput_test_stream(
+                socket,
+                remote,
+                link_id,
+                session,
+                test_id,
+                Duration::from_secs(1),
+                mtu,
+                target_mbps,
+            )
+            .await
+            .is_err()
+            {
+                return None;
+            }
+            match tokio::time::timeout(THROUGHPUT_TEST_RESULT_GRACE, rx.recv()).await {
+                Ok(Some(mbps)) => Some(mbps),
+                _ => None,
+            }
+        }
+    })
+    .await;
+
+    let confirmed = if result.steps.iter().any(|s| s.achieved_mbps.is_some()) {
+        Some(result.confirmed_mbps)
+    } else {
+        None
+    };
+    let steps = result
+        .steps
+        .iter()
+        .map(|s| (s.target_mbps, s.achieved_mbps))
+        .collect();
+    (confirmed, steps)
 }
 
 /// Reverse/download leg: asks the peer to send a `duration_secs` stream
