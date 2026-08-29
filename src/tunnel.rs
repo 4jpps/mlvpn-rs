@@ -2680,6 +2680,18 @@ fn suggest_probe_interval_ms(
 struct ThroughputTestReceiveState {
     test_id: Option<u32>,
     first_seen: Instant,
+    /// When the most recent *non-final* packet of the current stream
+    /// arrived, if any yet have. Used instead of "whenever the `done`
+    /// packet happened to arrive" to compute `elapsed_secs` -- see the
+    /// `ThroughputTestData` handling arm for why: the sender retries a
+    /// lost `done` packet up to twice, `THROUGHPUT_TEST_DONE_RETRY_DELAY`
+    /// apart, so if the original `done` is lost, whichever retry copy
+    /// finally gets through arrives up to ~500ms late relative to when
+    /// the stream's real data actually stopped flowing. On a short
+    /// (e.g. 1-second) ramp step, that inflates the measured duration by
+    /// 25-50%, comfortably enough to make an otherwise-healthy step look
+    /// like it failed.
+    last_data_at: Option<Instant>,
     bytes_seen: u64,
     last_completed_test_id: Option<u32>,
 }
@@ -2689,6 +2701,7 @@ impl ThroughputTestReceiveState {
         Self {
             test_id: None,
             first_seen: Instant::now(),
+            last_data_at: None,
             bytes_seen: 0,
             last_completed_test_id: None,
         }
@@ -2725,6 +2738,36 @@ impl ThroughputTestReceiveState {
 fn compute_achieved_mbps(bytes: u64, elapsed_secs: f64) -> f64 {
     let elapsed_secs = elapsed_secs.max(0.000_001);
     (bytes as f64 * 8.0) / elapsed_secs / 1_000_000.0
+}
+
+/// Pure elapsed-time calculation for `ThroughputTestData`'s receive
+/// side, extracted out of the `handle_incoming` match arm specifically
+/// so it's unit-testable without a real socket.
+///
+/// Measures to `last_data_at` (the last *non-final* packet of this
+/// stream actually received) rather than to `done_arrived_at` (when the
+/// `done`-flagged packet that triggered this calculation showed up).
+/// This matters because the sender retries a lost `done` packet up to
+/// twice, `THROUGHPUT_TEST_DONE_RETRY_DELAY` apart: if the original
+/// `done` is lost, whichever retry copy finally gets through can arrive
+/// up to ~500ms after the stream's real data actually stopped flowing.
+/// On a short (e.g. 1-second) ramp step that inflates the measured
+/// duration by 25-50% -- enough to cross `RAMP_SUCCESS_THRESHOLD` and
+/// make an otherwise-healthy step look like it failed, specifically on
+/// the lossy links where accurate measurement matters most.
+///
+/// Falls back to `done_arrived_at` only for a degenerate stream whose
+/// very first packet is already flagged `done` (no earlier non-final
+/// packet exists to measure to).
+fn receive_elapsed_secs(
+    first_seen: Instant,
+    last_data_at: Option<Instant>,
+    done_arrived_at: Instant,
+) -> f64 {
+    last_data_at
+        .unwrap_or(done_arrived_at)
+        .duration_since(first_seen)
+        .as_secs_f64()
 }
 
 /// One step of an `adaptive_bandwidth_ramp`: the rate attempted and
@@ -3559,6 +3602,7 @@ async fn handle_incoming(
             if state.test_id != Some(data.test_id) {
                 state.test_id = Some(data.test_id);
                 state.first_seen = Instant::now();
+                state.last_data_at = None;
                 state.bytes_seen = 0;
                 // Same reasoning as `send_throughput_test_stream`'s own
                 // start-of-stream log: marks the receive side's log tail
@@ -3574,8 +3618,12 @@ async fn handle_incoming(
                 );
             }
             state.bytes_seen += frame.len() as u64;
+            if !data.done {
+                state.last_data_at = Some(Instant::now());
+            }
             if data.done {
-                let elapsed_secs = state.first_seen.elapsed().as_secs_f64();
+                let elapsed_secs =
+                    receive_elapsed_secs(state.first_seen, state.last_data_at, Instant::now());
                 let achieved_mbps = compute_achieved_mbps(state.bytes_seen, elapsed_secs);
                 state.test_id = None;
                 state.last_completed_test_id = Some(data.test_id);
@@ -4360,6 +4408,54 @@ mod active_bandwidth_probe_tests {
     #[test]
     fn zero_bytes_yields_zero_rate() {
         assert_eq!(compute_achieved_mbps(0, 1.0), 0.0);
+    }
+
+    #[test]
+    fn receive_elapsed_measures_to_last_data_not_late_done_arrival() {
+        // A late-arriving retried `done` packet (up to
+        // THROUGHPUT_TEST_DONE_RETRY_DELAY * 2 after the real last data)
+        // must not inflate the measured duration -- elapsed should be
+        // pinned to when the last real (non-final) packet arrived, not
+        // to this delayed done copy's own arrival.
+        let first_seen = Instant::now();
+        let last_data_at = first_seen + Duration::from_millis(980); // ~1s stream
+        let done_arrived_at = first_seen + Duration::from_millis(1480); // 500ms late retry
+
+        let elapsed = receive_elapsed_secs(first_seen, Some(last_data_at), done_arrived_at);
+        assert!(
+            (elapsed - 0.98).abs() < 1e-9,
+            "expected ~0.98s, got {elapsed}"
+        );
+    }
+
+    #[test]
+    fn receive_elapsed_matches_done_arrival_when_nothing_lost() {
+        // Normal case: the done packet itself is the last data point
+        // (no loss/retry involved) -- same as measuring straight to its
+        // own arrival.
+        let first_seen = Instant::now();
+        let done_arrived_at = first_seen + Duration::from_millis(1000);
+
+        let elapsed = receive_elapsed_secs(first_seen, Some(done_arrived_at), done_arrived_at);
+        assert!(
+            (elapsed - 1.0).abs() < 1e-9,
+            "expected ~1.0s, got {elapsed}"
+        );
+    }
+
+    #[test]
+    fn receive_elapsed_falls_back_to_done_arrival_for_single_packet_stream() {
+        // Degenerate one-packet stream: the very first packet is
+        // already flagged done, so there's no earlier last_data_at to
+        // measure to -- fall back to this packet's own arrival.
+        let first_seen = Instant::now();
+        let done_arrived_at = first_seen + Duration::from_millis(5);
+
+        let elapsed = receive_elapsed_secs(first_seen, None, done_arrived_at);
+        assert!(
+            (elapsed - 0.005).abs() < 1e-9,
+            "expected ~0.005s, got {elapsed}"
+        );
     }
 
     #[test]
