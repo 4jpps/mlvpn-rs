@@ -2727,6 +2727,106 @@ fn compute_achieved_mbps(bytes: u64, elapsed_secs: f64) -> f64 {
     (bytes as f64 * 8.0) / elapsed_secs / 1_000_000.0
 }
 
+/// One step of an `adaptive_bandwidth_ramp`: the rate attempted and
+/// what the receiver actually measured for it. `clean` is
+/// `achieved_mbps >= RAMP_SUCCESS_THRESHOLD * target_mbps` -- see the
+/// module-level doc on `adaptive_bandwidth_ramp` for why 90%.
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
+pub(crate) struct RampStep {
+    #[allow(dead_code)]
+    pub target_mbps: f64,
+    pub achieved_mbps: Option<f64>,
+    pub clean: bool,
+}
+
+/// Full trace of a completed `adaptive_bandwidth_ramp`, plus its final
+/// converged rate. `steps` is kept (not just the final number) so
+/// `mlvpnd self-test`'s CLI output can show exactly where a real
+/// ISP-policer cliff sits, not just an opaque average.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub(crate) struct RampResult {
+    pub steps: Vec<RampStep>,
+    pub confirmed_mbps: f64,
+}
+
+#[allow(dead_code)]
+const RAMP_START_MBPS: f64 = 2.0;
+#[allow(dead_code)]
+const RAMP_DOUBLING_FACTOR: f64 = 2.0;
+#[allow(dead_code)]
+const RAMP_MAX_STEPS: usize = 12;
+#[allow(dead_code)]
+const RAMP_SUCCESS_THRESHOLD: f64 = 0.9;
+#[allow(dead_code)]
+const RAMP_BACKOFF_FACTOR: f64 = 0.8;
+
+/// Discovers a link's real achievable throughput by pacing successive
+/// short bursts at doubling rates (2, 4, 8, 16... Mbps) until one
+/// isn't delivered cleanly, then backing off to a safety margin below
+/// that cliff -- see
+/// `docs/superpowers/specs/2026-08-28-adaptive-bandwidth-pacing-design.md`
+/// for the full rationale (in short: an unpaced/too-fast probe gets
+/// silently hard-dropped by an ISP's policer well before it can
+/// measure the link's real ceiling, with zero local evidence of any
+/// loss at all).
+///
+/// `run_step` performs exactly one step: send a paced stream at the
+/// given `target_mbps` and return the receiver's measured
+/// `achieved_mbps` for it (`None` on failure/timeout). Generic over
+/// this so the state machine itself is fully unit-testable without a
+/// real socket -- see this module's `ramp_*` tests. Real callers
+/// (`run_throughput_test_leg_upload` for a manual `mlvpnd self-test`,
+/// `active_bandwidth_prober` for a background re-ramp) supply a
+/// closure that calls `send_throughput_test_stream` at 1-second
+/// duration and awaits its `ThroughputTestResult`.
+#[allow(dead_code)]
+pub(crate) async fn adaptive_bandwidth_ramp<F, Fut>(mut run_step: F) -> RampResult
+where
+    F: FnMut(f64) -> Fut,
+    Fut: std::future::Future<Output = Option<f64>>,
+{
+    let mut steps = Vec::with_capacity(RAMP_MAX_STEPS);
+    let mut target = RAMP_START_MBPS;
+    let mut last_clean: Option<f64> = None;
+
+    for _ in 0..RAMP_MAX_STEPS {
+        let achieved = run_step(target).await;
+        let clean = achieved
+            .map(|a| a >= RAMP_SUCCESS_THRESHOLD * target)
+            .unwrap_or(false);
+        steps.push(RampStep {
+            target_mbps: target,
+            achieved_mbps: achieved,
+            clean,
+        });
+
+        if !clean {
+            let backoff_base = last_clean.or(achieved).unwrap_or(target);
+            return RampResult {
+                steps,
+                confirmed_mbps: backoff_base * RAMP_BACKOFF_FACTOR,
+            };
+        }
+
+        last_clean = achieved;
+        target *= RAMP_DOUBLING_FACTOR;
+    }
+
+    // Every step up to the safety cap stayed clean -- a genuinely very
+    // fast link. Report the last step's achieved rate as-is; there is
+    // no discovered cliff to back off from.
+    let confirmed_mbps = steps
+        .last()
+        .and_then(|s| s.achieved_mbps)
+        .unwrap_or(RAMP_START_MBPS);
+    RampResult {
+        steps,
+        confirmed_mbps,
+    }
+}
+
 /// Sender side of `scheduler.active_bandwidth_probing` (off by default):
 /// periodically sends a real throughput-measurement stream down this
 /// link and lets the receiver's `ThroughputTestData` handling in
@@ -4126,5 +4226,75 @@ mod active_bandwidth_probe_tests {
         let fast = pacing_delay(1400, 50.0);
         assert!(slow > fast);
         assert!((slow.as_secs_f64() / fast.as_secs_f64() - 10.0).abs() < 0.01);
+    }
+}
+
+#[cfg(test)]
+mod adaptive_bandwidth_ramp_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn ramp_finds_ceiling_partway_through() {
+        // Clean up to 16 Mbps (achieves ~100%), then 32 Mbps only achieves
+        // 50% (well under the 90% threshold) -- ramp should stop there and
+        // report 80% of the last clean step's achieved rate (16.0 * 0.8).
+        let result = adaptive_bandwidth_ramp(|target| async move {
+            if target <= 16.0 {
+                Some(target * 0.98)
+            } else {
+                Some(target * 0.5)
+            }
+        })
+        .await;
+
+        assert_eq!(result.steps.len(), 5); // 2, 4, 8, 16 all clean, 32 fails
+        assert!(result.steps[..4].iter().all(|s| s.clean));
+        assert!(!result.steps[4].clean);
+        assert!((result.confirmed_mbps - (16.0 * 0.98 * 0.8)).abs() < 0.01);
+    }
+
+    #[tokio::test]
+    async fn ramp_fails_on_first_step_reports_backoff_of_that_step() {
+        // Even the very first (lowest, 2 Mbps) step is bad -- there's no
+        // earlier clean step to back off from, so the result is 80% of
+        // whatever this failing step itself achieved (still better than
+        // reporting 0, which would make an already-struggling link look
+        // completely dead to the scheduler).
+        let result = adaptive_bandwidth_ramp(|_target| async move { Some(0.3) }).await;
+
+        assert_eq!(result.steps.len(), 1);
+        assert!(!result.steps[0].clean);
+        assert!((result.confirmed_mbps - (0.3 * 0.8)).abs() < 0.01);
+    }
+
+    #[tokio::test]
+    async fn ramp_stops_at_safety_cap_when_link_never_saturates() {
+        // A genuinely very fast link: every step up to the 12-step cap
+        // stays clean. Result is the last step's achieved rate (no backoff
+        // applied -- nothing was ever found to back off from).
+        let result = adaptive_bandwidth_ramp(|target| async move { Some(target * 0.99) }).await;
+
+        assert_eq!(result.steps.len(), 12);
+        assert!(result.steps.iter().all(|s| s.clean));
+        let last = result.steps.last().unwrap();
+        assert!((result.confirmed_mbps - last.achieved_mbps.unwrap()).abs() < 0.01);
+    }
+
+    #[tokio::test]
+    async fn ramp_treats_missing_result_as_not_clean() {
+        let result = adaptive_bandwidth_ramp(|target| async move {
+            if target <= 4.0 {
+                Some(target * 0.95)
+            } else {
+                None // step 3 (8 Mbps) times out / never gets a result
+            }
+        })
+        .await;
+
+        assert_eq!(result.steps.len(), 3);
+        assert!(!result.steps[2].clean);
+        assert!(result.steps[2].achieved_mbps.is_none());
+        // Backs off from the last clean step (4 Mbps @ 0.95).
+        assert!((result.confirmed_mbps - (4.0 * 0.95 * 0.8)).abs() < 0.01);
     }
 }
