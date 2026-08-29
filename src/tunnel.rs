@@ -3077,11 +3077,20 @@ async fn active_bandwidth_prober(
 /// since `active_bandwidth_prober` runs entirely within `tunnel.rs`.
 const ACTIVE_BANDWIDTH_PROBE_RESULT_GRACE: Duration = Duration::from_secs(5);
 
-/// Reverse/download leg's pacing target when this link has no cached
-/// `confirmed_ceiling_mbps` yet (e.g. active bandwidth probing is off,
-/// or this is the very first test against a freshly-started link) --
-/// conservative enough not to trigger the same off-host policing this
-/// whole feature exists to avoid, on essentially any real-world link.
+/// Reverse/download leg's last-resort pacing target when this link has
+/// neither a cached `confirmed_ceiling_mbps` (active bandwidth probing
+/// is off -- the default -- or this is the very first test against a
+/// freshly-started link) nor an operator-configured
+/// `LinkConfig::bandwidth_cap_mbps` to fall back to. Conservative enough
+/// not to trigger the same off-host policing this whole feature exists
+/// to avoid, on essentially any real-world link.
+///
+/// This used to be the *only* fallback, which meant every deployment
+/// running with the (default-off) `active_bandwidth_probing` disabled
+/// paced its reverse leg at exactly this number forever, silently, with
+/// `mlvpnd self-test --bidirectional` reporting it as if it were a real
+/// measurement. See `ThroughputTestReverseRequest`'s handler for the
+/// full three-tier priority order this is now the last resort of.
 const REVERSE_LEG_FALLBACK_MBPS: f64 = 20.0;
 
 /// Sends a continuous, MTU-padded `ThroughputTestData` stream to
@@ -3631,11 +3640,22 @@ async fn handle_incoming(
                 // `idx` (this link's own index into `links`) and `links`
                 // are both already parameters of the enclosing
                 // `handle_incoming` function -- no need to search by id.
-                links[idx]
-                    .lock()
-                    .await
-                    .stats
+                //
+                // Three-tier priority: a real `confirmed_ceiling_mbps`
+                // measurement beats everything; absent that, the
+                // operator's own `bandwidth_cap_mbps` (already
+                // documented as exactly this -- a manual ceiling on the
+                // scheduler's throughput assumption for this link) is a
+                // far better guess than the fixed 20 Mbps last resort,
+                // which otherwise silently applies to every default
+                // (active_bandwidth_probing-disabled) deployment
+                // forever. Reading it here doesn't violate the "leave
+                // bandwidth_cap_mbps untouched" constraint elsewhere in
+                // this feature -- that's about not writing to it.
+                let link = links[idx].lock().await;
+                link.stats
                     .confirmed_ceiling_mbps
+                    .or(link.config.bandwidth_cap_mbps)
                     .unwrap_or(REVERSE_LEG_FALLBACK_MBPS)
             };
             // Autonomously start sending a stream back, without any
