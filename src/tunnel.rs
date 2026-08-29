@@ -3061,8 +3061,7 @@ async fn active_bandwidth_prober(
                 // that reset was fixed for. Cheap approximation: discard
                 // if the link isn't still Up, or if its `state_since` has
                 // moved since before the ramp started (i.e. it bounced).
-                if !ramp_result_still_valid(link.state, link.state_since, state_since_before_ramp)
-                {
+                if !ramp_result_still_valid(link.state, link.state_since, state_since_before_ramp) {
                     tracing::warn!(
                         link = %link.config.name,
                         "link state changed mid-ramp, discarding ramp result"
