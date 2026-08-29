@@ -47,8 +47,15 @@ variables:
   CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
 
 .cargo_cache:
+  # Deliberately NOT keyed on ${CI_COMMIT_REF_SLUG}: a tag pipeline's ref
+  # (e.g. v0.5.2) has never built before, so a per-ref key guaranteed a
+  # cold cache on every single tagged release even when `main`'s cache
+  # from the exact commit being tagged was sitting right there unused --
+  # confirmed the hard way on the v0.5.1 release (test job alone ran
+  # 15+ minutes cold). Keyed on job name alone so `main` and every tag
+  # built from it share one warm cache per job/target.
   cache:
-    key: rust-cache-${CI_COMMIT_REF_SLUG}-${CI_JOB_NAME}
+    key: rust-cache-${CI_JOB_NAME}
     paths:
       - .cargo/registry/cache
       - .cargo/registry/index
