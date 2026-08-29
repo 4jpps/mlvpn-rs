@@ -1,3 +1,18 @@
+mlvpn (0.5.1-1) unstable; urgency=medium
+
+  * Fix send_throughput_test_stream (mlvpnd self-test and the background
+    active_bandwidth_prober) blasting UDP with no rate limiting, which
+    was silently getting policed off-host and reporting a link's
+    throughput far lower than its real capacity. A new stepped adaptive
+    ramp discovers each link's real ceiling automatically, no manual
+    config needed. The background prober caches the discovered rate and
+    only re-ramps occasionally (new scheduler.active_bandwidth_reramp_
+    interval_secs, default 1800s). mlvpnd self-test now prints each
+    ramp step's target/achieved pair. mlvpn-tui's Links tab now shows
+    the probed bandwidth and confirmed ceiling per link.
+
+ -- Jeff Parrish PC Services <www.jpps.us>  Fri, 28 Aug 2026 22:20:47 -0500
+
 mlvpn (0.5.0-1) unstable; urgency=medium
 
   * Add software-support.jpps.us diagnostics report submission:
