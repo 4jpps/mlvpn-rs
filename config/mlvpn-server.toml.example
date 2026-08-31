@@ -34,6 +34,18 @@ ewma_alpha = 0.2         # smoothing factor for latency/jitter/loss/throughput s
                            # of picking one, trading bandwidth for reliability.
                            # Only worth it for a small, latency-critical tunnel --
                            # leave off for a normal bonded/bulk-transfer tunnel.
+# primary_link_mode = false   # opt-in: send everything over whichever single link
+                           # currently looks fastest, failing over immediately on a
+                           # hard Down and switching to a sustained better link only
+                           # after it holds a real margin for several refreshes.
+                           # Mutually exclusive with redundant_mode/follow_peer_primary.
+                           # NOTE: bandwidth_cap_mbps is not enforced while a link is
+                           # acting as primary -- see SchedulerConfig's doc comment.
+# follow_peer_primary = false   # opt-in: skip local primary-selection entirely and
+                           # adopt whatever primary link the peer last advertised over
+                           # the wire, falling back to ordinary SWRR if the peer hasn't
+                           # advertised one yet or the advertised link isn't Up here.
+                           # Mutually exclusive with primary_link_mode/redundant_mode.
 # auto_tune_reorder_window = false   # opt-in: periodically re-tune
                            # reorder_window_ms itself from the live RTT spread
                            # across bonded links, instead of leaving it fixed.

@@ -132,6 +132,18 @@ fn default_rekey_secs() -> u64 {
     120
 }
 
+/// `redundant_mode`, `primary_link_mode`, and `follow_peer_primary` are
+/// mutually exclusive -- at most one may be `true` at a time (enforced in
+/// `Config::validate`). Each represents a fundamentally different
+/// traffic-distribution strategy:
+/// - `redundant_mode`: send every packet on every currently-Up link at
+///   once (max reliability, N times the bandwidth).
+/// - `primary_link_mode`: send everything on this host's own best-scoring
+///   link, with hysteresis, failing over on a hard Down.
+/// - `follow_peer_primary`: don't decide locally at all -- adopt whatever
+///   primary link the peer last advertised over the wire.
+///
+/// See each field's own doc comment below for full detail.
 #[derive(Debug, Clone, Deserialize)]
 pub struct SchedulerConfig {
     /// Consecutive missed probes before a link is marked Down.
@@ -176,6 +188,16 @@ pub struct SchedulerConfig {
     /// comparable links for aggregate bandwidth. Mutually exclusive
     /// with redundant_mode (checked in Config::validate) -- send-to-
     /// one-link and send-to-every-link are contradictory strategies.
+    ///
+    /// **`bandwidth_cap_mbps` is NOT enforced while a link is acting as
+    /// the primary.** `Scheduler::select` returns the primary directly,
+    /// never reaching `swrr_pick_under_cap` (the only place a per-link
+    /// cap/`RateLimitState` is applied). A configured cap still
+    /// influences `monitor::score()`'s throughput term, so it can affect
+    /// which link gets *picked* as primary, but once picked, sending on
+    /// it is unmetered. An operator relying on a cap to protect a
+    /// metered/expensive link should be aware primary-link mode bypasses
+    /// that protection if the capped link ever becomes primary.
     #[serde(default)]
     pub primary_link_mode: bool,
     /// When true, this host does NOT run its own primary-selection
@@ -190,6 +212,11 @@ pub struct SchedulerConfig {
     /// control both directions of a link pair without requiring the other
     /// side to run its own independent primary-selection config -- useful
     /// for a host that answers multiple differently-configured peers.
+    ///
+    /// **Same `bandwidth_cap_mbps` caveat as `primary_link_mode` above
+    /// applies here too**: whatever link this host adopts as primary
+    /// (because the peer advertised it) is sent on directly, bypassing
+    /// `swrr_pick_under_cap`'s rate limiting.
     #[serde(default)]
     pub follow_peer_primary: bool,
     /// Opt-in: periodically re-tune `reorder_window_ms` at runtime based

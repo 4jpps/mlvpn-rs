@@ -698,14 +698,43 @@ pub(crate) type PeerMtu = Arc<std::sync::Mutex<Option<u16>>>;
 
 /// Tunnel-wide storage for the peer's most recently advertised primary
 /// link, piggybacked on the same `PacketType::VersionInfo` exchange as
-/// `PeerVersion`/`PeerMtu` above. Holds a wire-level `link_id` (not a
-/// local `Links`-array index -- this host's own index space may not
-/// match the peer's), `None` when the peer hasn't advertised one (either
-/// it isn't running `scheduler.primary_link_mode`, or it is but hasn't
-/// picked a primary yet). Consumed by `Scheduler::refresh` when this
-/// host has `scheduler.follow_peer_primary` set -- see that config
-/// field's doc comment.
-pub(crate) type PeerPrimaryLink = Arc<std::sync::Mutex<Option<u8>>>;
+/// `PeerVersion`/`PeerMtu` above. Holds the peer's advertised primary
+/// link's *name* (`LinkConfig::name`) -- deliberately NOT a wire
+/// `link_id`/local `Links`-array index. `link_id` is assigned per-host
+/// from each host's own `[[link]]` config order (see `main.rs`), so it
+/// is not a namespace shared between peers: two hosts can easily
+/// configure their links in a different order, in which case indexing
+/// this host's own `Links` array by the peer's numeric id would
+/// silently resolve to the wrong physical link. Resolving this to a
+/// local link always means matching `Link.config.name` against the
+/// stored name here -- never indexing directly.
+///
+/// `None` when the peer hasn't advertised a primary (either it isn't
+/// running `scheduler.primary_link_mode` at all, or it is but hasn't
+/// picked one yet), *or* when the current session has been superseded
+/// by a rekey (see `reset_for_session`'s call site in
+/// `handle_incoming`'s `PacketType::Data` arm -- the same
+/// session-id-change reset `ReorderBuffer` uses, applied here for the
+/// same reason: an adopted primary must not survive indefinitely past
+/// the peer going quiet/rolling back to a build that no longer sends
+/// this field).
+///
+/// Consumed by `Scheduler::refresh` when this host has
+/// `scheduler.follow_peer_primary` set -- see that config field's doc
+/// comment.
+pub(crate) type PeerPrimaryLink = Arc<std::sync::Mutex<Option<String>>>;
+
+/// Resolves `peer_primary_link`'s advertised link name to a LOCAL
+/// `Links`-array index by matching `Link.config.name`, for
+/// `Scheduler::refresh`'s `peer_primary_index` argument. Returns `None`
+/// when the peer hasn't advertised a primary, or advertised a name that
+/// doesn't match any link configured on this host -- both cases already
+/// fall back to ordinary SWRR selection in
+/// `Scheduler::refresh_from_scores`.
+fn resolve_peer_primary_index(snap: &[Link], peer_primary_link: &PeerPrimaryLink) -> Option<usize> {
+    let name = peer_primary_link.lock().unwrap().clone()?;
+    snap.iter().position(|l| l.config.name == name)
+}
 
 pub async fn run(
     tun: AsyncDevice,
@@ -2542,10 +2571,7 @@ async fn link_prober(
                         monitor::update_link_state(&mut link, &cfg);
                     }
                     let snap = link::snapshot_links(&links).await;
-                    let peer_primary_index = peer_primary_link
-                        .lock()
-                        .unwrap()
-                        .map(|link_id| link_id as usize);
+                    let peer_primary_index = resolve_peer_primary_index(&snap, &peer_primary_link);
                     let mut sched = scheduler.lock().unwrap();
                     sched.refresh(&snap, &cfg, peer_primary_index);
                 }
@@ -3588,7 +3614,14 @@ async fn handle_incoming(
 
             let ready = {
                 let mut ro = reorder.lock().await;
-                ro.reset_for_session(hdr.session_id);
+                let session_changed = ro.reset_for_session(hdr.session_id);
+                if session_changed {
+                    // Mirrors the ReorderBuffer rekey-stranding fix
+                    // (v0.5.3): `peer_primary_link` is tunnel-lifetime
+                    // state too, so it must not survive a session change
+                    // unbounded -- see `PeerPrimaryLink`'s doc comment.
+                    *peer_primary_link.lock().unwrap() = None;
+                }
                 ro.insert(hdr.seq, plaintext);
                 ro.drain_ready()
             };
@@ -3643,10 +3676,7 @@ async fn handle_incoming(
                     monitor::update_link_state(&mut link, cfg);
                 }
                 let snap = link::snapshot_links(links).await;
-                let peer_primary_index = peer_primary_link
-                    .lock()
-                    .unwrap()
-                    .map(|link_id| link_id as usize);
+                let peer_primary_index = resolve_peer_primary_index(&snap, peer_primary_link);
                 let mut sched = scheduler.lock().unwrap();
                 sched.refresh(&snap, cfg, peer_primary_index);
             }
@@ -3659,15 +3689,16 @@ async fn handle_incoming(
                 peer_stats.update(idx as u8, &payload);
             }
         }
-        PacketType::VersionInfo => {
-            if let Ok(payload) = VersionInfoPayload::decode(&plaintext) {
+        PacketType::VersionInfo => match VersionInfoPayload::decode(&plaintext) {
+            Ok(payload) => {
                 *peer_version.lock().unwrap() = Some(payload.version_str());
                 *peer_mtu.lock().unwrap() = Some(payload.tunnel_mtu);
-                *peer_primary_link.lock().unwrap() = (payload.primary_link_id
-                    != VersionInfoPayload::NO_PRIMARY)
-                    .then_some(payload.primary_link_id);
+                *peer_primary_link.lock().unwrap() = payload.primary_link_name_str();
             }
-        }
+            Err(e) => {
+                tracing::debug!(error = %e, %from, "failed to decode VersionInfo payload");
+            }
+        },
         PacketType::ThroughputTestData => {
             let Ok(data) = ThroughputTestDataPayload::decode(&plaintext) else {
                 return;
@@ -3889,10 +3920,7 @@ async fn record_send_failure_as_miss(
         monitor::update_link_state(&mut link, cfg);
     }
     let snap = link::snapshot_links(links).await;
-    let peer_primary_index = peer_primary_link
-        .lock()
-        .unwrap()
-        .map(|link_id| link_id as usize);
+    let peer_primary_index = resolve_peer_primary_index(&snap, peer_primary_link);
     let mut sched = scheduler.lock().unwrap();
     sched.refresh(&snap, cfg, peer_primary_index);
 }
@@ -4052,22 +4080,25 @@ async fn send_version_info(
         return;
     };
 
-    // Local `Links`-array index -> wire `link_id` is a direct cast: every
-    // `Link`'s own `id` is assigned from its position in the config Vec
-    // at `Link::bind` time (see main.rs), the same convention already
-    // relied on throughout this file (e.g. `links.get(link_id as usize)`
-    // in the redundant-send path above).
-    let primary_link_id = scheduler
-        .lock()
-        .unwrap()
-        .primary()
-        .map(|idx| idx as u8)
-        .unwrap_or(VersionInfoPayload::NO_PRIMARY);
+    // The scheduler's `primary()` is a LOCAL `Links`-array index -- not a
+    // value the peer can meaningfully interpret, since `link_id`
+    // numbering is per-host (see `PeerPrimaryLink`'s doc comment). Advertise
+    // the primary link's *name* instead, which both sides can agree on.
+    let primary_link_name = {
+        let primary_idx = scheduler.lock().unwrap().primary();
+        match primary_idx {
+            Some(idx) => match links.get(idx) {
+                Some(l) => l.lock().await.config.name.clone(),
+                None => String::new(),
+            },
+            None => String::new(),
+        }
+    };
 
     let payload = VersionInfoPayload {
         version: VersionInfoPayload::encode_version(crate::VERSION),
         tunnel_mtu: mtu.load(std::sync::atomic::Ordering::Relaxed),
-        primary_link_id,
+        primary_link_name: VersionInfoPayload::encode_link_name(&primary_link_name),
     };
     let plaintext = payload.encode();
     let (session_id, seq, ciphertext) = {
@@ -4216,12 +4247,19 @@ impl ReorderBuffer {
     /// otherwise strands the watermark permanently above the new
     /// session's low sequence numbers. A no-op on the common case
     /// (same session as the last call). Called once per received Data
-    /// frame, before `insert`.
-    fn reset_for_session(&mut self, session_id: u32) {
+    /// frame, before `insert`. Returns `true` exactly when a reset
+    /// happened (i.e. `session_id` actually changed) -- `handle_incoming`
+    /// uses this to also reset `PeerPrimaryLink` on the same event, the
+    /// same rekey-stranding fix shape applied to a second piece of
+    /// cross-session state.
+    fn reset_for_session(&mut self, session_id: u32) -> bool {
         if self.session_id != Some(session_id) {
             self.high_watermark = None;
             self.pending.clear();
             self.session_id = Some(session_id);
+            true
+        } else {
+            false
         }
     }
 

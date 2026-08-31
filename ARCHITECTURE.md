@@ -241,6 +241,33 @@ small, latency-critical tunnel, not a bulk-transfer one. The receiving
 side needs no special handling: the existing replay window already
 drops the second and later copies of the same packet as duplicates.
 
+**Primary-link mode.** Opt-in (`scheduler.primary_link_mode`, off by
+default), mutually exclusive with `redundant_mode`: instead of
+splitting traffic across every Up link via SWRR, send everything over
+whichever single link currently scores best, failing over immediately
+on a hard Down and only switching to a sustained better link once it
+holds a real score margin for several consecutive refreshes (hysteresis,
+to avoid flapping between two close-scoring links). This host's own
+choice is advertised to the peer, by link name, over the periodic
+`VersionInfo` exchange.
+
+**Follow-peer-primary mode.** Opt-in (`scheduler.follow_peer_primary`,
+off by default), also mutually exclusive with the two modes above:
+instead of running its own primary-selection hysteresis, this host
+directly adopts whatever primary link name the peer last advertised,
+as long as a link with that name is currently Up locally too --
+falling back to ordinary SWRR whenever the peer hasn't advertised one
+yet, or the advertised link isn't Up here. Resolution is always by
+link *name* (`LinkConfig.name`), never by the peer's wire `link_id`:
+`link_id` numbering is assigned per-host from each host's own
+`[[link]]` config order, so it isn't a namespace shared between peers.
+Lets one side (the "decider," running `primary_link_mode`) control
+both directions of a link pair without the other side needing its own
+independent primary-selection config. Note: `bandwidth_cap_mbps` is
+not enforced on whichever link is currently acting as primary, in
+either of these two modes -- see `SchedulerConfig::primary_link_mode`'s
+doc comment for why.
+
 **Up/Down transitions use hysteresis**, not a single missed probe --
 several consecutive misses to go down, several consecutive hits to
 come back -- so a marginal link doesn't flap in and out of rotation.
