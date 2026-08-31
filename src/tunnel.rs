@@ -2486,7 +2486,7 @@ async fn link_prober(
                     }
                     let snap = link::snapshot_links(&links).await;
                     let mut sched = scheduler.lock().unwrap();
-                    sched.refresh(&snap);
+                    sched.refresh(&snap, &cfg);
                 }
 
                 // Only one of the N probers needs to report the aggregate
@@ -3581,7 +3581,7 @@ async fn handle_incoming(
                 }
                 let snap = link::snapshot_links(links).await;
                 let mut sched = scheduler.lock().unwrap();
-                sched.refresh(&snap);
+                sched.refresh(&snap, cfg);
             }
         }
         PacketType::StatsShare => {
@@ -3818,7 +3818,7 @@ async fn record_send_failure_as_miss(
     }
     let snap = link::snapshot_links(links).await;
     let mut sched = scheduler.lock().unwrap();
-    sched.refresh(&snap);
+    sched.refresh(&snap, cfg);
 }
 
 /// Outcome of one `send_probe` attempt. Deliberately more granular than a

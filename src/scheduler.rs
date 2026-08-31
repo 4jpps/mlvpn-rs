@@ -19,10 +19,17 @@
 //! unreachable, which is indistinguishable from "all links down" from
 //! inside the process.
 
+use crate::config::SchedulerConfig;
 use crate::link::{Link, LinkScore, LinkState};
 use crate::monitor;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
+
+/// How far ahead (as a fraction, 0.2 = 20%) a candidate link's score
+/// must be over the current primary's before it even starts being
+/// tracked as a switch candidate -- see `Scheduler::apply_primary_selection`
+/// for the full hysteresis this feeds into.
+const PRIMARY_SWITCH_MARGIN: f64 = 0.2;
 
 struct SwrrEntry {
     link_index: usize,
@@ -82,6 +89,19 @@ impl RateLimitState {
 pub struct Scheduler {
     entries: Vec<SwrrEntry>,
     rate_limits: HashMap<usize, RateLimitState>,
+    /// Current primary link's index, when `scheduler.primary_link_mode`
+    /// is on. `None` before the first `refresh()`, or if every link is
+    /// currently Down. See `apply_primary_selection`'s doc comment for
+    /// the full selection/hysteresis logic.
+    primary: Option<usize>,
+    /// A link that has been beating the current primary's score by
+    /// `PRIMARY_SWITCH_MARGIN` for `count` consecutive refreshes in a
+    /// row, tracked so a switch only happens once that streak reaches
+    /// `SchedulerConfig::up_threshold` -- prevents flapping between two
+    /// close-scoring links on ordinary measurement noise. Reset to
+    /// `None` the moment a different link becomes the best candidate,
+    /// or the current candidate's margin lapses.
+    candidate: Option<(usize, u32)>,
 }
 
 impl Scheduler {
@@ -89,20 +109,24 @@ impl Scheduler {
         Self {
             entries: Vec::new(),
             rate_limits: HashMap::new(),
+            primary: None,
+            candidate: None,
         }
     }
 
-    /// Recompute per-link scores and rebuild the SWRR weight table. Call
-    /// this after every monitor tick (probe result, timeout sweep, or
-    /// state change) so scheduling reacts promptly to changing conditions.
-    pub fn refresh(&mut self, links: &[Link]) {
+    /// Recompute per-link scores and rebuild the SWRR weight table, then
+    /// (if `cfg.primary_link_mode` is on) update primary-link selection.
+    /// Call this after every monitor tick (probe result, timeout sweep,
+    /// or state change) so scheduling reacts promptly to changing
+    /// conditions.
+    pub fn refresh(&mut self, links: &[Link], cfg: &SchedulerConfig) {
         let up_indices: Vec<(usize, f64)> = links
             .iter()
             .enumerate()
             .map(|(i, l)| (i, monitor::score(l)))
             .filter(|(_, w)| *w > 0.0)
             .collect();
-
+        self.refresh_from_scores(&up_indices, cfg);
         // Rebuild rather than patch in place: link membership and scores
         // both change over time, and this runs at probe-interval
         // frequency (hundreds of ms), not per-packet, so the allocation
@@ -116,6 +140,66 @@ impl Scheduler {
                 bandwidth_cap_mbps: links[i].config.bandwidth_cap_mbps,
             })
             .collect();
+    }
+
+    /// The scored-pairs half of `refresh()`, factored out so the
+    /// primary-selection hysteresis is unit-testable with fake scores
+    /// and no real `Link`/socket -- see this module's `primary_link_mode`
+    /// tests. `up_indices` is exactly what `refresh()` already computed
+    /// (every currently-Up link's `(link_index, monitor::score())`) --
+    /// a link with score 0.0 (Down) has already been filtered out
+    /// before this is called, which is what makes a hard failure show
+    /// up here as "the current primary's index is simply absent from
+    /// `up_indices`," not as a zero score to compare against.
+    fn refresh_from_scores(&mut self, up_indices: &[(usize, f64)], cfg: &SchedulerConfig) {
+        if !cfg.primary_link_mode {
+            self.primary = None;
+            self.candidate = None;
+            return;
+        }
+
+        let primary_score = self
+            .primary
+            .and_then(|idx| up_indices.iter().find(|(i, _)| *i == idx).map(|(_, s)| *s));
+
+        let Some(primary_score) = primary_score else {
+            // No current primary, or it just went Down -- immediate
+            // (re)selection, no hysteresis. Picks the best of whatever
+            // is currently Up; None if nothing is.
+            self.primary = up_indices
+                .iter()
+                .max_by(|(_, a), (_, b)| a.total_cmp(b))
+                .map(|(i, _)| *i);
+            self.candidate = None;
+            return;
+        };
+
+        let best_other = up_indices
+            .iter()
+            .filter(|(i, _)| Some(*i) != self.primary)
+            .max_by(|(_, a), (_, b)| a.total_cmp(b));
+
+        let Some((other_idx, other_score)) = best_other else {
+            self.candidate = None;
+            return;
+        };
+
+        if *other_score > primary_score * (1.0 + PRIMARY_SWITCH_MARGIN) {
+            match &mut self.candidate {
+                Some((idx, count)) if *idx == *other_idx => {
+                    *count += 1;
+                    if *count >= cfg.up_threshold {
+                        self.primary = Some(*other_idx);
+                        self.candidate = None;
+                    }
+                }
+                _ => {
+                    self.candidate = Some((*other_idx, 1));
+                }
+            }
+        } else {
+            self.candidate = None;
+        }
     }
 
     /// Pick the link to send the next packet on, returning its index into
@@ -144,6 +228,10 @@ impl Scheduler {
     pub fn select(&mut self, links: &[LinkScore], frame_len: usize) -> Option<usize> {
         if links.is_empty() {
             return None;
+        }
+
+        if let Some(primary) = self.primary {
+            return Some(primary);
         }
 
         if !self.entries.is_empty() {
@@ -315,6 +403,164 @@ mod tests {
             (2.5..3.5).contains(&ratio),
             "ratio was {ratio}, counts {counts:?}"
         );
+    }
+
+    #[test]
+    fn primary_link_mode_off_never_sets_a_primary() {
+        let mut sched = Scheduler::new();
+        let cfg = SchedulerConfig {
+            primary_link_mode: false,
+            up_threshold: 3,
+            ..SchedulerConfig::default()
+        };
+        sched.refresh_from_scores(&[(0, 5.0), (1, 3.0)], &cfg);
+        assert_eq!(sched.primary, None);
+    }
+
+    #[test]
+    fn primary_link_mode_picks_highest_scoring_link_first() {
+        let mut sched = Scheduler::new();
+        let cfg = SchedulerConfig {
+            primary_link_mode: true,
+            up_threshold: 3,
+            ..SchedulerConfig::default()
+        };
+        sched.refresh_from_scores(&[(0, 5.0), (1, 3.0)], &cfg);
+        assert_eq!(sched.primary, Some(0));
+    }
+
+    #[test]
+    fn candidate_below_margin_never_switches() {
+        let mut sched = Scheduler::new();
+        let cfg = SchedulerConfig {
+            primary_link_mode: true,
+            up_threshold: 3,
+            ..SchedulerConfig::default()
+        };
+        sched.refresh_from_scores(&[(0, 5.0), (1, 3.0)], &cfg);
+        assert_eq!(sched.primary, Some(0));
+        // Link 1 improves to 5.5 -- only ~10% ahead of link 0's 5.0, well
+        // under the 20% margin. Run many refreshes; should never switch.
+        for _ in 0..10 {
+            sched.refresh_from_scores(&[(0, 5.0), (1, 5.5)], &cfg);
+        }
+        assert_eq!(sched.primary, Some(0));
+    }
+
+    #[test]
+    fn candidate_above_margin_needs_sustained_cycles_to_switch() {
+        let mut sched = Scheduler::new();
+        let cfg = SchedulerConfig {
+            primary_link_mode: true,
+            up_threshold: 3,
+            ..SchedulerConfig::default()
+        };
+        sched.refresh_from_scores(&[(0, 5.0), (1, 1.0)], &cfg);
+        assert_eq!(sched.primary, Some(0));
+        // Link 1 jumps to 7.0 -- 40% ahead of link 0's 5.0, over the 20%
+        // margin. Should NOT switch on the first or second favorable
+        // refresh (up_threshold is 3).
+        sched.refresh_from_scores(&[(0, 5.0), (1, 7.0)], &cfg);
+        assert_eq!(
+            sched.primary,
+            Some(0),
+            "1st favorable refresh: no switch yet"
+        );
+        sched.refresh_from_scores(&[(0, 5.0), (1, 7.0)], &cfg);
+        assert_eq!(
+            sched.primary,
+            Some(0),
+            "2nd favorable refresh: no switch yet"
+        );
+        // 3rd consecutive favorable refresh (== up_threshold): switches.
+        sched.refresh_from_scores(&[(0, 5.0), (1, 7.0)], &cfg);
+        assert_eq!(sched.primary, Some(1), "3rd favorable refresh: switches");
+    }
+
+    #[test]
+    fn candidate_streak_resets_if_it_drops_below_margin_mid_streak() {
+        let mut sched = Scheduler::new();
+        let cfg = SchedulerConfig {
+            primary_link_mode: true,
+            up_threshold: 3,
+            ..SchedulerConfig::default()
+        };
+        sched.refresh_from_scores(&[(0, 5.0), (1, 1.0)], &cfg);
+        sched.refresh_from_scores(&[(0, 5.0), (1, 7.0)], &cfg); // 1st favorable
+        sched.refresh_from_scores(&[(0, 5.0), (1, 5.1)], &cfg); // drops back under margin
+        sched.refresh_from_scores(&[(0, 5.0), (1, 7.0)], &cfg); // 1st favorable again (streak reset)
+        sched.refresh_from_scores(&[(0, 5.0), (1, 7.0)], &cfg); // 2nd
+        assert_eq!(
+            sched.primary,
+            Some(0),
+            "streak should have reset, not reached 3 yet"
+        );
+    }
+
+    #[test]
+    fn primary_going_down_switches_immediately_regardless_of_margin() {
+        let mut sched = Scheduler::new();
+        let cfg = SchedulerConfig {
+            primary_link_mode: true,
+            up_threshold: 3,
+            ..SchedulerConfig::default()
+        };
+        sched.refresh_from_scores(&[(0, 5.0), (1, 1.0)], &cfg);
+        assert_eq!(sched.primary, Some(0));
+        // Link 0 drops out entirely (Down -- score 0.0 links are already
+        // filtered out of the up_indices list before this point in the
+        // real refresh(), so simulate that by omitting it here).
+        sched.refresh_from_scores(&[(1, 1.0)], &cfg);
+        assert_eq!(
+            sched.primary,
+            Some(1),
+            "hard failure must switch immediately, even though link 1's \
+             score never beat link 0's by the 20% margin"
+        );
+    }
+
+    #[test]
+    fn select_returns_primary_when_primary_link_mode_is_on() {
+        let mut sched = Scheduler::new();
+        let cfg = SchedulerConfig {
+            primary_link_mode: true,
+            up_threshold: 3,
+            ..SchedulerConfig::default()
+        };
+        sched.refresh_from_scores(&[(0, 5.0), (1, 3.0)], &cfg);
+        let scores = [
+            LinkScore {
+                link_index: 0,
+                state: LinkState::Up,
+                admin_disabled: false,
+                weight: 1.0,
+                bandwidth_cap_mbps: None,
+                rtt_ms: Some(10.0),
+                jitter_ms: Some(1.0),
+                loss_rate: Some(0.0),
+                rx_throughput_mbps: None,
+                active_bandwidth_mbps: None,
+                consecutive_misses: 0,
+            },
+            LinkScore {
+                link_index: 1,
+                state: LinkState::Up,
+                admin_disabled: false,
+                weight: 1.0,
+                bandwidth_cap_mbps: None,
+                rtt_ms: Some(10.0),
+                jitter_ms: Some(1.0),
+                loss_rate: Some(0.0),
+                rx_throughput_mbps: None,
+                active_bandwidth_mbps: None,
+                consecutive_misses: 0,
+            },
+        ];
+        // Called many times -- every single pick must be link 0 (the
+        // primary), never SWRR-style alternation.
+        for _ in 0..20 {
+            assert_eq!(sched.select(&scores, 1000), Some(0));
+        }
     }
 
     /// `swrr_pick_under_cap`/`select` need a real `Link` (a live socket)
