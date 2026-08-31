@@ -933,9 +933,31 @@ fn draw_session_panel(f: &mut Frame, area: Rect, daemon: &DaemonSnapshot) {
         ]),
     };
 
+    let mtu_line = match daemon.peer_tunnel_mtu {
+        Some(peer_mtu) if peer_mtu == daemon.local_tunnel_mtu => Line::from(vec![
+            Span::raw("Tunnel MTU: "),
+            Span::raw(daemon.local_tunnel_mtu.to_string()),
+            Span::styled(" (peer matches)", Style::default().fg(COLOR_MUTED)),
+        ]),
+        Some(peer_mtu) => Line::from(vec![
+            Span::raw("Tunnel MTU: "),
+            Span::raw(daemon.local_tunnel_mtu.to_string()),
+            Span::raw("   Peer: "),
+            Span::styled(
+                format!("{peer_mtu} (MISMATCH)"),
+                Style::default().fg(COLOR_BAD),
+            ),
+        ]),
+        None => Line::from(vec![
+            Span::raw("Tunnel MTU: "),
+            Span::raw(daemon.local_tunnel_mtu.to_string()),
+            Span::styled("   Peer: unknown", Style::default().fg(COLOR_MUTED)),
+        ]),
+    };
+
     let block = Block::default().borders(Borders::ALL).title(" Session ");
     f.render_widget(
-        Paragraph::new(vec![session_line, version_line]).block(block),
+        Paragraph::new(vec![session_line, version_line, mtu_line]).block(block),
         area,
     );
 }
