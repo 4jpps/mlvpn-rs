@@ -164,6 +164,20 @@ pub struct SchedulerConfig {
     /// genuine replay attack.
     #[serde(default)]
     pub redundant_mode: bool,
+    /// Opt-in: instead of splitting traffic across every currently-Up
+    /// link via SWRR proportional to monitor::score(), send everything
+    /// over whichever single link currently looks fastest, failing
+    /// over immediately on a hard failure (the primary link going
+    /// Down) and switching to a sustained better link only after it
+    /// stays ahead by a real margin for several consecutive refreshes
+    /// -- see Scheduler's own primary-selection doc comment in
+    /// scheduler.rs for the exact hysteresis. Off by default: SWRR
+    /// bonding remains the default for anyone genuinely combining two
+    /// comparable links for aggregate bandwidth. Mutually exclusive
+    /// with redundant_mode (checked in Config::validate) -- send-to-
+    /// one-link and send-to-every-link are contradictory strategies.
+    #[serde(default)]
+    pub primary_link_mode: bool,
     /// Opt-in: periodically re-tune `reorder_window_ms` at runtime based
     /// on the live RTT spread across currently-Up links
     /// (`tunnel::reorder_tuning_loop`), instead of using the fixed value
@@ -341,6 +355,7 @@ impl Default for SchedulerConfig {
             reorder_window_ms: default_reorder_ms(),
             ewma_alpha: default_ewma_alpha(),
             redundant_mode: false,
+            primary_link_mode: false,
             auto_tune_reorder_window: false,
             reorder_window_min_ms: default_reorder_window_min_ms(),
             reorder_window_max_ms: default_reorder_window_max_ms(),
@@ -666,6 +681,14 @@ impl Config {
             )));
         }
 
+        if self.scheduler.primary_link_mode && self.scheduler.redundant_mode {
+            return Err(MlvpnError::Config(
+                "scheduler.primary_link_mode and scheduler.redundant_mode cannot both be true \
+                 -- send-to-one-link and send-to-every-link are contradictory strategies"
+                    .into(),
+            ));
+        }
+
         if self.crypto.rekey_interval_secs == 0 {
             return Err(MlvpnError::Config(
                 "crypto.rekey_interval_secs must be non-zero (tokio::time::interval panics on \
@@ -870,6 +893,28 @@ mod tests {
     fn tx_queue_len_within_bounds_is_accepted() {
         let mut cfg = minimal_valid_config();
         cfg.tunnel.tx_queue_len = 4000;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn primary_link_mode_alone_is_accepted() {
+        let mut cfg = minimal_valid_config();
+        cfg.scheduler.primary_link_mode = true;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn primary_link_mode_with_redundant_mode_is_rejected() {
+        let mut cfg = minimal_valid_config();
+        cfg.scheduler.primary_link_mode = true;
+        cfg.scheduler.redundant_mode = true;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn redundant_mode_alone_is_still_accepted() {
+        let mut cfg = minimal_valid_config();
+        cfg.scheduler.redundant_mode = true;
         assert!(cfg.validate().is_ok());
     }
 }
