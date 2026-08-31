@@ -10,6 +10,12 @@ For implementation detail beyond what's here, read the code -- most
 modules and non-trivial functions have doc comments explaining the
 design, and `ARCHITECTURE.md` covers the system as a whole.
 
+## [0.5.3] - 2026-08-31
+
+### Fixed
+
+- **`ReorderBuffer`'s v0.5.2 fix was itself undone by every rekey.** `Session::next_send_seq()` (in `src/crypto.rs`) starts a fresh, low sequence counter every time a rekey installs a new session -- but `ReorderBuffer::high_watermark` is a separate, tunnel-lifetime value that was never reset when that happened. With any real `crypto.rekey_interval_secs` configured, every single rekey permanently stranded the watermark far above the new session's low sequence numbers, meaning every real Data frame after the first rekey failed the "forward progress" check forever -- silently re-introducing v0.5.2's own just-fixed bug on a rekey cadence, and compounding worse with each subsequent rekey rather than staying constant. Confirmed live on real production infrastructure: v0.5.2 measured a healthy round-trip shortly after a fresh daemon restart (before the first rekey elapsed), then degraded back to roughly the pre-v0.5.2 baseline once a rekey occurred, while the raw physical link underneath stayed fast and clean throughout -- conclusively isolating the added latency to this daemon's own pipeline. Fixed by resetting `ReorderBuffer`'s watermark and pending state the moment a received Data frame's session ID changes; `hdr.session_id` is authenticated (checked only after successful decryption) before it's used for this, so it cannot be forged to trigger spurious resets. No configuration change, no wire-protocol change.
+
 ## [0.5.2] - 2026-08-29
 
 ### Fixed

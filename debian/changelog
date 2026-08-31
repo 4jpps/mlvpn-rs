@@ -1,3 +1,18 @@
+mlvpn (0.5.3-1) unstable; urgency=high
+
+  * Fix ReorderBuffer::high_watermark never resetting on rekey: since
+    Session::next_send_seq() restarts near zero on every rekey but the
+    watermark is tunnel-lifetime, any configured rekey_interval_secs
+    permanently stranded the watermark above the new session's low
+    sequence numbers, silently re-introducing v0.5.2's own just-fixed
+    bug every rekey cycle and compounding worse each time. Confirmed
+    live: v0.5.2 measured well right after a fresh restart, then
+    degraded back to baseline once the first rekey occurred, while the
+    raw underlying link stayed fast and clean throughout. Reset the
+    buffer's state on every observed session_id change.
+
+ -- Jeff Parrish PC Services <www.jpps.us>  Mon, 31 Aug 2026 13:05:02 -0500
+
 mlvpn (0.5.2-1) unstable; urgency=high
 
   * Fix ReorderBuffer needlessly delaying nearly every real Data packet
