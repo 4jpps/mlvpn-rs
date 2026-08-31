@@ -3525,6 +3525,7 @@ async fn handle_incoming(
 
             let ready = {
                 let mut ro = reorder.lock().await;
+                ro.reset_for_session(hdr.session_id);
                 ro.insert(hdr.seq, plaintext);
                 ro.drain_ready()
             };
@@ -4093,6 +4094,18 @@ struct ReorderBuffer {
     /// model replacing the old "must equal next_expected" one.
     high_watermark: Option<u64>,
     pending: BTreeMap<u64, (tokio::time::Instant, Vec<u8>)>,
+    /// The `session_id` `high_watermark`/`pending` were last built
+    /// against, or `None` before the first frame. `seq` is scoped to
+    /// one `Session` (`Session::next_send_seq()` starts fresh, near
+    /// zero, every time `SessionState::install` swaps in a new session
+    /// on rekey -- see `crypto.rs`) -- comparing a new session's low
+    /// seq values against a watermark built up over a previous
+    /// session's lifetime would judge every post-rekey Data frame as
+    /// "behind" forever, needlessly re-introducing this exact module's
+    /// original bug on a ~`rekey_interval_secs` cadence instead of
+    /// once. `reset_for_session` clears both fields the moment a
+    /// different session_id is observed.
+    session_id: Option<u32>,
 }
 
 impl ReorderBuffer {
@@ -4101,6 +4114,22 @@ impl ReorderBuffer {
             window: Duration::from_millis(window_ms),
             high_watermark: None,
             pending: BTreeMap::new(),
+            session_id: None,
+        }
+    }
+
+    /// Clears `high_watermark` and `pending` whenever `session_id`
+    /// differs from the session this buffer's state was last built
+    /// against -- see the field's own doc comment for why a rekey
+    /// otherwise strands the watermark permanently above the new
+    /// session's low sequence numbers. A no-op on the common case
+    /// (same session as the last call). Called once per received Data
+    /// frame, before `insert`.
+    fn reset_for_session(&mut self, session_id: u32) {
+        if self.session_id != Some(session_id) {
+            self.high_watermark = None;
+            self.pending.clear();
+            self.session_id = Some(session_id);
         }
     }
 
@@ -4329,6 +4358,52 @@ mod reorder_tuning_tests {
         let mut buf = ReorderBuffer::new(50);
         buf.insert(42_000, vec![1, 2, 3]);
         assert_eq!(buf.drain_ready(), vec![vec![1, 2, 3]]);
+    }
+
+    #[test]
+    fn reorder_buffer_resets_watermark_on_session_change() {
+        // A real, confirmed production regression: Session::next_send_seq()
+        // starts fresh (near zero) every time a rekey installs a new
+        // session, but a high_watermark built up over the previous
+        // session's lifetime doesn't know that -- without a reset, every
+        // Data frame after the very first rekey would compare its own
+        // low seq against a stale, much higher watermark and permanently
+        // fail the forward-progress check, reintroducing this module's
+        // original bug on a rekey_interval_secs cadence.
+        let mut buf = ReorderBuffer::new(50);
+        buf.reset_for_session(1);
+        buf.insert(10_000, vec![1]);
+        assert_eq!(buf.drain_ready(), vec![vec![1]]); // watermark now 10_000
+
+        // A rekey happens: the new session's first frame has a low seq,
+        // nowhere near the old watermark. Without the reset, this would
+        // be judged "not forward progress" and buffered/delayed.
+        buf.reset_for_session(2);
+        buf.insert(5, vec![2]);
+        assert_eq!(
+            buf.drain_ready(),
+            vec![vec![2]],
+            "first frame of a new session must deliver immediately even \
+             though its seq is far below the old session's watermark"
+        );
+    }
+
+    #[test]
+    fn reorder_buffer_reset_for_session_is_a_no_op_within_the_same_session() {
+        let mut buf = ReorderBuffer::new(50);
+        buf.reset_for_session(7);
+        buf.insert(100, vec![1]);
+        assert_eq!(buf.drain_ready(), vec![vec![1]]); // watermark now 100
+
+        // Same session_id again -- must not clear the watermark.
+        buf.reset_for_session(7);
+        buf.insert(50, vec![2]);
+        assert_eq!(
+            buf.drain_ready(),
+            Vec::<Vec<u8>>::new(),
+            "seq 50 is below the still-in-effect watermark of 100 within \
+             the same session, so it should be buffered, not delivered"
+        );
     }
 
     #[tokio::test(start_paused = true)]
