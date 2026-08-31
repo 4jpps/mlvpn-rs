@@ -49,13 +49,13 @@ async fn primary_link_mode_sends_all_traffic_on_one_link_and_fails_over_immediat
     ensure_mlvpn_system_user().expect("ensure mlvpn system user/group exists");
 
     let id = unique_id();
-    let ns_client = NetNs::create(&format!("mtpc{id}")).expect("create client netns");
-    let ns_server = NetNs::create(&format!("mtps{id}")).expect("create server netns");
+    let ns_client = NetNs::create(&format!("mtplc{id}")).expect("create client netns");
+    let ns_server = NetNs::create(&format!("mtpls{id}")).expect("create server netns");
 
-    let vc0 = format!("mtpc0{id}");
-    let vs0 = format!("mtps0{id}");
-    let vc1 = format!("mtpc1{id}");
-    let vs1 = format!("mtps1{id}");
+    let vc0 = format!("mplc0{id}");
+    let vs0 = format!("mpls0{id}");
+    let vc1 = format!("mplc1{id}");
+    let vs1 = format!("mpls1{id}");
     let (addr_c0, addr_s0) = veth_link_addrs(0);
     let (addr_c1, addr_s1) = veth_link_addrs(1);
 
