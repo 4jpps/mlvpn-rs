@@ -1272,6 +1272,7 @@ mod tests {
             address6: None,
             mtu,
             clamp_mss: true,
+            tx_queue_len: 4000,
         }
     }
 

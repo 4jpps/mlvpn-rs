@@ -93,10 +93,26 @@ pub struct TunnelConfig {
     /// doing MSS clamping and doing it twice would be redundant.
     #[serde(default = "default_clamp_mss")]
     pub clamp_mss: bool,
+    /// Transmit queue length (in packets) for the TUN device, passed to
+    /// `tun_rs::DeviceBuilder::tx_queue_len`. The OS default on Linux
+    /// (500 packets) was confirmed as a real production bottleneck: a
+    /// burst of real Data traffic caused 168 TUN-level TX drops in an
+    /// 8-second tunneled TCP test on real infrastructure, even though
+    /// the underlying WAN links had far more raw capacity available --
+    /// the queue was simply too shallow to absorb the burst. Raising it
+    /// eliminated further drops on retest. Defaults to 4000, the value
+    /// verified live; only worth changing for a deployment with unusual
+    /// bandwidth-delay-product characteristics.
+    #[serde(default = "default_tx_queue_len")]
+    pub tx_queue_len: u32,
 }
 
 fn default_clamp_mss() -> bool {
     true
+}
+
+fn default_tx_queue_len() -> u32 {
+    4000
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -643,6 +659,13 @@ impl Config {
             }
         }
 
+        if !(100..=65536).contains(&self.tunnel.tx_queue_len) {
+            return Err(MlvpnError::Config(format!(
+                "tunnel.tx_queue_len ({}) must be between 100 and 65536",
+                self.tunnel.tx_queue_len
+            )));
+        }
+
         if self.crypto.rekey_interval_secs == 0 {
             return Err(MlvpnError::Config(
                 "crypto.rekey_interval_secs must be non-zero (tokio::time::interval panics on \
@@ -771,6 +794,7 @@ mod tests {
                 address6: None,
                 mtu: Some(1400),
                 clamp_mss: true,
+                tx_queue_len: 4000,
             },
             crypto: CryptoConfig {
                 private_key_file: key_path,
@@ -820,6 +844,32 @@ mod tests {
     fn mtu_some_576_or_above_is_accepted() {
         let mut cfg = minimal_valid_config();
         cfg.tunnel.mtu = Some(1400);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn tx_queue_len_defaults_to_4000_when_absent_from_config() {
+        assert_eq!(default_tx_queue_len(), 4000);
+    }
+
+    #[test]
+    fn tx_queue_len_below_100_is_rejected() {
+        let mut cfg = minimal_valid_config();
+        cfg.tunnel.tx_queue_len = 99;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn tx_queue_len_above_65536_is_rejected() {
+        let mut cfg = minimal_valid_config();
+        cfg.tunnel.tx_queue_len = 65537;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn tx_queue_len_within_bounds_is_accepted() {
+        let mut cfg = minimal_valid_config();
+        cfg.tunnel.tx_queue_len = 4000;
         assert!(cfg.validate().is_ok());
     }
 }

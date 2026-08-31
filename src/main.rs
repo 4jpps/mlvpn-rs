@@ -807,7 +807,8 @@ fn open_tun(cfg: &config::TunnelConfig, mtu: u16) -> Result<tun_rs::AsyncDevice>
     let mut builder = tun_rs::DeviceBuilder::new()
         .name(cfg.name.as_str())
         .ipv4(addr.as_str(), prefix, None)
-        .mtu(mtu);
+        .mtu(mtu)
+        .tx_queue_len(cfg.tx_queue_len);
 
     if let Some(address6) = &cfg.address6 {
         let (addr6, prefix6) = parse_cidr(address6)?;
