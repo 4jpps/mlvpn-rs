@@ -178,6 +178,20 @@ pub struct SchedulerConfig {
     /// one-link and send-to-every-link are contradictory strategies.
     #[serde(default)]
     pub primary_link_mode: bool,
+    /// When true, this host does NOT run its own primary-selection
+    /// hysteresis (Scheduler::refresh_from_scores's margin/streak logic).
+    /// Instead it directly adopts whatever primary link_id the peer last
+    /// advertised over VersionInfo, as long as that link is currently Up
+    /// on this side too. Falls back to ordinary SWRR/least-bad selection
+    /// whenever the peer hasn't advertised a primary yet, or the
+    /// advertised link isn't Up locally.
+    ///
+    /// Lets one side (the "decider", running `primary_link_mode = true`)
+    /// control both directions of a link pair without requiring the other
+    /// side to run its own independent primary-selection config -- useful
+    /// for a host that answers multiple differently-configured peers.
+    #[serde(default)]
+    pub follow_peer_primary: bool,
     /// Opt-in: periodically re-tune `reorder_window_ms` at runtime based
     /// on the live RTT spread across currently-Up links
     /// (`tunnel::reorder_tuning_loop`), instead of using the fixed value
@@ -356,6 +370,7 @@ impl Default for SchedulerConfig {
             ewma_alpha: default_ewma_alpha(),
             redundant_mode: false,
             primary_link_mode: false,
+            follow_peer_primary: false,
             auto_tune_reorder_window: false,
             reorder_window_min_ms: default_reorder_window_min_ms(),
             reorder_window_max_ms: default_reorder_window_max_ms(),
@@ -689,6 +704,21 @@ impl Config {
             ));
         }
 
+        if self.scheduler.follow_peer_primary && self.scheduler.primary_link_mode {
+            return Err(MlvpnError::Config(
+                "scheduler.follow_peer_primary and scheduler.primary_link_mode cannot both be \
+                 true -- a host is either the primary-selection decider or a follower, not both"
+                    .into(),
+            ));
+        }
+        if self.scheduler.follow_peer_primary && self.scheduler.redundant_mode {
+            return Err(MlvpnError::Config(
+                "scheduler.follow_peer_primary and scheduler.redundant_mode cannot both be true \
+                 -- send-to-one-link-the-peer-chose and send-to-every-link are contradictory"
+                    .into(),
+            ));
+        }
+
         if self.crypto.rekey_interval_secs == 0 {
             return Err(MlvpnError::Config(
                 "crypto.rekey_interval_secs must be non-zero (tokio::time::interval panics on \
@@ -907,6 +937,29 @@ mod tests {
     fn primary_link_mode_with_redundant_mode_is_rejected() {
         let mut cfg = minimal_valid_config();
         cfg.scheduler.primary_link_mode = true;
+        cfg.scheduler.redundant_mode = true;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn follow_peer_primary_alone_is_accepted() {
+        let mut cfg = minimal_valid_config();
+        cfg.scheduler.follow_peer_primary = true;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn follow_peer_primary_with_primary_link_mode_is_rejected() {
+        let mut cfg = minimal_valid_config();
+        cfg.scheduler.follow_peer_primary = true;
+        cfg.scheduler.primary_link_mode = true;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn follow_peer_primary_with_redundant_mode_is_rejected() {
+        let mut cfg = minimal_valid_config();
+        cfg.scheduler.follow_peer_primary = true;
         cfg.scheduler.redundant_mode = true;
         assert!(cfg.validate().is_err());
     }

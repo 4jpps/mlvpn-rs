@@ -324,11 +324,19 @@ pub struct VersionInfoPayload {
     /// on this same periodic authenticated exchange rather than adding a
     /// new packet type.
     pub tunnel_mtu: u16,
+    /// The sender's own currently-selected primary link, as a wire
+    /// `link_id` (see `Link::id`), when it's running
+    /// `scheduler.primary_link_mode`. `NO_PRIMARY` means the sender has
+    /// no primary selected right now -- either it isn't running
+    /// `primary_link_mode` at all, or it is but hasn't picked one yet.
+    pub primary_link_id: u8,
 }
 
 impl VersionInfoPayload {
     pub const VERSION_LEN: usize = 16;
-    pub const LEN: usize = Self::VERSION_LEN + 2;
+    /// Sentinel meaning "sender has no primary link selected right now".
+    pub const NO_PRIMARY: u8 = 0xFF;
+    pub const LEN: usize = Self::VERSION_LEN + 2 + 1;
 
     pub fn encode_version(version: &str) -> [u8; Self::VERSION_LEN] {
         let mut out = [0u8; Self::VERSION_LEN];
@@ -352,7 +360,9 @@ impl VersionInfoPayload {
     pub fn encode(&self) -> [u8; Self::LEN] {
         let mut out = [0u8; Self::LEN];
         out[..Self::VERSION_LEN].copy_from_slice(&self.version);
-        out[Self::VERSION_LEN..].copy_from_slice(&self.tunnel_mtu.to_be_bytes());
+        out[Self::VERSION_LEN..Self::VERSION_LEN + 2]
+            .copy_from_slice(&self.tunnel_mtu.to_be_bytes());
+        out[Self::VERSION_LEN + 2] = self.primary_link_id;
         out
     }
 
@@ -365,9 +375,11 @@ impl VersionInfoPayload {
         let mut version = [0u8; Self::VERSION_LEN];
         version.copy_from_slice(&buf[0..Self::VERSION_LEN]);
         let tunnel_mtu = u16::from_be_bytes([buf[Self::VERSION_LEN], buf[Self::VERSION_LEN + 1]]);
+        let primary_link_id = buf[Self::VERSION_LEN + 2];
         Ok(Self {
             version,
             tunnel_mtu,
+            primary_link_id,
         })
     }
 }
@@ -579,6 +591,7 @@ mod version_info_payload_tests {
         let payload = VersionInfoPayload {
             version: VersionInfoPayload::encode_version("0.4.5"),
             tunnel_mtu: 1420,
+            primary_link_id: VersionInfoPayload::NO_PRIMARY,
         };
         let encoded = payload.encode();
         let decoded = VersionInfoPayload::decode(&encoded).unwrap();
@@ -591,6 +604,7 @@ mod version_info_payload_tests {
         let payload = VersionInfoPayload {
             version: encoded,
             tunnel_mtu: 1420,
+            primary_link_id: VersionInfoPayload::NO_PRIMARY,
         };
         assert_eq!(payload.version_str().len(), VersionInfoPayload::VERSION_LEN);
     }
@@ -606,10 +620,35 @@ mod version_info_payload_tests {
         let payload = VersionInfoPayload {
             version: VersionInfoPayload::encode_version("0.6.0"),
             tunnel_mtu: 1420,
+            primary_link_id: VersionInfoPayload::NO_PRIMARY,
         };
         let encoded = payload.encode();
         let decoded = VersionInfoPayload::decode(&encoded).unwrap();
         assert_eq!(decoded.tunnel_mtu, 1420);
         assert_eq!(decoded.version_str(), "0.6.0");
+    }
+
+    #[test]
+    fn version_info_payload_round_trips_primary_link_id() {
+        let payload = VersionInfoPayload {
+            version: VersionInfoPayload::encode_version("0.7.0"),
+            tunnel_mtu: 1420,
+            primary_link_id: 3,
+        };
+        let encoded = payload.encode();
+        let decoded = VersionInfoPayload::decode(&encoded).unwrap();
+        assert_eq!(decoded.primary_link_id, 3);
+    }
+
+    #[test]
+    fn version_info_payload_round_trips_no_primary_sentinel() {
+        let payload = VersionInfoPayload {
+            version: VersionInfoPayload::encode_version("0.7.0"),
+            tunnel_mtu: 1420,
+            primary_link_id: VersionInfoPayload::NO_PRIMARY,
+        };
+        let encoded = payload.encode();
+        let decoded = VersionInfoPayload::decode(&encoded).unwrap();
+        assert_eq!(decoded.primary_link_id, VersionInfoPayload::NO_PRIMARY);
     }
 }

@@ -696,6 +696,17 @@ pub(crate) type PeerVersion = Arc<std::sync::Mutex<Option<String>>>;
 /// only on receipt at that same slow cadence.
 pub(crate) type PeerMtu = Arc<std::sync::Mutex<Option<u16>>>;
 
+/// Tunnel-wide storage for the peer's most recently advertised primary
+/// link, piggybacked on the same `PacketType::VersionInfo` exchange as
+/// `PeerVersion`/`PeerMtu` above. Holds a wire-level `link_id` (not a
+/// local `Links`-array index -- this host's own index space may not
+/// match the peer's), `None` when the peer hasn't advertised one (either
+/// it isn't running `scheduler.primary_link_mode`, or it is but hasn't
+/// picked a primary yet). Consumed by `Scheduler::refresh` when this
+/// host has `scheduler.follow_peer_primary` set -- see that config
+/// field's doc comment.
+pub(crate) type PeerPrimaryLink = Arc<std::sync::Mutex<Option<u8>>>;
+
 pub async fn run(
     tun: AsyncDevice,
     links: Vec<Link>,
@@ -801,6 +812,10 @@ pub async fn run(
     // doc comment.
     let peer_mtu: PeerMtu = Arc::new(std::sync::Mutex::new(None));
 
+    // The peer's own last-advertised primary link -- see
+    // `PeerPrimaryLink`'s doc comment.
+    let peer_primary_link: PeerPrimaryLink = Arc::new(std::sync::Mutex::new(None));
+
     // One per link, tracking a possibly-in-progress incoming
     // `ThroughputTestData` stream -- see `ThroughputTestReceiveState`'s
     // doc comment. `throughput_test_ctx` is the shared registry both
@@ -861,6 +876,7 @@ pub async fn run(
             let throughput_test_ctx = throughput_test_ctx.clone();
             let peer_version = peer_version.clone();
             let peer_mtu = peer_mtu.clone();
+            let peer_primary_link = peer_primary_link.clone();
             handles.push(tokio::spawn(async move {
                 // link_receiver never returns under normal operation --
                 // see its doc comment: socket errors are retried/
@@ -885,6 +901,7 @@ pub async fn run(
                     throughput_test_ctx,
                     peer_version,
                     peer_mtu,
+                    peer_primary_link,
                 )
                 .await;
             }));
@@ -895,8 +912,19 @@ pub async fn run(
             let scheduler = scheduler.clone();
             let cfg = params.scheduler_cfg.clone();
             let mtu = live_mtu.clone();
+            let peer_primary_link = peer_primary_link.clone();
             handles.push(tokio::spawn(async move {
-                link_prober(idx, links, session, scheduler, cfg, mtu, tracker).await;
+                link_prober(
+                    idx,
+                    links,
+                    session,
+                    scheduler,
+                    cfg,
+                    mtu,
+                    tracker,
+                    peer_primary_link,
+                )
+                .await;
             }));
         }
         {
@@ -2324,6 +2352,7 @@ async fn link_receiver(
     throughput_test_ctx: Arc<ThroughputTestContext>,
     peer_version: PeerVersion,
     peer_mtu: PeerMtu,
+    peer_primary_link: PeerPrimaryLink,
 ) {
     let (handle, link_id, link_name) = {
         let link = links[idx].lock().await;
@@ -2360,6 +2389,7 @@ async fn link_receiver(
                     &throughput_test_ctx,
                     &peer_version,
                     &peer_mtu,
+                    &peer_primary_link,
                 )
                 .await;
             }
@@ -2410,6 +2440,7 @@ async fn link_receiver(
 /// Runs as a task fully independent of `link_receiver` -- see the module
 /// doc comment. Shares `tracker` with that link's `link_receiver` (see
 /// `run()`, where both tasks are handed the same `Arc`).
+#[allow(clippy::too_many_arguments)]
 async fn link_prober(
     idx: usize,
     links: Links,
@@ -2418,6 +2449,7 @@ async fn link_prober(
     cfg: SchedulerConfig,
     mtu: LiveMtu,
     tracker: Arc<AsyncMutex<ProbeTracker>>,
+    peer_primary_link: PeerPrimaryLink,
 ) {
     let (handle, link_id, probe_interval_ms, link_name) = {
         let link = links[idx].lock().await;
@@ -2462,7 +2494,7 @@ async fn link_prober(
                         // Feed the quality hysteresis directly instead
                         // of leaving it to notice only via whatever
                         // probes happened to already be in flight.
-                        record_send_failure_as_miss(&links, idx, &cfg, &scheduler).await;
+                        record_send_failure_as_miss(&links, idx, &cfg, &scheduler, &peer_primary_link).await;
                         if probe_send_failures >= RECONNECT_FAILURE_THRESHOLD {
                             attempt_reconnect(&handle, &link_name, &mut backoff_ms).await;
                             probe_send_failures = 0;
@@ -2476,7 +2508,7 @@ async fn link_prober(
                         // failure the quality hysteresis needs to know
                         // about, for the same reason as the
                         // `InterfaceGone` arm above.
-                        record_send_failure_as_miss(&links, idx, &cfg, &scheduler).await;
+                        record_send_failure_as_miss(&links, idx, &cfg, &scheduler, &peer_primary_link).await;
                     }
                     // Not a failure at all (no remote learned yet, or a
                     // non-socket encrypt failure) -- doesn't touch
@@ -2493,7 +2525,7 @@ async fn link_prober(
             _ = stats_tick.tick() => {
                 let socket = handle.current_socket().await;
                 send_stats_share(&socket, link_id, &links, idx, &session).await;
-                send_version_info(&socket, link_id, &links, idx, &session, &mtu).await;
+                send_version_info(&socket, link_id, &links, idx, &session, &mtu, &scheduler).await;
             }
 
             _ = sweep_tick.tick() => {
@@ -2510,8 +2542,12 @@ async fn link_prober(
                         monitor::update_link_state(&mut link, &cfg);
                     }
                     let snap = link::snapshot_links(&links).await;
+                    let peer_primary_index = peer_primary_link
+                        .lock()
+                        .unwrap()
+                        .map(|link_id| link_id as usize);
                     let mut sched = scheduler.lock().unwrap();
-                    sched.refresh(&snap, &cfg);
+                    sched.refresh(&snap, &cfg, peer_primary_index);
                 }
 
                 // Only one of the N probers needs to report the aggregate
@@ -3412,6 +3448,7 @@ async fn handle_incoming(
     throughput_test_ctx: &Arc<ThroughputTestContext>,
     peer_version: &PeerVersion,
     peer_mtu: &PeerMtu,
+    peer_primary_link: &PeerPrimaryLink,
 ) {
     let Ok((hdr, ciphertext)) = Header::decode(frame) else {
         return;
@@ -3606,8 +3643,12 @@ async fn handle_incoming(
                     monitor::update_link_state(&mut link, cfg);
                 }
                 let snap = link::snapshot_links(links).await;
+                let peer_primary_index = peer_primary_link
+                    .lock()
+                    .unwrap()
+                    .map(|link_id| link_id as usize);
                 let mut sched = scheduler.lock().unwrap();
-                sched.refresh(&snap, cfg);
+                sched.refresh(&snap, cfg, peer_primary_index);
             }
         }
         PacketType::StatsShare => {
@@ -3622,6 +3663,9 @@ async fn handle_incoming(
             if let Ok(payload) = VersionInfoPayload::decode(&plaintext) {
                 *peer_version.lock().unwrap() = Some(payload.version_str());
                 *peer_mtu.lock().unwrap() = Some(payload.tunnel_mtu);
+                *peer_primary_link.lock().unwrap() = (payload.primary_link_id
+                    != VersionInfoPayload::NO_PRIMARY)
+                    .then_some(payload.primary_link_id);
             }
         }
         PacketType::ThroughputTestData => {
@@ -3837,6 +3881,7 @@ async fn record_send_failure_as_miss(
     idx: usize,
     cfg: &SchedulerConfig,
     scheduler: &Arc<std::sync::Mutex<Scheduler>>,
+    peer_primary_link: &PeerPrimaryLink,
 ) {
     {
         let mut link = links[idx].lock().await;
@@ -3844,8 +3889,12 @@ async fn record_send_failure_as_miss(
         monitor::update_link_state(&mut link, cfg);
     }
     let snap = link::snapshot_links(links).await;
+    let peer_primary_index = peer_primary_link
+        .lock()
+        .unwrap()
+        .map(|link_id| link_id as usize);
     let mut sched = scheduler.lock().unwrap();
-    sched.refresh(&snap, cfg);
+    sched.refresh(&snap, cfg, peer_primary_index);
 }
 
 /// Outcome of one `send_probe` attempt. Deliberately more granular than a
@@ -3997,14 +4046,28 @@ async fn send_version_info(
     idx: usize,
     session: &Arc<AsyncMutex<SessionState>>,
     mtu: &LiveMtu,
+    scheduler: &Arc<std::sync::Mutex<Scheduler>>,
 ) {
     let Some(remote) = links[idx].lock().await.remote else {
         return;
     };
 
+    // Local `Links`-array index -> wire `link_id` is a direct cast: every
+    // `Link`'s own `id` is assigned from its position in the config Vec
+    // at `Link::bind` time (see main.rs), the same convention already
+    // relied on throughout this file (e.g. `links.get(link_id as usize)`
+    // in the redundant-send path above).
+    let primary_link_id = scheduler
+        .lock()
+        .unwrap()
+        .primary()
+        .map(|idx| idx as u8)
+        .unwrap_or(VersionInfoPayload::NO_PRIMARY);
+
     let payload = VersionInfoPayload {
         version: VersionInfoPayload::encode_version(crate::VERSION),
         tunnel_mtu: mtu.load(std::sync::atomic::Ordering::Relaxed),
+        primary_link_id,
     };
     let plaintext = payload.encode();
     let (session_id, seq, ciphertext) = {
