@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 
 /// How far ahead (as a fraction, 0.2 = 20%) a candidate link's score
 /// must be over the current primary's before it even starts being
-/// tracked as a switch candidate -- see `Scheduler::apply_primary_selection`
+/// tracked as a switch candidate -- see `Scheduler::refresh_from_scores`
 /// for the full hysteresis this feeds into.
 const PRIMARY_SWITCH_MARGIN: f64 = 0.2;
 
@@ -91,7 +91,7 @@ pub struct Scheduler {
     rate_limits: HashMap<usize, RateLimitState>,
     /// Current primary link's index, when `scheduler.primary_link_mode`
     /// is on. `None` before the first `refresh()`, or if every link is
-    /// currently Down. See `apply_primary_selection`'s doc comment for
+    /// currently Down. See `refresh_from_scores`'s doc comment for
     /// the full selection/hysteresis logic.
     primary: Option<usize>,
     /// A link that has been beating the current primary's score by
