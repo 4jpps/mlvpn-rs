@@ -106,6 +106,16 @@ pub struct DaemonSnapshot {
     /// the two ends without needing to SSH to the peer and check by
     /// hand.
     pub peer_version: Option<String>,
+    /// This side's own live tunnel MTU (`tunnel::LiveMtu`, from the
+    /// v0.5.0 adaptive-MTU feature) -- previously not exposed to
+    /// mlvpn-tui at all (neither side's MTU was, despite this
+    /// project's own design docs assuming local MTU already was).
+    pub local_tunnel_mtu: u16,
+    /// The peer's own live tunnel MTU, from the periodic authenticated
+    /// `VersionInfo` wire exchange (same source/reasoning as
+    /// `peer_version`). `None` until the first `VersionInfo` arrives.
+    #[serde(default)]
+    pub peer_tunnel_mtu: Option<u16>,
 }
 
 /// Host-wide load/memory/uptime, independent of anything tunnel- or
@@ -445,6 +455,8 @@ mod tests {
             },
             local_version: "0.4.5".to_string(),
             peer_version: Some("0.4.5".to_string()),
+            local_tunnel_mtu: 1420,
+            peer_tunnel_mtu: Some(1420),
         };
         let json = serde_json::to_string(&snap).expect("serialize");
         let back: DaemonSnapshot = serde_json::from_str(&json).expect("deserialize");
@@ -462,6 +474,8 @@ mod tests {
         assert_eq!(back.system.mem_available_kb, Some(8_192_000));
         assert_eq!(back.local_version, "0.4.5");
         assert_eq!(back.peer_version, Some("0.4.5".to_string()));
+        assert_eq!(back.local_tunnel_mtu, 1420);
+        assert_eq!(back.peer_tunnel_mtu, Some(1420));
     }
 
     #[test]
@@ -480,9 +494,30 @@ mod tests {
                 "rx_errors":null,"tx_errors":null,"rx_dropped":null,"tx_dropped":null},
             "system":{"load1":null,"load5":null,"load15":null,
                 "mem_total_kb":null,"mem_available_kb":null,"uptime_secs":null},
-            "local_version":"0.4.5","peer_version":null}"#;
+            "local_version":"0.4.5","peer_version":null,"local_tunnel_mtu":1420}"#;
         let snap: DaemonSnapshot = serde_json::from_str(json).expect("deserialize");
         assert_eq!(snap.peer_version, None);
+        assert_eq!(snap.peer_tunnel_mtu, None);
+    }
+
+    /// `peer_tunnel_mtu` is `#[serde(default)]` (unlike `peer_version`
+    /// above, which is a plain required field on `DaemonSnapshot`) so
+    /// that an older daemon binary's already-serialized snapshot (from
+    /// before this field existed) still deserializes cleanly on a newer
+    /// `mlvpn-tui` -- confirms the field can be entirely *absent* from
+    /// the JSON, not just present-and-null.
+    #[test]
+    fn daemon_snapshot_peer_tunnel_mtu_defaults_to_none_when_absent_from_the_wire() {
+        let json = r#"{"session_id":1,"session_uptime_ms":0,"rekey_count":0,
+            "outbound_queue_len":0,"outbound_queue_capacity":256,
+            "outbound_queue_dropped_total":0,
+            "tun":{"iface":"mlvpn0","rx_bytes":null,"tx_bytes":null,
+                "rx_errors":null,"tx_errors":null,"rx_dropped":null,"tx_dropped":null},
+            "system":{"load1":null,"load5":null,"load15":null,
+                "mem_total_kb":null,"mem_available_kb":null,"uptime_secs":null},
+            "local_version":"0.4.5","peer_version":null,"local_tunnel_mtu":1420}"#;
+        let snap: DaemonSnapshot = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(snap.peer_tunnel_mtu, None);
     }
 
     /// `new_log_lines` is the delta-streaming mechanism the Logs tab

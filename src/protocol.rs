@@ -320,11 +320,15 @@ impl StatsPayload {
 #[derive(Debug, Clone)]
 pub struct VersionInfoPayload {
     pub version: [u8; Self::VERSION_LEN],
+    /// The sender's own live tunnel MTU (`tunnel::LiveMtu`), piggybacked
+    /// on this same periodic authenticated exchange rather than adding a
+    /// new packet type.
+    pub tunnel_mtu: u16,
 }
 
 impl VersionInfoPayload {
     pub const VERSION_LEN: usize = 16;
-    pub const LEN: usize = Self::VERSION_LEN;
+    pub const LEN: usize = Self::VERSION_LEN + 2;
 
     pub fn encode_version(version: &str) -> [u8; Self::VERSION_LEN] {
         let mut out = [0u8; Self::VERSION_LEN];
@@ -346,7 +350,10 @@ impl VersionInfoPayload {
     }
 
     pub fn encode(&self) -> [u8; Self::LEN] {
-        self.version
+        let mut out = [0u8; Self::LEN];
+        out[..Self::VERSION_LEN].copy_from_slice(&self.version);
+        out[Self::VERSION_LEN..].copy_from_slice(&self.tunnel_mtu.to_be_bytes());
+        out
     }
 
     pub fn decode(buf: &[u8]) -> Result<Self> {
@@ -357,7 +364,11 @@ impl VersionInfoPayload {
         }
         let mut version = [0u8; Self::VERSION_LEN];
         version.copy_from_slice(&buf[0..Self::VERSION_LEN]);
-        Ok(Self { version })
+        let tunnel_mtu = u16::from_be_bytes([buf[Self::VERSION_LEN], buf[Self::VERSION_LEN + 1]]);
+        Ok(Self {
+            version,
+            tunnel_mtu,
+        })
     }
 }
 
@@ -567,6 +578,7 @@ mod version_info_payload_tests {
     fn round_trips_a_typical_version_string() {
         let payload = VersionInfoPayload {
             version: VersionInfoPayload::encode_version("0.4.5"),
+            tunnel_mtu: 1420,
         };
         let encoded = payload.encode();
         let decoded = VersionInfoPayload::decode(&encoded).unwrap();
@@ -576,7 +588,10 @@ mod version_info_payload_tests {
     #[test]
     fn truncates_a_version_string_longer_than_the_wire_field() {
         let encoded = VersionInfoPayload::encode_version("0.4.5-some-very-long-prerelease-tag");
-        let payload = VersionInfoPayload { version: encoded };
+        let payload = VersionInfoPayload {
+            version: encoded,
+            tunnel_mtu: 1420,
+        };
         assert_eq!(payload.version_str().len(), VersionInfoPayload::VERSION_LEN);
     }
 
@@ -584,5 +599,17 @@ mod version_info_payload_tests {
     fn decode_rejects_short_buffer() {
         let buf = [0u8; 3];
         assert!(VersionInfoPayload::decode(&buf).is_err());
+    }
+
+    #[test]
+    fn version_info_payload_round_trips_tunnel_mtu() {
+        let payload = VersionInfoPayload {
+            version: VersionInfoPayload::encode_version("0.6.0"),
+            tunnel_mtu: 1420,
+        };
+        let encoded = payload.encode();
+        let decoded = VersionInfoPayload::decode(&encoded).unwrap();
+        assert_eq!(decoded.tunnel_mtu, 1420);
+        assert_eq!(decoded.version_str(), "0.6.0");
     }
 }

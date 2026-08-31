@@ -239,6 +239,8 @@ mod tests {
                 },
                 local_version: "0.4.5".to_string(),
                 peer_version: Some("0.4.5".to_string()),
+                local_tunnel_mtu: 1420,
+                peer_tunnel_mtu: Some(1420),
             },
             new_log_lines: Vec::new(),
         }

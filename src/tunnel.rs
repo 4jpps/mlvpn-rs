@@ -689,6 +689,13 @@ impl SessionMeta {
 /// track regardless of how many links are configured.
 pub(crate) type PeerVersion = Arc<std::sync::Mutex<Option<String>>>;
 
+/// Tunnel-wide storage for the peer's most recently received live tunnel
+/// MTU, piggybacked on the same `PacketType::VersionInfo` exchange as
+/// `PeerVersion` above -- same shape, same reasoning: `None` until the
+/// first `VersionInfo` arrives, `std::sync::Mutex` since it's touched
+/// only on receipt at that same slow cadence.
+pub(crate) type PeerMtu = Arc<std::sync::Mutex<Option<u16>>>;
+
 pub async fn run(
     tun: AsyncDevice,
     links: Vec<Link>,
@@ -790,6 +797,10 @@ pub async fn run(
     // `PeerVersion`'s doc comment.
     let peer_version: PeerVersion = Arc::new(std::sync::Mutex::new(None));
 
+    // The peer's own last-reported live tunnel MTU -- see `PeerMtu`'s
+    // doc comment.
+    let peer_mtu: PeerMtu = Arc::new(std::sync::Mutex::new(None));
+
     // One per link, tracking a possibly-in-progress incoming
     // `ThroughputTestData` stream -- see `ThroughputTestReceiveState`'s
     // doc comment. `throughput_test_ctx` is the shared registry both
@@ -849,6 +860,7 @@ pub async fn run(
             let throughput_test_state = throughput_test_state.clone();
             let throughput_test_ctx = throughput_test_ctx.clone();
             let peer_version = peer_version.clone();
+            let peer_mtu = peer_mtu.clone();
             handles.push(tokio::spawn(async move {
                 // link_receiver never returns under normal operation --
                 // see its doc comment: socket errors are retried/
@@ -872,6 +884,7 @@ pub async fn run(
                     throughput_test_state,
                     throughput_test_ctx,
                     peer_version,
+                    peer_mtu,
                 )
                 .await;
             }));
@@ -881,8 +894,9 @@ pub async fn run(
             let session = session.clone();
             let scheduler = scheduler.clone();
             let cfg = params.scheduler_cfg.clone();
+            let mtu = live_mtu.clone();
             handles.push(tokio::spawn(async move {
-                link_prober(idx, links, session, scheduler, cfg, tracker).await;
+                link_prober(idx, links, session, scheduler, cfg, mtu, tracker).await;
             }));
         }
         {
@@ -911,6 +925,8 @@ pub async fn run(
         let outbound_dropped_total = outbound_dropped_total.clone();
         let log_ring = log_ring.clone();
         let peer_version = peer_version.clone();
+        let peer_mtu = peer_mtu.clone();
+        let mtu = live_mtu.clone();
         handles.push(tokio::spawn(async move {
             control::serve(
                 path,
@@ -923,6 +939,8 @@ pub async fn run(
                 outbound_dropped_total,
                 log_ring,
                 peer_version,
+                mtu,
+                peer_mtu,
             )
             .await;
         }));
@@ -943,6 +961,8 @@ pub async fn run(
             outbound_dropped_total: outbound_dropped_total.clone(),
             log_ring: log_ring.clone(),
             peer_version: peer_version.clone(),
+            mtu: live_mtu.clone(),
+            peer_mtu: peer_mtu.clone(),
         };
         handles.push(tokio::spawn(async move {
             control::serve_commands(
@@ -996,6 +1016,8 @@ pub async fn run(
             outbound_dropped_total: outbound_dropped_total.clone(),
             log_ring: log_ring.clone(),
             peer_version: peer_version.clone(),
+            mtu: live_mtu.clone(),
+            peer_mtu: peer_mtu.clone(),
         };
         handles.push(tokio::spawn(async move {
             control::diagnostics_watch_loop(watch, links, diag_ctx).await;
@@ -2301,6 +2323,7 @@ async fn link_receiver(
     throughput_test_state: Arc<AsyncMutex<ThroughputTestReceiveState>>,
     throughput_test_ctx: Arc<ThroughputTestContext>,
     peer_version: PeerVersion,
+    peer_mtu: PeerMtu,
 ) {
     let (handle, link_id, link_name) = {
         let link = links[idx].lock().await;
@@ -2336,6 +2359,7 @@ async fn link_receiver(
                     &throughput_test_state,
                     &throughput_test_ctx,
                     &peer_version,
+                    &peer_mtu,
                 )
                 .await;
             }
@@ -2392,6 +2416,7 @@ async fn link_prober(
     session: Arc<AsyncMutex<SessionState>>,
     scheduler: Arc<std::sync::Mutex<Scheduler>>,
     cfg: SchedulerConfig,
+    mtu: LiveMtu,
     tracker: Arc<AsyncMutex<ProbeTracker>>,
 ) {
     let (handle, link_id, probe_interval_ms, link_name) = {
@@ -2468,7 +2493,7 @@ async fn link_prober(
             _ = stats_tick.tick() => {
                 let socket = handle.current_socket().await;
                 send_stats_share(&socket, link_id, &links, idx, &session).await;
-                send_version_info(&socket, link_id, &links, idx, &session).await;
+                send_version_info(&socket, link_id, &links, idx, &session, &mtu).await;
             }
 
             _ = sweep_tick.tick() => {
@@ -3386,6 +3411,7 @@ async fn handle_incoming(
     throughput_test_state: &Arc<AsyncMutex<ThroughputTestReceiveState>>,
     throughput_test_ctx: &Arc<ThroughputTestContext>,
     peer_version: &PeerVersion,
+    peer_mtu: &PeerMtu,
 ) {
     let Ok((hdr, ciphertext)) = Header::decode(frame) else {
         return;
@@ -3595,6 +3621,7 @@ async fn handle_incoming(
         PacketType::VersionInfo => {
             if let Ok(payload) = VersionInfoPayload::decode(&plaintext) {
                 *peer_version.lock().unwrap() = Some(payload.version_str());
+                *peer_mtu.lock().unwrap() = Some(payload.tunnel_mtu);
             }
         }
         PacketType::ThroughputTestData => {
@@ -3969,6 +3996,7 @@ async fn send_version_info(
     links: &Links,
     idx: usize,
     session: &Arc<AsyncMutex<SessionState>>,
+    mtu: &LiveMtu,
 ) {
     let Some(remote) = links[idx].lock().await.remote else {
         return;
@@ -3976,6 +4004,7 @@ async fn send_version_info(
 
     let payload = VersionInfoPayload {
         version: VersionInfoPayload::encode_version(crate::VERSION),
+        tunnel_mtu: mtu.load(std::sync::atomic::Ordering::Relaxed),
     };
     let plaintext = payload.encode();
     let (session_id, seq, ciphertext) = {

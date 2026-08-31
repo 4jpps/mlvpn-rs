@@ -43,7 +43,8 @@ use crate::procstats;
 use crate::sysfs_net;
 use crate::tunnel::{
     adaptive_bandwidth_ramp, send_throughput_test_reverse_request, send_throughput_test_stream,
-    DiagnosticsWatchParams, OutboundFrame, PeerVersion, SessionMeta, ThroughputTestContext,
+    DiagnosticsWatchParams, LiveMtu, OutboundFrame, PeerMtu, PeerVersion, SessionMeta,
+    ThroughputTestContext,
 };
 use crate::tunneltest;
 use std::net::SocketAddr;
@@ -77,6 +78,8 @@ pub(crate) async fn serve(
     outbound_dropped_total: Arc<AtomicU64>,
     log_ring: Arc<LogRing>,
     peer_version: PeerVersion,
+    mtu: LiveMtu,
+    peer_mtu: PeerMtu,
 ) {
     if let Some(parent) = path.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
@@ -165,6 +168,8 @@ pub(crate) async fn serve(
         let outbound_dropped_total = outbound_dropped_total.clone();
         let log_ring = log_ring.clone();
         let peer_version = peer_version.clone();
+        let mtu = mtu.clone();
+        let peer_mtu = peer_mtu.clone();
         tokio::spawn(async move {
             serve_client(
                 stream,
@@ -177,6 +182,8 @@ pub(crate) async fn serve(
                 outbound_dropped_total,
                 log_ring,
                 peer_version,
+                mtu,
+                peer_mtu,
             )
             .await;
         });
@@ -195,6 +202,8 @@ async fn serve_client(
     outbound_dropped_total: Arc<AtomicU64>,
     log_ring: Arc<LogRing>,
     peer_version: PeerVersion,
+    mtu: LiveMtu,
+    peer_mtu: PeerMtu,
 ) {
     let mut tick = interval(Duration::from_millis(SNAPSHOT_INTERVAL_MS));
     // Per-connection cursor into `log_ring` -- each connected client
@@ -216,6 +225,8 @@ async fn serve_client(
             &log_ring,
             last_log_seq,
             &peer_version,
+            &mtu,
+            &peer_mtu,
         )
         .await;
         last_log_seq = new_last_log_seq;
@@ -241,6 +252,8 @@ async fn build_snapshot(
     log_ring: &LogRing,
     last_log_seq: u64,
     peer_version: &PeerVersion,
+    mtu: &LiveMtu,
+    peer_mtu: &PeerMtu,
 ) -> (Snapshot, u64) {
     let snap = link::snapshot_links(links).await;
     let link_snapshots = snap
@@ -338,6 +351,8 @@ async fn build_snapshot(
             },
             local_version: crate::VERSION.to_string(),
             peer_version: peer_version.lock().unwrap().clone(),
+            local_tunnel_mtu: mtu.load(Ordering::Relaxed),
+            peer_tunnel_mtu: *peer_mtu.lock().unwrap(),
         },
         new_log_lines,
     };
@@ -364,6 +379,8 @@ pub(crate) struct DiagContext {
     pub(crate) outbound_dropped_total: Arc<AtomicU64>,
     pub(crate) log_ring: Arc<LogRing>,
     pub(crate) peer_version: PeerVersion,
+    pub(crate) mtu: LiveMtu,
+    pub(crate) peer_mtu: PeerMtu,
 }
 
 /// Bind the command socket and serve `ipc::Command` requests until the
@@ -701,6 +718,8 @@ async fn run_diag_dump_command(links: &Links, diag_ctx: &DiagContext) -> Command
         &diag_ctx.log_ring,
         0,
         &diag_ctx.peer_version,
+        &diag_ctx.mtu,
+        &diag_ctx.peer_mtu,
     )
     .await;
     let text = diag::format_dump(&snapshot, "manual (mlvpnd diag-dump)");
@@ -975,6 +994,8 @@ pub(crate) async fn diagnostics_watch_loop(
             &diag_ctx.log_ring,
             0,
             &diag_ctx.peer_version,
+            &diag_ctx.mtu,
+            &diag_ctx.peer_mtu,
         )
         .await;
 
