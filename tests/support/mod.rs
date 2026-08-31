@@ -385,6 +385,9 @@ pub fn generate_test_keypair(dir: &Path, label: &str) -> io::Result<(PathBuf, St
 pub struct SchedulerOverrides {
     /// Used by `veth_redundant.rs` to exercise `scheduler.redundant_mode`.
     pub redundant_mode: bool,
+    /// Used by `veth_primary_link_mode.rs` to exercise
+    /// `scheduler.primary_link_mode`.
+    pub primary_link_mode: bool,
     /// Used by `veth_reorder_tuning.rs` to exercise
     /// `scheduler.auto_tune_reorder_window`.
     pub auto_tune_reorder_window: bool,
@@ -448,6 +451,7 @@ pub fn write_config(
     // re-declaring the same table twice, so this has to be one
     // conditional block rather than one per flag.
     if scheduler.redundant_mode
+        || scheduler.primary_link_mode
         || scheduler.auto_tune_reorder_window
         || scheduler.auto_tune_probe_interval
         || scheduler.auto_tune_ewma_alpha
@@ -457,6 +461,9 @@ pub fn write_config(
         toml.push_str("[scheduler]\n");
         if scheduler.redundant_mode {
             toml.push_str("redundant_mode = true\n");
+        }
+        if scheduler.primary_link_mode {
+            toml.push_str("primary_link_mode = true\n");
         }
         if scheduler.auto_tune_reorder_window {
             toml.push_str("auto_tune_reorder_window = true\n");
