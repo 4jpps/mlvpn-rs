@@ -10,6 +10,12 @@ For implementation detail beyond what's here, read the code -- most
 modules and non-trivial functions have doc comments explaining the
 design, and `ARCHITECTURE.md` covers the system as a whole.
 
+## [0.5.4] - 2026-08-31
+
+### Added
+
+- **`tunnel.tx_queue_len` -- the TUN device's transmit queue length is now a first-class config option, defaulting to 4000 instead of the OS default (500 packets on Linux).** Confirmed live on real production infrastructure: a burst of real Data traffic caused 168 TUN-level TX drops in an 8-second tunneled TCP test, even though the underlying WAN links had far more raw capacity available -- the queue was simply too shallow to absorb the burst under bursty encrypted tunnel traffic. Raising it eliminated further drops on retest. Previously this required a manual, easy-to-miss, per-deployment `systemd-networkd` workaround; every deployment now gets the fix automatically with no config changes needed. Bounded to `100..=65536` in `Config::validate()`; still tunable for deployments with unusual bandwidth-delay-product characteristics. See `docs/superpowers/specs/2026-08-31-tun-tx-queue-length-design.md`.
+
 ## [0.5.3] - 2026-08-31
 
 ### Fixed

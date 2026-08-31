@@ -1,3 +1,16 @@
+mlvpn (0.5.4-1) unstable; urgency=medium
+
+  * Raise the TUN device's default transmit queue length from the OS
+    default (500 packets on Linux) to 4000, now a first-class
+    tunnel.tx_queue_len config option (bounded 100..=65536). Confirmed
+    live: a burst of real Data traffic caused 168 TUN-level TX drops
+    in an 8-second tunneled TCP test despite the underlying WAN links
+    having far more raw capacity -- the queue was simply too shallow
+    to absorb the burst. Every deployment gets the fix automatically,
+    no config changes needed.
+
+ -- Jeff Parrish PC Services <www.jpps.us>  Mon, 31 Aug 2026 14:29:23 -0500
+
 mlvpn (0.5.3-1) unstable; urgency=high
 
   * Fix ReorderBuffer::high_watermark never resetting on rekey: since
