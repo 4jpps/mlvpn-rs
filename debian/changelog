@@ -1,3 +1,46 @@
+mlvpn (0.6.0-1) unstable; urgency=medium
+
+  * New opt-in scheduler.primary_link_mode: send all traffic over
+    whichever single bonded link currently looks fastest, instead of
+    splitting via SWRR across every Up link. Off by default. Failover
+    to the next-best link on a hard failure (primary going Down) is
+    immediate; switching to a link that merely looks a little better
+    right now requires it to stay ahead by a real margin (20%) for
+    several consecutive probe cycles, preventing flapping. Non-primary
+    links keep probing (and, if active_bandwidth_probing is on,
+    ramping) normally in the background, so failover starts from an
+    already-warm link, not a cold one. NOTE: bandwidth_cap_mbps is not
+    enforced while a link is acting as primary (only affects primary
+    *selection* via monitor::score(), not sending rate once selected).
+  * New opt-in scheduler.follow_peer_primary: instead of running its
+    own independent primary-selection hysteresis, a host in this mode
+    adopts whatever primary link its peer last advertised over the
+    wire, falling back to ordinary scheduling when the peer hasn't
+    chosen one yet or chose a link that isn't Up locally. Lets one side
+    (running primary_link_mode) act as the sole decider for both
+    directions of a link pair, without requiring every peer it talks
+    to carry its own matching config -- useful for a host serving
+    multiple differently-configured peers. Resolved by link name
+    (not a raw wire index, which is per-host and not a shared
+    namespace between peers) -- both hosts' [[link]] entries for the
+    same physical path must use the same name for this to work.
+    Requires v0.6.0+ on both ends to do anything; against an older
+    peer it's a silent no-op (no primary is ever advertised).
+  * mlvpn-tui now shows both sides' live tunnel MTU in the Session
+    panel, flagging a mismatch the same way peer version already is.
+    Piggybacked on the existing periodic VersionInfo wire exchange
+    (VersionInfoPayload gains a tunnel_mtu field) rather than a new
+    packet type. Previously neither side's tunnel MTU was shown
+    anywhere in mlvpn-tui at all.
+  * VersionInfoPayload's decode is now tolerant of a shorter payload
+    from a pre-0.6.0 peer (only the version field is required; MTU and
+    primary-link-name default sanely when absent) instead of failing
+    closed -- a mixed-version tunnel during a rolling upgrade no longer
+    goes silently blind on version/MTU/primary-link display right when
+    that visibility matters most for catching skew.
+
+ -- Jeff Parrish PC Services <www.jpps.us>  Mon, 31 Aug 2026 18:39:06 -0500
+
 mlvpn (0.5.4-1) unstable; urgency=medium
 
   * Raise the TUN device's default transmit queue length from the OS
