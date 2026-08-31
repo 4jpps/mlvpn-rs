@@ -118,8 +118,8 @@ impl Scheduler {
     /// `Links`-array index -- `None` when not in `primary_link_mode` (or
     /// `follow_peer_primary`), or when no link is currently Up. Used by
     /// `tunnel::send_version_info` to advertise this host's choice to the
-    /// peer over the wire (as a `link_id`, resolved by the caller -- see
-    /// `VersionInfoPayload::primary_link_id`).
+    /// peer over the wire (as a link name, resolved by the caller -- see
+    /// `VersionInfoPayload::primary_link_name`).
     pub fn primary(&self) -> Option<usize> {
         self.primary
     }
