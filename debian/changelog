@@ -1,3 +1,28 @@
+mlvpn (0.6.1-1) unstable; urgency=high
+
+  * Fix a real, confirmed throughput-limiting bug in the per-packet send
+    path: send_scheduled() was calling link::snapshot_scores() -- an
+    async lock on every configured link -- unconditionally on every
+    single outgoing Data packet, purely to satisfy an is_empty() guard
+    that Scheduler::select()'s actual primary/SWRR decision logic never
+    reads (both are populated by the last periodic refresh(), not
+    anything live at send time). Confirmed live in production via
+    `strace -f -c` on mlvpnd during a loaded tunnel: ~75% of wall-clock
+    time was spent in futex (async-lock contention), averaging ~1.9ms
+    per wait, while sendto -- the actual work -- accounted for only ~5%.
+    Real tunneled throughput was capped around 15-30 Mbps despite the
+    underlying link measuring 400+ Mbps raw, 0% loss on mlvpn's own
+    active probes, zero TUN-device drops, and negligible CPU usage --
+    the daemon was spending nearly all its time waiting on its own
+    locks, not doing I/O. New Scheduler::select_fast() resolves a
+    primary or SWRR pick straight from already-cached state with zero
+    link locking, falling back to the original path only in the rare
+    case where nothing is cached yet (every link Down). Same algorithm,
+    same results -- purely eliminates redundant per-packet lock
+    contention in the common case.
+
+ -- Jeff Parrish PC Services <www.jpps.us>  Mon, 31 Aug 2026 22:29:22 -0500
+
 mlvpn (0.6.0-1) unstable; urgency=medium
 
   * New opt-in scheduler.primary_link_mode: send all traffic over

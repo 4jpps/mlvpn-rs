@@ -10,6 +10,12 @@ For implementation detail beyond what's here, read the code -- most
 modules and non-trivial functions have doc comments explaining the
 design, and `ARCHITECTURE.md` covers the system as a whole.
 
+## [0.6.1] - 2026-08-31
+
+### Fixed
+
+- **A real, confirmed throughput-limiting bug in the per-packet send path.** `send_scheduled()` was calling `link::snapshot_scores()` -- an async lock acquisition on *every* configured link -- unconditionally, on every single outgoing Data packet, purely to satisfy an `is_empty()` guard that `Scheduler::select()`'s actual primary/SWRR decision logic never reads (both are populated entirely by the last periodic `refresh()` call, not anything live at send time). Confirmed live in production via `strace -f -c` on `mlvpnd` during a loaded tunnel: **~75% of the daemon's wall-clock time was spent in `futex`** (async-lock contention), averaging ~1.9ms per wait, while `sendto` -- the actual work -- accounted for only ~5%. Real tunneled throughput was capped around 15-30 Mbps despite the underlying link measuring 400+ Mbps raw, 0% loss on mlvpn's own active probes, zero TUN-device drops, and negligible CPU usage -- the daemon was spending nearly all its time waiting on its own locks, not doing I/O. New `Scheduler::select_fast()` resolves a primary or SWRR pick straight from already-cached state with zero link locking, falling back to the original `snapshot_scores()` + `select()` path only in the rare case where nothing is cached yet (every link Down). Same algorithm, same results -- purely eliminates redundant per-packet lock contention in the common case.
+
 ## [0.6.0] - 2026-08-31
 
 ### Added
