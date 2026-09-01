@@ -1,3 +1,21 @@
+mlvpn (0.6.4-1) unstable; urgency=high
+
+  * Fourth same-night follow-up: reorder_flush (a periodic task ticking
+    every 10ms to catch reorder-buffer entries that would otherwise
+    sit until a staleness timeout, since handle_incoming's own inline
+    drain only runs when a new packet actually arrives) was taking an
+    exclusive .lock().await unconditionally, contending with
+    handle_incoming's own per-Data-packet lock on the same buffer even
+    though the periodic flush's own work is almost always redundant
+    under real load. Switched to try_lock(): skip this tick entirely
+    when the lock is currently held (whatever's holding it is either
+    doing the same drain, or about to). Worst case a genuinely idle
+    straggler waits one extra ~10ms tick before its own staleness
+    timeout flushes it -- negligible next to reorder_window_ms's own
+    10-500ms range.
+
+ -- Jeff Parrish PC Services <www.jpps.us>  Tue, 01 Sep 2026 07:00:48 -0500
+
 mlvpn (0.6.3-1) unstable; urgency=high
 
   * Third same-night follow-up: split SessionState's locking (single

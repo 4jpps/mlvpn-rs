@@ -19,7 +19,7 @@
 %global debug_package %{nil}
 
 Name:           mlvpn
-Version:        0.6.3
+Version:        0.6.4
 Release:        1%{?dist}
 Summary:        Multi-link VPN bonding daemon
 

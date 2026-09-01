@@ -10,6 +10,12 @@ For implementation detail beyond what's here, read the code -- most
 modules and non-trivial functions have doc comments explaining the
 design, and `ARCHITECTURE.md` covers the system as a whole.
 
+## [0.6.4] - 2026-09-01
+
+### Fixed
+
+- **Fourth same-night follow-up: `reorder_flush` now uses `try_lock()` instead of unconditionally blocking on the reorder buffer's lock.** This periodic task ticks every 10ms specifically to catch entries that would otherwise sit in the reorder buffer until a staleness timeout, since `handle_incoming`'s own inline `insert()`+`drain_ready()` only runs when a new packet actually arrives to trigger it. Under real load, `handle_incoming` already drains the buffer far more often than this timer needs to, so `reorder_flush`'s own lock acquisition was almost always redundant contention against the hot per-packet path. Skips the tick entirely when the lock is currently held; worst case, a genuinely idle straggler waits one extra ~10ms tick before its own staleness timeout flushes it on the next successful tick -- negligible next to `reorder_window_ms`'s own 10-500ms range.
+
 ## [0.6.3] - 2026-09-01
 
 ### Fixed
