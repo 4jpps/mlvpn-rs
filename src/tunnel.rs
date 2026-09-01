@@ -272,7 +272,7 @@ use crate::config::{Mode, SchedulerConfig};
 use crate::control;
 use crate::crypto::{self, Handshake, LocalPrivateKey, Session, SessionState};
 use crate::error::{MlvpnError, Result};
-use crate::link::{self, is_interface_gone_error, Link, LinkHandle, LinkState, Links};
+use crate::link::{self, is_interface_gone_error, Link, LinkHandle, LinkScore, LinkState, Links};
 use crate::monitor::{self, ProbeTracker};
 use crate::peerstats::PeerStatsTable;
 use crate::protocol::{
@@ -1160,8 +1160,9 @@ pub async fn run(
         let links = links.clone();
         let reorder = reorder.clone();
         let cfg = params.scheduler_cfg.clone();
+        let scheduler = scheduler.clone();
         handles.push(tokio::spawn(async move {
-            reorder_tuning_loop(links, reorder, cfg).await;
+            reorder_tuning_loop(links, reorder, cfg, scheduler).await;
         }));
     }
 
@@ -4431,14 +4432,73 @@ const REORDER_TUNING_INTERVAL: Duration = Duration::from_secs(30);
 /// while the cost of it being too narrow is out-of-order delivery on
 /// every packet that arrives on the slower link even under perfectly
 /// normal conditions -- an asymmetric cost that favors erring wide.
-fn suggest_reorder_window_ms(rtts: &[f64], min_ms: u64, max_ms: u64) -> Option<u64> {
-    if rtts.len() < 2 {
+/// Multiplier applied to cross-link RTT spread when computing a
+/// suggested `reorder_window_ms` -- see `suggest_reorder_window_ms`'s
+/// doc comment for the full reasoning. Unchanged from this project's
+/// original reorder-window design.
+const REORDER_WINDOW_SPREAD_MULTIPLIER: f64 = 1.5;
+
+/// Multiplier applied to a link's own `jitter_ms` when computing a
+/// suggested `reorder_window_ms`. Deliberately mirrors TCP's own RTO
+/// formula (Jacobson/Karels: `RTO = SRTT + 4*RTTVAR`) -- `jitter_ms` is
+/// structurally the same quantity RTTVAR is (an EWMA of consecutive-
+/// sample deltas), and this feature exists specifically to stop
+/// tripping TCP's own RTO estimate with tunnel-induced latency
+/// variance, so borrowing TCP's own well-established multiplier is a
+/// principled choice rather than an arbitrary one.
+const REORDER_WINDOW_JITTER_MULTIPLIER: f64 = 4.0;
+
+/// Fixed headroom added on top of the spread/jitter terms regardless
+/// of how small either is -- guarantees a small amount of buffering
+/// even when both links are perfectly stable, since a real network
+/// path is never perfectly jitter-free in practice.
+const REORDER_WINDOW_FLOOR_MS: f64 = 10.0;
+
+fn suggest_reorder_window_ms(
+    scores: &[LinkScore],
+    primary_idx: Option<usize>,
+    min_ms: u64,
+    max_ms: u64,
+) -> Option<u64> {
+    let up: Vec<&LinkScore> = scores.iter().filter(|s| s.state == LinkState::Up).collect();
+    if up.is_empty() {
         return None;
     }
-    let min_rtt = rtts.iter().cloned().fold(f64::MAX, f64::min);
-    let max_rtt = rtts.iter().cloned().fold(f64::MIN, f64::max);
-    let spread = max_rtt - min_rtt;
-    let suggested = (spread * 1.5) + 10.0;
+
+    // A settled primary is only meaningful if it's actually in the
+    // current Up-links snapshot -- a stale/rare-transient index (the
+    // primary just went Down, not yet reselected) falls through to the
+    // multi-link branch below rather than being trusted.
+    let settled_primary = primary_idx.and_then(|idx| up.iter().find(|s| s.link_index == idx));
+
+    let (spread_term, jitter_term) = if let Some(primary) = settled_primary {
+        // Settled single-link delivery: no cross-link skew is possible,
+        // only this one link's own timing variance matters.
+        let jitter = primary.jitter_ms.unwrap_or(0.0);
+        (0.0, jitter * REORDER_WINDOW_JITTER_MULTIPLIER)
+    } else {
+        // Multi-link delivery is genuinely possible right now (plain
+        // SWRR, redundant_mode, or a primary/follow mode with no
+        // primary settled yet).
+        let rtts: Vec<f64> = up.iter().filter_map(|s| s.rtt_ms).collect();
+        let spread = if rtts.len() >= 2 {
+            let min_rtt = rtts.iter().cloned().fold(f64::MAX, f64::min);
+            let max_rtt = rtts.iter().cloned().fold(f64::MIN, f64::max);
+            max_rtt - min_rtt
+        } else {
+            0.0
+        };
+        let worst_jitter = up
+            .iter()
+            .filter_map(|s| s.jitter_ms)
+            .fold(0.0_f64, f64::max);
+        (
+            spread * REORDER_WINDOW_SPREAD_MULTIPLIER,
+            worst_jitter * REORDER_WINDOW_JITTER_MULTIPLIER,
+        )
+    };
+
+    let suggested = spread_term + jitter_term + REORDER_WINDOW_FLOOR_MS;
     Some(suggested.clamp(min_ms as f64, max_ms as f64).round() as u64)
 }
 
@@ -4456,6 +4516,7 @@ async fn reorder_tuning_loop(
     links: Links,
     reorder: Arc<AsyncMutex<ReorderBuffer>>,
     cfg: SchedulerConfig,
+    scheduler: Arc<std::sync::Mutex<Scheduler>>,
 ) {
     if !cfg.auto_tune_reorder_window {
         return;
@@ -4465,17 +4526,15 @@ async fn reorder_tuning_loop(
     loop {
         tick.tick().await;
 
-        let rtts: Vec<f64> = {
-            let snap = link::snapshot_links(&links).await;
-            snap.iter()
-                .filter(|l| l.state == LinkState::Up)
-                .filter_map(|l| l.stats.rtt_ms.get())
-                .collect()
-        };
+        let scores = link::snapshot_scores(&links).await;
+        let primary_idx = scheduler.lock().unwrap().primary();
 
-        let Some(suggested) =
-            suggest_reorder_window_ms(&rtts, cfg.reorder_window_min_ms, cfg.reorder_window_max_ms)
-        else {
+        let Some(suggested) = suggest_reorder_window_ms(
+            &scores,
+            primary_idx,
+            cfg.reorder_window_min_ms,
+            cfg.reorder_window_max_ms,
+        ) else {
             continue;
         };
 
@@ -4636,40 +4695,98 @@ mod reorder_tuning_tests {
         assert_eq!(buf.drain_ready(), Vec::<Vec<u8>>::new());
     }
 
-    #[test]
-    fn suggest_reorder_window_needs_at_least_two_samples() {
-        assert_eq!(suggest_reorder_window_ms(&[], 10, 500), None);
-        assert_eq!(suggest_reorder_window_ms(&[42.0], 10, 500), None);
+    fn score(link_index: usize, rtt_ms: f64, jitter_ms: f64) -> LinkScore {
+        LinkScore {
+            link_index,
+            state: LinkState::Up,
+            admin_disabled: false,
+            weight: 1.0,
+            bandwidth_cap_mbps: None,
+            rtt_ms: Some(rtt_ms),
+            jitter_ms: Some(jitter_ms),
+            loss_rate: Some(0.0),
+            rx_throughput_mbps: None,
+            active_bandwidth_mbps: None,
+            consecutive_misses: 0,
+        }
     }
 
     #[test]
-    fn suggest_reorder_window_scales_with_rtt_spread() {
-        // Spread of 20ms (30 - 10) * 1.5 + 10 = 40ms, well inside [10, 500].
-        let suggested = suggest_reorder_window_ms(&[10.0, 30.0], 10, 500)
-            .expect("two samples should always produce a suggestion");
-        assert_eq!(suggested, 40);
+    fn suggest_reorder_window_needs_at_least_one_sample() {
+        assert_eq!(suggest_reorder_window_ms(&[], None, 10, 500), None);
     }
 
     #[test]
-    fn suggest_reorder_window_is_symmetric_in_sample_order() {
-        // The spread math shouldn't care which sample came first.
-        let a = suggest_reorder_window_ms(&[10.0, 30.0], 10, 500);
-        let b = suggest_reorder_window_ms(&[30.0, 10.0], 10, 500);
+    fn suggest_reorder_window_no_primary_combines_spread_and_worst_jitter() {
+        // No settled primary -> multi-link branch. Spread = 30-10 = 20,
+        // spread_term = 20 * 1.5 = 30. Worst jitter = 8 (link 1's),
+        // jitter_term = 8 * 4.0 = 32. suggested = 30 + 32 + 10 = 72.
+        let scores = [score(0, 10.0, 2.0), score(1, 30.0, 8.0)];
+        let suggested = suggest_reorder_window_ms(&scores, None, 10, 500)
+            .expect("multiple Up links should always produce a suggestion");
+        assert_eq!(suggested, 72);
+    }
+
+    #[test]
+    fn suggest_reorder_window_no_primary_is_symmetric_in_sample_order() {
+        let a =
+            suggest_reorder_window_ms(&[score(0, 10.0, 2.0), score(1, 30.0, 8.0)], None, 10, 500);
+        let b =
+            suggest_reorder_window_ms(&[score(1, 30.0, 8.0), score(0, 10.0, 2.0)], None, 10, 500);
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn suggest_reorder_window_settled_primary_uses_only_that_links_jitter() {
+        // Link 1 is the settled primary with jitter 5 -> jitter_term =
+        // 5 * 4.0 = 20, suggested = 0 (no spread) + 20 + 10 = 30. Link
+        // 0's wildly different rtt/jitter (a stand-in for e.g. an idle
+        // T-Mobile backup) must have zero effect on the result -- this
+        // is the exact regression this whole feature exists to fix.
+        let scores = [score(0, 250.0, 90.0), score(1, 15.0, 5.0)];
+        let suggested = suggest_reorder_window_ms(&scores, Some(1), 10, 500)
+            .expect("a settled primary with a jitter sample should always produce a suggestion");
+        assert_eq!(suggested, 30);
+    }
+
+    #[test]
+    fn suggest_reorder_window_settled_primary_missing_jitter_sample_contributes_zero() {
+        // Primary link has no jitter sample yet (e.g. just came Up) --
+        // must not panic, contributes 0.0, so suggested = floor only.
+        let mut only_link = score(0, 15.0, 0.0);
+        only_link.jitter_ms = None;
+        let suggested = suggest_reorder_window_ms(&[only_link], Some(0), 10, 500).expect(
+            "a settled primary should always produce a suggestion even with no jitter sample yet",
+        );
+        assert_eq!(suggested, 10); // floor only
+    }
+
+    #[test]
+    fn suggest_reorder_window_primary_not_in_snapshot_falls_back_to_multi_link() {
+        // Scheduler says index 5 is primary, but the current Up-links
+        // snapshot doesn't contain that index (a rare transient -- the
+        // primary just went Down and hasn't been reselected yet). Must
+        // fall back to the multi-link branch, not panic.
+        let scores = [score(0, 10.0, 2.0), score(1, 30.0, 8.0)];
+        let with_stale_primary = suggest_reorder_window_ms(&scores, Some(5), 10, 500);
+        let with_no_primary = suggest_reorder_window_ms(&scores, None, 10, 500);
+        assert_eq!(with_stale_primary, with_no_primary);
     }
 
     #[test]
     fn suggest_reorder_window_clamps_to_configured_bounds() {
         // A huge spread should clamp to max_ms, not run away unbounded.
-        let suggested = suggest_reorder_window_ms(&[5.0, 5000.0], 10, 500)
-            .expect("two samples should always produce a suggestion");
+        let scores = [score(0, 5.0, 0.0), score(1, 5000.0, 0.0)];
+        let suggested = suggest_reorder_window_ms(&scores, None, 10, 500)
+            .expect("multiple Up links should always produce a suggestion");
         assert_eq!(suggested, 500);
 
-        // Even a zero spread still gets the fixed 10ms of headroom, but
+        // Even a zero spread/jitter still gets the fixed 10ms floor, but
         // never drops below min_ms.
-        let suggested = suggest_reorder_window_ms(&[15.0, 15.0], 10, 500)
-            .expect("two samples should always produce a suggestion");
-        assert_eq!(suggested, 10); // (0 * 1.5) + 10 = 10, and 10 is already the floor
+        let scores = [score(0, 15.0, 0.0), score(1, 15.0, 0.0)];
+        let suggested = suggest_reorder_window_ms(&scores, None, 10, 500)
+            .expect("multiple Up links should always produce a suggestion");
+        assert_eq!(suggested, 10); // (0 * 1.5) + (0 * 4.0) + 10 = 10, and 10 is already the floor
     }
 }
 
