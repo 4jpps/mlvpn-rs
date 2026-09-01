@@ -3609,20 +3609,25 @@ async fn handle_incoming(
     // mobile roaming, NAT rebinding) -- without letting an unauthenticated
     // spoofed packet redirect where we send subsequent traffic.
     if let Some(l) = links.get(idx) {
+        // Merged into one lock acquisition rather than two adjacent ones
+        // (the remote-address check below, plus a Data-only record_rx
+        // that used to re-lock the same link right after) -- confirmed
+        // live via `strace -f -c` that per-packet lock acquisitions
+        // dominate mlvpnd's wall-clock time (see send_scheduled's
+        // select_fast for the sibling fix on the send side); this halves
+        // the lock count on the hottest part of the receive path too.
         let mut link = l.lock().await;
         if link.remote != Some(from) {
             tracing::debug!(link = %link.config.name, %from, "learned/updated peer address");
             link.remote = Some(from);
         }
+        if hdr.ptype == PacketType::Data {
+            link.stats.record_rx(frame.len() as u64);
+        }
     }
 
     match hdr.ptype {
         PacketType::Data => {
-            if let Some(l) = links.get(idx) {
-                let mut link = l.lock().await;
-                link.stats.record_rx(frame.len() as u64);
-            }
-
             let ready = {
                 let mut ro = reorder.lock().await;
                 let session_changed = ro.reset_for_session(hdr.session_id);

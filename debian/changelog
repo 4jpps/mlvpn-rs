@@ -1,3 +1,19 @@
+mlvpn (0.6.2-1) unstable; urgency=high
+
+  * Follow-up to 0.6.1's send-path lock-contention fix: the receive
+    path (handle_incoming) had a matching, smaller version of the same
+    issue -- every incoming Data packet locked the same per-link mutex
+    twice in a row (once to check/update the learned remote address,
+    once immediately after just to record rx byte/packet counters).
+    Merged into a single lock acquisition. Live strace after 0.6.1
+    deployed showed futex contention essentially unchanged (~76-84% of
+    wall-clock time on both hosts), confirming the send-path fix alone
+    wasn't the full picture; this closes the matching gap on the
+    receive side. Real-world throughput impact still being measured on
+    both production hosts.
+
+ -- Jeff Parrish PC Services <www.jpps.us>  Mon, 31 Aug 2026 22:51:20 -0500
+
 mlvpn (0.6.1-1) unstable; urgency=high
 
   * Fix a real, confirmed throughput-limiting bug in the per-packet send

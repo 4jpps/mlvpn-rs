@@ -10,6 +10,12 @@ For implementation detail beyond what's here, read the code -- most
 modules and non-trivial functions have doc comments explaining the
 design, and `ARCHITECTURE.md` covers the system as a whole.
 
+## [0.6.2] - 2026-08-31
+
+### Fixed
+
+- **Follow-up to 0.6.1's send-path lock-contention fix: the receive path had a matching, smaller version of the same issue.** Every incoming Data packet locked the same per-link mutex twice in a row -- once to check/update the learned remote address (done for every packet type), once immediately after just to record rx byte/packet counters (Data-only). Merged into a single lock acquisition. Live `strace` after 0.6.1 was deployed showed futex contention essentially unchanged (~76-84% of wall-clock time on both production hosts), confirming the send-path fix alone wasn't the full picture; this closes the matching gap on the receive side.
+
 ## [0.6.1] - 2026-08-31
 
 ### Fixed
