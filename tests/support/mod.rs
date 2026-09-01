@@ -388,6 +388,14 @@ pub struct SchedulerOverrides {
     /// Used by `veth_primary_link_mode.rs` to exercise
     /// `scheduler.primary_link_mode`.
     pub primary_link_mode: bool,
+    /// Used by `veth_wireguard_style_immediate_delivery.rs` to exercise
+    /// `scheduler.follow_peer_primary`. `Config::validate` rejects this
+    /// being `true` at the same time as `primary_link_mode`/
+    /// `redundant_mode` on the same host, but nothing stops one host in
+    /// a pair using `primary_link_mode` and the other using
+    /// `follow_peer_primary`, which is exactly the topology that
+    /// feature is for.
+    pub follow_peer_primary: bool,
     /// Used by `veth_reorder_tuning.rs` to exercise
     /// `scheduler.auto_tune_reorder_window`.
     pub auto_tune_reorder_window: bool,
@@ -452,6 +460,7 @@ pub fn write_config(
     // conditional block rather than one per flag.
     if scheduler.redundant_mode
         || scheduler.primary_link_mode
+        || scheduler.follow_peer_primary
         || scheduler.auto_tune_reorder_window
         || scheduler.auto_tune_probe_interval
         || scheduler.auto_tune_ewma_alpha
@@ -464,6 +473,9 @@ pub fn write_config(
         }
         if scheduler.primary_link_mode {
             toml.push_str("primary_link_mode = true\n");
+        }
+        if scheduler.follow_peer_primary {
+            toml.push_str("follow_peer_primary = true\n");
         }
         if scheduler.auto_tune_reorder_window {
             toml.push_str("auto_tune_reorder_window = true\n");

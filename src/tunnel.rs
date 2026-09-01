@@ -3666,7 +3666,33 @@ async fn handle_incoming(
                 // module's "Locking discipline" doc comment and
                 // `ReorderBuffer::note_delivered`'s own doc comment for
                 // the full reasoning.
-                reorder.lock().await.note_delivered(hdr.seq, hdr.session_id);
+                //
+                // `Scheduler::primary` is driven entirely by monitor/
+                // probe ticks, not by Data-packet or session activity
+                // (see `scheduler.rs`), so once this branch engages it
+                // can stay engaged indefinitely -- the buffered branch
+                // below (which resets `peer_primary_link` on a session
+                // change) is NOT guaranteed to run again for the rest of
+                // the tunnel's lifetime. This branch must therefore
+                // perform that same `peer_primary_link` reset itself,
+                // using `note_delivered`'s own return value, or an
+                // adopted `peer_primary_link` would latch forever across
+                // every subsequent rekey once bypass mode takes over.
+                let session_changed = reorder.lock().await.note_delivered(hdr.seq, hdr.session_id);
+                if session_changed {
+                    *peer_primary_link.lock().unwrap() = None;
+                    // `info`, not `debug`: this only fires once per
+                    // rekey (a rare, low-frequency event), not per
+                    // packet, and is deliberately visible at the
+                    // default log level so it can be confirmed in
+                    // integration tests and real operator logs alike
+                    // (`tests/veth_wireguard_style_immediate_delivery.rs`
+                    // asserts on this exact line).
+                    tracing::info!(
+                        session_id = hdr.session_id,
+                        "cleared stale peer_primary_link in bypass mode after a session change"
+                    );
+                }
                 let _ = tun.send(&plaintext).await;
             } else {
                 let ready = {
@@ -4342,9 +4368,22 @@ impl ReorderBuffer {
     /// v0.5.3 rekey-stranding regression). Also performs the same
     /// session-id-change reset `reset_for_session` does, for the same
     /// rekey-safety reason.
-    fn note_delivered(&mut self, seq: u64, session_id: u32) {
-        self.reset_for_session(session_id);
+    ///
+    /// Returns `true` exactly when that session-id-change reset actually
+    /// happened (mirrors `reset_for_session`'s own return value).
+    /// `handle_incoming`'s bypass branch relies on this: `Scheduler::
+    /// primary` is driven purely by monitor/probe ticks (see
+    /// `scheduler.rs`), not by Data-packet or session activity, so once
+    /// bypass mode engages it can stay engaged indefinitely -- the
+    /// buffered branch (which is what resets `PeerPrimaryLink` on a
+    /// session change) is NOT guaranteed to run at all once bypass mode
+    /// takes over. The bypass branch therefore performs its own
+    /// `PeerPrimaryLink` reset using this return value, rather than
+    /// relying on the buffered branch to have done it.
+    fn note_delivered(&mut self, seq: u64, session_id: u32) -> bool {
+        let session_changed = self.reset_for_session(session_id);
         self.high_watermark = Some(self.high_watermark.map_or(seq, |wm| wm.max(seq)));
+        session_changed
     }
 
     /// Current window, in milliseconds -- used by `reorder_tuning_loop`
@@ -4443,9 +4482,13 @@ async fn reorder_flush(reorder: Arc<AsyncMutex<ReorderBuffer>>, tun: Arc<AsyncDe
         // negligible next to `reorder_window_ms`'s own 10-500ms range.
         // Requires no changes for settled-single-link bypass mode
         // (`ReorderBuffer::note_delivered`): bypass-mode packets never go
-        // through `insert`, so `pending` stays empty and `drain_ready`
-        // here correctly returns nothing to flush, every tick, for as
-        // long as bypass mode is active -- a harmless no-op, not a bug.
+        // through `insert`, so this tick's `drain_ready` correctly finds
+        // nothing new to flush while bypass mode is active -- a harmless
+        // no-op, not a bug. Note this only holds once bypass mode has
+        // been active long enough to drain whatever the buffered branch
+        // left in `pending` at the moment of the transition; `pending`
+        // isn't guaranteed empty at the instant bypass mode first
+        // engages.
         let Ok(mut ro) = reorder.try_lock() else {
             continue;
         };
@@ -4651,13 +4694,16 @@ mod reorder_tuning_tests {
 
         // note_delivered (the bypass-mode path) advances the watermark
         // directly, without going through insert/drain_ready at all.
-        buf.note_delivered(100, 1);
+        // Same session as already established above, so this must NOT
+        // report a session change.
+        assert!(!buf.note_delivered(100, 1));
 
         // The watermark is now 100 -- entry 5 is far behind it, so a
         // later drain_ready (e.g. if bypass mode ends and buffered mode
         // resumes) would treat it as forward-progress-eligible... but
         // note_delivered itself must not have removed or delivered it:
         // pending still holds it exactly as inserted.
+        assert_eq!(buf.high_watermark, Some(100));
         assert_eq!(buf.pending.len(), 1);
         assert!(buf.pending.contains_key(&5));
     }
@@ -4685,14 +4731,17 @@ mod reorder_tuning_tests {
     #[test]
     fn note_delivered_resets_on_session_id_change() {
         let mut buf = ReorderBuffer::new(50);
-        buf.note_delivered(100, 1);
+        assert!(buf.note_delivered(100, 1)); // fresh buffer: session_id was None, so this is a "change"
 
         // A different session_id (the rekey case) must reset the
         // watermark, the same way reset_for_session already does for
         // the buffered path -- otherwise this reintroduces the exact
         // rekey-stranding bug (v0.5.3) this project already fixed once,
-        // just via a different call path.
-        buf.note_delivered(5, 2);
+        // just via a different call path. It must also report the
+        // change happened (`true`) -- `handle_incoming`'s bypass branch
+        // (see C1 fix) relies on exactly this return value to reset
+        // `peer_primary_link` on the same event.
+        assert!(buf.note_delivered(5, 2));
 
         // Watermark reset to reflect only session 2's traffic: seq 5
         // was the first frame of the new session, so a later seq 6
