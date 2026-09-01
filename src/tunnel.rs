@@ -4506,12 +4506,16 @@ fn suggest_reorder_window_ms(
 /// that field's doc comment in `config.rs`) -- returns immediately in
 /// that case rather than the caller needing to conditionally spawn this
 /// task at all. Periodically recomputes a suggested `reorder_window_ms`
-/// from the live RTT spread across currently-Up links
 /// (`suggest_reorder_window_ms`) and applies it only if it clears a
 /// hysteresis threshold against the value currently in effect, so a
-/// single noisy RTT sample can't chase the window back and forth every
+/// single noisy sample can't chase the window back and forth every
 /// tick -- the same principle as the existing Up/Down hysteresis in
-/// `monitor.rs`. See `ARCHITECTURE.md` §7 for the full design.
+/// `monitor.rs`. The suggestion itself is scheduling-mode-aware: with a
+/// settled `Scheduler::primary()` (`primary_link_mode`/
+/// `follow_peer_primary`), it's driven entirely by that one link's own
+/// jitter, not RTT spread across every Up link -- see
+/// `suggest_reorder_window_ms`'s own doc comment for the full reasoning.
+/// See `ARCHITECTURE.md` §7 for the original design this extends.
 async fn reorder_tuning_loop(
     links: Links,
     reorder: Arc<AsyncMutex<ReorderBuffer>>,
