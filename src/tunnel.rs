@@ -128,6 +128,23 @@
 //! is slowest to receive -- exactly the kind of head-of-line blocking a
 //! multi-link bonding daemon exists to avoid.
 //!
+//! `session: Arc<AsyncRwLock<crypto::SessionState>>` follows the same
+//! "don't hold an exclusive lock across work that doesn't need it"
+//! principle, modeled directly on WireGuard's own design (its outgoing
+//! nonce is a lock-free atomic; its lock only ever guards which keypair
+//! is active, never the AEAD computation itself). `SessionState::encrypt`
+//! has always taken `&self` -- it only reads the active session's key
+//! material and calls the already-lock-free `next_send_seq()`
+//! (`AtomicU64::fetch_add`) -- so every encrypt call site (real Data,
+//! Probe replies, StatsShare, VersionInfo, ThroughputTest) uses
+//! `.read().await` and can now proceed concurrently with every other
+//! encrypt, instead of serializing behind them the way a plain `Mutex`
+//! forces even read-only access to. Only `decrypt`/`install`/
+//! `expire_previous` genuinely mutate state (the replay window, or
+//! which session is active during a rekey) and use `.write().await`,
+//! which still excludes every reader while it runs, so an in-flight
+//! encrypt can never observe a torn mid-swap `active` session.
+//!
 //! **Rekeying and session migration.** The initial handshake is raced
 //! across every configured link (`establish_session`'s `Mode::Client`
 //! arm and `race_handshake_reply` below); the *same* broadcast-and-race
@@ -631,17 +648,18 @@ impl ThroughputTestContext {
 }
 
 /// Session identity/uptime/rekey-count, readable by `control::serve`
-/// without ever contending with `SessionState`'s own mutex -- which is
-/// locked on every single outgoing packet (`tun_reader`'s
-/// `s.encrypt(...)` call). Adding a getter directly to `SessionState`
-/// and polling it once per connected monitoring client per 500ms tick
-/// would add read contention against that hot-path lock, however
-/// small; this project has already been burned once by underestimated
-/// per-packet lock contention (see `link::LinkScore`'s doc comment), so
-/// it's kept as its own independent, rarely-touched piece of state
-/// instead. `established_at` uses a plain `std::sync::Mutex` (not the
-/// async one `SessionState` uses) since it's only ever touched at
-/// rekey time (every few minutes at most) and once per monitoring
+/// without touching `SessionState` at all. `SessionState` is now an
+/// `RwLock` with encrypt on the shared read side (see this module's
+/// "Locking discipline" doc comment) -- a getter added directly to it
+/// would take a `.read()`, which would NOT contend with the hot-path
+/// encrypt calls it used to when `SessionState` was a plain `Mutex`.
+/// Still kept as its own independent piece of state regardless: this
+/// project has already been burned once by underestimated per-packet
+/// lock contention (see `link::LinkScore`'s doc comment), and this
+/// data changes rarely enough (rekey, every few minutes at most) that
+/// there's no real cost to keeping it separate either way.
+/// `established_at` uses a plain `std::sync::Mutex` (not an async one)
+/// since it's only ever touched at rekey time and once per monitoring
 /// tick -- nowhere near contended enough to need async-aware locking.
 pub(crate) struct SessionMeta {
     session_id: std::sync::atomic::AtomicU32,
