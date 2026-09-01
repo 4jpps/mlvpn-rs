@@ -3648,21 +3648,43 @@ async fn handle_incoming(
 
     match hdr.ptype {
         PacketType::Data => {
-            let ready = {
-                let mut ro = reorder.lock().await;
-                let session_changed = ro.reset_for_session(hdr.session_id);
-                if session_changed {
-                    // Mirrors the ReorderBuffer rekey-stranding fix
-                    // (v0.5.3): `peer_primary_link` is tunnel-lifetime
-                    // state too, so it must not survive a session change
-                    // unbounded -- see `PeerPrimaryLink`'s doc comment.
-                    *peer_primary_link.lock().unwrap() = None;
+            // Cheap, uncontended std::sync::Mutex lock (same pattern
+            // established by this project's earlier select_fast and
+            // reorder_tuning_loop fixes) -- read once per packet, not
+            // cached in a persistent flag, so a mid-stream transition
+            // (the primary going Down or a peer-followed primary
+            // settling) is picked up on the very next packet either
+            // way, correctly, since note_delivered and the buffered
+            // path's own watermark update both keep high_watermark
+            // in sync regardless of which path handled any given
+            // packet.
+            if scheduler.lock().unwrap().primary().is_some() {
+                // Settled single active link: no cross-link reordering
+                // is possible, so skip time-based buffering entirely
+                // and deliver immediately, matching WireGuard's own
+                // architecture for single-path tunnels -- see this
+                // module's "Locking discipline" doc comment and
+                // `ReorderBuffer::note_delivered`'s own doc comment for
+                // the full reasoning.
+                reorder.lock().await.note_delivered(hdr.seq, hdr.session_id);
+                let _ = tun.send(&plaintext).await;
+            } else {
+                let ready = {
+                    let mut ro = reorder.lock().await;
+                    let session_changed = ro.reset_for_session(hdr.session_id);
+                    if session_changed {
+                        // Mirrors the ReorderBuffer rekey-stranding fix
+                        // (v0.5.3): `peer_primary_link` is tunnel-lifetime
+                        // state too, so it must not survive a session change
+                        // unbounded -- see `PeerPrimaryLink`'s doc comment.
+                        *peer_primary_link.lock().unwrap() = None;
+                    }
+                    ro.insert(hdr.seq, plaintext);
+                    ro.drain_ready()
+                };
+                for pkt in ready {
+                    let _ = tun.send(&pkt).await;
                 }
-                ro.insert(hdr.seq, plaintext);
-                ro.drain_ready()
-            };
-            for pkt in ready {
-                let _ = tun.send(&pkt).await;
             }
         }
         PacketType::Probe => {
@@ -4302,6 +4324,29 @@ impl ReorderBuffer {
         }
     }
 
+    /// Bypass-mode counterpart to `insert`+`drain_ready`: used when
+    /// `Scheduler::primary()` is settled on a single active link (see
+    /// `handle_incoming`'s `PacketType::Data` arm), where every packet
+    /// is delivered to `tun` immediately, matching WireGuard's own
+    /// architecture for single-path tunnels -- no time-based buffering
+    /// at all, since there's no cross-link reordering to protect
+    /// against with only one active link.
+    ///
+    /// Advances `high_watermark` the same way `drain_ready` does for a
+    /// forward-progress frame, WITHOUT touching `pending` -- keeps the
+    /// watermark accurate for whenever buffered mode resumes (the
+    /// primary goes Down, falling back to multi-link delivery), so that
+    /// path doesn't reintroduce the exact stale-watermark failure mode
+    /// this project already fixed once (the original reorder-buffer
+    /// delay bug) and hit again in a different form once more (the
+    /// v0.5.3 rekey-stranding regression). Also performs the same
+    /// session-id-change reset `reset_for_session` does, for the same
+    /// rekey-safety reason.
+    fn note_delivered(&mut self, seq: u64, session_id: u32) {
+        self.reset_for_session(session_id);
+        self.high_watermark = Some(self.high_watermark.map_or(seq, |wm| wm.max(seq)));
+    }
+
     /// Current window, in milliseconds -- used by `reorder_tuning_loop`
     /// to compare a freshly suggested value against what's actually in
     /// effect right now (hysteresis).
@@ -4396,6 +4441,11 @@ async fn reorder_flush(reorder: Arc<AsyncMutex<ReorderBuffer>>, tun: Arc<AsyncDe
         // worst case is a genuinely idle straggler waits one extra
         // ~10ms tick before its own staleness timeout flushes it,
         // negligible next to `reorder_window_ms`'s own 10-500ms range.
+        // Requires no changes for settled-single-link bypass mode
+        // (`ReorderBuffer::note_delivered`): bypass-mode packets never go
+        // through `insert`, so `pending` stays empty and `drain_ready`
+        // here correctly returns nothing to flush, every tick, for as
+        // long as bypass mode is active -- a harmless no-op, not a bug.
         let Ok(mut ro) = reorder.try_lock() else {
             continue;
         };
@@ -4574,6 +4624,130 @@ mod reorder_tuning_tests {
         assert_eq!(rb.window_ms(), 50);
         rb.set_window(120);
         assert_eq!(rb.window_ms(), 120);
+    }
+
+    #[test]
+    fn note_delivered_updates_watermark_without_touching_pending() {
+        let mut buf = ReorderBuffer::new(50);
+        // Establish session 1 the same way handle_incoming does
+        // (reset_for_session before the first insert) -- session_id is
+        // only ever set by reset_for_session, never by insert alone, so
+        // without this the later note_delivered(_, 1) call below would
+        // see session_id still None, treat it as a session change, and
+        // wipe pending before this test can observe anything.
+        buf.reset_for_session(1);
+        // Prime a watermark ahead of 5 first -- on a genuinely fresh
+        // buffer (high_watermark still None), drain_ready's own
+        // forward-progress test (`is_none_or`) treats *any* first
+        // frame as forward progress, so this out-of-order case only
+        // arises once something later has already been delivered.
+        buf.insert(10, vec![10]);
+        assert_eq!(buf.drain_ready(), vec![vec![10]]); // watermark now 10
+
+        // A genuinely out-of-order entry sitting in pending, buffered
+        // the normal way.
+        buf.insert(5, vec![5]);
+        assert_eq!(buf.drain_ready(), Vec::<Vec<u8>>::new()); // nothing forward-progress yet (5 < 10)
+
+        // note_delivered (the bypass-mode path) advances the watermark
+        // directly, without going through insert/drain_ready at all.
+        buf.note_delivered(100, 1);
+
+        // The watermark is now 100 -- entry 5 is far behind it, so a
+        // later drain_ready (e.g. if bypass mode ends and buffered mode
+        // resumes) would treat it as forward-progress-eligible... but
+        // note_delivered itself must not have removed or delivered it:
+        // pending still holds it exactly as inserted.
+        assert_eq!(buf.pending.len(), 1);
+        assert!(buf.pending.contains_key(&5));
+    }
+
+    #[test]
+    fn note_delivered_advances_watermark_monotonically() {
+        let mut buf = ReorderBuffer::new(50);
+        buf.note_delivered(10, 1);
+        buf.note_delivered(50, 1);
+        // A lower seq arriving after a higher one (still real, on a
+        // single link occasionally) must not move the watermark
+        // backward.
+        buf.note_delivered(20, 1);
+
+        // Confirm indirectly via drain_ready's own forward-progress
+        // test: inserting exactly at the current watermark (50) must
+        // NOT be treated as forward progress (a real regression this
+        // test would catch: if note_delivered had let the watermark
+        // fall back to 20, seq 50 would wrongly look like forward
+        // progress here).
+        buf.insert(50, vec![50]);
+        assert_eq!(buf.drain_ready(), Vec::<Vec<u8>>::new());
+    }
+
+    #[test]
+    fn note_delivered_resets_on_session_id_change() {
+        let mut buf = ReorderBuffer::new(50);
+        buf.note_delivered(100, 1);
+
+        // A different session_id (the rekey case) must reset the
+        // watermark, the same way reset_for_session already does for
+        // the buffered path -- otherwise this reintroduces the exact
+        // rekey-stranding bug (v0.5.3) this project already fixed once,
+        // just via a different call path.
+        buf.note_delivered(5, 2);
+
+        // Watermark reset to reflect only session 2's traffic: seq 5
+        // was the first frame of the new session, so a later seq 6
+        // must be forward progress.
+        buf.insert(6, vec![6]);
+        assert_eq!(buf.drain_ready(), vec![vec![6]]);
+    }
+
+    #[test]
+    fn bypass_then_resume_buffered_mode_keeps_watermark_accurate() {
+        // The full transition scenario the watermark-staleness fix
+        // exists for: buffered mode, then bypass mode advances the
+        // watermark far ahead via note_delivered, then buffered mode
+        // resumes and must not treat already-passed sequence numbers
+        // as forward progress just because it never itself saw them.
+        let mut buf = ReorderBuffer::new(50);
+        // Establish session 1 first (see note_delivered_updates_
+        // watermark_without_touching_pending's comment for why): without
+        // this, the note_delivered(500, 1) call below would see
+        // session_id still None and wrongly reset pending/high_watermark
+        // instead of exercising the same-session watermark-advance path.
+        buf.reset_for_session(1);
+
+        // Buffered mode: seq 10 delivered normally.
+        buf.insert(10, vec![10]);
+        assert_eq!(buf.drain_ready(), vec![vec![10]]); // watermark now 10
+
+        // Bypass mode takes over (e.g. primary_link_mode settles):
+        // real traffic keeps flowing via note_delivered, advancing far
+        // past what buffered mode itself ever processed.
+        buf.note_delivered(500, 1);
+
+        // Buffered mode resumes (e.g. the primary went Down). A late
+        // frame with a seq between the old and new watermark must be
+        // correctly recognized as behind the watermark, not wrongly
+        // treated as forward progress just because buffered mode
+        // itself never saw seq 500 go by.
+        buf.insert(200, vec![200]);
+        assert_eq!(buf.drain_ready(), Vec::<Vec<u8>>::new());
+
+        // drain_ready only ever delivers from the front of `pending` in
+        // ascending-seq order (pre-existing, unmodified behavior --
+        // see reorder_buffer_preserves_order_for_buffered_frames_below_
+        // watermark) -- so the still-stuck 200 entry would otherwise
+        // block 600 from ever being reached, regardless of 600 being
+        // past the watermark. That in-order blocking is intentional
+        // and out of scope for this task; remove the stuck entry
+        // directly so this assertion isolates exactly what this test
+        // is for: that note_delivered's watermark stayed accurate.
+        buf.pending.remove(&200);
+
+        // A genuinely new frame past the bypass-mode watermark is
+        // still correctly forward progress.
+        buf.insert(600, vec![600u64 as u8]);
+        assert_eq!(buf.drain_ready(), vec![vec![600u64 as u8]]);
     }
 
     #[test]
