@@ -55,7 +55,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UdpSocket, UnixListener, UnixStream};
-use tokio::sync::{mpsc, Mutex as AsyncMutex};
+use tokio::sync::{mpsc, RwLock as AsyncRwLock};
 use tokio::time::interval;
 
 const SNAPSHOT_INTERVAL_MS: u64 = 500;
@@ -398,7 +398,7 @@ pub(crate) struct DiagContext {
 pub(crate) async fn serve_commands(
     path: PathBuf,
     links: Links,
-    session: Arc<AsyncMutex<SessionState>>,
+    session: Arc<AsyncRwLock<SessionState>>,
     throughput_test_ctx: Arc<ThroughputTestContext>,
     tunnel_test_ctx: Arc<tunneltest::TunnelTestContext>,
     mtu: crate::tunnel::LiveMtu,
@@ -489,7 +489,7 @@ pub(crate) async fn serve_commands(
 async fn serve_command_client(
     stream: UnixStream,
     links: Links,
-    session: Arc<AsyncMutex<SessionState>>,
+    session: Arc<AsyncRwLock<SessionState>>,
     throughput_test_ctx: Arc<ThroughputTestContext>,
     tunnel_test_ctx: Arc<tunneltest::TunnelTestContext>,
     mtu: crate::tunnel::LiveMtu,
@@ -544,7 +544,7 @@ async fn serve_command_client(
 async fn apply_command(
     cmd: Command,
     links: &Links,
-    session: &Arc<AsyncMutex<SessionState>>,
+    session: &Arc<AsyncRwLock<SessionState>>,
     throughput_test_ctx: &Arc<ThroughputTestContext>,
     tunnel_test_ctx: &Arc<tunneltest::TunnelTestContext>,
     mtu: crate::tunnel::LiveMtu,
@@ -1081,7 +1081,7 @@ const THROUGHPUT_TEST_RESULT_GRACE: Duration = Duration::from_secs(5);
 #[allow(clippy::too_many_arguments)]
 async fn run_throughput_test_command(
     links: &Links,
-    session: &Arc<AsyncMutex<SessionState>>,
+    session: &Arc<AsyncRwLock<SessionState>>,
     throughput_test_ctx: &Arc<ThroughputTestContext>,
     mtu: crate::tunnel::LiveMtu,
     link: Option<String>,
@@ -1198,7 +1198,7 @@ async fn run_throughput_test_leg_upload(
     socket: &Arc<UdpSocket>,
     remote: SocketAddr,
     link_id: u8,
-    session: &Arc<AsyncMutex<SessionState>>,
+    session: &Arc<AsyncRwLock<SessionState>>,
     throughput_test_ctx: &Arc<ThroughputTestContext>,
     mtu: crate::tunnel::LiveMtu,
 ) -> (Option<f64>, Vec<(f64, Option<f64>)>) {
@@ -1256,7 +1256,7 @@ async fn run_throughput_test_leg_download(
     socket: &Arc<UdpSocket>,
     remote: SocketAddr,
     link_id: u8,
-    session: &Arc<AsyncMutex<SessionState>>,
+    session: &Arc<AsyncRwLock<SessionState>>,
     throughput_test_ctx: &Arc<ThroughputTestContext>,
     duration_secs: u32,
 ) -> Option<f64> {

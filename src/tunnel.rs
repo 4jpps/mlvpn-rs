@@ -274,6 +274,7 @@ use tokio::net::UdpSocket;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::mpsc::{self, error::TrySendError};
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::RwLock as AsyncRwLock;
 use tokio::task::JoinSet;
 use tokio::time::interval;
 use tun_rs::AsyncDevice;
@@ -752,7 +753,7 @@ pub async fn run(
     let params = Arc::new(params);
 
     let (session_id, session) = establish_session_with_retry(&links, &params).await;
-    let session = Arc::new(AsyncMutex::new(SessionState::new(session_id, session)));
+    let session = Arc::new(AsyncRwLock::new(SessionState::new(session_id, session)));
     let session_meta = Arc::new(SessionMeta::new(session_id));
 
     tracing::info!(session_id, "tunnel session established");
@@ -1197,7 +1198,7 @@ pub async fn run(
 /// falls back to noticing via the probe timeout it would have hit
 /// anyway -- a clean shutdown should never block on this succeeding,
 /// which is also why this doesn't retry.
-async fn broadcast_disconnect(links: &Links, session: &Arc<AsyncMutex<SessionState>>) {
+async fn broadcast_disconnect(links: &Links, session: &Arc<AsyncRwLock<SessionState>>) {
     let targets: Vec<(LinkHandle, SocketAddr, u8)> = {
         let snap = link::snapshot_links(links).await;
         snap.iter()
@@ -1209,7 +1210,7 @@ async fn broadcast_disconnect(links: &Links, session: &Arc<AsyncMutex<SessionSta
     // plaintext is a perfectly valid AEAD message (just the tag, no
     // ciphertext body) -- Disconnect carries no payload, it's the frame
     // type itself that's the whole signal.
-    let Ok((session_id, seq, ciphertext)) = session.lock().await.encrypt(&[]) else {
+    let Ok((session_id, seq, ciphertext)) = session.read().await.encrypt(&[]) else {
         return;
     };
 
@@ -1831,7 +1832,7 @@ const RESOLVE_ALTERNATE_TIMEOUT: Duration = Duration::from_secs(2);
 /// back to its primary and drops the alternate -- exactly the old
 /// behavior, so this can only ever improve a link's outcome, never make
 /// one worse than before this existed.
-async fn resolve_remaining_alternates(links: &Links, session: &Arc<AsyncMutex<SessionState>>) {
+async fn resolve_remaining_alternates(links: &Links, session: &Arc<AsyncRwLock<SessionState>>) {
     let snap = link::snapshot_links(links).await;
     let mut join_set: JoinSet<(u8, Option<SocketAddr>)> = JoinSet::new();
     for link in snap.iter() {
@@ -1901,7 +1902,7 @@ async fn probe_one_address(
     handle: LinkHandle,
     remote: SocketAddr,
     link_id: u8,
-    session: Arc<AsyncMutex<SessionState>>,
+    session: Arc<AsyncRwLock<SessionState>>,
 ) -> Option<SocketAddr> {
     let probe_seq = crypto::random_session_id();
     let now_ns = SystemTime::now()
@@ -1916,7 +1917,7 @@ async fn probe_one_address(
 
     let socket = handle.current_socket().await;
     let (session_id, seq, ciphertext) = {
-        let s = session.lock().await;
+        let s = session.read().await;
         s.encrypt(&payload).ok()?
     };
     let mut frame = Vec::with_capacity(HEADER_LEN + ciphertext.len());
@@ -1943,7 +1944,7 @@ async fn probe_one_address(
             continue;
         }
         let plaintext = {
-            let mut s = session.lock().await;
+            let mut s = session.write().await;
             match s.decrypt(hdr.session_id, hdr.seq, ct) {
                 Ok(pt) => pt,
                 Err(_) => continue,
@@ -2056,7 +2057,7 @@ pub(crate) struct OutboundFrame {
 
 async fn tun_reader(
     tun: Arc<AsyncDevice>,
-    session: Arc<AsyncMutex<SessionState>>,
+    session: Arc<AsyncRwLock<SessionState>>,
     mtu: LiveMtu,
     clamp_mss: bool,
     tx: mpsc::Sender<OutboundFrame>,
@@ -2102,7 +2103,7 @@ async fn tun_reader(
         // is now active -- see `crypto::SessionState::encrypt`'s doc
         // comment.
         let (session_id, seq, ciphertext) = {
-            let s = session.lock().await;
+            let s = session.read().await;
             s.encrypt(&plaintext)?
         };
 
@@ -2377,7 +2378,7 @@ async fn send_redundant(links: &Links, session_id: u32, seq: u64, ciphertext: &[
 async fn link_receiver(
     idx: usize,
     links: Links,
-    session: Arc<AsyncMutex<SessionState>>,
+    session: Arc<AsyncRwLock<SessionState>>,
     scheduler: Arc<std::sync::Mutex<Scheduler>>,
     tun: Arc<AsyncDevice>,
     reorder: Arc<AsyncMutex<ReorderBuffer>>,
@@ -2484,7 +2485,7 @@ async fn link_receiver(
 async fn link_prober(
     idx: usize,
     links: Links,
-    session: Arc<AsyncMutex<SessionState>>,
+    session: Arc<AsyncRwLock<SessionState>>,
     scheduler: Arc<std::sync::Mutex<Scheduler>>,
     cfg: SchedulerConfig,
     mtu: LiveMtu,
@@ -3049,7 +3050,7 @@ fn ramp_result_still_valid(
 async fn active_bandwidth_prober(
     idx: usize,
     links: Links,
-    session: Arc<AsyncMutex<SessionState>>,
+    session: Arc<AsyncRwLock<SessionState>>,
     cfg: SchedulerConfig,
     mtu: LiveMtu,
     throughput_test_ctx: Arc<ThroughputTestContext>,
@@ -3301,7 +3302,7 @@ pub(crate) async fn send_throughput_test_stream(
     socket: Arc<UdpSocket>,
     remote: SocketAddr,
     link_id: u8,
-    session: Arc<AsyncMutex<SessionState>>,
+    session: Arc<AsyncRwLock<SessionState>>,
     test_id: u32,
     duration: Duration,
     mtu: LiveMtu,
@@ -3328,14 +3329,14 @@ pub(crate) async fn send_throughput_test_stream(
         socket: &Arc<UdpSocket>,
         remote: SocketAddr,
         link_id: u8,
-        session: &Arc<AsyncMutex<SessionState>>,
+        session: &Arc<AsyncRwLock<SessionState>>,
         test_id: u32,
         done: bool,
         payload_len: usize,
     ) -> Result<()> {
         let payload = ThroughputTestDataPayload { test_id, done }.encode_padded(payload_len);
         let (session_id, seq, ct) = {
-            let s = session.lock().await;
+            let s = session.read().await;
             s.encrypt(&payload)?
         };
         let mut out = Vec::with_capacity(HEADER_LEN + ct.len());
@@ -3436,7 +3437,7 @@ pub(crate) async fn send_throughput_test_reverse_request(
     socket: &Arc<UdpSocket>,
     remote: SocketAddr,
     link_id: u8,
-    session: &Arc<AsyncMutex<SessionState>>,
+    session: &Arc<AsyncRwLock<SessionState>>,
     test_id: u32,
     duration_secs: u32,
 ) -> Result<()> {
@@ -3446,7 +3447,7 @@ pub(crate) async fn send_throughput_test_reverse_request(
     }
     .encode();
     let (session_id, seq, ct) = {
-        let s = session.lock().await;
+        let s = session.read().await;
         s.encrypt(&payload)?
     };
     let mut out = Vec::with_capacity(HEADER_LEN + ct.len());
@@ -3470,7 +3471,7 @@ async fn handle_incoming(
     from: SocketAddr,
     socket: &Arc<UdpSocket>,
     links: &Links,
-    session: &Arc<AsyncMutex<SessionState>>,
+    session: &Arc<AsyncRwLock<SessionState>>,
     scheduler: &Arc<std::sync::Mutex<Scheduler>>,
     tun: &Arc<AsyncDevice>,
     reorder: &Arc<AsyncMutex<ReorderBuffer>>,
@@ -3534,7 +3535,7 @@ async fn handle_incoming(
                 // (see `crypto::SessionState::is_known_session_id`'s doc
                 // comment), so this can only ever filter out exactly the
                 // stale-duplicate case, never a real one.
-                if session.lock().await.is_known_session_id(hdr.session_id) {
+                if session.read().await.is_known_session_id(hdr.session_id) {
                     tracing::debug!(
                         session_id = hdr.session_id,
                         %from,
@@ -3559,7 +3560,7 @@ async fn handle_incoming(
                             if let Some(l) = links.get(idx) {
                                 l.lock().await.remote = Some(from);
                             }
-                            session.lock().await.install(new_id, new_session);
+                            session.write().await.install(new_id, new_session);
                             session_meta.record_rekey(new_id);
                             tracing::info!(session_id = new_id, "session rekeyed (peer-initiated)");
                         }
@@ -3592,7 +3593,7 @@ async fn handle_incoming(
             return;
         }
         _ => {
-            let mut s = session.lock().await;
+            let mut s = session.write().await;
             match s.decrypt(hdr.session_id, hdr.seq, ciphertext) {
                 Ok(pt) => pt,
                 Err(_) => return, // auth failure, replay, or unrecognized session id; silently drop
@@ -3660,7 +3661,7 @@ async fn handle_incoming(
             // the peer hasn't adopted yet, right at the moment of a
             // rekey, is expected and self-corrects.
             let encrypted = {
-                let s = session.lock().await;
+                let s = session.read().await;
                 s.encrypt(&plaintext)
             };
             let Ok((reply_session_id, reply_seq, reply_ct)) = encrypted else {
@@ -3766,7 +3767,7 @@ async fn handle_incoming(
                     achieved_mbps: achieved_mbps as f32,
                 };
                 let encrypted = {
-                    let s = session.lock().await;
+                    let s = session.read().await;
                     s.encrypt(&result_payload.encode())
                 };
                 if let Ok((reply_session_id, reply_seq, reply_ct)) = encrypted {
@@ -3972,7 +3973,7 @@ async fn send_probe(
     link_id: u8,
     links: &Links,
     idx: usize,
-    session: &Arc<AsyncMutex<SessionState>>,
+    session: &Arc<AsyncRwLock<SessionState>>,
     probe_seq_counter: &AtomicU32,
     tracker: &mut ProbeTracker,
 ) -> ProbeSendOutcome {
@@ -3993,7 +3994,7 @@ async fn send_probe(
     .encode();
 
     let (session_id, seq, ciphertext) = {
-        let s = session.lock().await;
+        let s = session.read().await;
         match s.encrypt(&payload) {
             Ok(v) => v,
             // Not a socket problem, so not a reconnect signal either --
@@ -4039,7 +4040,7 @@ async fn send_stats_share(
     link_id: u8,
     links: &Links,
     idx: usize,
-    session: &Arc<AsyncMutex<SessionState>>,
+    session: &Arc<AsyncRwLock<SessionState>>,
 ) {
     let (remote, payload) = {
         let link = links[idx].lock().await;
@@ -4057,7 +4058,7 @@ async fn send_stats_share(
 
     let plaintext = payload.encode();
     let (session_id, seq, ciphertext) = {
-        let s = session.lock().await;
+        let s = session.read().await;
         match s.encrypt(&plaintext) {
             Ok(v) => v,
             Err(_) => return,
@@ -4088,7 +4089,7 @@ async fn send_version_info(
     link_id: u8,
     links: &Links,
     idx: usize,
-    session: &Arc<AsyncMutex<SessionState>>,
+    session: &Arc<AsyncRwLock<SessionState>>,
     mtu: &LiveMtu,
     scheduler: &Arc<std::sync::Mutex<Scheduler>>,
 ) {
@@ -4118,7 +4119,7 @@ async fn send_version_info(
     };
     let plaintext = payload.encode();
     let (session_id, seq, ciphertext) = {
-        let s = session.lock().await;
+        let s = session.read().await;
         match s.encrypt(&plaintext) {
             Ok(v) => v,
             Err(_) => return,
@@ -4159,7 +4160,7 @@ async fn send_version_info(
 async fn rekey_loop(
     links: Links,
     params: Arc<TunnelParams>,
-    session: Arc<AsyncMutex<SessionState>>,
+    session: Arc<AsyncRwLock<SessionState>>,
     rekey_ctx: Arc<RekeyContext>,
     session_meta: Arc<SessionMeta>,
     reconnect: Arc<tokio::sync::Notify>,
@@ -4186,7 +4187,7 @@ async fn rekey_loop(
         // doc comment for why that distinction matters mid-session.
         match perform_client_handshake(&links, &params, Some(&rekey_ctx)).await {
             Ok((new_id, new_session)) => {
-                session.lock().await.install(new_id, new_session);
+                session.write().await.install(new_id, new_session);
                 session_meta.record_rekey(new_id);
                 tracing::info!(session_id = new_id, "session rekeyed");
             }
@@ -4209,11 +4210,14 @@ async fn rekey_loop(
 /// means having accepted a peer-initiated one -- this task is cheap
 /// enough to just always run rather than being conditionally spawned
 /// like `rekey_loop`.
-async fn session_expiry_loop(session: Arc<AsyncMutex<SessionState>>) {
+async fn session_expiry_loop(session: Arc<AsyncRwLock<SessionState>>) {
     let mut tick = interval(SESSION_EXPIRY_CHECK_INTERVAL);
     loop {
         tick.tick().await;
-        session.lock().await.expire_previous(SESSION_OVERLAP_WINDOW);
+        session
+            .write()
+            .await
+            .expire_previous(SESSION_OVERLAP_WINDOW);
     }
 }
 
