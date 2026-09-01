@@ -10,6 +10,12 @@ For implementation detail beyond what's here, read the code -- most
 modules and non-trivial functions have doc comments explaining the
 design, and `ARCHITECTURE.md` covers the system as a whole.
 
+## [0.6.5] - 2026-09-01
+
+### Fixed
+
+- **Reorder-window auto-tuning (`scheduler.auto_tune_reorder_window`) is now scheduling-mode-aware and jitter-aware.** Previously it computed the suggested `reorder_window_ms` purely from RTT spread across every currently-Up link, regardless of whether the active scheduling mode could actually deliver packets from more than one of them. With `primary_link_mode`/`follow_peer_primary` settled on a single active link, an idle backup link's own RTT (which can be dramatically different -- e.g. a cellular backup vs. a wired primary) was still inflating the auto-tuned window, adding real, unnecessary latency to every packet on the actual active link. The formula also never read `jitter_ms` at all, despite it already being tracked per link as an RFC 3550-style EWMA -- a link's own timing variance, not its distance from another link, is the physically correct signal for how much a single link's own packets could legitimately arrive out of order. Now: with a settled `Scheduler::primary()`, the suggestion is driven entirely by that one link's own jitter (multiplier 4.0, deliberately mirroring TCP's own RTO formula, Jacobson/Karels `RTO = SRTT + 4*RTTVAR`); without a settled primary (plain SWRR, `redundant_mode`, or a primary/follow mode before one has settled), it combines the existing RTT-spread term (multiplier 1.5, unchanged) with a new worst-case-jitter term across Up links. No new config fields; existing `reorder_window_min_ms`/`reorder_window_max_ms` bounds and hysteresis logic are unchanged. This targets a real production throughput investigation: tunneled TCP was observed exhibiting sawtooth retransmission-timeout cycling (bursts to 60+ Mbps followed by complete collapses to zero, repeating) despite 0% loss reported by mlvpn's own active probes and the raw physical path independently measuring 886 Mbps of sustained capacity -- the suspected root cause is exactly this kind of unnecessary tunnel-induced latency variance tripping TCP's own RTO estimate, even though nothing is actually being lost end-to-end.
+
 ## [0.6.4] - 2026-09-01
 
 ### Fixed

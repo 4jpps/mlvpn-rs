@@ -1,3 +1,30 @@
+mlvpn (0.6.5-1) unstable; urgency=high
+
+  * Reorder-window auto-tuning (scheduler.auto_tune_reorder_window) is
+    now scheduling-mode-aware and jitter-aware. Previously it computed
+    the suggested reorder_window_ms purely from RTT spread across every
+    currently-Up link, regardless of whether the active scheduling mode
+    could actually deliver packets from more than one of them -- with
+    primary_link_mode/follow_peer_primary settled on a single active
+    link, an idle backup link's own RTT (which can be dramatically
+    different, e.g. a cellular backup vs. a wired primary) was still
+    inflating the auto-tuned window, adding real, unnecessary latency
+    to every packet on the actual active link. The formula also never
+    read jitter_ms, despite it already being tracked per link. Now:
+    with a settled Scheduler primary, the suggestion uses only that
+    link's own jitter (mirroring TCP's own RTO formula, Jacobson/Karels
+    RTO = SRTT + 4*RTTVAR); without one, it combines the existing RTT-
+    spread term with a new worst-case-jitter term across Up links. This
+    targets a real production throughput investigation: tunneled TCP
+    was observed exhibiting sawtooth retransmission-timeout cycling
+    (bursts followed by complete collapses to zero) despite 0% loss on
+    mlvpn's own probes and the raw physical path independently
+    measuring far higher sustained capacity -- suspected root cause is
+    exactly this kind of unnecessary tunnel-induced latency variance
+    tripping TCP's own RTO estimate.
+
+ -- Jeff Parrish PC Services <www.jpps.us>  Tue, 01 Sep 2026 14:25:22 -0500
+
 mlvpn (0.6.4-1) unstable; urgency=high
 
   * Fourth same-night follow-up: reorder_flush (a periodic task ticking
