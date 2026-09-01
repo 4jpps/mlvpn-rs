@@ -10,6 +10,12 @@ For implementation detail beyond what's here, read the code -- most
 modules and non-trivial functions have doc comments explaining the
 design, and `ARCHITECTURE.md` covers the system as a whole.
 
+## [0.6.6] - 2026-09-01
+
+### Changed
+
+- **Settled single-link scheduling (`primary_link_mode`/`follow_peer_primary`) now bypasses `ReorderBuffer` entirely and delivers to the TUN device immediately, matching WireGuard's own architecture for single-path tunnels.** `ReorderBuffer` exists specifically to handle genuine cross-link reordering from bonding across multiple links with different real-world latencies -- but once scheduling has settled on one active link, there is no cross-link reordering left to protect against, only whatever minor natural reordering a single network path occasionally produces, which TCP's own SACK/fast-retransmit machinery already handles without help from the tunnel layer. The prior fix in this same investigation (v0.6.5, shrinking the auto-tuned reorder window) was verified in production and did not help; this is the more direct fix the negative result pointed toward. A new `ReorderBuffer::note_delivered` method keeps `high_watermark` accurate during bypass (without touching the buffer's `pending` map) so a later fallback to buffered multi-link delivery -- if the primary goes Down -- resumes from an accurate watermark rather than a stale one, avoiding the same class of bug this project has already been burned by twice (the original reorder-buffer delay bug, and the v0.5.3 rekey-stranding regression). Independent review caught and fixed a real gap in the initial implementation: the bypass branch now also resets `peer_primary_link` on a session-id change (matching the existing buffered-branch behavior), since `Scheduler::primary()` is driven purely by probe/monitor ticks and is not guaranteed to hand control back to the buffered branch on any predictable cadence -- without this, an adopted `peer_primary_link` under `follow_peer_primary` could have latched indefinitely across rekeys if the peer's `VersionInfo` stopped decoding. Zero behavior change for any host not running `primary_link_mode`/`follow_peer_primary` with a settled primary -- plain SWRR and `redundant_mode` are entirely unaffected.
+
 ## [0.6.5] - 2026-09-01
 
 ### Fixed
