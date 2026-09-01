@@ -10,6 +10,12 @@ For implementation detail beyond what's here, read the code -- most
 modules and non-trivial functions have doc comments explaining the
 design, and `ARCHITECTURE.md` covers the system as a whole.
 
+## [0.6.3] - 2026-09-01
+
+### Fixed
+
+- **Third same-night follow-up: split `SessionState`'s locking from a plain `Mutex` into an `RwLock`.** `SessionState` is a single, daemon-wide crypto session (not per-link) used for every encrypt on send and every decrypt on receive. `SessionState::encrypt` has always taken `&self` -- it only reads the active session's key material and the already-lock-free `next_send_seq()` atomic counter -- yet every encrypt call site (real Data traffic, Probe replies, StatsShare, VersionInfo, ThroughputTest -- 11 call sites) was serialized behind the same exclusive lock as `decrypt`/`install`/`expire_previous` (the only methods that genuinely mutate state: the replay-protection window, or which session is active during a rekey), and behind every *other* encrypt call too. Modeled directly on WireGuard's own design (researched from its actual `wireguard-go` source: the outgoing nonce is a lock-free atomic, and the lock only ever guards which keypair is currently active, never the AEAD computation itself): encrypt call sites now take a shared read lock and can run concurrently with each other; `decrypt`/`install`/`expire_previous` still take an exclusive write lock where genuinely needed, so an in-flight encrypt can never observe a torn mid-rekey session swap. No behavior change to encrypt/decrypt/replay-window/rekey semantics -- purely a lock-type change plus using the access level each call site already logically needed. Independently reviewed for correctness given the crypto-adjacent stakes: all 16 call-site classifications verified against `crypto.rs`'s real method signatures, concurrent-encrypt safety verified against the underlying `snow` crate's actual cipher implementation (a fresh cipher instance per call, no shared mutable state), and the `Sync` bound `RwLock` newly requires confirmed as genuinely, soundly satisfied (not just compiling by coincidence).
+
 ## [0.6.2] - 2026-08-31
 
 ### Fixed

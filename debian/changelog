@@ -1,3 +1,24 @@
+mlvpn (0.6.3-1) unstable; urgency=high
+
+  * Third same-night follow-up: split SessionState's locking (single
+    daemon-wide crypto session, not per-link) from a plain Mutex into
+    an RwLock. SessionState::encrypt has always taken &self -- it only
+    reads the active session's key material and the already-lock-free
+    next_send_seq() atomic -- yet every encrypt call site (real Data,
+    Probe replies, StatsShare, VersionInfo, ThroughputTest -- 11 sites)
+    was serialized behind an exclusive lock shared with decrypt/
+    install/expire_previous (the only methods that genuinely mutate
+    state), and behind every OTHER encrypt too. Modeled directly on
+    WireGuard's own design (its outgoing nonce is a lock-free atomic;
+    its lock only ever guards which keypair is active, never the AEAD
+    computation itself): encrypt call sites now take a read lock and
+    can run concurrently with each other; decrypt/install/
+    expire_previous still take an exclusive write lock where genuinely
+    needed. No behavior change -- purely a lock-type change plus using
+    the access level each call site already logically needed.
+
+ -- Jeff Parrish PC Services <www.jpps.us>  Tue, 01 Sep 2026 06:35:54 -0500
+
 mlvpn (0.6.2-1) unstable; urgency=high
 
   * Follow-up to 0.6.1's send-path lock-contention fix: the receive
