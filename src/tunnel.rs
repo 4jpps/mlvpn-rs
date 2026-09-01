@@ -4377,10 +4377,29 @@ async fn reorder_flush(reorder: Arc<AsyncMutex<ReorderBuffer>>, tun: Arc<AsyncDe
     let mut tick = interval(Duration::from_millis(10));
     loop {
         tick.tick().await;
-        let ready = {
-            let mut ro = reorder.lock().await;
-            ro.drain_ready()
+        // `try_lock`, not `.lock().await`: this tick's only job is to
+        // flush entries that would otherwise sit until they age out
+        // with no new packet arriving to trigger `handle_incoming`'s
+        // own inline `insert` + `drain_ready` (which already does this
+        // same draining on every real Data frame, under the same
+        // lock). Under real load, `handle_incoming` already holds this
+        // lock far more often than this 100-times-a-second timer needs
+        // to contend with it -- confirmed live via `strace -f -c` that
+        // per-packet lock contention was the dominant cost in mlvpnd's
+        // wall-clock time (see `Scheduler::select_fast`'s and
+        // `SessionState`'s own doc comments for the two earlier fixes
+        // in this same investigation). Skipping a tick when the lock is
+        // currently held is free: whatever's holding it right now is
+        // either the same drain this tick would have performed, or
+        // about to make the same call fresh from an insert -- the
+        // worst case is a genuinely idle straggler waits one extra
+        // ~10ms tick before its own staleness timeout flushes it,
+        // negligible next to `reorder_window_ms`'s own 10-500ms range.
+        let Ok(mut ro) = reorder.try_lock() else {
+            continue;
         };
+        let ready = ro.drain_ready();
+        drop(ro);
         for pkt in ready {
             let _ = tun.send(&pkt).await;
         }
