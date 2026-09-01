@@ -2205,16 +2205,27 @@ async fn send_scheduled(
 ) {
     let frame_len = HEADER_LEN + ciphertext.len();
 
-    // Scoring pass: a cheap, `Copy`-only snapshot (see
-    // `link::LinkScore`'s doc comment for why this matters here
-    // specifically -- this runs once per outgoing packet) rather than
-    // `link::snapshot_links`'s full `Link` clone. `Scheduler::select`
-    // returns just the winning index; nothing here has looked at (or
-    // locked) any link's remote address or socket handle yet.
+    // Fast path first: `Scheduler::select_fast` resolves a primary or
+    // an SWRR pick entirely from state the last periodic `refresh()`
+    // already cached, with zero link locking. Only fall back to a full
+    // `link::snapshot_scores` scan (locks every configured link) when
+    // that returns `None` -- the rare case where nothing is cached yet
+    // (every link Down). See `select_fast`'s doc comment: this used to
+    // run unconditionally on every packet and was confirmed live via
+    // `strace -f -c` to be the dominant cost in the entire send path.
     let chosen_idx: Option<usize> = {
-        let scores = link::snapshot_scores(links).await;
-        let mut sched = scheduler.lock().unwrap();
-        sched.select(&scores, frame_len)
+        let fast = scheduler
+            .lock()
+            .unwrap()
+            .select_fast(links.len(), frame_len);
+        match fast {
+            Some(idx) => Some(idx),
+            None => {
+                let scores = link::snapshot_scores(links).await;
+                let mut sched = scheduler.lock().unwrap();
+                sched.select(&scores, frame_len)
+            }
+        }
     };
     let Some(idx) = chosen_idx else {
         tracing::warn!("no link available to send on; dropping packet");
