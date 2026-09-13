@@ -112,6 +112,21 @@ impl StaticKeypair {
     pub fn private_base64(&self) -> String {
         base64::Engine::encode(&base64::engine::general_purpose::STANDARD, self.private)
     }
+
+    /// Copy out the raw `(private, public)` key bytes.
+    ///
+    /// `private`/`public` are deliberately not `pub` (so that raw key
+    /// material can't leak out of this struct by accident, e.g. via a
+    /// careless `Debug` derive or a stray field access elsewhere) --
+    /// this is the explicit, auditable escape hatch for callers that
+    /// genuinely need the raw bytes, such as `wireguard::WgTunnel::new`,
+    /// which hands them straight to `boringtun`'s own key types. Returns
+    /// owned `[u8; 32]` copies (both types are `Copy`), not references,
+    /// so the caller owns its own copy independent of this struct's
+    /// lifetime/zeroize-on-drop behavior.
+    pub fn raw_bytes(&self) -> ([u8; 32], [u8; 32]) {
+        (self.private, self.public)
+    }
 }
 
 /// A private key loaded from disk, with no known public counterpart in

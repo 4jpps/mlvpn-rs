@@ -29,6 +29,7 @@ pub mod scheduler;
 pub mod sysfs_net;
 pub mod tunnel;
 pub mod tunneltest;
+pub mod wireguard;
 
 /// This build's own `mlvpnd`/`mlvpn-tui` version -- the single source
 /// `PacketType::VersionInfo`'s sender (`tunnel::send_version_info`),

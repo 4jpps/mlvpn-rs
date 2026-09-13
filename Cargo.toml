@@ -48,6 +48,7 @@ bytes = "1"
 libc = "0.2"
 zeroize = { version = "1", features = ["derive"] }
 base64 = "0.22"
+boringtun = "0.7"
 hex = "0.4"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 # Monitoring TUI (src/bin/mlvpn-tui.rs) only -- not used by mlvpnd itself,
