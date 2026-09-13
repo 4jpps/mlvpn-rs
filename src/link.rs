@@ -28,7 +28,9 @@
 //! `CAP_NET_RAW` to still be held at the time of the call).
 
 use crate::config::LinkConfig;
+use crate::crypto;
 use crate::error::{MlvpnError, Result};
+use crate::wireguard::{self, WgTunnel};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::net::{IpAddr, SocketAddr, UdpSocket as StdUdpSocket};
 #[cfg(target_os = "linux")]
@@ -308,6 +310,15 @@ pub struct LinkHandle {
     remote: Option<SocketAddr>,
     socket: SharedSocket,
     reconnect_lock: Arc<AsyncMutex<()>>,
+    /// This link's own independent WireGuard tunnel (own keypair,
+    /// handshake, rekey, replay window) -- see `wireguard::WgTunnel`.
+    /// Shared (via `Arc`) with the `Link` this handle was built from
+    /// (`Link::handle`/`Link::alternate_handle`), since a link's crypto
+    /// session is tied to the *link's own identity/keys*, not to
+    /// whichever concrete socket currently backs it -- a `reconnect()`
+    /// that rebinds the socket must not disturb an already-established
+    /// WireGuard session.
+    wg: Arc<WgTunnel>,
 }
 
 impl LinkHandle {
@@ -318,6 +329,74 @@ impl LinkHandle {
     /// immediately instead of on the next task restart.
     pub async fn current_socket(&self) -> Arc<UdpSocket> {
         self.socket.read().await.clone()
+    }
+
+    /// Encrypt `frame` (an already-serialized mlvpn frame -- header,
+    /// seq, `PacketType`, payload; see `protocol.rs`) through this
+    /// link's own `WgTunnel` and send the resulting datagram out on the
+    /// link's *current* socket (re-read fresh, same reasoning as
+    /// `current_socket`'s own doc comment) to `self.remote`.
+    ///
+    /// Before a WireGuard session is established, `WgTunnel::encapsulate`
+    /// returns a handshake-initiation datagram instead of a datagram
+    /// actually carrying `frame` (boringtun queues the plaintext
+    /// internally and only actually delivers it once the handshake
+    /// completes and `encapsulate` is called again) -- this method's
+    /// contract is exactly `WgTunnel::encapsulate`'s own: "a datagram
+    /// ready to send", not a guarantee this specific call delivered
+    /// `frame` to the peer. Callers that need delivery confirmed should
+    /// retry, the same way real WireGuard relies on the *upper* protocol
+    /// (TCP, or here, mlvpn's own retry/ack behavior) to notice loss and
+    /// resend rather than solving it at this layer.
+    pub async fn wg_send(&self, frame: &[u8]) -> Result<()> {
+        let remote = self.remote.ok_or_else(|| {
+            MlvpnError::Protocol(format!(
+                "wg_send: link '{}' has no remote address to send to yet",
+                self.config.name
+            ))
+        })?;
+        let datagram = self.wg.encapsulate(frame)?;
+        let socket = self.current_socket().await;
+        socket
+            .send_to(&datagram, remote)
+            .await
+            .map_err(MlvpnError::Io)?;
+        Ok(())
+    }
+
+    /// Receive one raw datagram off this link's *current* socket and
+    /// feed it through this link's own `WgTunnel`, looping internally
+    /// until an actual decrypted mlvpn frame comes out -- callers never
+    /// see the handshake/keepalive/rekey traffic `WgTunnel::decapsulate`
+    /// also has to process on the very same socket:
+    ///  - `DecapsulateOutcome::Frame` -- a real mlvpn frame; returned to
+    ///    the caller immediately.
+    ///  - `DecapsulateOutcome::SendReply` -- boringtun produced a
+    ///    handshake response/keepalive confirmation that must go back to
+    ///    whichever address just sent us this datagram (not necessarily
+    ///    `self.remote` -- a server-mode link may not have learned that
+    ///    yet on its very first incoming packet). Sent immediately, then
+    ///    the loop continues waiting for the next datagram.
+    ///  - `DecapsulateOutcome::Consumed` -- nothing to send, nothing
+    ///    decoded (a bare keepalive ack, a duplicate, handshake
+    ///    progress with no reply due yet); the loop simply continues.
+    pub async fn wg_recv(&self) -> Result<Vec<u8>> {
+        // Sized the same way tunnel.rs's own largest raw-recv buffers
+        // are (see e.g. `tunnel.rs`'s `u16::MAX as usize + 64` buffer) --
+        // large enough for any legitimate UDP datagram this link could
+        // ever receive, not just a "should be enough" round number.
+        let mut buf = vec![0u8; u16::MAX as usize + 64];
+        loop {
+            let socket = self.current_socket().await;
+            let (n, from) = socket.recv_from(&mut buf).await.map_err(MlvpnError::Io)?;
+            match self.wg.decapsulate(&buf[..n])? {
+                wireguard::DecapsulateOutcome::Frame(frame) => return Ok(frame),
+                wireguard::DecapsulateOutcome::SendReply(reply) => {
+                    socket.send_to(&reply, from).await.map_err(MlvpnError::Io)?;
+                }
+                wireguard::DecapsulateOutcome::Consumed => {}
+            }
+        }
     }
 
     /// Re-create and re-bind this link's UDP socket from scratch (the
@@ -570,6 +649,17 @@ pub struct Link {
     /// has resolved which family actually works, win or lose -- see
     /// `commit_remote`.
     pub alternate: Option<(SocketAddr, SharedSocket)>,
+    /// This link's own independent WireGuard tunnel, constructed once at
+    /// `Link::bind` time from `config.private_key_file`/
+    /// `config.peer_public_key` and never replaced afterward -- a
+    /// `LinkHandle::reconnect` rebinds the socket only, deliberately
+    /// leaving an already-established WireGuard session (and its replay
+    /// window/rekey state) untouched, the same way `physical_mtu` and
+    /// `state_since` are one-shot startup state rather than something a
+    /// reconnect refreshes. `Arc`-wrapped so `handle()`/`alternate_handle()`
+    /// can hand every per-link task a shared reference to the same
+    /// tunnel instead of a separate one per socket.
+    wg: Arc<WgTunnel>,
 }
 
 impl Link {
@@ -588,7 +678,23 @@ impl Link {
     /// `bind_socket`), so there's no actual port conflict at the kernel
     /// level, the same way an ordinary dual-stack service binds both
     /// families to one port today.
-    pub async fn bind(id: u8, config: LinkConfig, ewma_alpha: f64) -> Result<Self> {
+    ///
+    /// `is_initiator` says whether this link should drive the WireGuard
+    /// handshake as the connecting side (`Mode::Client`) or wait to
+    /// respond (`Mode::Server`) -- passed in by the caller (`main.rs`,
+    /// from `Config.mode`) rather than inferred here, since `LinkConfig`
+    /// alone carries no client/server distinction of its own. Purely
+    /// advisory: `WgTunnel::new` accepts it for call-site clarity, but
+    /// `boringtun` itself doesn't actually need to know which side
+    /// initiates at construction time (see that function's own doc
+    /// comment) -- whichever side's `encapsulate`/`wg_send` is called
+    /// first is the one that in practice emits the handshake init.
+    pub async fn bind(
+        id: u8,
+        config: LinkConfig,
+        ewma_alpha: f64,
+        is_initiator: bool,
+    ) -> Result<Self> {
         let (remote, alternate_remote) = resolve_remote_addr(&config).await?;
         let (socket, physical_mtu) = bind_socket(&config, remote)?;
         let alternate = match alternate_remote {
@@ -598,6 +704,9 @@ impl Link {
             }
             None => None,
         };
+        let local_private = crypto::StaticKeypair::load_private(&config.private_key_file)?.0;
+        let peer_public = crypto::decode_public_key(&config.peer_public_key)?;
+        let wg = Arc::new(WgTunnel::new(local_private, peer_public, is_initiator)?);
 
         let effective_probe_interval_ms = config.probe_interval_ms;
 
@@ -615,6 +724,7 @@ impl Link {
             effective_probe_interval_ms,
             effective_ewma_alpha: ewma_alpha,
             alternate,
+            wg,
         })
     }
 
@@ -629,6 +739,7 @@ impl Link {
             remote: self.remote,
             socket: self.socket.clone(),
             reconnect_lock: self.reconnect_lock.clone(),
+            wg: self.wg.clone(),
         }
     }
 
@@ -649,6 +760,10 @@ impl Link {
             remote: Some(*remote),
             socket: socket.clone(),
             reconnect_lock: Arc::new(AsyncMutex::new(())),
+            // Same underlying WireGuard session as `handle()` above --
+            // the alternate is only a not-yet-confirmed *address*/socket
+            // for this same link, not a second independent tunnel/peer.
+            wg: self.wg.clone(),
         })
     }
 
@@ -1261,6 +1376,18 @@ impl MtuResizer {
     }
 }
 
+/// A `WgTunnel` with a fresh, throwaway keypair on both ends -- only
+/// good for filling in `Link::wg` in tests that never actually drive a
+/// real handshake (`test_link_for_state_transitions`,
+/// `test_link_with_alternate`), which only need *a* tunnel to exist to
+/// satisfy `Link`'s field, not one that talks to anything.
+#[cfg(test)]
+fn test_wg_tunnel() -> Arc<WgTunnel> {
+    let local = crypto::StaticKeypair::generate().unwrap();
+    let peer = crypto::StaticKeypair::generate().unwrap();
+    Arc::new(WgTunnel::new(local.raw_bytes().0, peer.raw_bytes().1, true).unwrap())
+}
+
 /// Minimal but fully real `Link` for tests outside this module (e.g.
 /// `monitor::tests`) that need to exercise state-transition logic against
 /// a genuine `Link` -- a plain loopback-bound socket, no
@@ -1296,6 +1423,7 @@ pub(crate) async fn test_link_for_state_transitions(state: LinkState, stats: Lin
         effective_probe_interval_ms: 200,
         effective_ewma_alpha: 0.2,
         alternate: None,
+        wg: test_wg_tunnel(),
     }
 }
 
@@ -1543,6 +1671,7 @@ mod tests {
             effective_probe_interval_ms: 200,
             effective_ewma_alpha: 0.2,
             alternate: Some((alt_remote, Arc::new(AsyncRwLock::new(Arc::new(alt_socket))))),
+            wg: test_wg_tunnel(),
         };
         (link, primary_remote, alt_remote)
     }
@@ -1609,6 +1738,115 @@ mod tests {
         // the old 0.5 alpha would instead give 0.5*0 + 0.5*100 = 50.
         let updated = e.update(0.0);
         assert!((updated - 90.0).abs() < 1e-9, "updated was {updated}");
+    }
+
+    /// Fresh throwaway keypair for wg-transport tests -- mirrors
+    /// `wireguard::tests::generate_test_keypair`, duplicated here rather
+    /// than reused since that helper is private to `wireguard`'s own
+    /// test module.
+    fn test_keypair() -> ([u8; 32], [u8; 32]) {
+        let kp = crypto::StaticKeypair::generate().unwrap();
+        kp.raw_bytes()
+    }
+
+    /// A minimal, fully real `Link` bound to a plain loopback socket (no
+    /// `SO_BINDTODEVICE` -- same reasoning as `test_link_with_alternate`),
+    /// pre-wired with a real `WgTunnel` built from `local_priv`/
+    /// `peer_pub`. `remote` starts unset -- the port isn't known until
+    /// `bind` returns, so callers point two of these at each other's
+    /// actual bound address afterward (see
+    /// `link_wg_round_trip_over_loopback_sockets`).
+    async fn test_wg_link(local_priv: [u8; 32], peer_pub: [u8; 32]) -> Link {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        Link {
+            id: 0,
+            config: test_link_config(None, None),
+            socket: Arc::new(AsyncRwLock::new(Arc::new(socket))),
+            reconnect_lock: Arc::new(AsyncMutex::new(())),
+            remote: None,
+            state: LinkState::Probing,
+            state_since: Instant::now(),
+            stats: LinkStats::new(0.2),
+            physical_mtu: None,
+            admin_disabled: false,
+            effective_probe_interval_ms: 200,
+            effective_ewma_alpha: 0.2,
+            alternate: None,
+            wg: Arc::new(WgTunnel::new(local_priv, peer_pub, true).unwrap()),
+        }
+    }
+
+    /// End-to-end proof that `Link`/`LinkHandle` correctly drive a real
+    /// `WgTunnel` over real (loopback) sockets, all the way through a
+    /// full WireGuard handshake to an actual application frame
+    /// delivered client -> server.
+    ///
+    /// Choreographed the way `wireguard.rs`'s own
+    /// `two_tunnels_handshake_and_exchange_a_frame` test confirmed
+    /// `boringtun` actually behaves, not the simpler "one send, one
+    /// receive" shape a naive reading of `wg_send`/`wg_recv`'s
+    /// signatures might suggest: `wg_send`'s very first call only ever
+    /// triggers the handshake (boringtun queues the plaintext internally
+    /// and hands back a handshake-init datagram instead -- see
+    /// `wg_send`'s own doc comment), so it is never actually delivered.
+    /// A background task continuously draining the client's own
+    /// `wg_recv` is what completes the handshake on the client's side --
+    /// processing the server's handshake response and automatically
+    /// sending back the post-handshake keepalive confirmation `wg_recv`
+    /// forwards for any `SendReply` outcome -- exactly what a real
+    /// `link_receiver` task is already doing continuously in production.
+    /// Only once that round trip finishes does a second `wg_send` call
+    /// actually deliver the real frame.
+    #[tokio::test]
+    async fn link_wg_round_trip_over_loopback_sockets() {
+        let (client_priv, client_pub) = test_keypair();
+        let (server_priv, server_pub) = test_keypair();
+
+        let client = test_wg_link(client_priv, server_pub).await;
+        let server = test_wg_link(server_priv, client_pub).await;
+
+        let client_addr = client.handle().current_socket().await.local_addr().unwrap();
+        let server_addr = server.handle().current_socket().await.local_addr().unwrap();
+
+        let mut client_handle = client.handle();
+        client_handle.remote = Some(server_addr);
+        let mut server_handle = server.handle();
+        server_handle.remote = Some(client_addr);
+
+        let frame = b"a full mlvpn frame's bytes, opaque to this test".to_vec();
+
+        // Drains the client's own inbound socket so the server's
+        // handshake response (and any further SendReply traffic) gets
+        // processed -- this is what actually completes the handshake on
+        // the client's side. Never expected to yield a real `Frame` in
+        // this test (only the server is ever sent application data), so
+        // it's aborted once this test's own assertions are done.
+        let client_drain = {
+            let h = client_handle.clone();
+            tokio::spawn(async move { h.wg_recv().await })
+        };
+
+        let server_recv = {
+            let h = server_handle.clone();
+            tokio::spawn(async move { h.wg_recv().await })
+        };
+
+        // First call only triggers the handshake (see this test's own
+        // doc comment); give the client's background drain task time to
+        // finish the handshake exchange before retrying with the real
+        // frame.
+        client_handle.wg_send(&frame).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        client_handle.wg_send(&frame).await.unwrap();
+
+        let received = tokio::time::timeout(Duration::from_secs(5), server_recv)
+            .await
+            .expect("server_recv timed out")
+            .unwrap()
+            .unwrap();
+        assert_eq!(received, frame);
+
+        client_drain.abort();
     }
 
     #[test]

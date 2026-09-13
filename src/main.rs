@@ -671,7 +671,9 @@ async fn run(cfg: Config, log_ring: Arc<LogRing>) -> anyhow::Result<()> {
     for (i, link_cfg) in cfg.links.iter().enumerate() {
         let id =
             u8::try_from(i).map_err(|_| MlvpnError::Config("too many links (max 255)".into()))?;
-        let link = link::Link::bind(id, link_cfg.clone(), cfg.scheduler.ewma_alpha).await?;
+        let is_initiator = cfg.mode == config::Mode::Client;
+        let link =
+            link::Link::bind(id, link_cfg.clone(), cfg.scheduler.ewma_alpha, is_initiator).await?;
         tracing::info!(
             link = %link_cfg.name,
             interface = %link_cfg.bind_interface,
