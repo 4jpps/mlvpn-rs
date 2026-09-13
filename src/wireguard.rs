@@ -93,10 +93,32 @@ const FAKE_IPV4_HEADER_LEN: usize = 20;
 /// downstream actually inspects this field.
 const FAKE_IPV4_PROTOCOL: u8 = 253;
 
-/// Scratch buffer size for `decapsulate`/`tick`'s output. Comfortably
-/// above any real mlvpn frame (bounded by the configured tunnel MTU) plus
-/// boringtun's own handshake/data overhead and our 20-byte fake header.
-const MAX_WG_PACKET: usize = 2048;
+/// Scratch buffer size for `decapsulate`/`tick`'s output, and the largest
+/// incoming datagram `decapsulate` will accept.
+///
+/// **Not just a generous round number** -- sized to the same
+/// `u16::MAX + 64` pattern `tunnel.rs`'s own TUN-read buffer uses (see
+/// `tun_reader`'s comment there), and for the same reason: this project
+/// treats frame sizes up to `u16::MAX` as a real, supported case (`mtu`
+/// is itself a `u16`), not a theoretical one, so a buffer sized from a
+/// "should be enough" constant instead of the real maximum would be a
+/// live bug, not just defensive slop. This one was originally sized as a
+/// plain `2048` in this module's first draft, which was wrong for a much
+/// more serious reason than truncation risk: `boringtun`'s own
+/// `Session::receive_packet_data` (`src/noise/session.rs`, confirmed by
+/// direct source reading) does `if dst.len() < ct_len { panic!(...) }`
+/// -- and that length check runs on the still-unauthenticated ciphertext
+/// length, *before* AEAD verification. A buffer too small for an
+/// oversized incoming datagram doesn't return an `Err` from
+/// `decapsulate`, it panics the whole process, and it's reachable by any
+/// unauthenticated third party sending a WireGuard-DATA-shaped datagram
+/// at the link's socket -- not just a genuine peer. Sizing this to the
+/// real maximum removes that risk entirely for anything this project
+/// itself would ever legitimately send or receive; the explicit length
+/// check in `decapsulate` below is the second, independent layer for
+/// anything larger still (e.g. a raw UDP datagram from an attacker that
+/// happens to exceed even this).
+const MAX_WG_PACKET: usize = u16::MAX as usize + 64;
 
 /// Wraps `plaintext` in a minimal fake IPv4 header so it survives
 /// boringtun's receive-side IP-packet validation (see module doc).
@@ -232,6 +254,23 @@ impl WgTunnel {
     /// to boringtun. See `DecapsulateOutcome` for the three possible
     /// results.
     pub fn decapsulate(&self, datagram: &[u8]) -> Result<DecapsulateOutcome> {
+        // Explicit pre-check, independent of `MAX_WG_PACKET`'s own
+        // sizing above: a real UDP datagram can never exceed 65507 bytes
+        // (the IPv4 UDP payload ceiling), so this can only ever reject
+        // something that was never a legitimate datagram off a real
+        // socket in the first place -- but reject it with a clean `Err`
+        // here rather than relying solely on the output buffer being
+        // "big enough", since the panic this guards against
+        // (`Session::receive_packet_data`'s `dst.len() < ct_len` check,
+        // see `MAX_WG_PACKET`'s doc comment) runs on unauthenticated,
+        // peer/attacker-controlled input.
+        if datagram.len() > MAX_WG_PACKET {
+            return Err(MlvpnError::Protocol(format!(
+                "wg decapsulate: datagram too large ({} bytes, max {})",
+                datagram.len(),
+                MAX_WG_PACKET
+            )));
+        }
         let mut buf = vec![0u8; MAX_WG_PACKET];
         let mut tunn = self.inner.lock().unwrap();
         match tunn.decapsulate(None, datagram, &mut buf) {
@@ -358,5 +397,89 @@ mod tests {
         let (_other_priv, other_pub) = generate_test_keypair();
         let tunnel = WgTunnel::new(priv_key, other_pub, true).unwrap();
         assert!(tunnel.tick().is_none());
+    }
+
+    /// Pins the exact fake-IPv4 header bytes for a known plaintext, so a
+    /// future `boringtun` version bump (or any refactor of this
+    /// function) has something concrete to diff against -- this header
+    /// shape is load-bearing (see the module doc comment on why it
+    /// exists at all), not incidental formatting.
+    #[test]
+    fn wrap_fake_ipv4_produces_the_expected_header_bytes() {
+        let plaintext = b"hi"; // 2 bytes -> total length 22 = 0x0016
+        let wrapped = wrap_fake_ipv4(plaintext).unwrap();
+        assert_eq!(
+            wrapped,
+            vec![
+                0x45,
+                0x00, // version/IHL, DSCP/ECN
+                0x00,
+                0x16, // total length = 22
+                0x00,
+                0x00, // identification
+                0x00,
+                0x00, // flags/fragment offset
+                64,
+                FAKE_IPV4_PROTOCOL, // TTL, protocol
+                0x00,
+                0x00, // header checksum
+                0,
+                0,
+                0,
+                0, // source address
+                0,
+                0,
+                0,
+                0, // destination address
+                b'h',
+                b'i', // payload
+            ]
+        );
+    }
+
+    /// `wrap_fake_ipv4`/`unwrap_fake_ipv4` round-trip exactly for a
+    /// variety of lengths, including the empty case.
+    #[test]
+    fn wrap_and_unwrap_fake_ipv4_round_trip() {
+        for plaintext in [&b""[..], &b"x"[..], &b"a longer mlvpn-shaped frame"[..]] {
+            let wrapped = wrap_fake_ipv4(plaintext).unwrap();
+            assert_eq!(wrapped.len(), FAKE_IPV4_HEADER_LEN + plaintext.len());
+            let unwrapped = unwrap_fake_ipv4(&wrapped).unwrap();
+            assert_eq!(unwrapped, plaintext);
+        }
+    }
+
+    /// `wrap_fake_ipv4`'s total-length field is a `u16`, so anything that
+    /// would push `20 + plaintext.len()` past `u16::MAX` must be rejected
+    /// with a clean `Err`, not silently wrap around or panic on the
+    /// `u16::try_from` conversion.
+    #[test]
+    fn wrap_fake_ipv4_rejects_oversized_plaintext() {
+        let max_ok_len = u16::MAX as usize - FAKE_IPV4_HEADER_LEN; // 65515
+        assert!(wrap_fake_ipv4(&vec![0u8; max_ok_len]).is_ok());
+        assert!(wrap_fake_ipv4(&vec![0u8; max_ok_len + 1]).is_err());
+    }
+
+    /// `unwrap_fake_ipv4` must reject anything shorter than the header it
+    /// always expects, rather than panicking on the slice index.
+    #[test]
+    fn unwrap_fake_ipv4_rejects_input_shorter_than_the_header() {
+        assert!(unwrap_fake_ipv4(&[0u8; FAKE_IPV4_HEADER_LEN - 1]).is_err());
+    }
+
+    /// `decapsulate` must reject an oversized datagram with a clean
+    /// `Err` rather than risk boringtun's own pre-authentication
+    /// `panic!` on a too-small destination buffer (see `MAX_WG_PACKET`'s
+    /// doc comment) -- this is the second, independent layer of defense
+    /// beyond simply sizing the buffer generously, and it's the layer
+    /// this test can actually exercise without a real oversized
+    /// ciphertext to feed boringtun.
+    #[test]
+    fn decapsulate_rejects_an_oversized_datagram() {
+        let (priv_key, _pub_key) = generate_test_keypair();
+        let (_other_priv, other_pub) = generate_test_keypair();
+        let tunnel = WgTunnel::new(priv_key, other_pub, true).unwrap();
+        let oversized = vec![0u8; MAX_WG_PACKET + 1];
+        assert!(tunnel.decapsulate(&oversized).is_err());
     }
 }
