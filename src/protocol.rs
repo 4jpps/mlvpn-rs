@@ -8,34 +8,34 @@
 //! +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 //! |  Magic (1)    |  Ver (1)    |   Type (1)  |   LinkId (1)      |
 //! +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-//! |                        Session Id (32)                       |
-//! +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 //! |                        Sequence Number (64)                  |
 //! +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 //! |                          Payload ...                         |
 //! +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 //! ```
 //!
-//! `SessionId`, `Type` and `LinkId` are plaintext dispatch metadata, *not*
-//! AEAD associated data -- `snow`'s `StatelessTransportState` (see
-//! `crypto.rs`) doesn't expose an AAD parameter, so they aren't
-//! cryptographically bound to the ciphertext. `Payload` is the ciphertext
-//! (which includes the AEAD tag at its end) for Data/Keepalive/Probe/
-//! ProbeReply frames, or raw Noise handshake bytes for Handshake frames
-//! (Noise protects its own handshake messages). See `crypto.rs`'s module
-//! doc comment for why this is an acceptable tradeoff: the sequence
-//! number doubles as the AEAD nonce and is therefore implicitly
-//! authenticated, which is what actually matters here.
+//! `Type` and `LinkId` are plaintext dispatch metadata, *not* AEAD
+//! associated data -- `snow`'s `StatelessTransportState` (see `crypto.rs`)
+//! doesn't expose an AAD parameter, so they aren't cryptographically bound
+//! to the ciphertext. `Payload` is the ciphertext (which includes the AEAD
+//! tag at its end) for Data/Keepalive/Probe/ProbeReply frames, or raw
+//! Noise handshake bytes for Handshake frames (Noise protects its own
+//! handshake messages). Each physical link now authenticates independently
+//! via its own WireGuard tunnel, so there is no longer a shared-session
+//! concept for dispatch -- session_id was removed in favor of per-link
+//! authentication. See `crypto.rs`'s module doc comment for the nonce
+//! handling: the sequence number doubles as the AEAD nonce and is
+//! therefore implicitly authenticated, which is what actually matters here.
 //!
-//! The 64-bit sequence number is global per session (not per-link): it is
+//! The 64-bit sequence number is now link-local (not global): it is
 //! what lets the receiver detect replay and reorder packets that arrive
-//! out of order because they took different physical paths.
+//! out of order because they took different physical paths on the same link.
 
 use crate::error::{MlvpnError, Result};
 
 pub const MAGIC: u8 = 0x4D; // 'M'
 pub const VERSION: u8 = 1;
-pub const HEADER_LEN: usize = 1 + 1 + 1 + 1 + 4 + 8;
+pub const HEADER_LEN: usize = 1 + 1 + 1 + 1 + 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -141,7 +141,6 @@ pub struct Header {
     /// the receiver purely for stats bookkeeping (RTT/jitter per link);
     /// it has no bearing on decryption.
     pub link_id: u8,
-    pub session_id: u32,
     pub seq: u64,
 }
 
@@ -151,7 +150,6 @@ impl Header {
         out.push(VERSION);
         out.push(self.ptype as u8);
         out.push(self.link_id);
-        out.extend_from_slice(&self.session_id.to_be_bytes());
         out.extend_from_slice(&self.seq.to_be_bytes());
     }
 
@@ -170,17 +168,8 @@ impl Header {
         }
         let ptype = PacketType::from_u8(buf[2])?;
         let link_id = buf[3];
-        let session_id = u32::from_be_bytes(buf[4..8].try_into().unwrap());
-        let seq = u64::from_be_bytes(buf[8..16].try_into().unwrap());
-        Ok((
-            Header {
-                ptype,
-                link_id,
-                session_id,
-                seq,
-            },
-            &buf[HEADER_LEN..],
-        ))
+        let seq = u64::from_be_bytes(buf[4..12].try_into().unwrap());
+        Ok((Header { ptype, link_id, seq }, &buf[HEADER_LEN..]))
     }
 }
 
@@ -562,6 +551,77 @@ impl ThroughputTestReverseRequestPayload {
             test_id: u32::from_be_bytes(buf[0..4].try_into().unwrap()),
             duration_secs: u32::from_be_bytes(buf[4..8].try_into().unwrap()),
         })
+    }
+}
+
+#[cfg(test)]
+mod header_tests {
+    use super::*;
+
+    #[test]
+    fn header_round_trips() {
+        let hdr = Header {
+            ptype: PacketType::Data,
+            link_id: 3,
+            seq: 42,
+        };
+        let mut buf = Vec::new();
+        hdr.encode(&mut buf);
+        assert_eq!(buf.len(), HEADER_LEN);
+        let (decoded, rest) = Header::decode(&buf).unwrap();
+        assert_eq!(decoded.ptype, PacketType::Data);
+        assert_eq!(decoded.link_id, 3);
+        assert_eq!(decoded.seq, 42);
+        assert!(rest.is_empty());
+    }
+
+    #[test]
+    fn header_round_trips_with_large_seq() {
+        let hdr = Header {
+            ptype: PacketType::Probe,
+            link_id: 255,
+            seq: 0xdeadbeefcafebabe,
+        };
+        let mut buf = Vec::new();
+        hdr.encode(&mut buf);
+        assert_eq!(buf.len(), HEADER_LEN);
+        let (decoded, rest) = Header::decode(&buf).unwrap();
+        assert_eq!(decoded.ptype, PacketType::Probe);
+        assert_eq!(decoded.link_id, 255);
+        assert_eq!(decoded.seq, 0xdeadbeefcafebabe);
+        assert!(rest.is_empty());
+    }
+
+    #[test]
+    fn header_has_correct_magic_and_version() {
+        let hdr = Header {
+            ptype: PacketType::Data,
+            link_id: 1,
+            seq: 100,
+        };
+        let mut buf = Vec::new();
+        hdr.encode(&mut buf);
+        assert_eq!(buf[0], MAGIC);
+        assert_eq!(buf[1], VERSION);
+    }
+
+    #[test]
+    fn header_decode_rejects_short_buffer() {
+        let buf = [0u8; 11];
+        assert!(Header::decode(&buf).is_err());
+    }
+
+    #[test]
+    fn header_decode_rejects_bad_magic() {
+        let mut buf = vec![0u8; HEADER_LEN];
+        buf[0] = 0xFF;
+        assert!(Header::decode(&buf).is_err());
+    }
+
+    #[test]
+    fn header_decode_rejects_bad_version() {
+        let buf = vec![MAGIC, 99, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert!(Header::decode(&buf).is_err());
     }
 }
 
