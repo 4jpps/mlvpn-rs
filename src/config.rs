@@ -21,8 +21,6 @@ pub struct Config {
 
     pub tunnel: TunnelConfig,
 
-    pub crypto: CryptoConfig,
-
     #[serde(default)]
     pub scheduler: SchedulerConfig,
 
@@ -115,22 +113,6 @@ fn default_tx_queue_len() -> u32 {
     4000
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct CryptoConfig {
-    /// Path to a file containing our base64 Curve25519 static private key
-    /// (32 bytes, base64-encoded). File must be mode 0600.
-    pub private_key_file: PathBuf,
-    /// Base64 Curve25519 public key of the remote peer.
-    pub peer_public_key: String,
-    /// How often to rotate (rekey) the session, in seconds. Rekeying limits
-    /// the amount of ciphertext ever protected by one set of keys.
-    #[serde(default = "default_rekey_secs")]
-    pub rekey_interval_secs: u64,
-}
-
-fn default_rekey_secs() -> u64 {
-    120
-}
 
 /// `redundant_mode`, `primary_link_mode`, and `follow_peer_primary` are
 /// mutually exclusive -- at most one may be `true` at a time (enforced in
@@ -468,6 +450,13 @@ pub struct LinkConfig {
     pub bandwidth_cap_mbps: Option<f64>,
     #[serde(default = "default_probe_interval_ms")]
     pub probe_interval_ms: u64,
+    /// Path to a file containing this link's base64 Curve25519 static
+    /// private key (32 bytes, base64-encoded). File must be mode 0600.
+    /// Generate with `mlvpnd genkey --link <name>`.
+    pub private_key_file: PathBuf,
+    /// Base64 Curve25519 public key the peer generated for this same
+    /// named link on their side.
+    pub peer_public_key: String,
 }
 
 fn default_weight() -> f64 {
@@ -706,7 +695,9 @@ impl Config {
             }
         }
 
-        check_permissions(&self.crypto.private_key_file)?;
+        for link in &self.links {
+            check_permissions(&link.private_key_file)?;
+        }
 
         if let Some(mtu) = self.tunnel.mtu {
             if mtu < 576 {
@@ -742,14 +733,6 @@ impl Config {
             return Err(MlvpnError::Config(
                 "scheduler.follow_peer_primary and scheduler.redundant_mode cannot both be true \
                  -- send-to-one-link-the-peer-chose and send-to-every-link are contradictory"
-                    .into(),
-            ));
-        }
-
-        if self.crypto.rekey_interval_secs == 0 {
-            return Err(MlvpnError::Config(
-                "crypto.rekey_interval_secs must be non-zero (tokio::time::interval panics on \
-                 a zero duration, and rekey_loop now actually runs this on the client)"
                     .into(),
             ));
         }
@@ -876,11 +859,6 @@ mod tests {
                 clamp_mss: true,
                 tx_queue_len: 4000,
             },
-            crypto: CryptoConfig {
-                private_key_file: key_path,
-                peer_public_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string(),
-                rekey_interval_secs: 120,
-            },
             scheduler: SchedulerConfig::default(),
             links: vec![LinkConfig {
                 name: "link0".to_string(),
@@ -891,6 +869,8 @@ mod tests {
                 weight: 1.0,
                 bandwidth_cap_mbps: None,
                 probe_interval_ms: default_probe_interval_ms(),
+                private_key_file: key_path,
+                peer_public_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string(),
             }],
             logging: LoggingConfig::default(),
             control: ControlConfig::default(),
@@ -996,5 +976,24 @@ mod tests {
         let mut cfg = minimal_valid_config();
         cfg.scheduler.redundant_mode = true;
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn link_config_requires_its_own_key_fields() {
+        let toml = r#"
+            mode = "client"
+            [tunnel]
+            name = "test"
+            address = "10.200.0.1/30"
+            [[links]]
+            name = "comcast"
+            bind_interface = "eth0"
+            remote_addr = "127.0.0.1:9999"
+            local_port = 51820
+            private_key_file = "/tmp/does-not-matter-for-this-test.key"
+            peer_public_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+        "#;
+        let cfg: Config = toml::from_str(toml).expect("per-link key fields must parse");
+        assert_eq!(cfg.links[0].peer_public_key, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=");
     }
 }

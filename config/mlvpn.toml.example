@@ -9,9 +9,10 @@
 #     config is read while still root, so root:root 0600 also works.
 # See systemd/mlvpn.service for the full one-time setup.
 #
-# Run `mlvpnd genkey --out /etc/mlvpn/private.key` on each end first, then
-# paste the resulting public keys into `peer_public_key` below (client's
-# config gets the server's public key and vice versa).
+# For each link, run `mlvpnd genkey --link <name>` on each end first to
+# generate a keypair specific to that link, then paste the resulting public
+# keys into each link's `peer_public_key` field below (client's config gets
+# the server's public key and vice versa for each link).
 
 mode = "client"   # "client" or "server" -- see ARCHITECTURE.md for what differs
 
@@ -35,11 +36,6 @@ address = "10.200.0.2/30"   # client and server must use addresses in the same /
 clamp_mss = true            # rewrite TCP SYN/SYN-ACK MSS options to fit the
                              # effective tunnel MTU instead of relying on PMTUD,
                              # which many networks silently black-hole
-
-[crypto]
-private_key_file = "/etc/mlvpn/private.key"   # must be mode 0600
-peer_public_key = "REPLACE_WITH_PEER_PUBLIC_KEY_BASE64"
-rekey_interval_secs = 120
 
 [scheduler]
 down_threshold = 5       # consecutive missed probes before a link is marked Down
@@ -191,6 +187,9 @@ remote_addr = "203.0.113.10:51000"   # server's address:port for this link
 local_port = 51000
 weight = 1.0
 probe_interval_ms = 200
+private_key_file = "/etc/mlvpn/fiber.key"   # must be mode 0600; generate with
+                                            # `mlvpnd genkey --link fiber`
+peer_public_key = "REPLACE_WITH_PEER_PUBLIC_KEY_BASE64"
 
 [[links]]
 name = "lte"
@@ -202,3 +201,6 @@ bandwidth_cap_mbps = 20.0    # optional hard ceiling: the scheduler stops sendin
                              # more to this link once it's hit this rate in the
                              # current second, picking another link instead
 probe_interval_ms = 200
+private_key_file = "/etc/mlvpn/lte.key"   # must be mode 0600; generate with
+                                          # `mlvpnd genkey --link lte`
+peer_public_key = "REPLACE_WITH_PEER_PUBLIC_KEY_BASE64"

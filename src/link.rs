@@ -1282,6 +1282,8 @@ pub(crate) async fn test_link_for_state_transitions(state: LinkState, stats: Lin
             weight: 1.0,
             bandwidth_cap_mbps: None,
             probe_interval_ms: 200,
+            private_key_file: std::path::PathBuf::from("/tmp/test.key"),
+            peer_public_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string(),
         },
         socket: Arc::new(AsyncRwLock::new(Arc::new(socket))),
         reconnect_lock: Arc::new(AsyncMutex::new(())),
@@ -1373,6 +1375,8 @@ mod tests {
             weight: 1.0,
             bandwidth_cap_mbps: None,
             probe_interval_ms: 200,
+            private_key_file: std::path::PathBuf::from("/tmp/test.key"),
+            peer_public_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string(),
         }
     }
 

@@ -20,11 +20,6 @@ address = "10.200.0.1/30"
                                  # ARCHITECTURE.md for the full rationale
 clamp_mss = true                # TCP MSS clamping to the effective tunnel MTU
 
-[crypto]
-private_key_file = "/etc/mlvpn/private.key"
-peer_public_key = "REPLACE_WITH_CLIENT_PUBLIC_KEY_BASE64"
-rekey_interval_secs = 120
-
 [scheduler]
 down_threshold = 5       # consecutive missed probes before a link is marked Down
 up_threshold = 3         # consecutive good probes before a Down link is marked Up again
@@ -115,6 +110,9 @@ bind_interface = "eth0"
 local_port = 51000
 weight = 1.0
 probe_interval_ms = 200
+private_key_file = "/etc/mlvpn/fiber.key"   # must be mode 0600; generate with
+                                            # `mlvpnd genkey --link fiber`
+peer_public_key = "REPLACE_WITH_CLIENT_PUBLIC_KEY_BASE64"
 
 [[links]]
 name = "lte"
@@ -125,3 +123,6 @@ bandwidth_cap_mbps = 20.0    # optional hard ceiling: the scheduler stops sendin
                              # more to this link once it's hit this rate in the
                              # current second, picking another link instead
 probe_interval_ms = 200
+private_key_file = "/etc/mlvpn/lte.key"   # must be mode 0600; generate with
+                                          # `mlvpnd genkey --link lte`
+peer_public_key = "REPLACE_WITH_CLIENT_PUBLIC_KEY_BASE64"
