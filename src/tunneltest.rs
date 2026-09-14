@@ -71,7 +71,7 @@ use tokio::sync::mpsc;
 /// firewalling for).
 pub const TUNNEL_TEST_PORT: u16 = 34551;
 
-const HEADER_LEN: usize = 4 + 1 + 4 + 8 + 4;
+const HEADER_LEN: usize = 4 + 1 + 4 + 8;
 const FLAG_DONE: u8 = 0b01;
 const FLAG_BIDIRECTIONAL_REQUESTED: u8 = 0b10;
 const RESULT_LEN: usize = 4 + 4;
@@ -103,29 +103,40 @@ const DONE_RETRY_COUNT: u32 = 4;
 /// spread plus normal round-trip time.
 const RESULT_GRACE: Duration = Duration::from_secs(8);
 
-/// Duration of each `adaptive_bandwidth_ramp` probe step in `run_test`'s
-/// upload leg. Deliberately longer than `tunnel::adaptive_bandwidth_ramp`'s
-/// other callers (`run_throughput_test_leg_upload`, `active_bandwidth_prober`,
-/// both 1 second): those measure raw UDP directly on one link's own
-/// socket, with no scheduler or reorder buffer in the path. This
-/// measures through the real bonded tunnel -- the SWRR scheduler
-/// splitting across links and the reorder buffer holding packets for
-/// out-of-order delivery both need real time to settle, and confirmed
-/// via a real diagnostic run (2026-09-14) that a 1-second window made
-/// even a modest 16 Mbps target look like a real ceiling (only ~72%
-/// delivered) despite a full 30-second stream at 150 Mbps running
-/// perfectly clean moments earlier on the same path. 3 seconds gives
-/// that settling cost room to become a small fraction of the
-/// measurement instead of dominating it.
-const RAMP_STEP_DURATION: Duration = Duration::from_secs(3);
-
-/// How long to wait for a ramp step's `ResultPayload` reply after
-/// `send_stream` returns for that step. `send_stream` itself already
-/// blocks for `RAMP_STEP_DURATION` plus `DONE_RETRY_COUNT *
-/// DONE_RETRY_DELAY` (the done-packet retry spread) before returning, so
-/// this only needs to cover the reply's own network round-trip, not that
-/// whole spread again.
-const RAMP_STEP_REPLY_TIMEOUT: Duration = Duration::from_secs(3);
+/// Ceiling `send_stream` paces itself against -- see that function's
+/// own doc comment for why this exists at all: without it, a fast
+/// enough sender can dump data into the TUN device's own kernel buffer
+/// faster than `tunnel::tun_reader` can drain it, building an unbounded
+/// backlog no downstream `tc` shaping can prevent (confirmed in
+/// testing: even pacing at 1000 Mbps still wasn't conservative enough
+/// to keep the real outbound-queue/TUN pipeline's own drain rate ahead
+/// of the sender on ordinary test hardware). Deliberately well below
+/// what a genuinely fast WAN link might sustain -- this trades some
+/// measurement ceiling for reliability, which matters more here: a
+/// self-test that frequently returns "no result" on a fast link is
+/// worse than one that reports an accurate number up to a conservative
+/// cap. Revisit with real adaptive pacing (back off on observed queue
+/// drops, not a fixed ceiling) if this cap turns out to matter in
+/// practice against a real link faster than it.
+///
+/// Two real attempts to replace this fixed cap with
+/// `tunnel::adaptive_bandwidth_ramp` (the same mechanism already proven
+/// for the per-link self-test) were tried and reverted on 2026-09-14 --
+/// see `CLAUDE.local.md` for the full account. Both a 1-second and a
+/// 3-second ramp-step duration converged to a real, reproducible cliff
+/// around 8-16 Mbps target rate on live production hardware -- far
+/// below this constant's own 150 Mbps and roughly 25x below the ~400
+/// Mbps raw per-link capacity measured the same night -- while this
+/// fixed-rate approach ran cleanly at 150 Mbps for a full 30 seconds on
+/// the identical path moments earlier. Lengthening the step duration
+/// (ruling out "not enough settling time for the scheduler/reorder
+/// buffer") made no difference at all, so whatever's wrong isn't
+/// duration-related. Left unsolved -- worth trying a much higher
+/// starting point for the ramp (closer to this constant's own known-safe
+/// 150) instead of climbing from 2 Mbps, or a success criterion based on
+/// confirmed queue-drops rather than percentage-of-target delivery,
+/// before attempting this again.
+const MAX_SEND_RATE_MBPS: f64 = 150.0;
 
 /// Plain (unauthenticated at this layer -- see the module doc comment
 /// for why that's fine) app-level payload carried by every packet of a
@@ -146,20 +157,6 @@ struct DataPayload {
     /// across sending this stream -- meaningful only when `done` is
     /// set, since it's not final until the stream is.
     sender_queue_drops: u64,
-    /// The rate (Mbps) this stream is actually being paced at -- the
-    /// real, adaptively-discovered safe rate from this sender's own
-    /// `adaptive_bandwidth_ramp`, not a fixed guess. When
-    /// `bidirectional_requested` is set, the receiver reuses this same
-    /// value to pace its own reverse leg, rather than re-running an
-    /// independent ramp against this sender's already-registered
-    /// listener (which would need its own correlation plumbing through
-    /// `TunnelTestContext`). An approximation -- the two hosts' own
-    /// local TUN-pipeline drain rates aren't guaranteed identical -- but
-    /// a real, freshly-measured value for this exact path beats a fixed
-    /// constant that was never validated against either host at all.
-    /// Ignored (irrelevant, but always populated) for `!bidirectional_requested`
-    /// or ramp-step probes, which never trigger a reverse leg.
-    target_mbps: f32,
 }
 
 impl DataPayload {
@@ -176,7 +173,6 @@ impl DataPayload {
         out[4] = flags;
         out[5..9].copy_from_slice(&self.duration_secs.to_be_bytes());
         out[9..17].copy_from_slice(&self.sender_queue_drops.to_be_bytes());
-        out[17..21].copy_from_slice(&self.target_mbps.to_be_bytes());
         out
     }
 
@@ -191,7 +187,6 @@ impl DataPayload {
             bidirectional_requested: flags & FLAG_BIDIRECTIONAL_REQUESTED != 0,
             duration_secs: u32::from_be_bytes(buf[5..9].try_into().unwrap()),
             sender_queue_drops: u64::from_be_bytes(buf[9..17].try_into().unwrap()),
-            target_mbps: f32::from_be_bytes(buf[17..21].try_into().unwrap()),
         })
     }
 }
@@ -293,15 +288,11 @@ fn compute_achieved_mbps(bytes: u64, elapsed_secs: f64) -> f64 {
 /// Sends a continuous stream of app-level test packets to
 /// `peer_addr:TUNNEL_TEST_PORT` for `duration`, then spaced redundant
 /// `done` copies -- see `DONE_RETRY_DELAY`'s doc comment for why the
-/// spacing matters. Used for the upload leg's own ramp-step probes and
-/// its final measured send (`run_test`, which then reads a reply off
-/// `socket` itself), and for the autonomous reverse leg (`run_listener`,
-/// which doesn't -- its result reaches the original requester through
-/// `TunnelTestContext` on the *other* end instead). `target_mbps` is the
-/// rate this specific call paces itself against -- see this module's
-/// `adaptive_bandwidth_ramp` usage in `run_test` for how that rate is
-/// discovered rather than assumed.
-#[allow(clippy::too_many_arguments)]
+/// spacing matters. Used for both the upload leg (`run_test`, which
+/// then reads a reply off `socket` itself) and the autonomous reverse
+/// leg (`run_listener`, which doesn't -- its result reaches the
+/// original requester through `TunnelTestContext` on the *other* end
+/// instead).
 async fn send_stream(
     socket: &UdpSocket,
     peer_addr: SocketAddr,
@@ -310,7 +301,6 @@ async fn send_stream(
     bidirectional_requested: bool,
     mtu: crate::tunnel::LiveMtu,
     outbound_dropped_total: &Arc<AtomicU64>,
-    target_mbps: f64,
 ) {
     let start = Instant::now();
     let deadline = start + duration;
@@ -341,7 +331,6 @@ async fn send_stream(
             bidirectional_requested,
             duration_secs: duration.as_secs() as u32,
             sender_queue_drops,
-            target_mbps: target_mbps as f32,
         }
         .encode_padded(payload_len);
         let _ = socket.send_to(&payload, peer_addr).await;
@@ -354,10 +343,9 @@ async fn send_stream(
             return;
         }
 
-        // Pace against `target_mbps` -- caller-supplied, not a fixed
-        // guess: see `run_test`'s `adaptive_bandwidth_ramp` usage for
-        // why an *unpaced* (or wrongly-paced) version of this loop is a
-        // real bug, not just a theoretical concern: unlike
+        // Pace against MAX_SEND_RATE_MBPS -- see that constant's own
+        // doc comment for why an *unpaced* version of this loop turned
+        // out to be a real bug, not just a theoretical concern: unlike
         // `tunnel::send_throughput_test_stream` (raw UDP directly on a
         // link's own socket), this traffic goes in through the TUN
         // device, and plain UDP `send_to` returns as soon as the
@@ -371,15 +359,9 @@ async fn send_stream(
         // sender against an uncapped local veth pair, or even a
         // 200mbit-shaped one, left a backlog that took many seconds
         // (well past any reasonable redundant-"done"-packet retry
-        // budget) to drain. This is exactly why `target_mbps` is
-        // discovered via a real adaptive ramp (short probes, doubling
-        // until one isn't delivered cleanly, back off) rather than a
-        // fixed constant: a fixed rate is either too conservative for a
-        // fast link (leaving real capacity unmeasured, the original bug
-        // this ramp replaces) or, on a slower/busier link, still fast
-        // enough to trigger the exact backlog this comment describes.
+        // budget) to drain.
         let elapsed = start.elapsed().as_secs_f64();
-        let ideal_elapsed_secs = (bytes_sent as f64 * 8.0) / (target_mbps.max(0.001) * 1_000_000.0);
+        let ideal_elapsed_secs = (bytes_sent as f64 * 8.0) / (MAX_SEND_RATE_MBPS * 1_000_000.0);
         if ideal_elapsed_secs > elapsed {
             tokio::time::sleep(Duration::from_secs_f64(ideal_elapsed_secs - elapsed)).await;
         }
@@ -434,56 +416,6 @@ pub(crate) async fn run_test(
         }
     };
 
-    // Discover a real, safe send rate before the actual measured stream,
-    // rather than assuming a fixed constant -- see `send_stream`'s own
-    // doc comment for why an unpaced (or wrongly-paced) sender can build
-    // an unbounded TUN-buffer backlog that no fixed "safe" guess can
-    // reliably avoid on every real link. Each step is a short (1s),
-    // independent probe on this same ephemeral socket with its own fresh
-    // `test_id`, so it can't be confused with the real measured stream's
-    // own `test_id` below or with any other concurrent test -- and
-    // `bidirectional_requested: false` on every step means the peer
-    // never spawns a reverse leg for a probe.
-    let ramp = crate::tunnel::adaptive_bandwidth_ramp(|step_target_mbps| {
-        let socket = &socket;
-        let mtu = mtu.clone();
-        async move {
-            let step_test_id = crate::crypto::random_session_id();
-            send_stream(
-                socket,
-                remote,
-                step_test_id,
-                RAMP_STEP_DURATION,
-                false,
-                mtu,
-                outbound_dropped_total,
-                step_target_mbps,
-            )
-            .await;
-            let mut buf = [0u8; RESULT_LEN];
-            match tokio::time::timeout(RAMP_STEP_REPLY_TIMEOUT, socket.recv_from(&mut buf)).await {
-                Ok(Ok((n, _from))) => ResultPayload::decode(&buf[..n])
-                    .filter(|r| r.test_id == step_test_id)
-                    .map(|r| r.achieved_mbps as f64),
-                _ => None,
-            }
-        }
-    })
-    .await;
-    let target_mbps = ramp.confirmed_mbps;
-    for step in &ramp.steps {
-        tracing::warn!(
-            target_mbps = step.target_mbps,
-            achieved_mbps = ?step.achieved_mbps,
-            clean = step.clean,
-            "tunnel-level self-test ramp step (temporary diagnostic)"
-        );
-    }
-    tracing::warn!(
-        confirmed_mbps = target_mbps,
-        "tunnel-level self-test ramp converged (temporary diagnostic)"
-    );
-
     let queue_drops_before = outbound_dropped_total.load(Ordering::Relaxed);
     send_stream(
         &socket,
@@ -493,7 +425,6 @@ pub(crate) async fn run_test(
         bidirectional,
         mtu,
         outbound_dropped_total,
-        target_mbps,
     )
     .await;
     let local_queue_drops = outbound_dropped_total
@@ -666,20 +597,6 @@ pub(crate) async fn run_listener(
             // out).
             let reverse_target = SocketAddr::new(from.ip(), TUNNEL_TEST_PORT);
             let mtu = mtu.clone();
-            // Reuse the forward leg's own just-discovered `target_mbps`
-            // (carried on the wire in `data`) rather than running a
-            // second, independent ramp for this direction -- see
-            // `DataPayload::target_mbps`'s own doc comment for why: an
-            // independent reverse-leg ramp would need its own
-            // step-result correlation plumbed through
-            // `TunnelTestContext` (this send races with the *same*
-            // long-running listener loop currently processing it, so it
-            // can't just do its own blocking `recv_from` the way
-            // `run_test`'s forward-leg ramp does on its own private
-            // ephemeral socket). An approximation, not a per-direction
-            // measurement, but real and adaptively-discovered rather
-            // than a fixed guess.
-            let target_mbps = data.target_mbps as f64;
             tokio::spawn(async move {
                 send_stream(
                     &socket,
@@ -689,7 +606,6 @@ pub(crate) async fn run_listener(
                     false,
                     mtu,
                     &outbound_dropped_total,
-                    target_mbps,
                 )
                 .await;
             });
@@ -709,7 +625,6 @@ mod tests {
             bidirectional_requested: true,
             duration_secs: 10,
             sender_queue_drops: 42,
-            target_mbps: 123.5,
         };
         let encoded = payload.encode_padded(1400);
         assert_eq!(encoded.len(), 1400);
@@ -719,7 +634,6 @@ mod tests {
         assert!(decoded.bidirectional_requested);
         assert_eq!(decoded.duration_secs, 10);
         assert_eq!(decoded.sender_queue_drops, 42);
-        assert!((decoded.target_mbps - 123.5).abs() < f32::EPSILON);
     }
 
     #[test]
@@ -730,7 +644,6 @@ mod tests {
             bidirectional_requested: false,
             duration_secs: 5,
             sender_queue_drops: 0,
-            target_mbps: 0.0,
         };
         let encoded = payload.encode_padded(64);
         let decoded = DataPayload::decode(&encoded).expect("decode");
@@ -746,7 +659,6 @@ mod tests {
             bidirectional_requested: false,
             duration_secs: 1,
             sender_queue_drops: 0,
-            target_mbps: 0.0,
         };
         let encoded = payload.encode_padded(0);
         assert_eq!(encoded.len(), HEADER_LEN);
