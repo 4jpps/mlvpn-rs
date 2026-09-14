@@ -120,6 +120,11 @@ const FAKE_IPV4_PROTOCOL: u8 = 253;
 /// happens to exceed even this).
 const MAX_WG_PACKET: usize = u16::MAX as usize + 64;
 
+/// Real WireGuard per-packet overhead added by `WgTunnel::encapsulate`:
+/// a 16-byte transport-message header (type + receiver index + counter)
+/// plus a 16-byte Poly1305 AEAD tag.
+pub const WG_OVERHEAD_BYTES: u32 = 32;
+
 /// Wraps `plaintext` in a minimal fake IPv4 header so it survives
 /// boringtun's receive-side IP-packet validation (see module doc).
 fn wrap_fake_ipv4(plaintext: &[u8]) -> Result<Vec<u8>> {

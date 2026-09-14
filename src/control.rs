@@ -768,7 +768,7 @@ pub fn effective_tunnel_mtu(
     cfg: &crate::config::TunnelConfig,
     detected_mtus: &[Option<u32>],
 ) -> u16 {
-    let outer_overhead = crate::protocol::HEADER_LEN as u32 + crate::crypto::TAG_LEN as u32 + 48;
+    let outer_overhead = crate::protocol::HEADER_LEN as u32 + crate::wireguard::WG_OVERHEAD_BYTES + 48;
 
     let Some(detected_min) = detected_mtus.iter().filter_map(|m| *m).min() else {
         return cfg.mtu.unwrap_or(FALLBACK_MTU_WHEN_NOTHING_DETECTED);
@@ -1250,14 +1250,24 @@ mod tests {
     }
 
     #[test]
+    fn effective_tunnel_mtu_accounts_for_wireguard_overhead() {
+        let cfg = test_tunnel_config(None);
+        let detected = [Some(1500u32)];
+        let expected_overhead = crate::protocol::HEADER_LEN as u32
+            + crate::wireguard::WG_OVERHEAD_BYTES
+            + 48;
+        assert_eq!(effective_tunnel_mtu(&cfg, &detected) as u32, 1500 - expected_overhead);
+    }
+
+    #[test]
     fn no_configured_ceiling_uses_full_detected_value() {
         let cfg = test_tunnel_config(None);
         let detected = [Some(1500u32)];
         // outer_overhead for IPv6/UDP framing is protocol::HEADER_LEN +
-        // crypto::TAG_LEN + 48 -- assert the result equals
+        // WG_OVERHEAD_BYTES + 48 -- assert the result equals
         // 1500 - that overhead, NOT the old hardcoded 1400.
         let expected = 1500u32
-            .saturating_sub(crate::protocol::HEADER_LEN as u32 + crate::crypto::TAG_LEN as u32 + 48)
+            .saturating_sub(crate::protocol::HEADER_LEN as u32 + crate::wireguard::WG_OVERHEAD_BYTES + 48)
             as u16;
         assert_eq!(effective_tunnel_mtu(&cfg, &detected), expected);
     }
