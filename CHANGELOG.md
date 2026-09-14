@@ -14,7 +14,8 @@ design, and `ARCHITECTURE.md` covers the system as a whole.
 
 ### Added
 
-- **`mlvpn-tui`'s Links tab now shows which link is actually primary.** A new "Role" column shows "Primary" (bold green) on whichever link `Scheduler::primary()` currently points at, and "Failover" (muted) on every other link -- but only when `primary_link_mode`/`follow_peer_primary` is actually active; under plain SWRR (bonded, no single-primary concept) both tags stay blank rather than mislabeling a link genuinely carrying its own real share of traffic as a "failover" standby. `LinkSnapshot` gains a new `is_primary` field (backward-compatible: `#[serde(default)]`, defaults to `false`) to carry this over the control socket. Motivated directly by a real troubleshooting session where confirming which link was actually selected required diffing raw `tx_bytes` counters by hand across two control-socket polls.
+- **`mlvpn-tui`'s Links tab now shows which link is actually primary.** A new "Role" column shows "Primary" (bold green) on whichever link `Scheduler::primary()` currently points at, and "Failover" (muted) on every other link -- but only when `primary_link_mode`/`follow_peer_primary` is actually active. `LinkSnapshot` gains a new `is_primary` field (backward-compatible: `#[serde(default)]`, defaults to `false`) to carry this over the control socket. Motivated directly by a real troubleshooting session where confirming which link was actually selected required diffing raw `tx_bytes` counters by hand across two control-socket polls.
+- **Same Role column also tags plain SWRR/bonded mode.** When no link is primary (i.e. `primary_link_mode`/`follow_peer_primary` off, every Up link genuinely sharing traffic by score), each currently-Up link now shows "Bonded" (cyan) instead of a blank cell; a Down/Probing link still renders blank since it isn't part of the active bonding set.
 
 ### Fixed
 

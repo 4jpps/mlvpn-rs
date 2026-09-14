@@ -738,6 +738,8 @@ fn link_row(l: &LinkSnapshot, any_primary: bool) -> Row<'static> {
         )
     } else if any_primary {
         ("Failover", Style::default().fg(COLOR_MUTED))
+    } else if l.state == "up" {
+        ("Bonded", Style::default().fg(Color::Cyan))
     } else {
         ("", Style::default())
     };

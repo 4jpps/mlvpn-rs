@@ -113,7 +113,6 @@ fn default_tx_queue_len() -> u32 {
     4000
 }
 
-
 /// `redundant_mode`, `primary_link_mode`, and `follow_peer_primary` are
 /// mutually exclusive -- at most one may be `true` at a time (enforced in
 /// `Config::validate`). Each represents a fundamentally different
@@ -995,6 +994,9 @@ mod tests {
             peer_public_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
         "#;
         let cfg: Config = toml::from_str(toml).expect("per-link key fields must parse");
-        assert_eq!(cfg.links[0].peer_public_key, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=");
+        assert_eq!(
+            cfg.links[0].peer_public_key,
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+        );
     }
 }

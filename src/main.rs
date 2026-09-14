@@ -645,8 +645,14 @@ fn genkey(link: &str, out: Option<PathBuf>) -> anyhow::Result<()> {
                 .mode(0o600)
                 .open(&path)?;
             f.write_all(kp.private_base64().as_bytes())?;
-            println!("private key for link '{link}' written to {}", path.display());
-            println!("public key for link '{link}' (share with peer): {}", kp.public_base64());
+            println!(
+                "private key for link '{link}' written to {}",
+                path.display()
+            );
+            println!(
+                "public key for link '{link}' (share with peer): {}",
+                kp.public_base64()
+            );
         }
         None => {
             println!("private key for link '{link}': {}", kp.private_base64());
@@ -850,7 +856,10 @@ mod tests {
         // clap's Parser derive rejects missing required args at parse time --
         // verify `mlvpnd genkey` with no --link fails to parse.
         let result = Cli::try_parse_from(["mlvpnd", "genkey"]);
-        assert!(result.is_err(), "genkey without --link should fail to parse");
+        assert!(
+            result.is_err(),
+            "genkey without --link should fail to parse"
+        );
 
         let result = Cli::try_parse_from(["mlvpnd", "genkey", "--link", "comcast"]);
         assert!(result.is_ok(), "genkey with --link should parse");

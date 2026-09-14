@@ -183,7 +183,14 @@ impl Header {
         let ptype = PacketType::from_u8(buf[2])?;
         let link_id = buf[3];
         let seq = u64::from_be_bytes(buf[4..12].try_into().unwrap());
-        Ok((Header { ptype, link_id, seq }, &buf[HEADER_LEN..]))
+        Ok((
+            Header {
+                ptype,
+                link_id,
+                seq,
+            },
+            &buf[HEADER_LEN..],
+        ))
     }
 }
 
