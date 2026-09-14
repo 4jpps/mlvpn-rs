@@ -784,7 +784,8 @@ impl Config {
         // main.rs) -- stderr is the only channel guaranteed visible here.
         if let Some(mtu) = self.tunnel.mtu {
             let outer_overhead = crate::protocol::HEADER_LEN as u32
-                + crate::crypto::TAG_LEN as u32
+                + crate::wireguard::WG_OVERHEAD_BYTES
+                + crate::wireguard::FAKE_IPV4_HEADER_LEN as u32
                 + 28 /* IPv4(20) + UDP(8); +20 more if the outer transport ends up on IPv6 */;
             const TYPICAL_PHYSICAL_MTU: u32 = 1500;
             if mtu as u32 + outer_overhead > TYPICAL_PHYSICAL_MTU {

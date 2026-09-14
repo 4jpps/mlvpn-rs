@@ -27,10 +27,10 @@ deliberate departures from that design:
 - **Memory-safe implementation** (Rust) instead of C, which matters
   most exactly where this daemon parses attacker-reachable network
   input.
-- **Modern authenticated-key-exchange cryptography** -- a full
-  `Noise_IK_25519_ChaChaPoly_BLAKE2s` handshake (the same family
-  WireGuard is built on) with mutual authentication and forward
-  secrecy, instead of a shared password-derived key.
+- **Modern authenticated-key-exchange cryptography** -- one independent
+  WireGuard tunnel per bonded physical link (via the `boringtun`
+  crate), each with its own mutually authenticated, forward-secret
+  handshake, instead of a shared password-derived key.
 - **`async`/tokio concurrency** instead of a single-threaded event
   loop.
 - **Privilege dropping**, not multi-process privilege separation.
@@ -63,21 +63,27 @@ unreachable, and current security best practice.
 ## 2. Process layout
 
 One binary, `mlvpnd`, run in either `client` or `server` mode. Both
-roles run the identical data path once a session is established; the
-only asymmetry is who initiates the Noise handshake.
+roles run the identical data path -- each bonded physical link
+independently owns and manages its own WireGuard handshake/rekey (via
+`boringtun`), with no tunnel-wide session-establishment step at all, so
+"client" and "server" here just mean which side initiates each link's
+UDP connection, not which side authenticates first.
 
 At startup: open the TUN device, bind one UDP socket per configured
 link to its named interface (requesting an 8 MiB kernel receive/send
 buffer on each, well past the stock ~208KB Linux default that would
 otherwise silently drop packets under a fast link's real
-bandwidth-delay product -- see `docs/performance-tuning.md`), load key
-material, drop privileges, then
-perform the Noise handshake and spawn the steady-state tasks. A client
-whose peer is unreachable never gives up and exits: it logs a warning
-and retries the handshake with exponential backoff indefinitely in the
-background (`tunnel::establish_session_with_retry`), the same way
-WireGuard and the original MLVPN behave -- earlier versions instead
-exited the process on a failed handshake, which under systemd's default
+bandwidth-delay product -- see `docs/performance-tuning.md`), load each
+link's own keypair, drop privileges, then spawn the steady-state tasks.
+Each link's `WgTunnel` handshakes lazily and independently the moment
+it has something to send or receives a peer's handshake attempt --
+there is no daemon-wide "wait for the handshake to complete" step, the
+same lazy, connectionless model real WireGuard uses. A client link
+whose peer is unreachable never gives up: `boringtun` retries the
+handshake with its own internal backoff indefinitely, logged by
+`link_receiver`/`link_prober` as an ordinary Down link rather than a
+fatal error -- earlier versions of this project instead exited the
+whole process on a failed handshake, which under systemd's default
 `Restart=on-failure` could trip the restart-rate-limit and leave the
 unit permanently `failed` if a peer stayed unreachable for more than a
 few minutes at boot.
@@ -110,42 +116,66 @@ Steady state (`tunnel.rs`) is a small set of tokio tasks:
 
 ## 3. Wire protocol
 
-Defined in `protocol.rs`. Every frame has a small plaintext header
-(packet type, link id, session id, sequence number) followed by a
-payload. Handshake payloads are raw Noise messages; every other frame
-type -- `Data`, `Probe`, `ProbeReply`, `StatsShare`, `VersionInfo`,
+Defined in `protocol.rs`. Every mlvpn frame has a small header (packet
+type, link id, sequence number) followed by a payload -- `Data`,
+`Probe`, `ProbeReply`, `StatsShare`, `VersionInfo`,
 `ThroughputTestData`, `ThroughputTestResult`,
-`ThroughputTestReverseRequest` -- is AEAD ciphertext, so an off-path
-attacker can't inject forged probe/stats samples, forge a fake
-throughput result, forge a fake version, or read tunnel traffic.
+`ThroughputTestReverseRequest`, etc. There is no separate plaintext
+header on the wire and no `session_id` field: the entire serialized
+frame, header included, is handed as one opaque plaintext blob to
+whichever physical link is sending it (`link::LinkHandle::wg_send` ->
+`wireguard::WgTunnel::encapsulate`), which WireGuard encrypts and
+authenticates as a single unit. An off-path attacker can't inject
+forged probe/stats samples, forge a fake throughput result, forge a
+fake version, tamper with the header fields, or read tunnel traffic --
+see `protocol.rs`'s own module doc comment for the full detail on what
+this buys over the old design.
 
-The sequence number is global per session, not per link -- this is
-what makes replay protection and receive-side reordering work
-correctly when the same stream is spread across links with different
-latencies.
+The sequence number is a single counter shared across every link and
+packet type, not per-link -- this is what makes `ReorderBuffer`'s
+cross-link reordering detection work correctly when the same stream is
+spread across links with different latencies. It is unrelated to each
+link's own WireGuard-internal transport counter, which is what
+actually serves as the AEAD nonce for that link's traffic.
 
 ## 4. Crypto
 
-`Noise_IK_25519_ChaChaPoly_BLAKE2s` via the `snow` crate -- the same
-protocol family WireGuard is built on. Both peers hold each other's
-long-term public key out of band (from the config file) and pin it
-after the handshake, so "authenticated" means "authenticated as the
-specific configured peer," not just "holds some valid key."
+Each configured `[[links]]` entry gets its own completely independent
+WireGuard tunnel, via the `boringtun` crate (`wireguard::WgTunnel`,
+wrapping `boringtun::noise::Tunn`) -- not a tunnel-wide shared session.
+There is no daemon-level handshake, rekey timer, or session concept at
+all; every one of those is WireGuard's own, managed entirely inside
+`boringtun` for that one link, exactly as real WireGuard behaves for
+any single interface. Both peers hold each other's long-term Curve25519
+public key out of band (a `[[links]]` entry's `peer_public_key`,
+alongside `private_key_file` for the local half), so "authenticated"
+means "authenticated as the specific configured peer for this link,"
+not just "holds some valid key."
 
-Replay protection is a sliding-window bitmap keyed on the session's
-sequence number, tolerant of the reordering multipath introduces.
+Handshake, rekey timing, and replay protection (a sliding-window
+bitmap keyed on WireGuard's own per-link transport counter) are all
+`boringtun`'s responsibility, not this project's -- there is nothing in
+`mlvpn-rs` itself analogous to the old shared `crypto::SessionState`'s
+active/previous-session overlap window, because there is no shared
+session left to rekey. A link's handshake happens lazily, the moment
+there's real traffic to send or a peer's handshake attempt arrives,
+and re-keys on WireGuard's own standard schedule with no daemon-level
+coordination needed between links.
 
-Sessions rekey periodically (`crypto.rekey_interval_secs`, default
-120s) to bound how much traffic is ever protected by one set of keys.
-The client always initiates a rekey the same way it initiates the
-first handshake; the server passively accepts it. A short overlap
-window keeps the outgoing session's keys valid briefly after a swap so
-packets already in flight aren't dropped. See `crypto.rs`'s
-`SessionState` doc comment for the full design.
+Because `boringtun::Tunn::decapsulate` internally validates its
+decrypted plaintext as if it were a real IP packet (to replicate real
+WireGuard's own TUN-write behavior), `wireguard.rs` wraps every mlvpn
+frame in a minimal synthetic 20-byte IPv4 header
+(`wireguard::FAKE_IPV4_HEADER_LEN`) before encryption and strips it
+back off after decryption -- an implementation detail entirely private
+to that module; see its own module doc comment for the full reasoning,
+including the exact `boringtun` source behavior this works around.
 
-Key handling: `mlvpnd genkey` writes a private key to a 0600 file;
-`mlvpnd` refuses to start if key/config files are group- or
-other-readable, and zeroizes private key bytes on drop.
+Key handling: `mlvpnd genkey --link <name>` generates and writes one
+link's private key to a 0600 file plus prints/saves the matching public
+key to hand to the peer; `mlvpnd` refuses to start if key/config files
+are group- or other-readable, and zeroizes private key bytes on drop
+(`crypto::StaticKeypair`, `crypto::LocalPrivateKey`).
 
 ## 5. Link quality: latency, jitter, throughput
 
@@ -301,28 +331,29 @@ preferred (`link::pick_remote_addr`). This is distinct from
 `tunnel.address6` (§12), which is about the TUN interface's own
 address, not the transport sockets between the two `mlvpnd` instances.
 
-**Resolving a dual-stack ambiguity for real.** An `AAAA` record
-existing doesn't mean that IPv6 path actually works end-to-end --
-residential/consumer ISPs with a broken or absent IPv6 route are common
-enough that blindly committing to "IPv6 if present" could otherwise
-strand a link forever. `link::Link::alternate` holds the untried other
-family alongside the chosen primary; `tunnel::perform_client_handshake`
-broadcasts both during the very first handshake attempt, and whichever
-one the peer actually answers wins. But the peer deduplicates every
-copy of that broadcast by `session_id` (they're identical except for
-source link/address), so only the very first arrival *across every
-configured link* ever gets a real reply -- every other link, and every
-other family on whichever link did win, learns nothing from that
-exchange. `tunnel::resolve_remaining_alternates` covers those: right
-after the session is established, it races a real authenticated
-`Probe`/`ProbeReply` between each remaining link's own primary and
-alternate (cheap -- the session already exists, no second handshake
-needed) and commits whichever one actually answers, falling back to the
-original primary only if neither does. Without this second pass, a
-link whose primary family happened to be the broken one -- reported in
-practice as "this link is stuck trying IPv6 even though IPv6 is
-disabled on its interface" -- would sit in `Probing` forever, having
-had a working alternate that was simply discarded unused.
+**Dual-stack ambiguity, a known gap since the WireGuard rewrite.** An
+`AAAA` record existing doesn't mean that IPv6 path actually works
+end-to-end -- residential/consumer ISPs with a broken or absent IPv6
+route are common enough that blindly committing to "IPv6 if present"
+can strand a link. `link::Link::alternate` still holds the untried
+other family alongside the chosen primary (`link::pick_remote_addr`),
+but the active mechanism that used to recover from a wrong guess --
+the old shared-session design's `tunnel::perform_client_handshake`
+racing both families during the tunnel-wide initial handshake, with
+`tunnel::resolve_remaining_alternates` following up for every link that
+didn't win that race -- depended entirely on there being one shared,
+tunnel-wide handshake moment to race during. That moment no longer
+exists: each link now handshakes lazily and independently, on its own
+schedule, via its own `WgTunnel` (see §2, §4), so there is nothing left
+to hang a "race both families once, right after the handshake" step
+off of. This has deliberately **not** been reimplemented as part of the
+WireGuard rewrite -- `Link::alternate`/`alternate_handle`/`commit_remote`
+still exist in `link.rs` but nothing in `tunnel.rs` calls them anymore
+(see that module's own doc comment for the full accounting). A link
+configured with a dual-stack `remote_addr` now simply uses whichever
+family `pick_remote_addr` guessed at bind time, with no runtime
+fallback if that guess is wrong -- worth reconsidering in a later task
+if this turns out to matter in practice.
 
 ## 7. Receive-side reordering
 
@@ -397,8 +428,7 @@ streams live JSON snapshots over a local Unix socket
 -- read-only, no command/write side.
 
 Beyond per-link stats, each `Snapshot` carries a `DaemonSnapshot`
-(session id/uptime/rekey count off the hot-path lock via `SessionMeta`;
-outbound queue depth/capacity/lifetime drops; the TUN device's own
+(outbound queue depth/capacity/lifetime drops; the TUN device's own
 `/sys/class/net/<iface>/statistics/*` counters via `sysfs_net.rs`;
 machine-wide load/memory/uptime from `/proc` via `procstats.rs`) and a
 `new_log_lines` delta from an in-memory ring of the daemon's own INFO+
@@ -415,7 +445,7 @@ Overview, Links, Daemon, Logs -- see [monitoring.md](docs/monitoring.md).
 the peer's own version, learned from a `VersionInfo` frame sent
 alongside `StatsShare` on that same per-link timer (piggybacked rather
 than a dedicated timer/packet, for the same multi-link redundancy
-`StatsShare` already gets). `mlvpn-tui`'s Session panel and both
+`StatsShare` already gets). `mlvpn-tui`'s Daemon tab and both
 `mlvpnd self-test` CLI paths (`CommandResult::peer_version`, sourced
 from the same field) flag a mismatch -- the self-test case matters
 specifically because it's still available even when the self-test's
@@ -455,7 +485,8 @@ currently three commands:
   batching matters for a *sub-millisecond* measurement), a self-test
   stream deliberately does *not* batch its encrypts under one lock
   acquisition -- a multi-second stream is meant to compete fairly with
-  real Data traffic for the shared session lock, not race around it.
+  real Data traffic for that link's own per-link WireGuard lock
+  (`wireguard::WgTunnel`'s internal `Mutex`), not race around it.
 - Run an on-demand **tunnel-level** throughput self-test
   (`ipc::Command::RunTunnelThroughputTest`, `mlvpnd self-test --tunnel
   --peer-addr <ip>` on the CLI) -- distinct from the link-level self-test
@@ -464,7 +495,7 @@ currently three commands:
   real UDP packets addressed to the peer's *tunnel-internal* IP, so the
   OS kernel genuinely routes them through the TUN device, exercising the
   real pipeline end to end (`tunneltest.rs`). It's a self-contained
-  app-level protocol, not `protocol.rs`'s Header/PacketType/Noise --
+  app-level protocol, not `protocol.rs`'s Header/PacketType/WireGuard --
   the traffic gets authentication "for free" by virtue of actually
   transiting the tunnel, so there's no need to duplicate the wire
   crypto for it. The server side's listener (`tunneltest::run_listener`,
@@ -484,8 +515,8 @@ currently three commands:
   reading zero, see `docs/monitoring.md`).
 - Capture a diagnostic dump right now (`ipc::Command::DiagDump`,
   `mlvpnd diag-dump` on the CLI) -- builds a fresh `ipc::Snapshot` the
-  same way the monitoring socket does (link/session/queue/tun/system
-  state, plus every log line currently in `logbuf::LogRing`, not just a
+  same way the monitoring socket does (link/queue/tun/system state,
+  plus every log line currently in `logbuf::LogRing`, not just a
   recent delta) and renders it via `diag.rs::format_dump` into the
   `CommandResult`'s `diag_dump` text field. The CLI then appends its own
   kernel-level UDP diagnostics (`nstat -az`, `ss -lu -n -a`,
@@ -530,8 +561,8 @@ for the full history of what and when.
 **IPv4/IPv6 dual-stack TUN interface.** The optional IPv6
 `tunnel.address6` is assigned alongside the required IPv4
 `tunnel.address` on the same device -- there's no separate "IPv6
-tunnel." Both address families share the one encrypted session and the
-one set of bonded links.
+tunnel." Both address families share the same set of bonded links and
+each link's own WireGuard tunnel.
 
 **Adaptive MTU.** `tunnel.mtu` is optional, and leaving it unset is the
 recommended configuration. Unset, the tunnel MTU is derived entirely

@@ -1,6 +1,11 @@
-//! Wire format for packets exchanged between mlvpn peers.
+//! Wire format for mlvpn frames -- the plaintext that gets encrypted as a
+//! whole by each link's own WireGuard tunnel (see `wireguard.rs`), not the
+//! bytes actually visible on the wire (those are `boringtun`'s own
+//! WireGuard transport-message format: a 16-byte header plus this entire
+//! frame as AEAD ciphertext plus a 16-byte Poly1305 tag -- see
+//! `wireguard::WG_OVERHEAD_BYTES`).
 //!
-//! Every on-the-wire packet (after the outer UDP header) looks like:
+//! Every mlvpn frame, before encryption, looks like:
 //!
 //! ```text
 //!  0                   1                   2                   3
@@ -14,22 +19,31 @@
 //! +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 //! ```
 //!
-//! `Type` and `LinkId` are plaintext dispatch metadata, *not* AEAD
-//! associated data -- `snow`'s `StatelessTransportState` (see `crypto.rs`)
-//! doesn't expose an AAD parameter, so they aren't cryptographically bound
-//! to the ciphertext. `Payload` is the ciphertext (which includes the AEAD
-//! tag at its end) for Data/Keepalive/Probe/ProbeReply frames, or raw
-//! Noise handshake bytes for Handshake frames (Noise protects its own
-//! handshake messages). Each physical link now authenticates independently
-//! via its own WireGuard tunnel, so there is no longer a shared-session
-//! concept for dispatch -- session_id was removed in favor of per-link
-//! authentication. See `crypto.rs`'s module doc comment for the nonce
-//! handling: the sequence number doubles as the AEAD nonce and is
-//! therefore implicitly authenticated, which is what actually matters here.
+//! `Type` and `LinkId` are **not** separately-transmitted plaintext dispatch
+//! metadata the way they were under the old shared Noise_IK design (where
+//! `snow`'s `StatelessTransportState` had no AAD parameter to bind them
+//! to). Under the current per-link WireGuard transport, `wireguard::
+//! WgTunnel::encapsulate` takes this entire serialized frame -- header
+//! included -- as its plaintext input and encrypts it as one unit
+//! (`link::LinkHandle::wg_send`), so `Type`, `LinkId`, and `Sequence
+//! Number` are all fully covered by WireGuard's own AEAD tag on the wire,
+//! the same as the payload itself: an attacker cannot tamper with any
+//! header field without the receiving `WgTunnel::decapsulate` rejecting
+//! the whole frame. This is actually a stronger property than the old
+//! design had, not merely a different one. Each physical link
+//! authenticates independently via its own WireGuard tunnel, with no
+//! shared tunnel-wide session and no `session_id` field at all -- see
+//! `ARCHITECTURE.md` §4 for the current crypto design.
 //!
-//! The 64-bit sequence number is now link-local (not global): it is
-//! what lets the receiver detect replay and reorder packets that arrive
-//! out of order because they took different physical paths on the same link.
+//! The 64-bit sequence number is a single tunnel-wide monotonic counter
+//! (`tunnel::next_send_seq`), shared across every packet type on every
+//! link -- not per-link. This is what lets `ReorderBuffer` detect genuine
+//! cross-link reordering (the same logical stream arriving out of order
+//! because different packets took different physical paths). It is
+//! unrelated to, and does not need to agree with, any per-link
+//! WireGuard-internal nonce/counter, which is entirely private to that
+//! link's own `WgTunnel`/`boringtun::Tunn` and serves as the actual AEAD
+//! nonce for that link's ciphertext.
 
 use crate::error::{MlvpnError, Result};
 

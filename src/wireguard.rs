@@ -84,8 +84,11 @@ pub enum DecapsulateOutcome {
 
 /// Minimal synthetic IPv4 header prepended to every plaintext frame before
 /// it's handed to `boringtun`, and stripped back off on receive -- see
-/// this module's own doc comment above for why this exists.
-const FAKE_IPV4_HEADER_LEN: usize = 20;
+/// this module's own doc comment above for why this exists. `pub` so
+/// callers computing real per-packet tunnel overhead (`control.rs`'s
+/// `effective_tunnel_mtu`, `config.rs`'s MTU-fragmentation advisory check)
+/// can account for this wrapping cost on top of `WG_OVERHEAD_BYTES`.
+pub const FAKE_IPV4_HEADER_LEN: usize = 20;
 
 /// boringtun protocol-number convention for our synthetic header:
 /// IANA-reserved "for experimentation and testing" (RFC 3692), so it's
