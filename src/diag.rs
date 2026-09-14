@@ -84,10 +84,6 @@ pub fn format_dump(snapshot: &Snapshot, trigger: &str) -> String {
         d.peer_version.as_deref().unwrap_or("unknown")
     ));
     out.push_str(&format!(
-        "session_id={} session_uptime_ms={} rekey_count={}\n",
-        d.session_id, d.session_uptime_ms, d.rekey_count
-    ));
-    out.push_str(&format!(
         "outbound_queue: {}/{} (dropped_lifetime={})\n",
         d.outbound_queue_len, d.outbound_queue_capacity, d.outbound_queue_dropped_total
     ));
@@ -214,9 +210,6 @@ mod tests {
             unix_ts_ms: 1_753_000_000_000,
             links,
             daemon: DaemonSnapshot {
-                session_id: 42,
-                session_uptime_ms: 60_000,
-                rekey_count: 3,
                 outbound_queue_len: 0,
                 outbound_queue_capacity: 1024,
                 outbound_queue_dropped_total: 0,
@@ -255,7 +248,6 @@ mod tests {
         assert!(text.contains("comcast: state=up"));
         assert!(text.contains("loss=41.0%"));
         assert!(text.contains("version: local=0.4.5 peer=0.4.5"));
-        assert!(text.contains("session_id=42"));
         assert!(text.contains("outbound_queue: 0/1024"));
         assert!(text.contains("tun(mlvpn0):"));
         assert!(text.contains("load=0.38,0.25,0.18"));

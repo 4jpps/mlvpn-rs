@@ -897,17 +897,13 @@ fn draw_daemon_tab(f: &mut Frame, area: Rect, state: &SharedState) {
 }
 
 fn draw_session_panel(f: &mut Frame, area: Rect, daemon: &DaemonSnapshot) {
-    let session_line = Line::from(vec![
-        Span::raw("Session ID: "),
-        Span::styled(
-            format!("{:08x}", daemon.session_id),
-            Style::default().fg(COLOR_ACCENT),
-        ),
-        Span::raw("   Uptime: "),
-        Span::raw(fmt_duration_ms(daemon.session_uptime_ms)),
-        Span::raw("   Rekeys: "),
-        Span::raw(daemon.rekey_count.to_string()),
-    ]);
+    // NOTE: this panel used to also show a tunnel-wide "Session ID /
+    // Uptime / Rekeys" line, but that concept no longer exists now that
+    // each link owns its own independent WireGuard tunnel (see
+    // `src/wireguard.rs::WgTunnel`) instead of one shared Noise
+    // transport session. A per-link replacement (e.g. handshake
+    // count/age per link) would need new tracking state that doesn't
+    // exist yet -- left as a possible follow-up, not done here.
 
     // Peer version comes from the periodic authenticated `VersionInfo`
     // wire exchange (`PacketType::VersionInfo`), independent of
@@ -957,7 +953,7 @@ fn draw_session_panel(f: &mut Frame, area: Rect, daemon: &DaemonSnapshot) {
 
     let block = Block::default().borders(Borders::ALL).title(" Session ");
     f.render_widget(
-        Paragraph::new(vec![session_line, version_line, mtu_line]).block(block),
+        Paragraph::new(vec![version_line, mtu_line]).block(block),
         area,
     );
 }

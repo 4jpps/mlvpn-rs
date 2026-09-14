@@ -690,9 +690,6 @@ async fn run(cfg: Config, log_ring: Arc<LogRing>) -> anyhow::Result<()> {
     );
     let tun = open_tun(&cfg.tunnel, effective_mtu)?;
 
-    let local_private = crypto::StaticKeypair::load_private(&cfg.crypto.private_key_file)?;
-    let peer_public = crypto::decode_public_key(&cfg.crypto.peer_public_key)?;
-
     // --- Drop privileges before touching the network further ---------
     privilege::drop_privileges(&privilege::DropTarget::default())?;
     privilege::assert_unprivileged()?;
@@ -780,9 +777,6 @@ async fn run(cfg: Config, log_ring: Arc<LogRing>) -> anyhow::Result<()> {
         mtu: effective_mtu,
         clamp_mss: cfg.tunnel.clamp_mss,
         scheduler_cfg: cfg.scheduler.clone(),
-        local_private,
-        peer_public,
-        rekey_interval: std::time::Duration::from_secs(cfg.crypto.rekey_interval_secs),
         tunnel_name: cfg.tunnel.name.clone(),
         control_socket,
         command_socket,

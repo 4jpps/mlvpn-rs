@@ -44,7 +44,7 @@ pub struct Snapshot {
 pub struct LogEntry {
     /// Monotonically increasing within one daemon process's lifetime,
     /// never reused -- the cursor `new_log_lines` delta streaming is
-    /// built on. Resets to 0 on a daemon restart, same as `rekey_count`.
+    /// built on. Resets to 0 on a daemon restart.
     pub seq: u64,
     pub unix_ts_ms: u64,
     /// "ERROR" | "WARN" | "INFO" (`tracing::Level::as_str()`'s own
@@ -67,14 +67,13 @@ pub struct LogEntry {
 /// read (sysfs/`/proc`) can fail independently.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DaemonSnapshot {
-    /// The active Noise transport session's id right now.
-    pub session_id: u32,
-    /// How long (ms) the *current* session has been active -- resets
-    /// to 0 on every rekey, successful or peer-initiated alike.
-    pub session_uptime_ms: u64,
-    /// Total rekeys since this process started (not since the tunnel
-    /// was first configured -- a daemon restart resets this to 0).
-    pub rekey_count: u32,
+    // NOTE: `session_id`/`session_uptime_ms`/`rekey_count` were removed
+    // here -- they described the old tunnel-wide shared Noise transport
+    // session, which no longer exists now that each link owns its own
+    // independent WireGuard tunnel (see `src/wireguard.rs::WgTunnel`).
+    // A per-link replacement (e.g. handshake count/age per link) would
+    // need new tracking state inside `WgTunnel`/`Link` that doesn't
+    // exist yet -- left as a possible follow-up, not done here.
     /// Frames currently buffered between `tun_reader` and
     /// `outbound_sender`, waiting to be sent -- 0 on a healthy tunnel
     /// keeping up with the TUN device's read rate.
@@ -430,9 +429,6 @@ mod tests {
     #[test]
     fn daemon_snapshot_round_trips_with_outbound_queue_and_tun_fields() {
         let snap = DaemonSnapshot {
-            session_id: 42,
-            session_uptime_ms: 5_000,
-            rekey_count: 3,
             outbound_queue_len: 12,
             outbound_queue_capacity: 256,
             outbound_queue_dropped_total: 7,
@@ -460,9 +456,6 @@ mod tests {
         };
         let json = serde_json::to_string(&snap).expect("serialize");
         let back: DaemonSnapshot = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(back.session_id, 42);
-        assert_eq!(back.session_uptime_ms, 5_000);
-        assert_eq!(back.rekey_count, 3);
         assert_eq!(back.outbound_queue_len, 12);
         assert_eq!(back.outbound_queue_capacity, 256);
         assert_eq!(back.outbound_queue_dropped_total, 7);
@@ -487,8 +480,7 @@ mod tests {
         // `DaemonSnapshot` is always freshly constructed server-side, so
         // there's no `#[serde(default)]` backward-compat concern here,
         // just confirming `Option::None` itself round-trips.
-        let json = r#"{"session_id":1,"session_uptime_ms":0,"rekey_count":0,
-            "outbound_queue_len":0,"outbound_queue_capacity":256,
+        let json = r#"{"outbound_queue_len":0,"outbound_queue_capacity":256,
             "outbound_queue_dropped_total":0,
             "tun":{"iface":"mlvpn0","rx_bytes":null,"tx_bytes":null,
                 "rx_errors":null,"tx_errors":null,"rx_dropped":null,"tx_dropped":null},
@@ -508,8 +500,7 @@ mod tests {
     /// the JSON, not just present-and-null.
     #[test]
     fn daemon_snapshot_peer_tunnel_mtu_defaults_to_none_when_absent_from_the_wire() {
-        let json = r#"{"session_id":1,"session_uptime_ms":0,"rekey_count":0,
-            "outbound_queue_len":0,"outbound_queue_capacity":256,
+        let json = r#"{"outbound_queue_len":0,"outbound_queue_capacity":256,
             "outbound_queue_dropped_total":0,
             "tun":{"iface":"mlvpn0","rx_bytes":null,"tx_bytes":null,
                 "rx_errors":null,"tx_errors":null,"rx_dropped":null,"tx_dropped":null},

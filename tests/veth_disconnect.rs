@@ -240,7 +240,7 @@ async fn server_sigterm_triggers_fast_client_reconnect_without_restarting() {
     })
     .await
     .expect("link0 never reached 'up' before shutdown could even be tested");
-    let session_id_before = snapshot.daemon.session_id;
+    drop(snapshot);
 
     // Restart the server -- SIGTERM (same as `systemctl stop`), wait
     // for the old process to actually exit, then spawn a fresh one
@@ -275,18 +275,34 @@ async fn server_sigterm_triggers_fast_client_reconnect_without_restarting() {
     // server's own startup/bind time is generous enough to not be
     // flaky while still meaningfully shorter than "waited for a
     // production-sized rekey_interval."
-    let snapshot = poll_snapshot_until(
+    //
+    // `session_id`-based before/after tracking doesn't exist anymore now
+    // that each link owns its own independent WireGuard tunnel instead
+    // of one shared, tunnel-wide Noise session (see `src/wireguard.rs`).
+    // Reconnection is instead confirmed via a real link-state round
+    // trip: first wait for link0 to actually drop out of "up" (the old
+    // server is gone and stops answering), then wait for it to come
+    // back "up" against the replacement server -- that round trip can
+    // only happen if the client genuinely re-established a new
+    // handshake, not just kept talking to a still-alive session.
+    poll_snapshot_until(&client_ctl, Duration::from_secs(30), |s| {
+        !link_is_up(s, "link0")
+    })
+    .await
+    .expect(
+        "link0 never dropped out of 'up' after the old server exited -- expected it to \
+         notice the peer is gone before it can reconnect to the replacement",
+    );
+    poll_snapshot_until(
         &client_ctl,
         Duration::from_secs(REKEY_INTERVAL_SECS * 2 + 10),
-        |s| link_is_up(s, "link0") && s.daemon.session_id != session_id_before,
+        |s| link_is_up(s, "link0"),
     )
     .await
     .expect(
-        "client never reconnected (new session_id, link0 back up) to the replacement \
-         server within the expected window -- the Disconnect fast-reconnect path may be \
-         broken",
+        "client never reconnected (link0 back up) to the replacement server within the \
+         expected window -- the Disconnect fast-reconnect path may be broken",
     );
-    assert_ne!(snapshot.daemon.session_id, session_id_before);
 
     // Real traffic should work again after reconnecting.
     ns_client

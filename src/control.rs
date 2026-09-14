@@ -30,7 +30,7 @@
 //! or out, the same guarantee any other 0600 Unix socket or file
 //! provides.
 
-use crate::crypto::{random_session_id, SessionState};
+use crate::crypto::random_session_id;
 use crate::diag;
 use crate::ipc::{
     Command, CommandResult, DaemonSnapshot, LinkSnapshot, Snapshot, SystemSnapshot,
@@ -43,19 +43,17 @@ use crate::procstats;
 use crate::sysfs_net;
 use crate::tunnel::{
     adaptive_bandwidth_ramp, send_throughput_test_reverse_request, send_throughput_test_stream,
-    DiagnosticsWatchParams, LiveMtu, OutboundFrame, PeerMtu, PeerVersion, SessionMeta,
-    ThroughputTestContext,
+    DiagnosticsWatchParams, LiveMtu, OutboundFrame, PeerMtu, PeerVersion, ThroughputTestContext,
 };
 use crate::tunneltest;
-use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{UdpSocket, UnixListener, UnixStream};
-use tokio::sync::{mpsc, RwLock as AsyncRwLock};
+use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::mpsc;
 use tokio::time::interval;
 
 const SNAPSHOT_INTERVAL_MS: u64 = 500;
@@ -73,7 +71,6 @@ pub(crate) async fn serve(
     peer_stats: Arc<PeerStatsTable>,
     tunnel_name: String,
     mode: String,
-    session_meta: Arc<SessionMeta>,
     outbound_tx: mpsc::Sender<OutboundFrame>,
     outbound_dropped_total: Arc<AtomicU64>,
     log_ring: Arc<LogRing>,
@@ -163,7 +160,6 @@ pub(crate) async fn serve(
         let peer_stats = peer_stats.clone();
         let tunnel_name = tunnel_name.clone();
         let mode = mode.clone();
-        let session_meta = session_meta.clone();
         let outbound_tx = outbound_tx.clone();
         let outbound_dropped_total = outbound_dropped_total.clone();
         let log_ring = log_ring.clone();
@@ -177,7 +173,6 @@ pub(crate) async fn serve(
                 peer_stats,
                 tunnel_name,
                 mode,
-                session_meta,
                 outbound_tx,
                 outbound_dropped_total,
                 log_ring,
@@ -197,7 +192,6 @@ async fn serve_client(
     peer_stats: Arc<PeerStatsTable>,
     tunnel_name: String,
     mode: String,
-    session_meta: Arc<SessionMeta>,
     outbound_tx: mpsc::Sender<OutboundFrame>,
     outbound_dropped_total: Arc<AtomicU64>,
     log_ring: Arc<LogRing>,
@@ -219,7 +213,6 @@ async fn serve_client(
             &peer_stats,
             &tunnel_name,
             &mode,
-            &session_meta,
             &outbound_tx,
             &outbound_dropped_total,
             &log_ring,
@@ -246,7 +239,6 @@ async fn build_snapshot(
     peer_stats: &Arc<PeerStatsTable>,
     tunnel_name: &str,
     mode: &str,
-    session_meta: &SessionMeta,
     outbound_tx: &mpsc::Sender<OutboundFrame>,
     outbound_dropped_total: &AtomicU64,
     log_ring: &LogRing,
@@ -297,8 +289,6 @@ async fn build_snapshot(
         })
         .collect();
 
-    let (session_id, rekey_count, session_uptime_ms) = session_meta.snapshot();
-
     // `max_capacity` is fixed (OUTBOUND_QUEUE_CAPACITY) for the channel's
     // whole lifetime; `capacity` is the number of currently-free slots,
     // so `max_capacity - capacity` is the current queue depth. Reading
@@ -326,9 +316,6 @@ async fn build_snapshot(
             .as_millis() as u64,
         links: link_snapshots,
         daemon: DaemonSnapshot {
-            session_id,
-            session_uptime_ms,
-            rekey_count,
             outbound_queue_len: outbound_queue_len as u64,
             outbound_queue_capacity: outbound_queue_capacity as u64,
             outbound_queue_dropped_total: outbound_dropped_total.load(Ordering::Relaxed),
@@ -374,7 +361,6 @@ pub(crate) struct DiagContext {
     pub(crate) peer_stats: Arc<PeerStatsTable>,
     pub(crate) tunnel_name: String,
     pub(crate) mode: String,
-    pub(crate) session_meta: Arc<SessionMeta>,
     pub(crate) outbound_tx: mpsc::Sender<OutboundFrame>,
     pub(crate) outbound_dropped_total: Arc<AtomicU64>,
     pub(crate) log_ring: Arc<LogRing>,
@@ -398,7 +384,6 @@ pub(crate) struct DiagContext {
 pub(crate) async fn serve_commands(
     path: PathBuf,
     links: Links,
-    session: Arc<AsyncRwLock<SessionState>>,
     throughput_test_ctx: Arc<ThroughputTestContext>,
     tunnel_test_ctx: Arc<tunneltest::TunnelTestContext>,
     mtu: crate::tunnel::LiveMtu,
@@ -459,7 +444,6 @@ pub(crate) async fn serve_commands(
             }
         };
         let links = links.clone();
-        let session = session.clone();
         let throughput_test_ctx = throughput_test_ctx.clone();
         let tunnel_test_ctx = tunnel_test_ctx.clone();
         let diag_ctx = diag_ctx.clone();
@@ -468,7 +452,6 @@ pub(crate) async fn serve_commands(
             serve_command_client(
                 stream,
                 links,
-                session,
                 throughput_test_ctx,
                 tunnel_test_ctx,
                 mtu,
@@ -489,7 +472,6 @@ pub(crate) async fn serve_commands(
 async fn serve_command_client(
     stream: UnixStream,
     links: Links,
-    session: Arc<AsyncRwLock<SessionState>>,
     throughput_test_ctx: Arc<ThroughputTestContext>,
     tunnel_test_ctx: Arc<tunneltest::TunnelTestContext>,
     mtu: crate::tunnel::LiveMtu,
@@ -512,7 +494,6 @@ async fn serve_command_client(
             apply_command(
                 cmd,
                 &links,
-                &session,
                 &throughput_test_ctx,
                 &tunnel_test_ctx,
                 mtu,
@@ -544,7 +525,6 @@ async fn serve_command_client(
 async fn apply_command(
     cmd: Command,
     links: &Links,
-    session: &Arc<AsyncRwLock<SessionState>>,
     throughput_test_ctx: &Arc<ThroughputTestContext>,
     tunnel_test_ctx: &Arc<tunneltest::TunnelTestContext>,
     mtu: crate::tunnel::LiveMtu,
@@ -600,7 +580,6 @@ async fn apply_command(
         } => {
             run_throughput_test_command(
                 links,
-                session,
                 throughput_test_ctx,
                 mtu,
                 link,
@@ -712,7 +691,6 @@ async fn run_diag_dump_command(links: &Links, diag_ctx: &DiagContext) -> Command
         &diag_ctx.peer_stats,
         &diag_ctx.tunnel_name,
         &diag_ctx.mode,
-        &diag_ctx.session_meta,
         &diag_ctx.outbound_tx,
         &diag_ctx.outbound_dropped_total,
         &diag_ctx.log_ring,
@@ -988,7 +966,6 @@ pub(crate) async fn diagnostics_watch_loop(
             &diag_ctx.peer_stats,
             &diag_ctx.tunnel_name,
             &diag_ctx.mode,
-            &diag_ctx.session_meta,
             &diag_ctx.outbound_tx,
             &diag_ctx.outbound_dropped_total,
             &diag_ctx.log_ring,
@@ -1081,7 +1058,6 @@ const THROUGHPUT_TEST_RESULT_GRACE: Duration = Duration::from_secs(5);
 #[allow(clippy::too_many_arguments)]
 async fn run_throughput_test_command(
     links: &Links,
-    session: &Arc<AsyncRwLock<SessionState>>,
     throughput_test_ctx: &Arc<ThroughputTestContext>,
     mtu: crate::tunnel::LiveMtu,
     link: Option<String>,
@@ -1089,12 +1065,12 @@ async fn run_throughput_test_command(
     bidirectional: bool,
     peer_version: &PeerVersion,
 ) -> CommandResult {
-    // Snapshot (name, id, remote, socket) for every candidate link up
-    // front, before running any test -- avoids holding a link's own
-    // lock for the whole multi-second test duration, and means a link
-    // that disappears or reconnects mid-run doesn't take the others
-    // down with it.
-    let mut targets: Vec<(String, u8, SocketAddr, Arc<UdpSocket>)> = Vec::new();
+    // Snapshot (name, id, handle) for every candidate link up front,
+    // before running any test -- avoids holding a link's own lock for
+    // the whole multi-second test duration, and means a link that
+    // disappears or reconnects mid-run doesn't take the others down
+    // with it.
+    let mut targets: Vec<(String, u8, crate::link::LinkHandle)> = Vec::new();
     for l in links.iter() {
         let guard = l.lock().await;
         if let Some(name) = &link {
@@ -1102,11 +1078,10 @@ async fn run_throughput_test_command(
                 continue;
             }
         }
-        let Some(remote) = guard.remote else {
+        if guard.remote.is_none() {
             continue;
-        };
-        let socket = guard.handle().current_socket().await;
-        targets.push((guard.config.name.clone(), guard.id, remote, socket));
+        }
+        targets.push((guard.config.name.clone(), guard.id, guard.handle()));
     }
 
     if targets.is_empty() {
@@ -1126,7 +1101,7 @@ async fn run_throughput_test_command(
     }
 
     let mut results = Vec::with_capacity(targets.len());
-    for (link_name, link_id, remote, socket) in targets {
+    for (link_name, link_id, handle) in targets {
         // Marks operator intent in the log tail as early as possible --
         // before either leg sends a single packet -- so a diagnostic
         // dump (`mlvpnd diag-dump`) covering this window makes it clear
@@ -1141,25 +1116,16 @@ async fn run_throughput_test_command(
             "starting throughput self-test"
         );
         let (upload_mbps, upload_steps) = run_throughput_test_leg_upload(
-            &socket,
-            remote,
+            handle.clone(),
             link_id,
-            session,
             throughput_test_ctx,
             mtu.clone(),
         )
         .await;
 
         let download_mbps = if bidirectional {
-            run_throughput_test_leg_download(
-                &socket,
-                remote,
-                link_id,
-                session,
-                throughput_test_ctx,
-                duration_secs,
-            )
-            .await
+            run_throughput_test_leg_download(&handle, link_id, throughput_test_ctx, duration_secs)
+                .await
         } else {
             None
         };
@@ -1195,26 +1161,21 @@ async fn run_throughput_test_command(
 /// `ThroughputTestResult` reply per step. Returns both the ramp's
 /// final confirmed rate and its full step trace.
 async fn run_throughput_test_leg_upload(
-    socket: &Arc<UdpSocket>,
-    remote: SocketAddr,
+    handle: crate::link::LinkHandle,
     link_id: u8,
-    session: &Arc<AsyncRwLock<SessionState>>,
     throughput_test_ctx: &Arc<ThroughputTestContext>,
     mtu: crate::tunnel::LiveMtu,
 ) -> (Option<f64>, Vec<(f64, Option<f64>)>) {
     let result = adaptive_bandwidth_ramp(|target_mbps| {
-        let socket = socket.clone();
-        let session = session.clone();
+        let handle = handle.clone();
         let mtu = mtu.clone();
         let throughput_test_ctx = throughput_test_ctx.clone();
         async move {
             let test_id = random_session_id();
             let mut rx = throughput_test_ctx.register_wait(test_id);
             if send_throughput_test_stream(
-                socket,
-                remote,
+                handle,
                 link_id,
-                session,
                 test_id,
                 Duration::from_secs(1),
                 mtu,
@@ -1253,24 +1214,15 @@ async fn run_throughput_test_leg_upload(
 /// over the wire (there's nothing the *peer* needs to be told about a
 /// result *we* computed from data *they* sent).
 async fn run_throughput_test_leg_download(
-    socket: &Arc<UdpSocket>,
-    remote: SocketAddr,
+    handle: &crate::link::LinkHandle,
     link_id: u8,
-    session: &Arc<AsyncRwLock<SessionState>>,
     throughput_test_ctx: &Arc<ThroughputTestContext>,
     duration_secs: u32,
 ) -> Option<f64> {
     let test_id = random_session_id();
     let mut rx = throughput_test_ctx.register_wait(test_id);
-    if let Err(e) = send_throughput_test_reverse_request(
-        socket,
-        remote,
-        link_id,
-        session,
-        test_id,
-        duration_secs,
-    )
-    .await
+    if let Err(e) =
+        send_throughput_test_reverse_request(handle, link_id, test_id, duration_secs).await
     {
         tracing::warn!(error = %e, "throughput self-test reverse request failed to send");
         return None;

@@ -130,18 +130,15 @@ async fn daemon_snapshot_and_log_streaming_report_real_data() {
     .await
     .expect("link0 never reached 'up' before daemon health could even be checked");
 
-    // Sanity: a freshly established session/daemon should already
-    // report *something* sane for the fields that don't depend on
-    // traffic or a rekey having happened yet.
-    assert!(
-        snapshot.daemon.session_uptime_ms < 20_000,
-        "session_uptime_ms ({}) implausibly large for a session just established",
-        snapshot.daemon.session_uptime_ms
-    );
-    assert_eq!(
-        snapshot.daemon.rekey_count, 0,
-        "rekey_count should still be 0 before rekey_loop's first (deliberately skipped) tick"
-    );
+    // NOTE: this used to also sanity-check `session_uptime_ms`/
+    // `rekey_count` here (a freshly established tunnel-wide Noise
+    // session should read a small uptime and 0 rekeys). Those fields no
+    // longer exist now that each link owns its own independent
+    // WireGuard tunnel instead of one shared session (see
+    // `src/wireguard.rs::WgTunnel`) -- a per-link replacement (e.g.
+    // handshake age/count per link) would need new tracking state that
+    // doesn't exist yet, left as a possible follow-up rather than
+    // scope-creeping this fix.
     assert_eq!(snapshot.daemon.tun.iface, "mdhcli0");
     assert!(
         snapshot.daemon.outbound_queue_capacity > 0,
@@ -245,29 +242,25 @@ async fn daemon_snapshot_and_log_streaming_report_real_data() {
         "mem_total_kb should be readable from /proc/meminfo on any real Linux host"
     );
 
-    // --- Rekeying: session_id changes and rekey_count increments, same
-    // timing pattern as veth_rekey.rs (rekey_loop skips its first,
-    // immediate tick, so the first real attempt fires ~REKEY_INTERVAL_SECS
-    // after the initial handshake).
-    let session_id_before = snapshot.daemon.session_id;
-
+    // NOTE: this section used to also assert `session_id`/`rekey_count`
+    // changed here, same timing pattern as `veth_rekey.rs` (rekey_loop
+    // skips its first, immediate tick, so the first real attempt fired
+    // ~REKEY_INTERVAL_SECS after the initial handshake). Those
+    // tunnel-wide fields no longer exist now that each link owns its
+    // own independent WireGuard tunnel with its own internal rekeying
+    // (see `src/wireguard.rs::WgTunnel`) instead of one shared Noise
+    // session -- a per-link replacement would need new tracking state
+    // that doesn't exist yet, left as a possible follow-up. Following
+    // `veth_rekey.rs`'s own pattern instead: just wait past the rekey
+    // window and confirm the link is still healthy and passing traffic,
+    // which is what actually matters operationally.
     tokio::time::sleep(Duration::from_secs(REKEY_INTERVAL_SECS * 2 + 2)).await;
 
-    let snapshot = poll_snapshot_until(&client_ctl, Duration::from_secs(10), |s| {
-        s.daemon.rekey_count >= 1
+    poll_snapshot_until(&client_ctl, Duration::from_secs(10), |s| {
+        link_is_up(s, "link0")
     })
     .await
-    .expect("rekey_count never incremented past 0 within the expected rekey window");
-    assert_ne!(
-        snapshot.daemon.session_id, session_id_before,
-        "session_id should change on every rekey, successful or peer-initiated alike"
-    );
-    assert!(
-        snapshot.daemon.session_uptime_ms < REKEY_INTERVAL_SECS * 1000,
-        "session_uptime_ms ({}) should have reset to well under one rekey interval \
-         right after a rekey just happened",
-        snapshot.daemon.session_uptime_ms
-    );
+    .expect("link0 not reported 'up' after the rekey window");
 
     // Data should still be flowing after all of the above.
     ns_client
