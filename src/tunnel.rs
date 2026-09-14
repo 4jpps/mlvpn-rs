@@ -74,16 +74,15 @@
 //! restart on *either* end (a `.deb` upgrade, a manual
 //! `systemctl restart`) cascaded into a full stop-then-cold-restart on
 //! the *other* end too, even though nothing was actually wrong with it.
-//! Now a received `Disconnect` just means "the peer's session is
-//! stale" -- treated exactly like any other authenticated signal that
-//! recovery should happen fast rather than through the slow path:
-//! `Mode::Client` immediately nudges `rekey_loop` to attempt a fresh
-//! handshake right away instead of waiting up to `rekey_interval`
-//! (potentially hours); `Mode::Server` needs no extra action at all,
-//! since it already accepts a peer-initiated `HandshakeInit` at any
-//! time regardless of why (`respond_to_handshake_init`). Either way,
-//! this side's own tasks (TUN reader, outbound queue, control sockets,
-//! other links) keep running the whole time -- no process exit, no
+//! Now a received `Disconnect` just means "the peer is shutting down or
+//! restarting" -- purely informational (logged), since neither role
+//! needs to *do* anything about it anymore: each link's own WireGuard
+//! session re-handshakes lazily on its own the next time either side
+//! sends real traffic (see this module's own doc comment on the
+//! per-link transport), the same way real WireGuard recovers from a
+//! peer restart without any explicit reconnect signal. This side's own
+//! tasks (TUN reader, outbound queue, control sockets, other links)
+//! keep running the whole time regardless -- no process exit, no
 //! `systemd` `RestartSec` gap, no cold-boot re-bind of every socket.
 //!
 //! Locking discipline: `links: link::Links` (`Arc<Vec<AsyncMutex<Link>>>`)
@@ -128,125 +127,64 @@
 //! is slowest to receive -- exactly the kind of head-of-line blocking a
 //! multi-link bonding daemon exists to avoid.
 //!
-//! `session: Arc<AsyncRwLock<crypto::SessionState>>` follows the same
-//! "don't hold an exclusive lock across work that doesn't need it"
-//! principle, modeled directly on WireGuard's own design (its outgoing
-//! nonce is a lock-free atomic; its lock only ever guards which keypair
-//! is active, never the AEAD computation itself). `SessionState::encrypt`
-//! has always taken `&self` -- it only reads the active session's key
-//! material and calls the already-lock-free `next_send_seq()`
-//! (`AtomicU64::fetch_add`) -- so every encrypt call site (real Data,
-//! Probe replies, StatsShare, VersionInfo, ThroughputTest) uses
-//! `.read().await` and can now proceed concurrently with every other
-//! encrypt, instead of serializing behind them the way a plain `Mutex`
-//! forces even read-only access to. Only `decrypt`/`install`/
-//! `expire_previous` genuinely mutate state (the replay window, or
-//! which session is active during a rekey) and use `.write().await`,
-//! which still excludes every reader while it runs, so an in-flight
-//! encrypt can never observe a torn mid-swap `active` session.
+//! **Per-link WireGuard transport (replaces the old shared Noise
+//! session).** There is no longer one tunnel-wide crypto session, no
+//! app-level handshake, and no app-driven rekeying in this module at
+//! all: each configured link owns its own independent `wireguard::WgTunnel`
+//! (built at `Link::bind` time from that link's own
+//! `private_key_file`/`peer_public_key`, see `link.rs`), which handles
+//! its own handshake, rekey, keepalive, and replay window entirely
+//! internally via `boringtun`. Every send goes through that link's own
+//! `LinkHandle::wg_send` (encrypts + transmits) and every receive
+//! through `LinkHandle::wg_recv` (receives + decrypts, looping
+//! internally past any handshake/keepalive traffic so callers only ever
+//! see a genuine decrypted mlvpn frame). Because encryption is now tied
+//! to *which link* a frame goes out on, a frame can no longer be
+//! encrypted once, tunnel-wide, before a link is chosen the way the old
+//! shared-session design did -- `send_scheduled`/`send_redundant` below
+//! pick the link first, then build and encrypt that specific frame via
+//! the chosen link's own `wg_send`.
 //!
-//! **Rekeying and session migration.** The initial handshake is raced
-//! across every configured link (`establish_session`'s `Mode::Client`
-//! arm and `race_handshake_reply` below); the *same* broadcast-and-race
-//! logic (factored into `perform_client_handshake`) also drives
-//! periodic rekeying, run by a new `rekey_loop` task, client-side only
-//! -- the client is always the Noise_IK initiator, both for the very
-//! first handshake and every later rekey, so the server never needs to
-//! initiate one of its own. The server instead passively accepts a
-//! peer-initiated rekey `HandshakeInit` arriving after the tunnel is
-//! already running, in `handle_incoming`, the same way it already
-//! passively accepted the very first one pre-session (shared per-packet
-//! logic factored into `respond_to_handshake_init`). Either side
-//! completing its half of a rekey calls `crypto::SessionState::install`,
-//! which keeps the just-replaced session reachable for a short, bounded
-//! overlap window (`session_expiry_loop`) so packets already in flight
-//! under the old keys at the moment of the swap aren't dropped -- see
-//! `crypto.rs`'s `SessionState` doc comment for the full design.
+//! `protocol::Header.seq` is still a single, tunnel-wide monotonic
+//! counter (`next_send_seq` below, a plain `AtomicU64` -- previously
+//! this lived on the old shared `crypto::Session`), shared across every
+//! packet type on every link, exactly as before: `ReorderBuffer` still
+//! uses it to detect genuine cross-link reordering. This is unrelated to
+//! -- and does not need to agree with -- any per-link WireGuard-internal
+//! nonce/counter, which is now entirely private to that link's own
+//! `WgTunnel`/`boringtun::Tunn`.
 //!
-//! Four correctness hazards this design has to actively guard against,
-//! both caught by this project's own integration tests rather than by
-//! inspection, and both worth calling out here since neither is
-//! obvious from the individual functions involved:
+//! There is no explicit "wait for the handshake" step anywhere in this
+//! module's startup sequence, on either `Mode::Client` or `Mode::Server`
+//! -- `run()` spawns every link's tasks immediately. This mirrors real
+//! WireGuard's own lazy, connectionless handshake model rather than
+//! reintroducing a new tunnel-wide readiness gate: a link's very first
+//! `wg_send` call (a `Probe`, fired unconditionally on `link_prober`'s
+//! own timer, or real Data traffic) queues the plaintext internally and
+//! emits a handshake-initiation datagram instead of delivering it
+//! immediately (see `wireguard::WgTunnel::encapsulate`'s doc comment);
+//! `link_prober` also drives boringtun's own internal retry/keepalive
+//! timers by calling `LinkHandle::wg_tick` (`link.rs`) once per probe
+//! interval, so a handshake that needs retrying (a lost init/response,
+//! a peer that's briefly unreachable) recovers on its own without any
+//! bespoke retry loop in this module. Each link therefore comes up
+//! independently, on its own schedule -- exactly the same per-link
+//! Up/Down tolerance `scheduler.rs`/`monitor.rs` already had to handle
+//! for ordinary link-quality reasons, reused here rather than inventing
+//! a second "is the whole tunnel up yet" concept.
 //!
-//! - **Mid-session replies need routing, not a raw socket read.**
-//!   `perform_client_handshake` was originally written for the
-//!   pre-session case, where it's the only thing reading each link's
-//!   socket. Reused as-is for a live rekey, it would race
-//!   `link_receiver`'s own already-running `recv_from` loop on that same
-//!   socket for every incoming datagram -- and losing that race meant
-//!   silently dropping the exact `HandshakeResp` it was waiting for,
-//!   timing out a rekey the server had, from its own side, already
-//!   irreversibly committed to (a Noise_IK responder is done the moment
-//!   it sends message 2). `RekeyContext::register_rekey_wait` /
-//!   `forward_rekey_reply` / `race_rekey_reply` exist specifically to
-//!   route a rekey's reply through `handle_incoming` instead.
-//! - **A stale duplicate of the *first* handshake must not look like a
-//!   new rekey.** The client broadcasts the same message 1 (same
-//!   session id) to every configured link at once; the server's
-//!   pre-session wait loop only consumes the first copy that arrives
-//!   before returning, so a duplicate that landed on a different link is
-//!   still sitting unread once steady state begins. `link_receiver`
-//!   reading it later would otherwise reprocess it as a "new"
-//!   peer-initiated rekey -- deriving different key material under the
-//!   *same* session id, immediately desynchronizing both sides right
-//!   after the tunnel came up. `crypto::SessionState::is_known_session_id`
-//!   is the guard: a genuinely new rekey always carries a freshly
-//!   generated random id, so any `HandshakeInit` naming an id already
-//!   installed is, by construction, a stale duplicate rather than a real
-//!   attempt.
-//! - **A late reply from an abandoned retry must not poison every retry
-//!   after it.** The retry loop in `perform_client_handshake` used to
-//!   reuse one fixed session id across all `RETRIES` attempts for the
-//!   *initial* handshake, on the theory that only the guard above
-//!   needed session-id stability. But each attempt also generates a
-//!   fresh Noise ephemeral, and a reply that arrived just late enough to
-//!   miss one attempt's `HANDSHAKE_TIMEOUT` -- purely a matter of
-//!   scheduling/network timing, not a bug in the reply itself -- but
-//!   still in time for a *later* attempt's window would get read
-//!   against that later attempt's (non-matching) ephemeral and always
-//!   fail to decrypt. Worse, the very guard above would then refuse to
-//!   let the server process any further attempt carrying that same
-//!   session id, so every remaining retry was doomed once that one race
-//!   happened -- even though the peer had a valid, waiting session the
-//!   whole time. Each initial-handshake attempt now generates its own
-//!   fresh session id (rekey attempts still keep one fixed per call,
-//!   which `RekeyContext::register_rekey_wait`'s single up-front
-//!   registration depends on), so a late reply from an abandoned
-//!   attempt can no longer be fed into a mismatched later one this way.
-//! - **A stale reply must not win a *later* attempt's race, either.**
-//!   The fix above stops a late reply from being fed into the wrong
-//!   `Handshake` instance, but on its own that only means the stale
-//!   reply gets ignored by the attempt it actually arrived for -- it
-//!   doesn't stop `race_handshake_reply` from handing that same stale
-//!   packet to a *subsequent* attempt as if it were fresh, since it only
-//!   filtered by source address and packet type. This was unreachable
-//!   in practice before `establish_session_with_retry` existed (a failed
-//!   initial handshake used to just crash the process after one round),
-//!   but became a real, repeatable failure once retrying indefinitely
-//!   made it possible for many rounds' worth of stale replies to pile up
-//!   in the socket's receive queue, each capable of falsely winning a
-//!   future attempt's race and consuming its one shot at the genuine
-//!   reply. `race_handshake_reply` now also requires the reply's
-//!   `session_id` to match the *current* attempt's, the same guarantee
-//!   `race_rekey_reply`'s `RekeyContext::forward_rekey_reply` already
-//!   provided for the mid-session case via its own `want_id` check.
-//!
-//! **The initial handshake never crashes the daemon.** `establish_session_with_retry`
-//! wraps the client's very first handshake attempt: if every configured
-//! link is unreachable (peer not up yet, still booting, a route not
-//! converged) and `perform_client_handshake` exhausts its bounded
-//! `RETRIES` for one round, this logs a warning and retries with
-//! exponential backoff (capped at `RECONNECT_BACKOFF_MAX_MS`) instead of
-//! returning an error out of `run()`. Previously that error propagated
-//! all the way to `main()`'s top-level `anyhow::Result` handler and
-//! exited the process -- harmless under a plain `systemd start`, but
-//! under the default `Restart=on-failure` a peer that stayed
-//! unreachable for a few minutes at boot (e.g. both ends power-cycling
-//! together, or one side waiting on DHCP) could burn through
-//! `StartLimitBurst` restarts and leave the unit in `failed` state for
-//! good, silently, until someone happened to check. Neither WireGuard
-//! nor the original C `MLVPN` exit on a failed handshake; this now
-//! matches that.
+//! One real, known gap this leaves relative to the old design: the old
+//! `perform_client_handshake` actively raced a link's not-yet-confirmed
+//! alternate address family (`link::Link::alternate`/`commit_remote`,
+//! see their own doc comments) once, right after the initial handshake,
+//! to recover a link whose `pick_remote_addr` guess picked the wrong
+//! family. That active-racing step has not been reimplemented here --
+//! `Link::alternate`/`alternate_handle`/`commit_remote` still exist in
+//! `link.rs` but nothing in this module calls them anymore, so a link
+//! configured with a dual-stack `remote_addr` now simply uses whichever
+//! family `pick_remote_addr` chose at bind time, with no runtime
+//! fallback if that guess is wrong. Worth reconsidering in a later task
+//! if this turns out to matter in practice.
 //!
 //! **Self-healing reconnection.** `link_receiver` and `link_prober` each
 //! track consecutive I/O failures on the socket they're currently using
@@ -270,7 +208,7 @@
 use crate::config;
 use crate::config::{Mode, SchedulerConfig};
 use crate::control;
-use crate::crypto::{self, Handshake, LocalPrivateKey, Session, SessionState};
+use crate::crypto;
 use crate::error::{MlvpnError, Result};
 use crate::link::{self, is_interface_gone_error, Link, LinkHandle, LinkScore, LinkState, Links};
 use crate::monitor::{self, ProbeTracker};
@@ -287,16 +225,11 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::net::UdpSocket;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::mpsc::{self, error::TrySendError};
 use tokio::sync::Mutex as AsyncMutex;
-use tokio::sync::RwLock as AsyncRwLock;
-use tokio::task::JoinSet;
 use tokio::time::interval;
 use tun_rs::AsyncDevice;
-
-const MAX_FRAME: usize = 2048;
 
 /// How often each link reports its own stats to the peer via a
 /// `StatsShare` frame. Not performance-sensitive (this only feeds a
@@ -395,15 +328,6 @@ pub struct TunnelParams {
     /// `LiveMtu`, not the `mtu` field above). See `mss.rs`.
     pub clamp_mss: bool,
     pub scheduler_cfg: SchedulerConfig,
-    pub local_private: LocalPrivateKey,
-    pub peer_public: [u8; 32],
-    /// How often `rekey_loop` (client-side only, see the module doc
-    /// comment) re-runs the handshake. `interval()`'s minimum
-    /// resolution effectively floors this around a millisecond or so;
-    /// `config::default_rekey_secs` defaults to 120s, and
-    /// `config::CryptoConfig::rekey_interval_secs`'s doc comment is
-    /// where an operator would actually change it.
-    pub rekey_interval: Duration,
     /// Used to label snapshots served over the control socket and to
     /// compute its default path (`/run/mlvpn/<tunnel_name>.sock`).
     pub tunnel_name: String,
@@ -454,134 +378,22 @@ pub struct DiagnosticsWatchParams {
     pub auto_submit: bool,
 }
 
-/// How long a retired ("previous") session's keys remain able to
-/// decrypt anything after a rekey swap -- see `crypto::SessionState`'s
-/// doc comment. Long enough to cover realistic reordering/in-flight
-/// delay across multiple bonded physical links, short enough that a
-/// retired key stops mattering quickly. Not currently configurable;
-/// revisit if a real deployment's link RTTs or `reorder_window_ms` ever
-/// make this too tight.
-const SESSION_OVERLAP_WINDOW: Duration = Duration::from_secs(10);
+/// Global, tunnel-lifetime monotonic sequence counter used to tag every
+/// outgoing frame's `Header.seq` field, independent of any per-link
+/// WireGuard session -- see this module's doc comment. Previously this
+/// counter lived on the old shared `crypto::Session`
+/// (`Session::next_send_seq`); now that encryption is per-link
+/// (`wireguard::WgTunnel`), there is no longer a single shared session
+/// to own it, so it lives here as a plain, process-wide atomic instead.
+/// Safe as a `static` (rather than a field threaded through every
+/// function that sends a frame) because exactly one `run()` invocation
+/// is ever active in a given `mlvpnd` process.
+static SEND_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// How often `session_expiry_loop` checks whether `SESSION_OVERLAP_WINDOW`
-/// has elapsed. Deliberately much more frequent than any reasonable
-/// `rekey_interval_secs` -- this timer's only job is to bound the
-/// overlap window promptly, not to pace rekeying itself.
-const SESSION_EXPIRY_CHECK_INTERVAL: Duration = Duration::from_secs(1);
-
-/// Global, cross-link rate limiter for inbound `HandshakeInit` frames.
-/// `HandshakeInit` carries no authentication of its own (it's what
-/// *starts* authentication), so processing one always costs real
-/// X25519 work before it can be rejected as forged/malformed --
-/// deliberately global rather than per-source-IP, since UDP source
-/// addresses are trivially spoofable and a per-IP table would itself be
-/// an unbounded-memory attack surface. Used both by `establish_session`'s
-/// pre-session `Mode::Server` wait loop (its own private instance, since
-/// no per-link tasks exist yet at that point) and by `handle_incoming`'s
-/// steady-state rekey acceptance (one instance shared across every
-/// `link_receiver` task via `RekeyContext`, since a flood could arrive
-/// on any link).
-struct HandshakeRateLimiter {
-    window: std::sync::Mutex<(Instant, u32)>,
-}
-
-impl HandshakeRateLimiter {
-    const MAX_PER_SEC: u32 = 20;
-
-    fn new() -> Self {
-        Self {
-            window: std::sync::Mutex::new((Instant::now(), 0)),
-        }
-    }
-
-    /// Returns `true` if this attempt should be processed, `false` if
-    /// it should be dropped for exceeding the rate. A plain
-    /// `std::sync::Mutex` rather than the tokio one: every caller here
-    /// checks and releases it without awaiting anything in between.
-    fn allow(&self) -> bool {
-        let mut guard = self.window.lock().unwrap();
-        let (start, count) = &mut *guard;
-        if start.elapsed() >= Duration::from_secs(1) {
-            *start = Instant::now();
-            *count = 0;
-        }
-        *count += 1;
-        *count <= Self::MAX_PER_SEC
-    }
-}
-
-/// What `handle_incoming` needs to accept a rekey `HandshakeInit`
-/// arriving after the tunnel's initial handshake is already done --
-/// bundled into one struct, shared (via `Arc`) across every
-/// `link_receiver` task, rather than adding several more individual
-/// parameters on top of `handle_incoming`'s already-long list. Only
-/// ever acted on when `mode == Mode::Server` (see `handle_incoming`);
-/// kept unconditional/cheap to construct rather than an `Option` so
-/// there's exactly one code path regardless of role.
-///
-/// Also carries the client-side rekey reply-forwarding mailbox
-/// (`rekey_reply_tx`) -- see `register_rekey_wait`'s doc comment for why
-/// this exists: once the tunnel is running, `link_receiver` -- not
-/// `perform_client_handshake` -- owns every link's socket, so a rekey
-/// attempt's `HandshakeResp` has to be routed to it rather than read
-/// directly.
-/// One forwarded `HandshakeResp`: the link it arrived on, plus its
-/// still-encrypted message-2 payload.
-type RekeyReply = (u8, Vec<u8>);
-
-struct RekeyContext {
-    mode: Mode,
-    local_private: LocalPrivateKey,
-    peer_public: [u8; 32],
-    limiter: HandshakeRateLimiter,
-    rekey_reply_tx: std::sync::Mutex<Option<(u32, mpsc::UnboundedSender<RekeyReply>)>>,
-}
-
-impl RekeyContext {
-    /// Registers interest in any `HandshakeResp` frame carrying
-    /// `session_id`, returning the receiving half. Called once by
-    /// `perform_client_handshake` before it sends this attempt's first
-    /// `HandshakeInit`, so `forward_rekey_reply` has somewhere to route
-    /// the eventual reply from the moment it could possibly arrive.
-    ///
-    /// Only one rekey attempt is ever in flight at a time (`rekey_loop`
-    /// runs its attempts sequentially), so this simply overwrites
-    /// whatever the previous registration was; a stray late reply for an
-    /// abandoned session id then just fails to match in
-    /// `forward_rekey_reply` (or, in the small window before it's
-    /// overwritten, finds its `tx` half's receiver already dropped, so
-    /// the `send` silently no-ops) rather than needing explicit cleanup
-    /// on every one of `perform_client_handshake`'s several return
-    /// paths.
-    fn register_rekey_wait(&self, session_id: u32) -> mpsc::UnboundedReceiver<RekeyReply> {
-        let (tx, rx) = mpsc::unbounded_channel();
-        *self.rekey_reply_tx.lock().unwrap() = Some((session_id, tx));
-        rx
-    }
-
-    /// Called from `handle_incoming`'s `HandshakeResp` arm for every
-    /// role, not just `Mode::Client` -- cheap to check unconditionally,
-    /// and correct regardless: a server never calls
-    /// `register_rekey_wait`, so `rekey_reply_tx` is permanently `None`
-    /// on that side and this is just as much of a no-op as the
-    /// unconditional drop it replaces. Forwards to the waiting attempt
-    /// only if `session_id` matches what's currently registered;
-    /// anything else (a stale retransmit from an attempt that already
-    /// gave up, a spoofed frame, plain noise) is silently ignored, same
-    /// as before this existed. `link_id` isn't validated against which
-    /// link this attempt actually broadcast on -- see
-    /// `race_handshake_reply`'s doc comment on why that filtering was
-    /// already "not a security boundary" even in the direct-socket path;
-    /// the real authentication is `Handshake::read_second`'s own Noise
-    /// AEAD check, downstream of this.
-    fn forward_rekey_reply(&self, session_id: u32, link_id: u8, payload: Vec<u8>) {
-        let guard = self.rekey_reply_tx.lock().unwrap();
-        if let Some((want_id, tx)) = guard.as_ref() {
-            if *want_id == session_id {
-                let _ = tx.send((link_id, payload));
-            }
-        }
-    }
+/// Allocate the next `Header.seq` value for an outgoing frame. See
+/// `SEND_SEQ`'s doc comment.
+fn next_send_seq() -> u64 {
+    SEND_SEQ.fetch_add(1, Ordering::Relaxed)
 }
 
 /// Correlates an in-flight `ipc::Command::RunThroughputTest` with its
@@ -647,58 +459,6 @@ impl ThroughputTestContext {
     }
 }
 
-/// Session identity/uptime/rekey-count, readable by `control::serve`
-/// without touching `SessionState` at all. `SessionState` is now an
-/// `RwLock` with encrypt on the shared read side (see this module's
-/// "Locking discipline" doc comment) -- a getter added directly to it
-/// would take a `.read()`, which would NOT contend with the hot-path
-/// encrypt calls it used to when `SessionState` was a plain `Mutex`.
-/// Still kept as its own independent piece of state regardless: this
-/// project has already been burned once by underestimated per-packet
-/// lock contention (see `link::LinkScore`'s doc comment), and this
-/// data changes rarely enough (rekey, every few minutes at most) that
-/// there's no real cost to keeping it separate either way.
-/// `established_at` uses a plain `std::sync::Mutex` (not an async one)
-/// since it's only ever touched at rekey time and once per monitoring
-/// tick -- nowhere near contended enough to need async-aware locking.
-pub(crate) struct SessionMeta {
-    session_id: std::sync::atomic::AtomicU32,
-    rekey_count: std::sync::atomic::AtomicU32,
-    established_at: std::sync::Mutex<Instant>,
-}
-
-impl SessionMeta {
-    fn new(session_id: u32) -> Self {
-        Self {
-            session_id: std::sync::atomic::AtomicU32::new(session_id),
-            rekey_count: std::sync::atomic::AtomicU32::new(0),
-            established_at: std::sync::Mutex::new(Instant::now()),
-        }
-    }
-
-    /// Called alongside every `SessionState::install` -- both the
-    /// client-initiated (`rekey_loop`) and peer-initiated
-    /// (`handle_incoming`'s `HandshakeInit` arm) rekey paths.
-    fn record_rekey(&self, new_session_id: u32) {
-        self.session_id
-            .store(new_session_id, std::sync::atomic::Ordering::Relaxed);
-        self.rekey_count
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        *self.established_at.lock().unwrap() = Instant::now();
-    }
-
-    /// `(session_id, rekey_count, session_uptime_ms)` -- already-elapsed
-    /// duration, not a raw timestamp, matching this codebase's existing
-    /// `peer_stats_age_ms`/`state_duration_ms` convention so a viewer
-    /// never has to do its own clock math.
-    pub(crate) fn snapshot(&self) -> (u32, u32, u64) {
-        let id = self.session_id.load(std::sync::atomic::Ordering::Relaxed);
-        let count = self.rekey_count.load(std::sync::atomic::Ordering::Relaxed);
-        let uptime_ms = self.established_at.lock().unwrap().elapsed().as_millis() as u64;
-        (id, count, uptime_ms)
-    }
-}
-
 /// Tunnel-wide storage for the peer's most recently received `mlvpnd`
 /// version (`PacketType::VersionInfo`) -- see that variant's doc
 /// comment. A bare `Option<String>` behind a `std::sync::Mutex`
@@ -728,15 +488,13 @@ pub(crate) type PeerMtu = Arc<std::sync::Mutex<Option<u16>>>;
 /// local link always means matching `Link.config.name` against the
 /// stored name here -- never indexing directly.
 ///
-/// `None` when the peer hasn't advertised a primary (either it isn't
-/// running `scheduler.primary_link_mode` at all, or it is but hasn't
-/// picked one yet), *or* when the current session has been superseded
-/// by a rekey (see `reset_for_session`'s call site in
-/// `handle_incoming`'s `PacketType::Data` arm -- the same
-/// session-id-change reset `ReorderBuffer` uses, applied here for the
-/// same reason: an adopted primary must not survive indefinitely past
-/// the peer going quiet/rolling back to a build that no longer sends
-/// this field).
+/// `None` when the peer hasn't advertised a primary at all (either it
+/// isn't running `scheduler.primary_link_mode`, or it is but hasn't
+/// picked one yet). Each link's own WireGuard session now rekeys
+/// entirely internally (`boringtun`), invisibly to this module, so
+/// there is no longer an app-level "session changed" event to reset
+/// this on -- it simply reflects whatever the peer's most recent
+/// `VersionInfo` said.
 ///
 /// Consumed by `Scheduler::refresh` when this host has
 /// `scheduler.follow_peer_primary` set -- see that config field's doc
@@ -764,47 +522,18 @@ pub async fn run(
     let tun = Arc::new(tun);
     let links: Links = Arc::new(links.into_iter().map(AsyncMutex::new).collect());
     let scheduler = Arc::new(std::sync::Mutex::new(Scheduler::new()));
-    // Wrapped once, here, so every task below (including ones spawned
-    // later, like `rekey_loop`) can cheaply clone a handle to the full
-    // params instead of each needing its own hand-picked subset of
-    // fields threaded through as separate arguments.
+    // Wrapped once, here, so every task below can cheaply clone a handle
+    // to the full params instead of each needing its own hand-picked
+    // subset of fields threaded through as separate arguments.
     let params = Arc::new(params);
 
-    let (session_id, session) = establish_session_with_retry(&links, &params).await;
-    let session = Arc::new(AsyncRwLock::new(SessionState::new(session_id, session)));
-    let session_meta = Arc::new(SessionMeta::new(session_id));
-
-    tracing::info!(session_id, "tunnel session established");
-
-    // Every link's `link::Link::alternate` (if any) was only ever meant
-    // to be raced during that initial handshake above -- see its own
-    // doc comment. The link that actually answered already resolved its
-    // own via `commit_remote` inside `perform_client_handshake`; this
-    // actively verifies every *other* link's still-untested alternate
-    // now that a session exists to authenticate a probe with, rather
-    // than just discarding it -- see `resolve_remaining_alternates`'s
-    // doc comment for why (CHANGELOG: a link whose primary family
-    // turned out to be unreachable, e.g. IPv6 administratively disabled
-    // on that link's own physical interface, used to be stuck that way
-    // forever, never given the chance to fail over to a working
-    // alternate it never lost this race against -- it simply never got
-    // to run it).
-    resolve_remaining_alternates(&links, &session).await;
-
-    let rekey_ctx = Arc::new(RekeyContext {
-        mode: params.mode,
-        local_private: params.local_private.clone(),
-        peer_public: params.peer_public,
-        limiter: HandshakeRateLimiter::new(),
-        rekey_reply_tx: std::sync::Mutex::new(None),
-    });
-
-    // Client-only in practice (see `handle_incoming`'s `PacketType::Disconnect`
-    // arm and `rekey_loop`'s doc comment), but cheap enough to always
-    // create -- nudges `rekey_loop` to attempt a fresh handshake right
-    // away, rather than waiting up to `rekey_interval`, the moment an
-    // authenticated `Disconnect` arrives from the peer.
-    let reconnect = Arc::new(tokio::sync::Notify::new());
+    // No app-level handshake to wait for here anymore -- see the module
+    // doc comment: each link independently drives its own WireGuard
+    // handshake (via `wg_send`/`wg_recv`/`wg_tick`, all in `link.rs`)
+    // once its tasks are spawned below, lazily, the same way real
+    // WireGuard does. `run()` never blocks tunnel startup on any of them
+    // completing.
+    tracing::info!("tunnel starting; each link will handshake independently");
 
     let reorder = Arc::new(AsyncMutex::new(ReorderBuffer::new(
         params.scheduler_cfg.reorder_window_ms,
@@ -909,16 +638,12 @@ pub async fn run(
         let tracker = tracker.clone();
         {
             let links = links.clone();
-            let session = session.clone();
             let scheduler = scheduler.clone();
             let tun = tun.clone();
             let reorder = reorder.clone();
             let cfg = params.scheduler_cfg.clone();
             let tracker = tracker.clone();
             let peer_stats = peer_stats.clone();
-            let rekey_ctx = rekey_ctx.clone();
-            let reconnect = reconnect.clone();
-            let session_meta = session_meta.clone();
             let mtu = live_mtu.clone();
             let throughput_test_state = throughput_test_state.clone();
             let throughput_test_ctx = throughput_test_ctx.clone();
@@ -934,16 +659,12 @@ pub async fn run(
                 link_receiver(
                     idx,
                     links,
-                    session,
                     scheduler,
                     tun,
                     reorder,
                     cfg,
                     tracker,
                     peer_stats,
-                    rekey_ctx,
-                    reconnect,
-                    session_meta,
                     mtu,
                     throughput_test_state,
                     throughput_test_ctx,
@@ -956,28 +677,16 @@ pub async fn run(
         }
         {
             let links = links.clone();
-            let session = session.clone();
             let scheduler = scheduler.clone();
             let cfg = params.scheduler_cfg.clone();
             let mtu = live_mtu.clone();
             let peer_primary_link = peer_primary_link.clone();
             handles.push(tokio::spawn(async move {
-                link_prober(
-                    idx,
-                    links,
-                    session,
-                    scheduler,
-                    cfg,
-                    mtu,
-                    tracker,
-                    peer_primary_link,
-                )
-                .await;
+                link_prober(idx, links, scheduler, cfg, mtu, tracker, peer_primary_link).await;
             }));
         }
         {
             let links = links.clone();
-            let session = session.clone();
             let cfg = params.scheduler_cfg.clone();
             let mtu = live_mtu.clone();
             let throughput_test_ctx = throughput_test_ctx.clone();
@@ -986,7 +695,7 @@ pub async fn run(
                 // active_bandwidth_probing is on -- see the function's
                 // own doc comment, same "spawn unconditionally, check
                 // inside" pattern as reorder_tuning_loop below.
-                active_bandwidth_prober(idx, links, session, cfg, mtu, throughput_test_ctx).await;
+                active_bandwidth_prober(idx, links, cfg, mtu, throughput_test_ctx).await;
             }));
         }
     }
@@ -996,7 +705,6 @@ pub async fn run(
         let peer_stats = peer_stats.clone();
         let tunnel_name = params.tunnel_name.clone();
         let mode = params.mode.as_str().to_string();
-        let session_meta = session_meta.clone();
         let outbound_tx = outbound_tx.clone();
         let outbound_dropped_total = outbound_dropped_total.clone();
         let log_ring = log_ring.clone();
@@ -1004,13 +712,19 @@ pub async fn run(
         let peer_mtu = peer_mtu.clone();
         let mtu = live_mtu.clone();
         handles.push(tokio::spawn(async move {
+            // NOTE(task 5): `control::serve`'s signature still expects a
+            // `session_meta: Arc<SessionMeta>` argument that no longer
+            // exists in this module -- `SessionMeta` was removed along
+            // with the shared Noise session it described (see the module
+            // doc comment). Left as a known, external compile error for
+            // Task 6 (which owns control.rs) rather than guessing at a
+            // replacement session-info shape here.
             control::serve(
                 path,
                 links,
                 peer_stats,
                 tunnel_name,
                 mode,
-                session_meta,
                 outbound_tx,
                 outbound_dropped_total,
                 log_ring,
@@ -1024,7 +738,6 @@ pub async fn run(
 
     if let Some(path) = params.command_socket.clone() {
         let links = links.clone();
-        let session = session.clone();
         let throughput_test_ctx = throughput_test_ctx.clone();
         let tunnel_test_ctx_for_commands = tunnel_test_ctx.clone();
         let mtu = live_mtu.clone();
@@ -1032,7 +745,6 @@ pub async fn run(
             peer_stats: peer_stats.clone(),
             tunnel_name: params.tunnel_name.clone(),
             mode: params.mode.as_str().to_string(),
-            session_meta: session_meta.clone(),
             outbound_tx: outbound_tx.clone(),
             outbound_dropped_total: outbound_dropped_total.clone(),
             log_ring: log_ring.clone(),
@@ -1041,10 +753,13 @@ pub async fn run(
             peer_mtu: peer_mtu.clone(),
         };
         handles.push(tokio::spawn(async move {
+            // NOTE(task 5): same `SessionMeta`/`session` removal as
+            // above -- `control::DiagContext.session_meta` and
+            // `control::serve_commands`'s `session` parameter are both
+            // stale now; left for Task 6.
             control::serve_commands(
                 path,
                 links,
-                session,
                 throughput_test_ctx,
                 tunnel_test_ctx_for_commands,
                 mtu,
@@ -1087,7 +802,6 @@ pub async fn run(
             peer_stats: peer_stats.clone(),
             tunnel_name: params.tunnel_name.clone(),
             mode: params.mode.as_str().to_string(),
-            session_meta: session_meta.clone(),
             outbound_tx: outbound_tx.clone(),
             outbound_dropped_total: outbound_dropped_total.clone(),
             log_ring: log_ring.clone(),
@@ -1135,14 +849,13 @@ pub async fn run(
     }
 
     {
-        let session = session.clone();
         let tun = tun.clone();
         let mtu = live_mtu.clone();
         let clamp_mss = params.clamp_mss;
         let tx = outbound_tx.clone();
         let dropped_total = outbound_dropped_total.clone();
         handles.push(tokio::spawn(async move {
-            if let Err(e) = tun_reader(tun, session, mtu, clamp_mss, tx, dropped_total).await {
+            if let Err(e) = tun_reader(tun, mtu, clamp_mss, tx, dropped_total).await {
                 tracing::error!(error = %e, "tun reader exited");
             }
         }));
@@ -1166,28 +879,6 @@ pub async fn run(
         }));
     }
 
-    {
-        let session = session.clone();
-        handles.push(tokio::spawn(async move {
-            session_expiry_loop(session).await;
-        }));
-    }
-
-    // Client-initiated only -- see the module doc comment for why the
-    // server never runs this task and instead passively accepts a
-    // rekey `HandshakeInit` in `handle_incoming`.
-    if params.mode == Mode::Client {
-        let links = links.clone();
-        let params = params.clone();
-        let session = session.clone();
-        let rekey_ctx = rekey_ctx.clone();
-        let session_meta = session_meta.clone();
-        let reconnect = reconnect.clone();
-        handles.push(tokio::spawn(async move {
-            rekey_loop(links, params, session, rekey_ctx, session_meta, reconnect).await;
-        }));
-    }
-
     // None of the tasks above normally return on their own (they're all
     // infinite loops or `select!` loops), so without this, `run()`
     // would never return short of the whole process being killed out
@@ -1202,7 +893,7 @@ pub async fn run(
     }
 
     tracing::info!("shutting down: notifying peer");
-    broadcast_disconnect(&links, &session).await;
+    broadcast_disconnect(&links).await;
 
     for h in handles {
         h.abort();
@@ -1217,798 +908,28 @@ pub async fn run(
 /// falls back to noticing via the probe timeout it would have hit
 /// anyway -- a clean shutdown should never block on this succeeding,
 /// which is also why this doesn't retry.
-async fn broadcast_disconnect(links: &Links, session: &Arc<AsyncRwLock<SessionState>>) {
-    let targets: Vec<(LinkHandle, SocketAddr, u8)> = {
+async fn broadcast_disconnect(links: &Links) {
+    let targets: Vec<(LinkHandle, u8)> = {
         let snap = link::snapshot_links(links).await;
         snap.iter()
-            .filter_map(|link| link.remote.map(|r| (link.handle(), r, link.id)))
+            .filter(|link| link.remote.is_some())
+            .map(|link| (link.handle(), link.id))
             .collect()
     };
 
-    // Same reasoning as everywhere else a frame is encrypted: an empty
-    // plaintext is a perfectly valid AEAD message (just the tag, no
-    // ciphertext body) -- Disconnect carries no payload, it's the frame
-    // type itself that's the whole signal.
-    let Ok((session_id, seq, ciphertext)) = session.read().await.encrypt(&[]) else {
-        return;
-    };
+    // Disconnect carries no payload -- it's the frame type itself that's
+    // the whole signal.
+    let seq = next_send_seq();
 
-    for (handle, remote, link_id) in targets {
-        let socket = handle.current_socket().await;
-        let mut frame = Vec::with_capacity(HEADER_LEN + ciphertext.len());
+    for (handle, link_id) in targets {
+        let mut frame = Vec::with_capacity(HEADER_LEN);
         Header {
             ptype: PacketType::Disconnect,
             link_id,
-            session_id,
             seq,
         }
         .encode(&mut frame);
-        frame.extend_from_slice(&ciphertext);
-        let _ = socket.send_to(&frame, remote).await;
-    }
-}
-
-/// Perform (or wait for) the initial Noise handshake and return the
-/// resulting session id plus transport session. Thin dispatcher over
-/// `perform_client_handshake` (client) or a dedicated pre-session wait
-/// loop (server) -- see each for the real logic. This runs before any
-/// `link_actor` tasks exist, so the server arm is free to hold the
-/// `links` lock across its own recv calls without contending with them.
-async fn establish_session(links: &Links, params: &TunnelParams) -> Result<(u32, Session)> {
-    match params.mode {
-        // `None`: no `RekeyContext`/`link_receiver` tasks exist yet at
-        // this point (see `run()`'s ordering), so there is no socket
-        // contention to route around -- `perform_client_handshake` reads
-        // each link's socket directly. See its doc comment.
-        Mode::Client => perform_client_handshake(links, params, None).await,
-        Mode::Server => {
-            // Race a short-timeout recv across every link in turn. This is
-            // a simple sequential poll rather than a true concurrent
-            // select over a dynamic set of futures, which is adequate
-            // pre-session (no data path running yet) but would be a poor
-            // pattern for the hot path -- link_actor uses proper
-            // per-socket ownership instead once the session exists.
-            // Resolved once, before any per-link tasks exist: reconnect
-            // support (see the module doc comment) lives in the
-            // link_receiver/link_prober tasks spawned after a session
-            // is established, so it deliberately doesn't apply to this
-            // pre-session wait loop -- an interface that's gone before
-            // the tunnel ever comes up is just "not up yet", not a
-            // reconnect scenario.
-            let mut sockets: Vec<(Arc<UdpSocket>, u8)> = Vec::new();
-            {
-                let snap = link::snapshot_links(links).await;
-                for l in snap.iter() {
-                    sockets.push((l.handle().current_socket().await, l.id));
-                }
-            }
-            let mut buf = vec![0u8; MAX_FRAME];
-
-            // Lightweight defense against a pre-session CPU-exhaustion
-            // flood: `hdr.ptype == HandshakeInit` is plaintext, so
-            // anyone can tag arbitrary garbage that way, and each one
-            // that reaches `respond_to_handshake_init` forces real
-            // X25519 operations before it's rejected. This cannot forge
-            // a valid session (that function's own pin check still
-            // requires holding the real peer's private key), but it can
-            // burn CPU cycles for free. This only matters pre-session --
-            // once established, `handle_incoming`'s own
-            // `HandshakeRateLimiter` instance (shared across every
-            // per-link task via `RekeyContext`) covers the same concern
-            // for a peer-initiated rekey.
-            let rate_limiter = HandshakeRateLimiter::new();
-
-            loop {
-                let mut hit = None;
-                for (socket, link_id) in &sockets {
-                    if let Ok(Ok((n, from))) =
-                        tokio::time::timeout(Duration::from_millis(50), socket.recv_from(&mut buf))
-                            .await
-                    {
-                        hit = Some((n, from, *link_id, socket.clone()));
-                        break;
-                    }
-                }
-                let Some((n, from, link_id, socket)) = hit else {
-                    continue;
-                };
-                buf.truncate(n);
-                let Ok((hdr, payload)) = Header::decode(&buf) else {
-                    buf.resize(MAX_FRAME, 0);
-                    continue;
-                };
-                if hdr.ptype != PacketType::HandshakeInit {
-                    buf.resize(MAX_FRAME, 0);
-                    continue;
-                }
-
-                if !rate_limiter.allow() {
-                    tracing::debug!(%from, "dropping HandshakeInit: rate limit exceeded");
-                    buf.resize(MAX_FRAME, 0);
-                    continue;
-                }
-
-                match respond_to_handshake_init(
-                    &params.local_private,
-                    &params.peer_public,
-                    &hdr,
-                    payload,
-                    from,
-                    &socket,
-                    link_id,
-                )
-                .await
-                {
-                    Ok((session_id, session)) => {
-                        for l in links.iter() {
-                            let mut guard = l.lock().await;
-                            if guard.id == link_id {
-                                guard.remote = Some(from);
-                                break;
-                            }
-                        }
-                        return Ok((session_id, session));
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            %from,
-                            "rejected malformed/invalid/unpinned handshake attempt"
-                        );
-                        buf.resize(MAX_FRAME, 0);
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// Wraps `establish_session` so the *initial* handshake retries in the
-/// background forever instead of ever taking the whole daemon down.
-/// `establish_session`'s `Mode::Server` arm already loops internally and
-/// never returns `Err`; only `Mode::Client`'s `perform_client_handshake`
-/// can exhaust its bounded `RETRIES` and give up on one round. That
-/// `Err` used to propagate straight out of `run()` via `?`, so `main()`'s
-/// top-level `anyhow::Result` handler printed it and the whole process
-/// exited. Under `systemd`'s default `Restart=on-failure`, enough
-/// consecutive failed rounds -- the peer host still booting, down for
-/// maintenance, or just briefly unreachable -- trips
-/// `StartLimitBurst`/`StartLimitIntervalSec`, and systemd gives up
-/// entirely: the unit lands in `failed` and stays down for good until
-/// someone notices and runs `systemctl reset-failed`. Neither WireGuard
-/// nor the original C `MLVPN` this project replaces ever exit on a
-/// failed handshake -- they just keep trying in the background. This
-/// matches that: log a warning and back off (the same exponential
-/// schedule `attempt_reconnect` above uses, capped at
-/// `RECONNECT_BACKOFF_MAX_MS`) instead of ever returning an error here,
-/// so a client started before its peer is reachable just quietly waits
-/// it out rather than crash-looping itself into a permanently failed
-/// systemd unit.
-async fn establish_session_with_retry(links: &Links, params: &TunnelParams) -> (u32, Session) {
-    let mut backoff_ms = RECONNECT_BACKOFF_INITIAL_MS;
-    loop {
-        match establish_session(links, params).await {
-            Ok(result) => return result,
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    backoff_ms,
-                    "initial handshake failed; retrying in the background rather than \
-                     exiting -- a peer that's temporarily unreachable at startup \
-                     shouldn't take the daemon down or trip systemd's restart-rate-limit"
-                );
-                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-                backoff_ms = (backoff_ms * 2).min(RECONNECT_BACKOFF_MAX_MS);
-            }
-        }
-    }
-}
-
-/// The client side of a Noise_IK handshake: broadcast message 1 on
-/// every configured link with a `remote_addr` and race them for the
-/// first valid reply, retrying up to `RETRIES` whole rounds if one comes
-/// up empty. Used both for the tunnel's very first handshake
-/// (`establish_session`'s `Mode::Client` arm, passing `rekey_ctx: None`)
-/// and every later rekey (`rekey_loop`, passing `Some`) -- factored out
-/// here specifically so there is exactly one implementation of
-/// "broadcast and race" rather than two copies that could drift apart.
-/// Generates its own fresh session id per call (reused across that
-/// call's own retry attempts, same as before this was factored out), so
-/// a rekey never risks colliding with the session id the current session
-/// is still using.
-///
-/// `rekey_ctx` selects how replies are received, not just whether one is
-/// available to log into: `None` (`establish_session`, pre-session) reads
-/// each target link's socket directly (`race_handshake_reply`), which is
-/// safe because no `link_receiver` task exists yet to contend with it.
-/// `Some` (`rekey_loop`, mid-session) instead registers this attempt's
-/// session id with `rekey_ctx` and waits on the channel `handle_incoming`
-/// forwards matching `HandshakeResp` frames into (`race_rekey_reply`) --
-/// reading the socket directly here would race `link_receiver`'s own
-/// already-running `recv_from` loop on the same socket for every
-/// datagram, and losing that race silently drops the exact reply this is
-/// waiting for. That was a real bug (see `CHANGELOG.md`): the server-side
-/// responder considers a Noise_IK handshake complete the moment it sends
-/// message 2, so a client-side timeout caused by a stolen reply didn't
-/// just mean "retry" -- the server had already committed to a session the
-/// client had no way to learn the keys for, permanently desynchronizing
-/// the two sides under the same session id label.
-async fn perform_client_handshake(
-    links: &Links,
-    params: &TunnelParams,
-    rekey_ctx: Option<&Arc<RekeyContext>>,
-) -> Result<(u32, Session)> {
-    const RETRIES: u32 = 10;
-    const HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(500);
-    let session_id = crypto::random_session_id();
-    let mut last_err = None;
-    let mut rekey_rx = rekey_ctx.map(|ctx| ctx.register_rekey_wait(session_id));
-    for attempt in 0..RETRIES {
-        // For a rekey, `session_id` must stay fixed across every attempt
-        // in this call: it's what correlates an in-flight attempt's
-        // expected `HandshakeResp` with the wait channel registered once,
-        // above, via `register_rekey_wait`/`rekey_rx`. The initial
-        // handshake (`rekey_ctx: None`) has no such channel to keep in
-        // sync, and this shadowed `session_id` fixes a real race that
-        // integration testing caught: each attempt already generates a
-        // fresh Noise ephemeral (`hs` below), but previously reused the
-        // *same* session_id across every attempt -- so a reply that
-        // arrived just late enough to miss one attempt's timeout, but
-        // still land during a *later* attempt's window, would get fed
-        // into that later attempt's `hs.read_second()` and always fail
-        // (it was encrypted against the earlier, now-discarded
-        // ephemeral). Worse, once that happened, the server's own
-        // stale-duplicate protection (`handle_incoming`'s HandshakeInit
-        // arm, `is_known_session_id`) would refuse to process *any*
-        // further HandshakeInit carrying a session_id it had already
-        // installed a session under -- so every remaining attempt in
-        // this call was doomed to get nothing back at all, guaranteeing
-        // the whole handshake failed once that one race happened, even
-        // though the peer had a valid, waiting session the entire time.
-        // A fresh session_id per initial-handshake attempt sidesteps
-        // both problems: a late reply from an abandoned attempt can't be
-        // fed into a mismatched later ephemeral in this specific way,
-        // and the server's stale-duplicate check only ever suppresses a
-        // genuinely repeated attempt, never a legitimately new one.
-        let session_id = if rekey_ctx.is_none() {
-            crypto::random_session_id()
-        } else {
-            session_id
-        };
-
-        // Every configured link with a remote_addr, not just the first
-        // one (ARCHITECTURE.md roadmap item #1): a down or unreachable
-        // first link no longer stalls handshake setup on its own.
-        let targets: Vec<(LinkHandle, SocketAddr, u8)> = {
-            let snap = link::snapshot_links(links).await;
-            if snap.is_empty() {
-                return Err(MlvpnError::Config("no links configured".into()));
-            }
-            let mut targets: Vec<(LinkHandle, SocketAddr, u8)> = snap
-                .iter()
-                .filter_map(|link| link.remote.map(|r| (link.handle(), r, link.id)))
-                .collect();
-            // A link's not-yet-confirmed alternate-family candidate
-            // (see `link::Link::alternate`'s doc comment) only ever
-            // races here, on the very first handshake attempt
-            // (`rekey_ctx` is `None` exactly then) -- by the time a
-            // rekey runs, `link_receiver`/`link_prober` already hold
-            // their own `LinkHandle` snapshotted at spawn time, which
-            // wouldn't observe a `remote` flip happening this late.
-            if rekey_ctx.is_none() {
-                targets.extend(snap.iter().filter_map(|link| {
-                    let (alt_remote, _) = link.alternate.as_ref()?;
-                    let alt_handle = link.alternate_handle()?;
-                    Some((alt_handle, *alt_remote, link.id))
-                }));
-            }
-            targets
-        };
-        if targets.is_empty() {
-            return Err(MlvpnError::Config(
-                "no configured link has a remote_addr set".into(),
-            ));
-        }
-
-        let mut hs = Handshake::new_initiator(&params.local_private, &params.peer_public)?;
-        let msg1 = hs.write_first()?;
-
-        // Broadcast the identical message 1 on every target link at
-        // once -- safe to send unmodified on each: Noise's first
-        // message doesn't depend on which transport path carries it,
-        // only on `hs`'s single ephemeral key (generated once above,
-        // shared across every copy). A send failure on one link just
-        // means one fewer path racing this round; the others still
-        // have a chance.
-        for (handle, remote, link_id) in &targets {
-            let socket = handle.current_socket().await;
-            let mut frame = Vec::with_capacity(HEADER_LEN + msg1.len());
-            Header {
-                ptype: PacketType::HandshakeInit,
-                link_id: *link_id,
-                session_id,
-                seq: 0,
-            }
-            .encode(&mut frame);
-            frame.extend_from_slice(&msg1);
-            if let Err(e) = socket.send_to(&frame, *remote).await {
-                tracing::debug!(
-                    link_id = *link_id,
-                    error = %e,
-                    "handshake init send failed on this link, still racing the others"
-                );
-            }
-        }
-
-        // `reply_remote` is `None` on the rekey path (never races an
-        // alternate -- see the target-building comment above) and
-        // `Some` on the initial-handshake path, carrying whichever of
-        // that link's raced addresses actually answered.
-        let reply = if let Some(rx) = rekey_rx.as_mut() {
-            race_rekey_reply(rx, HANDSHAKE_TIMEOUT)
-                .await
-                .map(|(link_id, payload)| (link_id, None, payload))
-        } else {
-            race_handshake_reply(&targets, session_id, HANDSHAKE_TIMEOUT)
-                .await
-                .map(|(link_id, remote, payload)| (link_id, Some(remote), payload))
-        };
-        let (reply_link_id, reply_remote, payload) = match reply {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!(attempt, error = %e, "handshake attempt failed, retrying");
-                last_err = Some(e);
-                continue;
-            }
-        };
-
-        // A garbled or forged HandshakeResp -- anyone can send a packet
-        // tagged with this ptype, header fields are plaintext -- must
-        // not crash the daemon or abort the retry loop via `?`. Treat
-        // it exactly like a timeout and try again next iteration with
-        // a fresh `hs`. This was previously a real bug: a single
-        // unauthenticated garbage packet here used to propagate
-        // straight out of this function (and from there out of the
-        // whole process), a one-packet remote DoS against the client
-        // role. `race_handshake_reply` already filters out anything
-        // that isn't well-formed and from the expected source on its
-        // own; what reaches here can still fail Noise's own
-        // authentication, which is exactly what this still guards
-        // against.
-        match hs.read_second(&payload) {
-            Ok(()) => {}
-            Err(e) => {
-                tracing::warn!(
-                    attempt,
-                    link_id = reply_link_id,
-                    error = %e,
-                    "rejected malformed/invalid handshake reply, retrying"
-                );
-                last_err = Some(e);
-                continue;
-            }
-        }
-
-        match hs.remote_static() {
-            Some(remote_static) if remote_static == params.peer_public => {
-                tracing::info!(
-                    link_id = reply_link_id,
-                    session_id,
-                    "handshake completed via this link"
-                );
-                // Only on the initial handshake (see the target-building
-                // comment above for why): resolve this link's
-                // primary-vs-alternate race now that we know which
-                // address actually answered. Every other link's own
-                // still-unresolved alternate gets cleaned up right after
-                // `establish_session_with_retry` returns in `run()`.
-                if rekey_ctx.is_none() {
-                    if let Some(link) = links.get(reply_link_id as usize) {
-                        link.lock().await.commit_remote(reply_remote);
-                    }
-                }
-                return Ok((session_id, hs.into_session()?));
-            }
-            Some(_) => {
-                // Definitively the wrong key: no amount of retrying
-                // will fix that, so this one stays a hard failure
-                // rather than looping.
-                return Err(MlvpnError::AuthFailed);
-            }
-            None => {
-                // Fail closed: a Noise_IK handshake that completed
-                // `read_second` successfully must have a remote static
-                // key. Treating "can't verify the pin" the same as
-                // "verified and it didn't match" means this check can
-                // never be silently skipped.
-                return Err(MlvpnError::AuthFailed);
-            }
-        }
-    }
-    Err(last_err.unwrap_or(MlvpnError::Handshake("handshake failed".into())))
-}
-
-/// The responder side of one inbound `HandshakeInit` frame: verify it
-/// authenticates as the pinned peer, reply with message 2 on the same
-/// socket/source it arrived from, and return the (client-chosen, now
-/// mutually adopted) session id plus the resulting `Session` on
-/// success. Shared by `establish_session`'s pre-session `Mode::Server`
-/// wait loop (the tunnel's very first handshake) and `handle_incoming`'s
-/// steady-state rekey acceptance -- both need exactly this same
-/// sequence, differing only in what surrounds it (a dedicated wait loop
-/// with no data path running yet, vs. one case in the normal per-link
-/// dispatch of an already-running tunnel).
-///
-/// A malformed or malicious attempt from any source must never take
-/// the whole server down: every failure here is a plain `Err`, for the
-/// caller to log and keep listening rather than something that should
-/// ever propagate out with `?` and end a whole task.
-async fn respond_to_handshake_init(
-    local_private: &LocalPrivateKey,
-    peer_public: &[u8; 32],
-    hdr: &Header,
-    payload: &[u8],
-    from: SocketAddr,
-    socket: &Arc<UdpSocket>,
-    link_id: u8,
-) -> Result<(u32, Session)> {
-    let mut hs = Handshake::new_responder(local_private)?;
-    let msg2 = hs.read_first_and_reply(payload)?;
-
-    // Fail closed: treat "couldn't determine the peer's static key" the
-    // same as "determined it and it didn't match" rather than silently
-    // letting a `None` skip the pin check. For a Noise_IK responder
-    // that has just successfully processed message 1, `remote_static()`
-    // returning `None` shouldn't happen in practice, but the one line
-    // of code that turns "authenticated by Noise" into "authenticated
-    // as the specific pinned peer" is exactly the wrong place to fail
-    // open on an unexpected case.
-    match hs.remote_static() {
-        Some(remote_static) if remote_static == *peer_public => {}
-        _ => return Err(MlvpnError::AuthFailed),
-    }
-
-    let mut frame = Vec::with_capacity(HEADER_LEN + msg2.len());
-    Header {
-        ptype: PacketType::HandshakeResp,
-        link_id,
-        session_id: hdr.session_id,
-        seq: 0,
-    }
-    .encode(&mut frame);
-    frame.extend_from_slice(&msg2);
-    socket.send_to(&frame, from).await.map_err(MlvpnError::Io)?;
-
-    Ok((hdr.session_id, hs.into_session()?))
-}
-
-/// One handshake attempt's receive phase, used by `establish_session`'s
-/// `Mode::Client` arm: race every `target` link's socket for the first
-/// well-formed `HandshakeResp` from that link's *expected* source
-/// address *and* carrying this attempt's own `session_id`, within
-/// `timeout`. Each link is listened to in its own task (via `JoinSet`)
-/// that loops internally, silently discarding anything that doesn't
-/// look like a genuine reply to *this* attempt (garbage, a
-/// spoofed-source injection attempt, an unrelated frame, or -- see
-/// below -- a stale reply to an earlier, already-abandoned attempt) and
-/// only returning once it finds a plausible candidate -- so a single bad
-/// packet on one link can't cost the whole race the way it would if we
-/// stopped listening on that link after its first (bad) datagram.
-///
-/// The `session_id` check is not optional. Since `establish_session_with_retry`
-/// started retrying a failed initial handshake indefinitely instead of
-/// giving up, this became reachable in practice, not just in theory: if
-/// one attempt's reply arrives just late enough to miss its own
-/// timeout, the peer has (by design, see `perform_client_handshake`'s
-/// doc comment on the fresh-session-id-per-attempt fix) already
-/// committed that session and will keep responding to it if anything
-/// ever re-triggers it, and every later attempt's own `HandshakeInit`
-/// gets legitimately treated by the peer as a *new* rekey once it's
-/// past its own initial accept -- each producing its own `HandshakeResp`.
-/// Without filtering by `session_id`, this function would happily hand
-/// whichever one of those replies happened to be sitting first in the
-/// socket's receive queue to the caller, almost always a stale reply
-/// meaning nothing to the *current* attempt's Noise ephemeral, which
-/// then always fails to decrypt -- consuming the one candidate this
-/// function is allowed to return per attempt (see below) without ever
-/// reaching the genuine, matching reply potentially queued right behind
-/// it. Across repeated retry rounds this compounds: each abandoned
-/// attempt leaves one more stale reply in the queue that can wrongly
-/// win a future race, so once one late reply happens the client could
-/// otherwise never recover on its own. Filtering by `session_id` here
-/// makes a stale reply invisible to every future attempt instead,
-/// exactly the same guarantee `rekey_ctx`'s `forward_rekey_reply`
-/// (`race_rekey_reply`'s counterpart) already provides for the mid-session
-/// case via its own `want_id` check.
-///
-/// Deliberately returns the still-encrypted message 2 payload rather
-/// than calling `Handshake::read_second` itself: that call can only
-/// safely be attempted once per `Handshake` instance (a failed
-/// `read_message` call leaves `snow`'s internal transcript hash mutated
-/// from the bad input, so a second, later-arriving *genuine* reply would
-/// then also fail authentication against that now-diverged state) --
-/// see `establish_session` for why finding a well-formed candidate here
-/// and having Noise itself reject it there consumes the whole attempt
-/// round rather than letting this function keep searching for another
-/// candidate.
-///
-/// Returns `(link_id, remote, payload)` -- `remote` is which of that
-/// link's raced addresses actually answered (its primary, or its
-/// not-yet-confirmed alternate -- see `link::Link::alternate`), so the
-/// caller (`perform_client_handshake`) can commit that link to whichever
-/// one just proved itself reachable.
-async fn race_handshake_reply(
-    targets: &[(LinkHandle, SocketAddr, u8)],
-    session_id: u32,
-    timeout: Duration,
-) -> Result<(u8, SocketAddr, Vec<u8>)> {
-    let mut join_set: JoinSet<Option<(u8, SocketAddr, Vec<u8>)>> = JoinSet::new();
-    for (handle, remote, link_id) in targets.iter().cloned() {
-        join_set.spawn(async move {
-            let socket = handle.current_socket().await;
-            let mut buf = vec![0u8; MAX_FRAME];
-            loop {
-                let (n, from) = match socket.recv_from(&mut buf).await {
-                    Ok(v) => v,
-                    // This link's socket itself is broken; give up on
-                    // it for this round rather than spinning -- the
-                    // other targets still get their full chance, and
-                    // this link's own reconnect logic (once the
-                    // steady-state tasks exist) handles the socket
-                    // itself.
-                    Err(_) => return None,
-                };
-                // Quick filter, not a security boundary (UDP source
-                // addresses are trivially spoofable; the actual
-                // authentication is the Noise handshake back in
-                // `establish_session`) -- just avoids treating obvious
-                // off-target traffic, and stale replies to an earlier
-                // abandoned attempt (see this function's doc comment),
-                // as a candidate. Anything that doesn't match keeps
-                // this task listening rather than giving up, so a
-                // single stray, spoofed, or stale packet can't cost
-                // this link its chance at the real reply.
-                if from != remote {
-                    continue;
-                }
-                let Ok((hdr, payload)) = Header::decode(&buf[..n]) else {
-                    continue;
-                };
-                if hdr.ptype != PacketType::HandshakeResp || hdr.session_id != session_id {
-                    continue;
-                }
-                return Some((link_id, remote, payload.to_vec()));
-            }
-        });
-    }
-
-    let winner = tokio::time::timeout(timeout, async {
-        while let Some(joined) = join_set.join_next().await {
-            // `Ok(Some(..))`: a candidate. `Ok(None)`: that link's
-            // socket errored, keep waiting on the rest. `Err(..)`: the
-            // task itself panicked, which shouldn't happen; also just
-            // keep waiting rather than letting one bad task sink the
-            // whole race.
-            if let Ok(Some(candidate)) = joined {
-                return Some(candidate);
-            }
-        }
-        None
-    })
-    .await;
-
-    // Whether we found a winner, ran out of links, or hit the timeout,
-    // nothing should keep listening into the next attempt round (a
-    // fresh `hs`/broadcast) or after a successful handshake.
-    join_set.abort_all();
-
-    match winner {
-        Ok(Some((link_id, remote, payload))) => Ok((link_id, remote, payload)),
-        Ok(None) => Err(MlvpnError::Handshake(
-            "no valid handshake reply on any link".into(),
-        )),
-        Err(_) => Err(MlvpnError::Handshake("timeout".into())),
-    }
-}
-
-/// How long `resolve_remaining_alternates` waits for either a link's
-/// primary or alternate address to answer a probe before giving up on
-/// both and falling back to the primary (today's pre-fix behavior).
-/// Generous enough for a real round trip plus normal jitter; this runs
-/// once, for at most a handful of links, all racing concurrently, so
-/// it's not worth trimming tighter at the cost of a spurious failure
-/// under momentary network noise right at startup.
-const RESOLVE_ALTERNATE_TIMEOUT: Duration = Duration::from_secs(2);
-
-/// Actively resolves every remaining link's untested primary-vs-
-/// alternate ambiguity (see `link::Link::alternate`'s doc comment),
-/// rather than just discarding the alternate the way `run()` used to.
-///
-/// Only one link+family combination ever gets a real reply during the
-/// initial handshake broadcast in `perform_client_handshake`: the peer
-/// deduplicates every copy of that broadcast by `session_id` (they're
-/// all identical except for source address/link), so whichever one
-/// arrives first is the only one that ever gets a `HandshakeResp` --
-/// every other link, and every other family on the winning link, gets
-/// no reply at all, not even a delayed one, no matter how long anyone
-/// waited. That's fine for the link that won (it obviously has a
-/// working path), but it means every *other* configured link's own
-/// primary-vs-alternate ambiguity is never actually tested -- the old
-/// code just kept `pick_remote_addr`'s IPv6-preferred guess and dropped
-/// the alternate outright. If that guess was wrong (e.g. IPv6
-/// administratively disabled on that link's own physical interface),
-/// the link would sit in `Probing` forever: its primary never works,
-/// and its one working alternate was already closed before anything
-/// tried it.
-///
-/// Fixes that by racing a real authenticated `Probe`/`ProbeReply` round
-/// trip between each remaining link's primary and alternate, now that a
-/// session exists to encrypt one under -- no second handshake needed.
-/// Runs once, here, before any `link_receiver` task exists to contend
-/// with these sockets' `recv_from` calls (same reasoning as
-/// `establish_session`'s pre-session server-mode loop). A link where
-/// neither address answers within `RESOLVE_ALTERNATE_TIMEOUT` falls
-/// back to its primary and drops the alternate -- exactly the old
-/// behavior, so this can only ever improve a link's outcome, never make
-/// one worse than before this existed.
-async fn resolve_remaining_alternates(links: &Links, session: &Arc<AsyncRwLock<SessionState>>) {
-    let snap = link::snapshot_links(links).await;
-    let mut join_set: JoinSet<(u8, Option<SocketAddr>)> = JoinSet::new();
-    for link in snap.iter() {
-        let (Some((alt_remote, _)), Some(primary_remote)) = (link.alternate.as_ref(), link.remote)
-        else {
-            continue;
-        };
-        let Some(alt_handle) = link.alternate_handle() else {
-            continue;
-        };
-        let primary_handle = link.handle();
-        let link_id = link.id;
-        let alt_remote = *alt_remote;
-        let session = session.clone();
-        join_set.spawn(async move {
-            let mut inner: JoinSet<Option<SocketAddr>> = JoinSet::new();
-            inner.spawn(probe_one_address(
-                primary_handle,
-                primary_remote,
-                link_id,
-                session.clone(),
-            ));
-            inner.spawn(probe_one_address(alt_handle, alt_remote, link_id, session));
-            let winner = tokio::time::timeout(RESOLVE_ALTERNATE_TIMEOUT, async {
-                while let Some(joined) = inner.join_next().await {
-                    if let Ok(Some(addr)) = joined {
-                        return Some(addr);
-                    }
-                }
-                None
-            })
-            .await
-            .ok()
-            .flatten();
-            inner.abort_all();
-            (link_id, winner)
-        });
-    }
-    while let Some(joined) = join_set.join_next().await {
-        let Ok((link_id, winner)) = joined else {
-            continue;
-        };
-        if let Some(link) = links.get(link_id as usize) {
-            let mut guard = link.lock().await;
-            if winner.is_none() {
-                tracing::warn!(
-                    link = %guard.config.name,
-                    "neither primary nor alternate address answered a post-handshake probe; \
-                     keeping the originally selected primary -- this link may not actually be \
-                     reachable over that family"
-                );
-            }
-            guard.commit_remote(winner);
-        }
-    }
-}
-
-/// Sends one authenticated `Probe` on `handle`'s current socket to
-/// `remote` and waits for a matching `ProbeReply` (by `probe_seq`),
-/// returning `remote` on success. Used only by
-/// `resolve_remaining_alternates`, to test one candidate address of one
-/// link's primary-vs-alternate pair; `None` on a send failure. Loops on
-/// `recv_from` with no timeout of its own -- the caller is always
-/// responsible for bounding this, same pattern as
-/// `race_handshake_reply`'s per-target receive tasks.
-async fn probe_one_address(
-    handle: LinkHandle,
-    remote: SocketAddr,
-    link_id: u8,
-    session: Arc<AsyncRwLock<SessionState>>,
-) -> Option<SocketAddr> {
-    let probe_seq = crypto::random_session_id();
-    let now_ns = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64;
-    let payload = ProbePayload {
-        probe_seq,
-        send_ts_ns: now_ns,
-    }
-    .encode();
-
-    let socket = handle.current_socket().await;
-    let (session_id, seq, ciphertext) = {
-        let s = session.read().await;
-        s.encrypt(&payload).ok()?
-    };
-    let mut frame = Vec::with_capacity(HEADER_LEN + ciphertext.len());
-    Header {
-        ptype: PacketType::Probe,
-        link_id,
-        session_id,
-        seq,
-    }
-    .encode(&mut frame);
-    frame.extend_from_slice(&ciphertext);
-    socket.send_to(&frame, remote).await.ok()?;
-
-    let mut buf = vec![0u8; MAX_FRAME];
-    loop {
-        let (n, from) = socket.recv_from(&mut buf).await.ok()?;
-        if from != remote {
-            continue;
-        }
-        let Ok((hdr, ct)) = Header::decode(&buf[..n]) else {
-            continue;
-        };
-        if hdr.ptype != PacketType::ProbeReply {
-            continue;
-        }
-        let plaintext = {
-            let mut s = session.write().await;
-            match s.decrypt(hdr.session_id, hdr.seq, ct) {
-                Ok(pt) => pt,
-                Err(_) => continue,
-            }
-        };
-        let Ok(reply) = ProbePayload::decode(&plaintext) else {
-            continue;
-        };
-        if reply.probe_seq != probe_seq {
-            continue;
-        }
-        return Some(remote);
-    }
-}
-
-/// The rekey counterpart of `race_handshake_reply`, used when
-/// `perform_client_handshake` is called mid-session (`rekey_loop`)
-/// rather than pre-session (`establish_session`). By the time a rekey
-/// runs, every link's socket already belongs to that link's
-/// `link_receiver` task, which is continuously calling `recv_from` on it
-/// in its own loop; a second, independent `recv_from` here (the
-/// pre-session approach) would race that task for every incoming
-/// datagram with no guarantee which of the two callers the kernel
-/// delivers any given one to. Instead, `handle_incoming` forwards any
-/// `HandshakeResp` matching this attempt's session id through `rx`
-/// (wired up by `RekeyContext::register_rekey_wait` before message 1
-/// went out), and this just waits on that channel -- already filtered to
-/// this attempt by `RekeyContext::forward_rekey_reply` -- with the same
-/// one-reply-per-attempt, timeout-bounded semantics as the direct-socket
-/// version.
-async fn race_rekey_reply(
-    rx: &mut mpsc::UnboundedReceiver<RekeyReply>,
-    timeout: Duration,
-) -> Result<RekeyReply> {
-    match tokio::time::timeout(timeout, rx.recv()).await {
-        Ok(Some(candidate)) => Ok(candidate),
-        // The sender half lives on `rekey_ctx`, itself kept alive for
-        // the tunnel's whole lifetime, so this shouldn't happen in
-        // practice; treat it the same as "nothing arrived in time"
-        // rather than as a distinct error case callers need to handle
-        // differently.
-        Ok(None) => Err(MlvpnError::Handshake(
-            "rekey reply channel closed unexpectedly".into(),
-        )),
-        Err(_) => Err(MlvpnError::Handshake("timeout".into())),
+        let _ = handle.wg_send(&frame).await;
     }
 }
 
@@ -2063,20 +984,20 @@ const OUTBOUND_QUEUE_CAPACITY: usize = 256;
 /// mechanism exists to surface, but the report itself never firing.
 const OUTBOUND_QUEUE_DROP_REPORT_INTERVAL: Duration = Duration::from_secs(2);
 
-/// One packet, already encrypted and ready to hand to a link's socket --
-/// what `tun_reader` pushes onto the outbound queue and `outbound_sender`
-/// pulls back off. Just the pieces `send_scheduled`/`send_redundant`
-/// already took as separate arguments, bundled so a single value can
-/// travel through the channel.
+/// One plaintext IP packet read off the TUN device, ready to hand to a
+/// link's socket -- what `tun_reader` pushes onto the outbound queue and
+/// `outbound_sender` pulls back off. Unlike the old shared-session
+/// design, this is deliberately *not* pre-encrypted: encryption now
+/// happens per-link (`wireguard::WgTunnel`, via `LinkHandle::wg_send`),
+/// so which link's key material applies is only known once
+/// `send_scheduled`/`send_redundant` has actually picked a link -- see
+/// this module's doc comment.
 pub(crate) struct OutboundFrame {
-    session_id: u32,
-    seq: u64,
-    ciphertext: Vec<u8>,
+    plaintext: Vec<u8>,
 }
 
 async fn tun_reader(
     tun: Arc<AsyncDevice>,
-    session: Arc<AsyncRwLock<SessionState>>,
     mtu: LiveMtu,
     clamp_mss: bool,
     tx: mpsc::Sender<OutboundFrame>,
@@ -2116,16 +1037,6 @@ async fn tun_reader(
             );
         }
 
-        // `session_id` comes back from `encrypt` itself rather than a
-        // value captured once at startup, specifically so a packet sent
-        // right after a rekey automatically carries whichever session
-        // is now active -- see `crypto::SessionState::encrypt`'s doc
-        // comment.
-        let (session_id, seq, ciphertext) = {
-            let s = session.read().await;
-            s.encrypt(&plaintext)?
-        };
-
         // `try_send`, never `.send().await`: this loop's whole job is to
         // keep draining the kernel's TUN queue as fast as packets arrive
         // there, so blocking it on a full outbound queue would defeat
@@ -2134,11 +1045,7 @@ async fn tun_reader(
         // drop this packet and count it rather than stall reading the
         // next one, same drop-rather-than-block policy the original C
         // MLVPN's `freebuffer_t` used.
-        if let Err(TrySendError::Full(_)) = tx.try_send(OutboundFrame {
-            session_id,
-            seq,
-            ciphertext,
-        }) {
+        if let Err(TrySendError::Full(_)) = tx.try_send(OutboundFrame { plaintext }) {
             dropped_total.fetch_add(1, Ordering::Relaxed);
         }
         // TrySendError::Closed would mean outbound_sender's receiver was
@@ -2161,16 +1068,9 @@ async fn outbound_sender(
 ) {
     while let Some(frame) = rx.recv().await {
         if redundant_mode {
-            send_redundant(&links, frame.session_id, frame.seq, &frame.ciphertext).await;
+            send_redundant(&links, &frame.plaintext).await;
         } else {
-            send_scheduled(
-                &links,
-                &scheduler,
-                frame.session_id,
-                frame.seq,
-                &frame.ciphertext,
-            )
-            .await;
+            send_scheduled(&links, &scheduler, &frame.plaintext).await;
         }
     }
 }
@@ -2219,11 +1119,14 @@ async fn outbound_queue_drop_reporter(dropped_total: Arc<AtomicU64>) {
 async fn send_scheduled(
     links: &Links,
     scheduler: &Arc<std::sync::Mutex<Scheduler>>,
-    session_id: u32,
-    seq: u64,
-    ciphertext: &[u8],
+    plaintext: &[u8],
 ) {
-    let frame_len = HEADER_LEN + ciphertext.len();
+    // Not the real on-wire size (WireGuard adds its own AEAD overhead on
+    // top, invisibly to this layer), but the same approximation the old
+    // shared-session design used for the scheduler's own cap-check
+    // accounting, which only ever needed a reasonable estimate, not an
+    // exact byte count.
+    let frame_len = HEADER_LEN + plaintext.len();
 
     // Fast path first: `Scheduler::select_fast` resolves a primary or
     // an SWRR pick entirely from state the last periodic `refresh()`
@@ -2258,34 +1161,33 @@ async fn send_scheduled(
 
     // Only *now*, having already picked a winner, do we lock a link at
     // all for its full data -- and only this one, not every candidate
-    // that didn't win. `LinkHandle` rather than a resolved socket here,
-    // specifically so the actual send below always reads whatever
+    // that didn't win. `LinkHandle` (which owns this link's own
+    // `WgTunnel`) rather than a resolved socket here, specifically so
+    // the actual send below always encrypts/sends through whatever
     // socket is current at send time (post-reconnect if one just
     // happened) instead of one captured slightly stale.
-    let chosen: Option<(u8, LinkHandle, SocketAddr, String)> = {
+    let chosen: Option<(u8, LinkHandle, String)> = {
         let guard = link_mutex.lock().await;
         guard
             .remote
-            .map(|r| (guard.id, guard.handle(), r, guard.config.name.clone()))
+            .map(|_| (guard.id, guard.handle(), guard.config.name.clone()))
     };
-    let Some((link_id, handle, remote, link_name)) = chosen else {
+    let Some((link_id, handle, link_name)) = chosen else {
         tracing::warn!("no link available to send on; dropping packet");
         return;
     };
-    let socket = handle.current_socket().await;
 
     let mut frame = Vec::with_capacity(frame_len);
     Header {
         ptype: PacketType::Data,
         link_id,
-        session_id,
-        seq,
+        seq: next_send_seq(),
     }
     .encode(&mut frame);
-    frame.extend_from_slice(ciphertext);
+    frame.extend_from_slice(plaintext);
 
-    match socket.send_to(&frame, remote).await {
-        Ok(_) => {
+    match handle.wg_send(&frame).await {
+        Ok(()) => {
             // Re-lock just the winning link, only on success, purely to
             // update the lifetime tx counters -- everything else in this
             // function already released `link_mutex` before the `.await`
@@ -2323,25 +1225,20 @@ async fn send_scheduled(
 /// latency-sensitive ones. Only worth enabling for a small,
 /// latency-critical tunnel (e.g. VoIP/control traffic bonded across a
 /// couple of links); a bulk-transfer tunnel should leave this off.
-async fn send_redundant(links: &Links, session_id: u32, seq: u64, ciphertext: &[u8]) {
-    let targets: Vec<(u8, LinkHandle, SocketAddr, String)> = {
+async fn send_redundant(links: &Links, plaintext: &[u8]) {
+    let targets: Vec<(u8, LinkHandle, String)> = {
         let snap = link::snapshot_links(links).await;
         let up: Vec<_> = snap
             .iter()
-            .filter(|l| l.state == LinkState::Up)
-            .filter_map(|l| {
-                l.remote
-                    .map(|r| (l.id, l.handle(), r, l.config.name.clone()))
-            })
+            .filter(|l| l.state == LinkState::Up && l.remote.is_some())
+            .map(|l| (l.id, l.handle(), l.config.name.clone()))
             .collect();
         if !up.is_empty() {
             up
         } else {
             snap.iter()
-                .filter_map(|l| {
-                    l.remote
-                        .map(|r| (l.id, l.handle(), r, l.config.name.clone()))
-                })
+                .filter(|l| l.remote.is_some())
+                .map(|l| (l.id, l.handle(), l.config.name.clone()))
                 .collect()
         }
     };
@@ -2351,20 +1248,26 @@ async fn send_redundant(links: &Links, session_id: u32, seq: u64, ciphertext: &[
         return;
     }
 
-    for (link_id, handle, remote, link_name) in targets {
-        let socket = handle.current_socket().await;
-        let frame_len = HEADER_LEN + ciphertext.len();
+    // Every copy carries the SAME seq -- the receiving side's replay
+    // window (now per-link, inside each `WgTunnel`) doesn't dedupe
+    // across links on its own, but `ReorderBuffer`'s own high-watermark
+    // logic (`note_delivered`) treats every copy after the first as "not
+    // forward progress" and buffers/discards it via the ordinary
+    // stale-duplicate path, the same as before this task.
+    let seq = next_send_seq();
+    let frame_len = HEADER_LEN + plaintext.len();
+
+    for (link_id, handle, link_name) in targets {
         let mut frame = Vec::with_capacity(frame_len);
         Header {
             ptype: PacketType::Data,
             link_id,
-            session_id,
             seq,
         }
         .encode(&mut frame);
-        frame.extend_from_slice(ciphertext);
-        match socket.send_to(&frame, remote).await {
-            Ok(_) => {
+        frame.extend_from_slice(plaintext);
+        match handle.wg_send(&frame).await {
+            Ok(()) => {
                 // `link_id` is always the live link's own Vec index (see
                 // main.rs's `Link::bind(id, ...)` call site: id is
                 // assigned from the config Vec's own position), so this
@@ -2397,16 +1300,12 @@ async fn send_redundant(links: &Links, session_id: u32, seq: u64, ciphertext: &[
 async fn link_receiver(
     idx: usize,
     links: Links,
-    session: Arc<AsyncRwLock<SessionState>>,
     scheduler: Arc<std::sync::Mutex<Scheduler>>,
     tun: Arc<AsyncDevice>,
     reorder: Arc<AsyncMutex<ReorderBuffer>>,
     cfg: SchedulerConfig,
     tracker: Arc<AsyncMutex<ProbeTracker>>,
     peer_stats: Arc<PeerStatsTable>,
-    rekey_ctx: Arc<RekeyContext>,
-    reconnect: Arc<tokio::sync::Notify>,
-    session_meta: Arc<SessionMeta>,
     mtu: LiveMtu,
     throughput_test_state: Arc<AsyncMutex<ThroughputTestReceiveState>>,
     throughput_test_ctx: Arc<ThroughputTestContext>,
@@ -2419,31 +1318,30 @@ async fn link_receiver(
         (link.handle(), link.id, link.config.name.clone())
     };
 
-    let mut buf = vec![0u8; MAX_FRAME];
     let mut consecutive_failures = 0u32;
     let mut backoff_ms = RECONNECT_BACKOFF_INITIAL_MS;
     loop {
-        let socket = handle.current_socket().await;
-        match socket.recv_from(&mut buf).await {
-            Ok((n, from)) => {
+        // `wg_recv` loops internally past any handshake/keepalive
+        // traffic on this link's socket -- what comes back here is
+        // always either a genuine decrypted mlvpn frame plus the
+        // datagram's source address, or a real error (a socket I/O
+        // failure, or a malformed/oversized datagram that
+        // `wireguard::WgTunnel::decapsulate` rejected outright).
+        match handle.wg_recv().await {
+            Ok((frame, from)) => {
                 consecutive_failures = 0;
                 handle_incoming(
                     idx,
                     link_id,
-                    &buf[..n],
+                    &frame,
                     from,
-                    &socket,
                     &links,
-                    &session,
                     &scheduler,
                     &tun,
                     &reorder,
                     &cfg,
                     &tracker,
                     &peer_stats,
-                    &rekey_ctx,
-                    &reconnect,
-                    &session_meta,
                     &mtu,
                     &throughput_test_state,
                     &throughput_test_ctx,
@@ -2453,7 +1351,7 @@ async fn link_receiver(
                 )
                 .await;
             }
-            Err(e) if is_interface_gone_error(&e) => {
+            Err(MlvpnError::Io(e)) if is_interface_gone_error(&e) => {
                 consecutive_failures += 1;
                 tracing::debug!(
                     link = %link_name,
@@ -2472,7 +1370,7 @@ async fn link_receiver(
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
             }
-            Err(e) => {
+            Err(MlvpnError::Io(e)) => {
                 // Not classified as "interface gone" -- e.g. ENETDOWN
                 // from an interface that's merely administratively down,
                 // or a momentary route lookup failure. Deliberately not
@@ -2490,6 +1388,20 @@ async fn link_receiver(
                 );
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
+            Err(e) => {
+                // A malformed/oversized/garbled datagram rejected by
+                // `WgTunnel::decapsulate` before it ever became a real
+                // frame -- not a socket problem, so it neither resets
+                // nor increments the reconnect-failure counter, and
+                // there's nothing to hand to `handle_incoming`. Anyone
+                // can send arbitrary garbage at this socket; rejecting
+                // it here and continuing is the correct response.
+                tracing::debug!(
+                    link = %link_name,
+                    error = %e,
+                    "link receive error (malformed datagram, ignoring)"
+                );
+            }
         }
     }
 }
@@ -2504,7 +1416,6 @@ async fn link_receiver(
 async fn link_prober(
     idx: usize,
     links: Links,
-    session: Arc<AsyncRwLock<SessionState>>,
     scheduler: Arc<std::sync::Mutex<Scheduler>>,
     cfg: SchedulerConfig,
     mtu: LiveMtu,
@@ -2538,10 +1449,17 @@ async fn link_prober(
     loop {
         tokio::select! {
             _ = probe_tick.tick() => {
-                let socket = handle.current_socket().await;
+                // Drives boringtun's own internal handshake-retry/
+                // keepalive timers -- see `LinkHandle::wg_tick`'s doc
+                // comment and this module's own doc comment for why no
+                // separate handshake-retry loop exists anywhere else.
+                // Best-effort: a failure here doesn't affect probe
+                // sending below, which has its own error handling.
+                let _ = handle.wg_tick().await;
+
                 let sent = {
                     let mut t = tracker.lock().await;
-                    send_probe(&socket, link_id, &links, idx, &session, &probe_seq_counter, &mut t).await
+                    send_probe(link_id, &links, idx, &probe_seq_counter, &mut t).await
                 };
                 match sent {
                     ProbeSendOutcome::Sent => probe_send_failures = 0,
@@ -2583,9 +1501,8 @@ async fn link_prober(
             // to delay (or be delayed by) probing, which is what actually
             // drives scheduling decisions.
             _ = stats_tick.tick() => {
-                let socket = handle.current_socket().await;
-                send_stats_share(&socket, link_id, &links, idx, &session).await;
-                send_version_info(&socket, link_id, &links, idx, &session, &mtu, &scheduler).await;
+                send_stats_share(link_id, &links, idx).await;
+                send_version_info(link_id, &links, idx, &mtu, &scheduler).await;
             }
 
             _ = sweep_tick.tick() => {
@@ -3069,7 +1986,6 @@ fn ramp_result_still_valid(
 async fn active_bandwidth_prober(
     idx: usize,
     links: Links,
-    session: Arc<AsyncRwLock<SessionState>>,
     cfg: SchedulerConfig,
     mtu: LiveMtu,
     throughput_test_ctx: Arc<ThroughputTestContext>,
@@ -3078,10 +1994,7 @@ async fn active_bandwidth_prober(
         return;
     }
 
-    let (handle, link_id) = {
-        let link = links[idx].lock().await;
-        (link.handle(), link.id)
-    };
+    let link_id = links[idx].lock().await.id;
 
     let mut tick = interval(Duration::from_secs(
         cfg.active_bandwidth_probe_interval_secs,
@@ -3090,16 +2003,20 @@ async fn active_bandwidth_prober(
     loop {
         tick.tick().await;
 
-        // Skip this cycle entirely if we don't yet have a learned peer
-        // address for this link (e.g. right at startup, or a link that's
-        // never come up) -- same "nothing to send to yet" condition
-        // `send_probe` already handles for latency probes.
-        let remote = links[idx].lock().await.remote;
-        let Some(remote) = remote else {
-            continue;
+        // A fresh handle from the live `Link` every tick, not one
+        // captured once at task startup -- see `send_probe`'s comment
+        // for why a stale captured `LinkHandle.remote` would otherwise
+        // never observe a remote address learned later. Skipped
+        // entirely if there's no remote to send to yet (e.g. right at
+        // startup, or a link that's never come up).
+        let handle = {
+            let link = links[idx].lock().await;
+            if link.remote.is_none() {
+                continue;
+            }
+            link.handle()
         };
 
-        let socket = handle.current_socket().await;
         let reramp_interval = Duration::from_secs(cfg.active_bandwidth_reramp_interval_secs);
         let full_ramp = {
             let link = links[idx].lock().await;
@@ -3110,18 +2027,15 @@ async fn active_bandwidth_prober(
         // `target_mbps` and waits for the peer's result, same shape
         // Task 3's CLI upload leg uses.
         let run_step = |target_mbps: f64| {
-            let socket = socket.clone();
-            let session = session.clone();
+            let handle = handle.clone();
             let mtu = mtu.clone();
             let throughput_test_ctx = throughput_test_ctx.clone();
             async move {
                 let test_id = crypto::random_session_id();
                 let mut rx = throughput_test_ctx.register_wait(test_id);
                 if send_throughput_test_stream(
-                    socket,
-                    remote,
+                    handle,
                     link_id,
-                    session,
                     test_id,
                     Duration::from_secs(1),
                     mtu,
@@ -3318,10 +2232,8 @@ fn target_elapsed_for_bytes(bytes_sent: u64, target_mbps: f64) -> Duration {
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn send_throughput_test_stream(
-    socket: Arc<UdpSocket>,
-    remote: SocketAddr,
+    handle: LinkHandle,
     link_id: u8,
-    session: Arc<AsyncRwLock<SessionState>>,
     test_id: u32,
     duration: Duration,
     mtu: LiveMtu,
@@ -3337,7 +2249,6 @@ pub(crate) async fn send_throughput_test_stream(
     tracing::info!(
         link_id,
         test_id,
-        %remote,
         duration_secs = duration.as_secs(),
         "throughput self-test stream starting"
     );
@@ -3345,33 +2256,26 @@ pub(crate) async fn send_throughput_test_stream(
     let deadline = Instant::now() + duration;
 
     async fn send_one(
-        socket: &Arc<UdpSocket>,
-        remote: SocketAddr,
+        handle: &LinkHandle,
         link_id: u8,
-        session: &Arc<AsyncRwLock<SessionState>>,
         test_id: u32,
         done: bool,
         payload_len: usize,
     ) -> Result<()> {
         let payload = ThroughputTestDataPayload { test_id, done }.encode_padded(payload_len);
-        let (session_id, seq, ct) = {
-            let s = session.read().await;
-            s.encrypt(&payload)?
-        };
-        let mut out = Vec::with_capacity(HEADER_LEN + ct.len());
+        let mut out = Vec::with_capacity(HEADER_LEN + payload.len());
         Header {
             ptype: PacketType::ThroughputTestData,
             link_id,
-            session_id,
-            seq,
+            seq: next_send_seq(),
         }
         .encode(&mut out);
-        out.extend_from_slice(&ct);
+        out.extend_from_slice(&payload);
         // Best-effort, same as active_bandwidth_prober's burst: a single
         // dropped packet mid-stream just means a slightly smaller
         // bytes_seen on the receiver, not a fatal error for the whole
         // test.
-        let _ = socket.send_to(&out, remote).await;
+        let _ = handle.wg_send(&out).await;
         Ok(())
     }
 
@@ -3388,16 +2292,7 @@ pub(crate) async fn send_throughput_test_stream(
         let payload_len = (mtu.load(std::sync::atomic::Ordering::Relaxed) as usize)
             .max(ThroughputTestDataPayload::HEADER_LEN);
         let done = Instant::now() >= deadline;
-        send_one(
-            &socket,
-            remote,
-            link_id,
-            &session,
-            test_id,
-            done,
-            payload_len,
-        )
-        .await?;
+        send_one(&handle, link_id, test_id, done, payload_len).await?;
         bytes_sent += payload_len as u64;
 
         if done {
@@ -3420,16 +2315,7 @@ pub(crate) async fn send_throughput_test_stream(
                 // packet, and production logs showed the same "no
                 // result" pattern on a real, heavily loss-laden link.
                 tokio::time::sleep(THROUGHPUT_TEST_DONE_RETRY_DELAY).await;
-                let _ = send_one(
-                    &socket,
-                    remote,
-                    link_id,
-                    &session,
-                    test_id,
-                    true,
-                    payload_len,
-                )
-                .await;
+                let _ = send_one(&handle, link_id, test_id, true, payload_len).await;
             }
             return Ok(());
         }
@@ -3453,10 +2339,8 @@ pub(crate) async fn send_throughput_test_stream(
 /// made just ahead of this call) for that reverse stream to arrive and
 /// complete.
 pub(crate) async fn send_throughput_test_reverse_request(
-    socket: &Arc<UdpSocket>,
-    remote: SocketAddr,
+    handle: &LinkHandle,
     link_id: u8,
-    session: &Arc<AsyncRwLock<SessionState>>,
     test_id: u32,
     duration_secs: u32,
 ) -> Result<()> {
@@ -3465,21 +2349,15 @@ pub(crate) async fn send_throughput_test_reverse_request(
         duration_secs,
     }
     .encode();
-    let (session_id, seq, ct) = {
-        let s = session.read().await;
-        s.encrypt(&payload)?
-    };
-    let mut out = Vec::with_capacity(HEADER_LEN + ct.len());
+    let mut out = Vec::with_capacity(HEADER_LEN + payload.len());
     Header {
         ptype: PacketType::ThroughputTestReverseRequest,
         link_id,
-        session_id,
-        seq,
+        seq: next_send_seq(),
     }
     .encode(&mut out);
-    out.extend_from_slice(&ct);
-    socket.send_to(&out, remote).await.map_err(MlvpnError::Io)?;
-    Ok(())
+    out.extend_from_slice(&payload);
+    handle.wg_send(&out).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3488,18 +2366,13 @@ async fn handle_incoming(
     link_id: u8,
     frame: &[u8],
     from: SocketAddr,
-    socket: &Arc<UdpSocket>,
     links: &Links,
-    session: &Arc<AsyncRwLock<SessionState>>,
     scheduler: &Arc<std::sync::Mutex<Scheduler>>,
     tun: &Arc<AsyncDevice>,
     reorder: &Arc<AsyncMutex<ReorderBuffer>>,
     cfg: &SchedulerConfig,
     tracker: &Arc<AsyncMutex<ProbeTracker>>,
     peer_stats: &Arc<PeerStatsTable>,
-    rekey_ctx: &Arc<RekeyContext>,
-    reconnect: &Arc<tokio::sync::Notify>,
-    session_meta: &Arc<SessionMeta>,
     mtu: &LiveMtu,
     throughput_test_state: &Arc<AsyncMutex<ThroughputTestReceiveState>>,
     throughput_test_ctx: &Arc<ThroughputTestContext>,
@@ -3507,118 +2380,33 @@ async fn handle_incoming(
     peer_mtu: &PeerMtu,
     peer_primary_link: &PeerPrimaryLink,
 ) {
-    let Ok((hdr, ciphertext)) = Header::decode(frame) else {
+    // `frame` is already the plaintext output of `LinkHandle::wg_recv`
+    // (this link's own `WgTunnel` already authenticated and decrypted
+    // it) -- unlike the old shared-session design, there is no decrypt
+    // step here at all, and no `HandshakeInit`/`HandshakeResp` arms:
+    // WireGuard's handshake happens entirely inside `wireguard.rs`/
+    // `link.rs`, below this layer, so a genuine mlvpn frame reaching
+    // this function is authentication enough on its own.
+    let Ok((hdr, plaintext)) = Header::decode(frame) else {
         return;
     };
-
-    // Every non-handshake frame type -- Data, Probe, and ProbeReply alike
-    // -- is AEAD-protected under the shared Noise transport session, using
-    // the header's `seq` as the nonce. This matters as much for Probe
-    // traffic as for Data: if probes were sent in the clear, an off-path
-    // attacker could inject forged RTT/loss samples and steer the
-    // scheduler's link scoring, or trigger bogus Up/Down transitions.
-    // Requiring authentication here means only someone holding the
-    // session's derived keys (i.e. someone who passed the Noise_IK
-    // handshake) can influence link scoring or get a Data payload
-    // accepted at all.
-    let plaintext = match hdr.ptype {
-        PacketType::HandshakeInit => {
-            // A rekey request -- or, just as plausibly, a spoofed or
-            // stale frame; `ptype` is plaintext and unauthenticated
-            // until `respond_to_handshake_init`'s own pin check
-            // succeeds. Only `Mode::Server` ever accepts one
-            // post-establishment: the client is always the Noise_IK
-            // initiator, both for the very first handshake and every
-            // rekey, so it never expects to receive one itself -- see
-            // the module doc comment.
-            if rekey_ctx.mode == Mode::Server {
-                // Guards against a real bug this project's integration
-                // tests caught: the client broadcasts the identical
-                // message 1 (same session id) to *every* configured
-                // link at once during the initial handshake (see
-                // `perform_client_handshake`), but `establish_session`'s
-                // pre-session wait loop only ever consumes the first
-                // copy that arrives before returning -- any duplicate
-                // that landed on another link's socket in the meantime
-                // is still sitting there, unread, once steady state
-                // begins. Without this check, the `link_receiver` task
-                // that eventually reads it would treat that stale
-                // duplicate as a brand new peer-initiated rekey, derive
-                // a *different* session under the *same* session id
-                // (Noise's responder generates a fresh ephemeral for
-                // every message-2 it sends, even from an identical
-                // message 1), and install it -- silently desynchronizing
-                // the two sides' keys under a label that looked
-                // unchanged in the logs. A genuinely new rekey attempt
-                // always carries a freshly generated random session id
-                // (see `crypto::SessionState::is_known_session_id`'s doc
-                // comment), so this can only ever filter out exactly the
-                // stale-duplicate case, never a real one.
-                if session.read().await.is_known_session_id(hdr.session_id) {
-                    tracing::debug!(
-                        session_id = hdr.session_id,
-                        %from,
-                        "ignoring HandshakeInit for an already-installed session id \
-                         (stale duplicate of an earlier handshake, not a new rekey)"
-                    );
-                    return;
-                }
-                if rekey_ctx.limiter.allow() {
-                    match respond_to_handshake_init(
-                        &rekey_ctx.local_private,
-                        &rekey_ctx.peer_public,
-                        &hdr,
-                        ciphertext,
-                        from,
-                        socket,
-                        link_id,
-                    )
-                    .await
-                    {
-                        Ok((new_id, new_session)) => {
-                            if let Some(l) = links.get(idx) {
-                                l.lock().await.remote = Some(from);
-                            }
-                            session.write().await.install(new_id, new_session);
-                            session_meta.record_rekey(new_id);
-                            tracing::info!(session_id = new_id, "session rekeyed (peer-initiated)");
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                error = %e,
-                                %from,
-                                "rejected rekey handshake attempt"
-                            );
-                        }
-                    }
-                } else {
-                    tracing::debug!(%from, "dropping HandshakeInit: rate limit exceeded");
-                }
-            }
-            return;
-        }
-        PacketType::HandshakeResp => {
-            // Pre-session, `race_handshake_reply` reads this directly
-            // off the socket and this branch never even runs (no
-            // `link_receiver` task exists yet -- see `establish_session`).
-            // Mid-session, this *is* how a rekey's `HandshakeResp` gets
-            // back to the waiting `rekey_loop` attempt: forwarded
-            // through `rekey_ctx` if it matches a currently in-flight
-            // attempt's session id, silently dropped otherwise (a stale
-            // retransmit from an attempt that already gave up, or plain
-            // noise) -- see `RekeyContext::forward_rekey_reply` and
-            // `race_rekey_reply`.
-            rekey_ctx.forward_rekey_reply(hdr.session_id, link_id, ciphertext.to_vec());
-            return;
-        }
-        _ => {
-            let mut s = session.write().await;
-            match s.decrypt(hdr.session_id, hdr.seq, ciphertext) {
-                Ok(pt) => pt,
-                Err(_) => return, // auth failure, replay, or unrecognized session id; silently drop
-            }
-        }
-    };
+    // Owned copy: several branches below (`ReorderBuffer::insert`, the
+    // `ThroughputTestReverseRequest` spawn) need to hold onto this past
+    // `frame`'s own borrow.
+    let plaintext = plaintext.to_vec();
+    if matches!(
+        hdr.ptype,
+        PacketType::HandshakeInit | PacketType::HandshakeResp
+    ) {
+        // `PacketType` still declares these two variants (protocol.rs is
+        // outside this task's scope), but nothing on this side ever
+        // constructs one anymore -- a peer that somehow still sends one
+        // (an old build, a forged frame) has nothing meaningful to do
+        // here now that the real WireGuard handshake lives entirely
+        // below this layer.
+        tracing::debug!(%from, ptype = ?hdr.ptype, "ignoring legacy app-level handshake frame");
+        return;
+    }
 
     // Only now, having verified the frame is authentic, do we trust its
     // source address enough to (re-)learn it as this link's peer address.
@@ -3654,57 +2442,23 @@ async fn handle_incoming(
             // cached in a persistent flag, so a mid-stream transition
             // (the primary going Down or a peer-followed primary
             // settling) is picked up on the very next packet either
-            // way, correctly, since note_delivered and the buffered
-            // path's own watermark update both keep high_watermark
-            // in sync regardless of which path handled any given
-            // packet.
+            // way, correctly.
             if scheduler.lock().unwrap().primary().is_some() {
                 // Settled single active link: no cross-link reordering
                 // is possible, so skip time-based buffering entirely
                 // and deliver immediately, matching WireGuard's own
                 // architecture for single-path tunnels -- see this
-                // module's "Locking discipline" doc comment and
-                // `ReorderBuffer::note_delivered`'s own doc comment for
-                // the full reasoning.
-                //
-                // `Scheduler::primary` is driven entirely by monitor/
-                // probe ticks, not by Data-packet or session activity
-                // (see `scheduler.rs`), so once this branch engages it
-                // can stay engaged indefinitely -- the buffered branch
-                // below (which resets `peer_primary_link` on a session
-                // change) is NOT guaranteed to run again for the rest of
-                // the tunnel's lifetime. This branch must therefore
-                // perform that same `peer_primary_link` reset itself,
-                // using `note_delivered`'s own return value, or an
-                // adopted `peer_primary_link` would latch forever across
-                // every subsequent rekey once bypass mode takes over.
-                let session_changed = reorder.lock().await.note_delivered(hdr.seq, hdr.session_id);
-                if session_changed {
-                    *peer_primary_link.lock().unwrap() = None;
-                    // `info`, not `debug`: this only fires once per
-                    // rekey (a rare, low-frequency event), not per
-                    // packet, and is deliberately visible at the
-                    // default log level so it can be confirmed in
-                    // integration tests and real operator logs alike
-                    // (`tests/veth_wireguard_style_immediate_delivery.rs`
-                    // asserts on this exact line).
-                    tracing::info!(
-                        session_id = hdr.session_id,
-                        "cleared stale peer_primary_link in bypass mode after a session change"
-                    );
-                }
+                // module's doc comment and `ReorderBuffer::note_delivered`'s
+                // own doc comment for the full reasoning. Each link's
+                // own WireGuard session now rekeys entirely internally
+                // (invisibly to this module), so there is no longer an
+                // app-level session-change event to reset `peer_primary_link`
+                // on here.
+                reorder.lock().await.note_delivered(hdr.seq);
                 let _ = tun.send(&plaintext).await;
             } else {
                 let ready = {
                     let mut ro = reorder.lock().await;
-                    let session_changed = ro.reset_for_session(hdr.session_id);
-                    if session_changed {
-                        // Mirrors the ReorderBuffer rekey-stranding fix
-                        // (v0.5.3): `peer_primary_link` is tunnel-lifetime
-                        // state too, so it must not survive a session change
-                        // unbounded -- see `PeerPrimaryLink`'s doc comment.
-                        *peer_primary_link.lock().unwrap() = None;
-                    }
                     ro.insert(hdr.seq, plaintext);
                     ro.drain_ready()
                 };
@@ -3714,36 +2468,26 @@ async fn handle_incoming(
             }
         }
         PacketType::Probe => {
-            // Echo the decrypted probe payload straight back,
-            // re-encrypted under our own current active session, so the
+            // Echo the decrypted probe payload straight back, so the
             // original sender can match it against their
             // outstanding-probe table by `probe_seq` and compute RTT
-            // from their own clock. Always uses *our own* current
-            // active session id for the reply, not necessarily whatever
-            // session decrypted the request -- a reply is new outgoing
-            // traffic, and this is what keeps a probe reply sent right
-            // after our own rekey installs correctly tagged with the
-            // new session id. See `crypto::SessionState`'s doc comment
-            // for why a handful of replies briefly using a session id
-            // the peer hasn't adopted yet, right at the moment of a
-            // rekey, is expected and self-corrects.
-            let encrypted = {
-                let s = session.read().await;
-                s.encrypt(&plaintext)
-            };
-            let Ok((reply_session_id, reply_seq, reply_ct)) = encrypted else {
+            // from their own clock. Sent through a fresh `LinkHandle`
+            // (this link's own `WgTunnel` encrypts it) rather than the
+            // raw socket -- see `send_probe`'s comment on why a fresh
+            // handle, not the caller's possibly-stale one, is used here.
+            let Some(link_mutex) = links.get(idx) else {
                 return;
             };
-            let mut out = Vec::with_capacity(HEADER_LEN + reply_ct.len());
+            let handle = link_mutex.lock().await.handle();
+            let mut out = Vec::with_capacity(HEADER_LEN + plaintext.len());
             Header {
                 ptype: PacketType::ProbeReply,
                 link_id,
-                session_id: reply_session_id,
-                seq: reply_seq,
+                seq: next_send_seq(),
             }
             .encode(&mut out);
-            out.extend_from_slice(&reply_ct);
-            let _ = socket.send_to(&out, from).await;
+            out.extend_from_slice(&plaintext);
+            let _ = handle.wg_send(&out).await;
         }
         PacketType::ProbeReply => {
             let Ok(probe) = ProbePayload::decode(&plaintext) else {
@@ -3833,21 +2577,18 @@ async fn handle_incoming(
                     test_id: data.test_id,
                     achieved_mbps: achieved_mbps as f32,
                 };
-                let encrypted = {
-                    let s = session.read().await;
-                    s.encrypt(&result_payload.encode())
-                };
-                if let Ok((reply_session_id, reply_seq, reply_ct)) = encrypted {
-                    let mut out = Vec::with_capacity(HEADER_LEN + reply_ct.len());
+                if let Some(link_mutex) = links.get(idx) {
+                    let handle = link_mutex.lock().await.handle();
+                    let reply_plaintext = result_payload.encode();
+                    let mut out = Vec::with_capacity(HEADER_LEN + reply_plaintext.len());
                     Header {
                         ptype: PacketType::ThroughputTestResult,
                         link_id,
-                        session_id: reply_session_id,
-                        seq: reply_seq,
+                        seq: next_send_seq(),
                     }
                     .encode(&mut out);
-                    out.extend_from_slice(&reply_ct);
-                    let _ = socket.send_to(&out, from).await;
+                    out.extend_from_slice(&reply_plaintext);
+                    let _ = handle.wg_send(&out).await;
                 }
 
                 // Also deliver locally: if *we* are the one waiting on
@@ -3905,19 +2646,17 @@ async fn handle_incoming(
             // Autonomously start sending a stream back, without any
             // local command-socket trigger -- this is what makes a
             // bidirectional throughput test work without needing the
-            // operator to separately run a command on *both* ends. See
-            // `send_throughput_test_stream`'s doc comment for why this
-            // deliberately does not batch its encrypts.
-            let socket = socket.clone();
-            let session = session.clone();
+            // operator to separately run a command on *both* ends.
+            let Some(link_mutex) = links.get(idx) else {
+                return;
+            };
+            let handle = link_mutex.lock().await.handle();
             let mtu = mtu.clone();
             let duration = Duration::from_secs(req.duration_secs as u64);
             tokio::spawn(async move {
                 if let Err(e) = send_throughput_test_stream(
-                    socket,
-                    from,
+                    handle,
                     link_id,
-                    session,
                     req.test_id,
                     duration,
                     mtu,
@@ -3937,33 +2676,22 @@ async fn handle_incoming(
             // itself is enough to keep NAT bindings alive.
         }
         PacketType::Disconnect => {
-            // This already went through the same AEAD decrypt as every
-            // other frame type above (it's handled in the `_` arm of
-            // the earlier `match hdr.ptype`, same as Data/Probe/
-            // StatsShare) -- a forged Disconnect can't reach here
-            // without holding the session's keys, so this is a
-            // trustworthy signal that the peer's session just went
-            // stale (it's shutting down, or restarting). Does *not*
-            // shut this side down too anymore (see the module doc
-            // comment's "Graceful shutdown" section for why that was
-            // actively harmful -- it made a routine restart on either
-            // end cascade into a full stop-then-cold-restart on the
-            // other end as well). Only `Mode::Client` needs to do
-            // anything at all: nudge `rekey_loop` to attempt a fresh
-            // handshake right away instead of waiting up to
-            // `rekey_interval`. `Mode::Server` already accepts a
-            // peer-initiated `HandshakeInit` at any time regardless of
-            // why (`respond_to_handshake_init`), so there's nothing
-            // extra for it to do here -- it'll just see one once the
-            // client reconnects, exactly like any other rekey.
-            if rekey_ctx.mode == Mode::Client {
-                tracing::info!(%from, "peer sent Disconnect; attempting an immediate reconnect");
-                reconnect.notify_one();
-            } else {
-                tracing::info!(%from, "peer sent Disconnect");
-            }
+            // `frame` already round-tripped through this link's own
+            // authenticated `WgTunnel` (`LinkHandle::wg_recv`) -- a
+            // forged Disconnect can't reach here without holding that
+            // link's WireGuard keys, so this is a trustworthy signal
+            // that the peer is shutting down or restarting. Does *not*
+            // shut this side down too (see the module doc comment's
+            // "Graceful shutdown" section) -- the peer's own link will
+            // simply re-handshake on its own the next time it sends
+            // anything, exactly like real WireGuard's lazy reconnection
+            // model. There is no app-level rekey/reconnect nudge needed
+            // anymore on either role.
+            tracing::info!(%from, "peer sent Disconnect");
         }
-        PacketType::HandshakeInit | PacketType::HandshakeResp => unreachable!("handled above"),
+        PacketType::HandshakeInit | PacketType::HandshakeResp => {
+            unreachable!("filtered out above")
+        }
     }
 }
 
@@ -4036,18 +2764,19 @@ enum ProbeSendOutcome {
 /// Sends one `Probe` frame on `socket`. See `ProbeSendOutcome` for what
 /// each result means to the caller.
 async fn send_probe(
-    socket: &Arc<UdpSocket>,
     link_id: u8,
     links: &Links,
     idx: usize,
-    session: &Arc<AsyncRwLock<SessionState>>,
     probe_seq_counter: &AtomicU32,
     tracker: &mut ProbeTracker,
 ) -> ProbeSendOutcome {
-    let remote = links[idx].lock().await.remote;
-    let Some(remote) = remote else {
-        return ProbeSendOutcome::Skipped;
-    };
+    // A fresh handle from the live `Link`, not one captured once at task
+    // startup -- `remote` is a plain (non-shared) field on `LinkHandle`,
+    // so a stale captured copy would never observe a remote address
+    // learned later (e.g. a server-mode link whose peer address is only
+    // known once the client's first authenticated frame arrives). See
+    // `send_scheduled`'s own comment for the same reasoning.
+    let handle = links[idx].lock().await.handle();
 
     let probe_seq = probe_seq_counter.fetch_add(1, Ordering::Relaxed);
     let now_ns = SystemTime::now()
@@ -4060,33 +2789,22 @@ async fn send_probe(
     }
     .encode();
 
-    let (session_id, seq, ciphertext) = {
-        let s = session.read().await;
-        match s.encrypt(&payload) {
-            Ok(v) => v,
-            // Not a socket problem, so not a reconnect signal either --
-            // see `ProbeSendOutcome::Skipped`'s doc comment.
-            Err(_) => return ProbeSendOutcome::Skipped,
-        }
-    };
-
-    let mut frame = Vec::with_capacity(HEADER_LEN + ciphertext.len());
+    let mut frame = Vec::with_capacity(HEADER_LEN + payload.len());
     Header {
         ptype: PacketType::Probe,
         link_id,
-        session_id,
-        seq,
+        seq: next_send_seq(),
     }
     .encode(&mut frame);
-    frame.extend_from_slice(&ciphertext);
+    frame.extend_from_slice(&payload);
 
-    match socket.send_to(&frame, remote).await {
-        Ok(_) => {
+    match handle.wg_send(&frame).await {
+        Ok(()) => {
             tracker.record_sent(probe_seq);
             ProbeSendOutcome::Sent
         }
-        Err(e) if is_interface_gone_error(&e) => ProbeSendOutcome::InterfaceGone,
-        Err(e) => {
+        Err(MlvpnError::Io(e)) if is_interface_gone_error(&e) => ProbeSendOutcome::InterfaceGone,
+        Err(MlvpnError::Io(e)) => {
             tracing::debug!(
                 link_id,
                 error = %e,
@@ -4094,6 +2812,9 @@ async fn send_probe(
             );
             ProbeSendOutcome::TransientFailure
         }
+        // Not a socket problem (e.g. no remote learned yet) -- see
+        // `ProbeSendOutcome::Skipped`'s doc comment.
+        Err(_) => ProbeSendOutcome::Skipped,
     }
 }
 
@@ -4102,16 +2823,12 @@ async fn send_probe(
 /// measure themselves. See `PacketType::StatsShare` and `StatsPayload`'s
 /// doc comments in `protocol.rs` for the wire format and design
 /// rationale.
-async fn send_stats_share(
-    socket: &Arc<UdpSocket>,
-    link_id: u8,
-    links: &Links,
-    idx: usize,
-    session: &Arc<AsyncRwLock<SessionState>>,
-) {
-    let (remote, payload) = {
+async fn send_stats_share(link_id: u8, links: &Links, idx: usize) {
+    let (handle, payload) = {
         let link = links[idx].lock().await;
-        let Some(remote) = link.remote else { return };
+        if link.remote.is_none() {
+            return;
+        }
         let payload = StatsPayload {
             name: StatsPayload::encode_name(&link.config.name),
             rtt_ms: link.stats.rtt_ms.get().unwrap_or(0.0) as f32,
@@ -4120,29 +2837,20 @@ async fn send_stats_share(
             throughput_mbps: link.stats.rx_throughput_mbps.get().unwrap_or(0.0) as f32,
             state: link.state.to_wire(),
         };
-        (remote, payload)
+        (link.handle(), payload)
     };
 
     let plaintext = payload.encode();
-    let (session_id, seq, ciphertext) = {
-        let s = session.read().await;
-        match s.encrypt(&plaintext) {
-            Ok(v) => v,
-            Err(_) => return,
-        }
-    };
-
-    let mut frame = Vec::with_capacity(HEADER_LEN + ciphertext.len());
+    let mut frame = Vec::with_capacity(HEADER_LEN + plaintext.len());
     Header {
         ptype: PacketType::StatsShare,
         link_id,
-        session_id,
-        seq,
+        seq: next_send_seq(),
     }
     .encode(&mut frame);
-    frame.extend_from_slice(&ciphertext);
+    frame.extend_from_slice(&plaintext);
 
-    let _ = socket.send_to(&frame, remote).await;
+    let _ = handle.wg_send(&frame).await;
 }
 
 /// Send our own `mlvpnd` version to the peer -- see `PacketType::VersionInfo`'s
@@ -4152,16 +2860,18 @@ async fn send_stats_share(
 /// per link per tick costs nothing extra worth a new timer, and gives
 /// the same multi-link redundancy `StatsShare` already gets for free.
 async fn send_version_info(
-    socket: &Arc<UdpSocket>,
     link_id: u8,
     links: &Links,
     idx: usize,
-    session: &Arc<AsyncRwLock<SessionState>>,
     mtu: &LiveMtu,
     scheduler: &Arc<std::sync::Mutex<Scheduler>>,
 ) {
-    let Some(remote) = links[idx].lock().await.remote else {
-        return;
+    let handle = {
+        let link = links[idx].lock().await;
+        if link.remote.is_none() {
+            return;
+        }
+        link.handle()
     };
 
     // The scheduler's `primary()` is a LOCAL `Links`-array index -- not a
@@ -4185,107 +2895,16 @@ async fn send_version_info(
         primary_link_name: VersionInfoPayload::encode_link_name(&primary_link_name),
     };
     let plaintext = payload.encode();
-    let (session_id, seq, ciphertext) = {
-        let s = session.read().await;
-        match s.encrypt(&plaintext) {
-            Ok(v) => v,
-            Err(_) => return,
-        }
-    };
-
-    let mut frame = Vec::with_capacity(HEADER_LEN + ciphertext.len());
+    let mut frame = Vec::with_capacity(HEADER_LEN + plaintext.len());
     Header {
         ptype: PacketType::VersionInfo,
         link_id,
-        session_id,
-        seq,
+        seq: next_send_seq(),
     }
     .encode(&mut frame);
-    frame.extend_from_slice(&ciphertext);
+    frame.extend_from_slice(&plaintext);
 
-    let _ = socket.send_to(&frame, remote).await;
-}
-
-/// Client-only: periodically re-runs the handshake (`perform_client_handshake`)
-/// and, on success, installs the result as `session`'s new active
-/// session -- see the module doc comment and `crypto::SessionState`'s
-/// doc comment for the overlap-window design this participates in.
-/// Never spawned for `Mode::Server` (see `run()`), which instead
-/// passively accepts a peer-initiated rekey via `handle_incoming`,
-/// mirroring how it already passively accepts the very first handshake
-/// pre-session.
-///
-/// Also races its own periodic `tick` against `reconnect` -- notified
-/// by `handle_incoming`'s `PacketType::Disconnect` arm the moment the
-/// peer's own session goes stale, so this doesn't sit waiting for the
-/// next scheduled `rekey_interval` tick (which can be configured
-/// hours out) before noticing the peer is gone and reconnecting.
-/// Either wakeup runs the exact same attempt below; `tick.reset()`
-/// after an out-of-band wakeup just restarts the normal periodic
-/// clock from now, so a fresh reconnect doesn't get immediately
-/// followed by a redundant scheduled rekey a moment later.
-async fn rekey_loop(
-    links: Links,
-    params: Arc<TunnelParams>,
-    session: Arc<AsyncRwLock<SessionState>>,
-    rekey_ctx: Arc<RekeyContext>,
-    session_meta: Arc<SessionMeta>,
-    reconnect: Arc<tokio::sync::Notify>,
-) {
-    let mut tick = interval(params.rekey_interval);
-    // tokio::time::interval's first tick fires immediately; skip it so
-    // a rekey doesn't happen right on the heels of the initial
-    // handshake that just established this session.
-    tick.tick().await;
-    loop {
-        tokio::select! {
-            _ = tick.tick() => {}
-            _ = reconnect.notified() => {
-                tracing::info!(
-                    "peer disconnected; attempting an immediate reconnect rather than \
-                     waiting for the next scheduled rekey"
-                );
-                tick.reset();
-            }
-        }
-        // `Some(&rekey_ctx)`: routes this attempt's `HandshakeResp`
-        // through `rekey_ctx`'s forwarding channel instead of reading
-        // the link sockets directly -- see `perform_client_handshake`'s
-        // doc comment for why that distinction matters mid-session.
-        match perform_client_handshake(&links, &params, Some(&rekey_ctx)).await {
-            Ok((new_id, new_session)) => {
-                session.write().await.install(new_id, new_session);
-                session_meta.record_rekey(new_id);
-                tracing::info!(session_id = new_id, "session rekeyed");
-            }
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "rekey attempt failed; will retry next interval, current session keeps working"
-                );
-            }
-        }
-    }
-}
-
-/// Periodically retires `session`'s `previous` slot once it's older
-/// than `SESSION_OVERLAP_WINDOW` -- see `crypto::SessionState::expire_previous`'s
-/// doc comment for why this needs its own timer independent of the
-/// (much longer) rekey interval. Runs unconditionally for both roles:
-/// a session only ever has a `previous` slot to expire after either
-/// side has actually rekeyed at least once, which for `Mode::Server`
-/// means having accepted a peer-initiated one -- this task is cheap
-/// enough to just always run rather than being conditionally spawned
-/// like `rekey_loop`.
-async fn session_expiry_loop(session: Arc<AsyncRwLock<SessionState>>) {
-    let mut tick = interval(SESSION_EXPIRY_CHECK_INTERVAL);
-    loop {
-        tick.tick().await;
-        session
-            .write()
-            .await
-            .expire_previous(SESSION_OVERLAP_WINDOW);
-    }
+    let _ = handle.wg_send(&frame).await;
 }
 
 /// Holds decrypted, still-possibly-out-of-order Data payloads keyed by the
@@ -4302,20 +2921,17 @@ struct ReorderBuffer {
     /// be "late" relative to anything already delivered -- see
     /// `drain_ready`'s doc comment for the full reasoning behind this
     /// model replacing the old "must equal next_expected" one.
+    ///
+    /// No longer has a session-boundary reset (removed in task 5, along
+    /// with the rest of the shared Noise session): `seq` is now issued
+    /// by `next_send_seq`, a single tunnel-lifetime `AtomicU64` that
+    /// never resets, and each link's own WireGuard session rekeys
+    /// entirely internally (invisibly to this module) -- there is no
+    /// longer an app-level discontinuity in `seq` for this buffer to
+    /// guard against the way the old per-rekey `crypto::Session::next_send_seq`
+    /// restarting near zero required.
     high_watermark: Option<u64>,
     pending: BTreeMap<u64, (tokio::time::Instant, Vec<u8>)>,
-    /// The `session_id` `high_watermark`/`pending` were last built
-    /// against, or `None` before the first frame. `seq` is scoped to
-    /// one `Session` (`Session::next_send_seq()` starts fresh, near
-    /// zero, every time `SessionState::install` swaps in a new session
-    /// on rekey -- see `crypto.rs`) -- comparing a new session's low
-    /// seq values against a watermark built up over a previous
-    /// session's lifetime would judge every post-rekey Data frame as
-    /// "behind" forever, needlessly re-introducing this exact module's
-    /// original bug on a ~`rekey_interval_secs` cadence instead of
-    /// once. `reset_for_session` clears both fields the moment a
-    /// different session_id is observed.
-    session_id: Option<u32>,
 }
 
 impl ReorderBuffer {
@@ -4324,29 +2940,6 @@ impl ReorderBuffer {
             window: Duration::from_millis(window_ms),
             high_watermark: None,
             pending: BTreeMap::new(),
-            session_id: None,
-        }
-    }
-
-    /// Clears `high_watermark` and `pending` whenever `session_id`
-    /// differs from the session this buffer's state was last built
-    /// against -- see the field's own doc comment for why a rekey
-    /// otherwise strands the watermark permanently above the new
-    /// session's low sequence numbers. A no-op on the common case
-    /// (same session as the last call). Called once per received Data
-    /// frame, before `insert`. Returns `true` exactly when a reset
-    /// happened (i.e. `session_id` actually changed) -- `handle_incoming`
-    /// uses this to also reset `PeerPrimaryLink` on the same event, the
-    /// same rekey-stranding fix shape applied to a second piece of
-    /// cross-session state.
-    fn reset_for_session(&mut self, session_id: u32) -> bool {
-        if self.session_id != Some(session_id) {
-            self.high_watermark = None;
-            self.pending.clear();
-            self.session_id = Some(session_id);
-            true
-        } else {
-            false
         }
     }
 
@@ -4361,29 +2954,9 @@ impl ReorderBuffer {
     /// Advances `high_watermark` the same way `drain_ready` does for a
     /// forward-progress frame, WITHOUT touching `pending` -- keeps the
     /// watermark accurate for whenever buffered mode resumes (the
-    /// primary goes Down, falling back to multi-link delivery), so that
-    /// path doesn't reintroduce the exact stale-watermark failure mode
-    /// this project already fixed once (the original reorder-buffer
-    /// delay bug) and hit again in a different form once more (the
-    /// v0.5.3 rekey-stranding regression). Also performs the same
-    /// session-id-change reset `reset_for_session` does, for the same
-    /// rekey-safety reason.
-    ///
-    /// Returns `true` exactly when that session-id-change reset actually
-    /// happened (mirrors `reset_for_session`'s own return value).
-    /// `handle_incoming`'s bypass branch relies on this: `Scheduler::
-    /// primary` is driven purely by monitor/probe ticks (see
-    /// `scheduler.rs`), not by Data-packet or session activity, so once
-    /// bypass mode engages it can stay engaged indefinitely -- the
-    /// buffered branch (which is what resets `PeerPrimaryLink` on a
-    /// session change) is NOT guaranteed to run at all once bypass mode
-    /// takes over. The bypass branch therefore performs its own
-    /// `PeerPrimaryLink` reset using this return value, rather than
-    /// relying on the buffered branch to have done it.
-    fn note_delivered(&mut self, seq: u64, session_id: u32) -> bool {
-        let session_changed = self.reset_for_session(session_id);
+    /// primary goes Down, falling back to multi-link delivery).
+    fn note_delivered(&mut self, seq: u64) {
         self.high_watermark = Some(self.high_watermark.map_or(seq, |wm| wm.max(seq)));
-        session_changed
     }
 
     /// Current window, in milliseconds -- used by `reorder_tuning_loop`
@@ -4672,13 +3245,6 @@ mod reorder_tuning_tests {
     #[test]
     fn note_delivered_updates_watermark_without_touching_pending() {
         let mut buf = ReorderBuffer::new(50);
-        // Establish session 1 the same way handle_incoming does
-        // (reset_for_session before the first insert) -- session_id is
-        // only ever set by reset_for_session, never by insert alone, so
-        // without this the later note_delivered(_, 1) call below would
-        // see session_id still None, treat it as a session change, and
-        // wipe pending before this test can observe anything.
-        buf.reset_for_session(1);
         // Prime a watermark ahead of 5 first -- on a genuinely fresh
         // buffer (high_watermark still None), drain_ready's own
         // forward-progress test (`is_none_or`) treats *any* first
@@ -4694,9 +3260,7 @@ mod reorder_tuning_tests {
 
         // note_delivered (the bypass-mode path) advances the watermark
         // directly, without going through insert/drain_ready at all.
-        // Same session as already established above, so this must NOT
-        // report a session change.
-        assert!(!buf.note_delivered(100, 1));
+        buf.note_delivered(100);
 
         // The watermark is now 100 -- entry 5 is far behind it, so a
         // later drain_ready (e.g. if bypass mode ends and buffered mode
@@ -4711,12 +3275,12 @@ mod reorder_tuning_tests {
     #[test]
     fn note_delivered_advances_watermark_monotonically() {
         let mut buf = ReorderBuffer::new(50);
-        buf.note_delivered(10, 1);
-        buf.note_delivered(50, 1);
+        buf.note_delivered(10);
+        buf.note_delivered(50);
         // A lower seq arriving after a higher one (still real, on a
         // single link occasionally) must not move the watermark
         // backward.
-        buf.note_delivered(20, 1);
+        buf.note_delivered(20);
 
         // Confirm indirectly via drain_ready's own forward-progress
         // test: inserting exactly at the current watermark (50) must
@@ -4729,28 +3293,6 @@ mod reorder_tuning_tests {
     }
 
     #[test]
-    fn note_delivered_resets_on_session_id_change() {
-        let mut buf = ReorderBuffer::new(50);
-        assert!(buf.note_delivered(100, 1)); // fresh buffer: session_id was None, so this is a "change"
-
-        // A different session_id (the rekey case) must reset the
-        // watermark, the same way reset_for_session already does for
-        // the buffered path -- otherwise this reintroduces the exact
-        // rekey-stranding bug (v0.5.3) this project already fixed once,
-        // just via a different call path. It must also report the
-        // change happened (`true`) -- `handle_incoming`'s bypass branch
-        // (see C1 fix) relies on exactly this return value to reset
-        // `peer_primary_link` on the same event.
-        assert!(buf.note_delivered(5, 2));
-
-        // Watermark reset to reflect only session 2's traffic: seq 5
-        // was the first frame of the new session, so a later seq 6
-        // must be forward progress.
-        buf.insert(6, vec![6]);
-        assert_eq!(buf.drain_ready(), vec![vec![6]]);
-    }
-
-    #[test]
     fn bypass_then_resume_buffered_mode_keeps_watermark_accurate() {
         // The full transition scenario the watermark-staleness fix
         // exists for: buffered mode, then bypass mode advances the
@@ -4758,12 +3300,6 @@ mod reorder_tuning_tests {
         // resumes and must not treat already-passed sequence numbers
         // as forward progress just because it never itself saw them.
         let mut buf = ReorderBuffer::new(50);
-        // Establish session 1 first (see note_delivered_updates_
-        // watermark_without_touching_pending's comment for why): without
-        // this, the note_delivered(500, 1) call below would see
-        // session_id still None and wrongly reset pending/high_watermark
-        // instead of exercising the same-session watermark-advance path.
-        buf.reset_for_session(1);
 
         // Buffered mode: seq 10 delivered normally.
         buf.insert(10, vec![10]);
@@ -4772,7 +3308,7 @@ mod reorder_tuning_tests {
         // Bypass mode takes over (e.g. primary_link_mode settles):
         // real traffic keeps flowing via note_delivered, advancing far
         // past what buffered mode itself ever processed.
-        buf.note_delivered(500, 1);
+        buf.note_delivered(500);
 
         // Buffered mode resumes (e.g. the primary went Down). A late
         // frame with a seq between the old and new watermark must be
@@ -4831,52 +3367,6 @@ mod reorder_tuning_tests {
         let mut buf = ReorderBuffer::new(50);
         buf.insert(42_000, vec![1, 2, 3]);
         assert_eq!(buf.drain_ready(), vec![vec![1, 2, 3]]);
-    }
-
-    #[test]
-    fn reorder_buffer_resets_watermark_on_session_change() {
-        // A real, confirmed production regression: Session::next_send_seq()
-        // starts fresh (near zero) every time a rekey installs a new
-        // session, but a high_watermark built up over the previous
-        // session's lifetime doesn't know that -- without a reset, every
-        // Data frame after the very first rekey would compare its own
-        // low seq against a stale, much higher watermark and permanently
-        // fail the forward-progress check, reintroducing this module's
-        // original bug on a rekey_interval_secs cadence.
-        let mut buf = ReorderBuffer::new(50);
-        buf.reset_for_session(1);
-        buf.insert(10_000, vec![1]);
-        assert_eq!(buf.drain_ready(), vec![vec![1]]); // watermark now 10_000
-
-        // A rekey happens: the new session's first frame has a low seq,
-        // nowhere near the old watermark. Without the reset, this would
-        // be judged "not forward progress" and buffered/delayed.
-        buf.reset_for_session(2);
-        buf.insert(5, vec![2]);
-        assert_eq!(
-            buf.drain_ready(),
-            vec![vec![2]],
-            "first frame of a new session must deliver immediately even \
-             though its seq is far below the old session's watermark"
-        );
-    }
-
-    #[test]
-    fn reorder_buffer_reset_for_session_is_a_no_op_within_the_same_session() {
-        let mut buf = ReorderBuffer::new(50);
-        buf.reset_for_session(7);
-        buf.insert(100, vec![1]);
-        assert_eq!(buf.drain_ready(), vec![vec![1]]); // watermark now 100
-
-        // Same session_id again -- must not clear the watermark.
-        buf.reset_for_session(7);
-        buf.insert(50, vec![2]);
-        assert_eq!(
-            buf.drain_ready(),
-            Vec::<Vec<u8>>::new(),
-            "seq 50 is below the still-in-effect watermark of 100 within \
-             the same session, so it should be buffered, not delivered"
-        );
     }
 
     #[tokio::test(start_paused = true)]

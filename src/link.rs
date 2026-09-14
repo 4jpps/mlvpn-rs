@@ -380,7 +380,17 @@ impl LinkHandle {
     ///  - `DecapsulateOutcome::Consumed` -- nothing to send, nothing
     ///    decoded (a bare keepalive ack, a duplicate, handshake
     ///    progress with no reply due yet); the loop simply continues.
-    pub async fn wg_recv(&self) -> Result<Vec<u8>> {
+    ///
+    /// Returns the datagram's own source address alongside the decrypted
+    /// frame (deviation from this method's original task-4 shape, added
+    /// in task 5): `tunnel.rs`'s `handle_incoming` still needs to learn/
+    /// re-learn a server-mode link's peer address the same way it always
+    /// has (a server-side link may start with no configured
+    /// `remote_addr` at all, becoming usable only once the client's
+    /// first authenticated frame arrives -- see `Link::remote`'s doc
+    /// comment), and that's only ever observable from the raw socket
+    /// read, not from anything `WgTunnel` itself exposes.
+    pub async fn wg_recv(&self) -> Result<(Vec<u8>, SocketAddr)> {
         // Sized the same way tunnel.rs's own largest raw-recv buffers
         // are (see e.g. `tunnel.rs`'s `u16::MAX as usize + 64` buffer) --
         // large enough for any legitimate UDP datagram this link could
@@ -390,13 +400,38 @@ impl LinkHandle {
             let socket = self.current_socket().await;
             let (n, from) = socket.recv_from(&mut buf).await.map_err(MlvpnError::Io)?;
             match self.wg.decapsulate(&buf[..n])? {
-                wireguard::DecapsulateOutcome::Frame(frame) => return Ok(frame),
+                wireguard::DecapsulateOutcome::Frame(frame) => return Ok((frame, from)),
                 wireguard::DecapsulateOutcome::SendReply(reply) => {
                     socket.send_to(&reply, from).await.map_err(MlvpnError::Io)?;
                 }
                 wireguard::DecapsulateOutcome::Consumed => {}
             }
         }
+    }
+
+    /// Drives this link's own `WgTunnel::tick` (boringtun's internal
+    /// handshake-retry/keepalive timers) and sends whatever it produces
+    /// to `self.remote`, if anything and if a remote is known yet. Added
+    /// in task 5, called once per probe interval from `tunnel::link_prober`
+    /// -- see that function's doc comment and this module's own `bind`
+    /// doc comment on `is_initiator` for why no separate handshake-retry
+    /// loop is needed anywhere else: a link's very first `wg_send`
+    /// already triggers the handshake, and this is what keeps retrying
+    /// it (or sending keepalives) afterward without any real traffic
+    /// having to flow.
+    pub async fn wg_tick(&self) -> Result<()> {
+        let Some(bytes) = self.wg.tick() else {
+            return Ok(());
+        };
+        let Some(remote) = self.remote else {
+            return Ok(());
+        };
+        let socket = self.current_socket().await;
+        socket
+            .send_to(&bytes, remote)
+            .await
+            .map_err(MlvpnError::Io)?;
+        Ok(())
     }
 
     /// Re-create and re-bind this link's UDP socket from scratch (the
@@ -1839,12 +1874,13 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
         client_handle.wg_send(&frame).await.unwrap();
 
-        let received = tokio::time::timeout(Duration::from_secs(5), server_recv)
+        let (received, from) = tokio::time::timeout(Duration::from_secs(5), server_recv)
             .await
             .expect("server_recv timed out")
             .unwrap()
             .unwrap();
         assert_eq!(received, frame);
+        assert_eq!(from, client_addr);
 
         client_drain.abort();
     }
