@@ -27,10 +27,15 @@ enum Command {
         config: PathBuf,
     },
     /// Generate a new Curve25519 static keypair and print both halves as
-    /// base64. Save the private half to a 0600 file referenced by
-    /// `crypto.private_key_file` in the config, and share the public half
-    /// with the peer for their `crypto.peer_public_key`.
+    /// base64. Save the private half to a 0600 file referenced by this
+    /// link's `private_key_file` in the config, and share the public half
+    /// with the peer for their matching `[[links]]` entry's `peer_public_key`.
     Genkey {
+        /// Which [[links]] entry this keypair is for (matches that
+        /// link's `name` in the config) -- printed in the output so it's
+        /// obvious which link's config to paste the generated keys into.
+        #[arg(short, long)]
+        link: String,
         /// Write the private key to this file (mode 0600) instead of
         /// printing it to stdout.
         #[arg(short, long)]
@@ -150,7 +155,7 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Genkey { out } => genkey(out),
+        Command::Genkey { link, out } => genkey(&link, out),
         Command::Run { config } => {
             let cfg = Config::load(&config)?;
             let log_ring = init_logging(&cfg.logging.level);
@@ -627,7 +632,7 @@ fn init_logging(level: &str) -> Arc<LogRing> {
     log_ring
 }
 
-fn genkey(out: Option<PathBuf>) -> anyhow::Result<()> {
+fn genkey(link: &str, out: Option<PathBuf>) -> anyhow::Result<()> {
     let kp = crypto::StaticKeypair::generate()?;
     match out {
         Some(path) => {
@@ -640,12 +645,12 @@ fn genkey(out: Option<PathBuf>) -> anyhow::Result<()> {
                 .mode(0o600)
                 .open(&path)?;
             f.write_all(kp.private_base64().as_bytes())?;
-            println!("private key written to {}", path.display());
-            println!("public key (share with peer): {}", kp.public_base64());
+            println!("private key for link '{link}' written to {}", path.display());
+            println!("public key for link '{link}' (share with peer): {}", kp.public_base64());
         }
         None => {
-            println!("private key: {}", kp.private_base64());
-            println!("public key:  {}", kp.public_base64());
+            println!("private key for link '{link}': {}", kp.private_base64());
+            println!("public key for link '{link}':  {}", kp.public_base64());
             eprintln!(
                 "\nwarning: private key printed to stdout; prefer --out to write it \
                  straight to a 0600 file instead of letting it touch your shell history \
@@ -834,4 +839,20 @@ fn parse_cidr(s: &str) -> Result<(String, u8)> {
         MlvpnError::Config(format!("invalid prefix length in tunnel.address '{s}'"))
     })?;
     Ok((addr.to_string(), prefix))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn genkey_requires_a_link_name() {
+        // clap's Parser derive rejects missing required args at parse time --
+        // verify `mlvpnd genkey` with no --link fails to parse.
+        let result = Cli::try_parse_from(["mlvpnd", "genkey"]);
+        assert!(result.is_err(), "genkey without --link should fail to parse");
+
+        let result = Cli::try_parse_from(["mlvpnd", "genkey", "--link", "comcast"]);
+        assert!(result.is_ok(), "genkey with --link should parse");
+    }
 }
