@@ -10,6 +10,24 @@ For implementation detail beyond what's here, read the code -- most
 modules and non-trivial functions have doc comments explaining the
 design, and `ARCHITECTURE.md` covers the system as a whole.
 
+## [0.7.0] - 2026-09-13
+
+### Changed
+
+- **BREAKING WIRE-PROTOCOL CHANGE: mlvpn-rs now uses an independent WireGuard tunnel (via `boringtun`) per physical link, instead of a single shared Noise_IK session. Both peers MUST be upgraded together; an old build cannot communicate with a new one.** The shared-session design was inherently single-threaded on the cryptography side -- every packet (Data or control) competed for an exclusive lock on the daemon-wide `SessionState` during AEAD encryption/decryption, creating a hard throughput ceiling. Replacing it with one independent WireGuard tunnel per link eliminates that serialization point entirely, allowing each link's encryption/decryption to proceed independently and in parallel. A real, reproduced throughput investigation showed the symptom: mlvpn-rs's own transport measured at roughly 1/4 of a parallel WireGuard tunnel's throughput on the identical physical link (50.7 Mbps via WireGuard vs. 4.68 Mbps via mlvpn-rs, under equivalent test conditions), and this fix closes that gap by removing the crypto bottleneck entirely.
+
+  **Configuration changes (non-optional):**
+  - The `[crypto]` section (`rekey_interval_secs`, `preferred_cipher`, `noise_pattern`, `dh_function`) has been completely removed. Each link now manages its own independent WireGuard session -- no daemon-wide rekey timer or shared key material.
+  - Each `[[links]]` entry now *requires* `private_key_file` (path to this link's WireGuard private key) and `peer_public_key` (the peer's corresponding WireGuard public key for that same link). Both are non-optional; config validation will error if either is absent.
+  - `mlvpnd genkey` now requires `--link <name>` instead of generating a daemon-global key -- it generates a WireGuard keypair for a specific link. Write the private key to the path specified in `[[links.<name>.private_key_file]]`.
+
+  **Migration from 0.6.x:** The tunnel is not backward-compatible. Upgrading both peers together requires:
+  1. Generate new WireGuard keypairs for each link via `mlvpnd genkey --link <linkname>`.
+  2. Update both hosts' configs with the matching public/private key material for each link.
+  3. Restart both `mlvpnd` processes together (or very close in time -- no version negotiation exists; an older peer rejects a newer one).
+
+  All higher-layer functionality (bonding, failover, load balancing, monitoring, self-test, TUI) remains identical -- only the link-level transport and crypto changed.
+
 ## [0.6.6] - 2026-09-01
 
 ### Changed
