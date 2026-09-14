@@ -162,6 +162,14 @@ pub struct LinkSnapshot {
     pub remote_addr: Option<String>,
     /// "probing" | "up" | "down".
     pub state: String,
+    /// True for the single link `Scheduler::primary()` currently returns,
+    /// when `scheduler.primary_link_mode`/`follow_peer_primary` is on.
+    /// Always `false` for every link under plain SWRR (no concept of a
+    /// single primary there -- see `Scheduler::primary`'s own doc
+    /// comment). Lets a viewer show which link is actually carrying
+    /// traffic without cross-referencing byte counters by hand.
+    #[serde(default)]
+    pub is_primary: bool,
     /// This process's own SWRR weight for the link right now (0 when not
     /// Up); mirrors what the scheduler is actually doing with traffic.
     pub score: f64,
@@ -384,6 +392,7 @@ mod tests {
             local_port: 51000,
             remote_addr: Some("198.51.100.1:51000".to_string()),
             state: "up".to_string(),
+            is_primary: true,
             score: 1.5,
             state_duration_ms: 12_345,
             tx_bytes: 1_000_000,

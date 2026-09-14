@@ -644,6 +644,7 @@ fn draw_links_tab(f: &mut Frame, area: Rect, state: &SharedState) {
     let header = Row::new(vec![
         Cell::from("Link"),
         Cell::from("State"),
+        Cell::from("Role"),
         Cell::from("Up For"),
         Cell::from("Peer Addr"),
         Cell::from("Score"),
@@ -655,12 +656,27 @@ fn draw_links_tab(f: &mut Frame, area: Rect, state: &SharedState) {
     .bottom_margin(1);
 
     let rows: Vec<Row> = match &state.snapshot {
-        Some(snap) => snap.links.iter().map(link_row).collect(),
+        Some(snap) => {
+            // Any link's `is_primary` implies `primary_link_mode`/
+            // `follow_peer_primary` is active on this daemon -- every
+            // *other* link is then genuinely a standby ("Failover"), not
+            // just "not selected". Under plain SWRR (bonded, no single
+            // primary concept) no link has `is_primary` set, so this is
+            // correctly blank for everyone rather than mislabeling a
+            // bonded link as "Failover" when it's actually carrying its
+            // own real share of traffic right now.
+            let any_primary = snap.links.iter().any(|l| l.is_primary);
+            snap.links
+                .iter()
+                .map(|l| link_row(l, any_primary))
+                .collect()
+        }
         None => Vec::new(),
     };
 
     let widths = [
         Constraint::Length(10),
+        Constraint::Length(9),
         Constraint::Length(9),
         Constraint::Length(8),
         Constraint::Length(21),
@@ -709,9 +725,22 @@ fn aggregate_throughput(links: &[LinkSnapshot]) -> (f64, f64) {
         })
 }
 
-fn link_row(l: &LinkSnapshot) -> Row<'static> {
+fn link_row(l: &LinkSnapshot, any_primary: bool) -> Row<'static> {
     let state_style = state_style(&l.state);
     let peer_stale = l.peer_stats_age_ms.map(|a| a > 5000).unwrap_or(true);
+
+    let (role_text, role_style) = if l.is_primary {
+        (
+            "Primary",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else if any_primary {
+        ("Failover", Style::default().fg(COLOR_MUTED))
+    } else {
+        ("", Style::default())
+    };
 
     let local_line = local_measurement_line(
         l.local_rtt_ms,
@@ -748,6 +777,7 @@ fn link_row(l: &LinkSnapshot) -> Row<'static> {
     Row::new(vec![
         Cell::from(l.name.clone()),
         Cell::from(l.state.clone()).style(state_style),
+        Cell::from(role_text).style(role_style),
         Cell::from(fmt_duration_ms(l.state_duration_ms)),
         Cell::from(l.remote_addr.clone().unwrap_or_else(|| "-".to_string())),
         Cell::from(format!("{:.2}", l.score)).style(score_style(l.score)),

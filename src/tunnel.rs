@@ -711,14 +711,8 @@ pub async fn run(
         let peer_version = peer_version.clone();
         let peer_mtu = peer_mtu.clone();
         let mtu = live_mtu.clone();
+        let scheduler = scheduler.clone();
         handles.push(tokio::spawn(async move {
-            // NOTE(task 5): `control::serve`'s signature still expects a
-            // `session_meta: Arc<SessionMeta>` argument that no longer
-            // exists in this module -- `SessionMeta` was removed along
-            // with the shared Noise session it described (see the module
-            // doc comment). Left as a known, external compile error for
-            // Task 6 (which owns control.rs) rather than guessing at a
-            // replacement session-info shape here.
             control::serve(
                 path,
                 links,
@@ -731,6 +725,7 @@ pub async fn run(
                 peer_version,
                 mtu,
                 peer_mtu,
+                scheduler,
             )
             .await;
         }));
@@ -751,6 +746,7 @@ pub async fn run(
             peer_version: peer_version.clone(),
             mtu: live_mtu.clone(),
             peer_mtu: peer_mtu.clone(),
+            scheduler: scheduler.clone(),
         };
         handles.push(tokio::spawn(async move {
             // NOTE(task 5): same `SessionMeta`/`session` removal as
@@ -808,6 +804,7 @@ pub async fn run(
             peer_version: peer_version.clone(),
             mtu: live_mtu.clone(),
             peer_mtu: peer_mtu.clone(),
+            scheduler: scheduler.clone(),
         };
         handles.push(tokio::spawn(async move {
             control::diagnostics_watch_loop(watch, links, diag_ctx).await;

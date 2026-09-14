@@ -40,6 +40,7 @@ use crate::link::{self, LinkState, Links};
 use crate::logbuf::LogRing;
 use crate::peerstats::PeerStatsTable;
 use crate::procstats;
+use crate::scheduler::Scheduler;
 use crate::sysfs_net;
 use crate::tunnel::{
     adaptive_bandwidth_ramp, send_throughput_test_reverse_request, send_throughput_test_stream,
@@ -77,6 +78,7 @@ pub(crate) async fn serve(
     peer_version: PeerVersion,
     mtu: LiveMtu,
     peer_mtu: PeerMtu,
+    scheduler: Arc<std::sync::Mutex<Scheduler>>,
 ) {
     if let Some(parent) = path.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
@@ -166,6 +168,7 @@ pub(crate) async fn serve(
         let peer_version = peer_version.clone();
         let mtu = mtu.clone();
         let peer_mtu = peer_mtu.clone();
+        let scheduler = scheduler.clone();
         tokio::spawn(async move {
             serve_client(
                 stream,
@@ -179,6 +182,7 @@ pub(crate) async fn serve(
                 peer_version,
                 mtu,
                 peer_mtu,
+                scheduler,
             )
             .await;
         });
@@ -198,6 +202,7 @@ async fn serve_client(
     peer_version: PeerVersion,
     mtu: LiveMtu,
     peer_mtu: PeerMtu,
+    scheduler: Arc<std::sync::Mutex<Scheduler>>,
 ) {
     let mut tick = interval(Duration::from_millis(SNAPSHOT_INTERVAL_MS));
     // Per-connection cursor into `log_ring` -- each connected client
@@ -220,6 +225,7 @@ async fn serve_client(
             &peer_version,
             &mtu,
             &peer_mtu,
+            &scheduler,
         )
         .await;
         last_log_seq = new_last_log_seq;
@@ -246,8 +252,14 @@ async fn build_snapshot(
     peer_version: &PeerVersion,
     mtu: &LiveMtu,
     peer_mtu: &PeerMtu,
+    scheduler: &Arc<std::sync::Mutex<Scheduler>>,
 ) -> (Snapshot, u64) {
     let snap = link::snapshot_links(links).await;
+    // `Scheduler::primary()` returns `None` under plain SWRR (no single
+    // primary concept there) -- every link's `is_primary` is correctly
+    // `false` in that case via the `Some(idx) ==` comparison below, no
+    // separate branch needed.
+    let primary_idx = scheduler.lock().unwrap().primary();
     let link_snapshots = snap
         .iter()
         .enumerate()
@@ -259,6 +271,7 @@ async fn build_snapshot(
                 local_port: link.config.local_port,
                 remote_addr: link.remote.map(|a| a.to_string()),
                 state: link.state.as_str().to_string(),
+                is_primary: primary_idx == Some(idx),
                 score: crate::monitor::score(link),
                 state_duration_ms: link.state_since.elapsed().as_millis() as u64,
                 tx_bytes: link.stats.tx_bytes,
@@ -367,6 +380,7 @@ pub(crate) struct DiagContext {
     pub(crate) peer_version: PeerVersion,
     pub(crate) mtu: LiveMtu,
     pub(crate) peer_mtu: PeerMtu,
+    pub(crate) scheduler: Arc<std::sync::Mutex<Scheduler>>,
 }
 
 /// Bind the command socket and serve `ipc::Command` requests until the
@@ -698,6 +712,7 @@ async fn run_diag_dump_command(links: &Links, diag_ctx: &DiagContext) -> Command
         &diag_ctx.peer_version,
         &diag_ctx.mtu,
         &diag_ctx.peer_mtu,
+        &diag_ctx.scheduler,
     )
     .await;
     let text = diag::format_dump(&snapshot, "manual (mlvpnd diag-dump)");
@@ -976,6 +991,7 @@ pub(crate) async fn diagnostics_watch_loop(
             &diag_ctx.peer_version,
             &diag_ctx.mtu,
             &diag_ctx.peer_mtu,
+            &diag_ctx.scheduler,
         )
         .await;
 
