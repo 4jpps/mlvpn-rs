@@ -418,6 +418,31 @@ pub struct SchedulerOverrides {
 /// Writes a minimal-but-complete `mlvpnd` TOML config to `dir`. The
 /// config file itself is written mode 0600, same reasoning as
 /// `generate_test_keypair`'s key file.
+///
+/// **Post-WireGuard-migration note (2026-09-13, Task 9 of the
+/// `wireguard-per-link-transport` plan):** crypto keys used to live in
+/// one tunnel-wide `[crypto]` table (`private_key_file`/
+/// `peer_public_key`), with a top-level `rekey_interval_secs` governing
+/// the old shared Noise session's rekey cadence. Both are gone from
+/// `config::Config` now -- each `[[links]]` entry owns its own
+/// `private_key_file`/`peer_public_key` (`config::LinkConfig`), and
+/// rekeying is `boringtun`'s own internal per-link WireGuard timer, not
+/// a configurable knob at all anymore (see `src/wireguard.rs`). This
+/// function's *signature* is kept exactly as-is on purpose, so none of
+/// the ~18 existing `tests/veth_*.rs` call sites need to change: the one
+/// keypair passed in here is written into *every* link's own
+/// `[[links]]` block instead of a single shared `[crypto]` table --
+/// harmless for these tests (`config::Config::validate` has no
+/// uniqueness constraint on link keys, and each link's `WgTunnel` is a
+/// fully independent object regardless of whether its static key
+/// happens to match another link's), and correct for every existing
+/// caller, none of which cared about per-link key *distinctness*.
+/// `rekey_interval_secs` is now accepted but silently ignored (nothing
+/// to write anymore -- boringtun handles this itself). A test that
+/// specifically needs genuinely distinct, CLI-generated per-link keys
+/// (the actual point of `veth_wireguard_transport.rs`) builds its own
+/// config TOML locally instead of using this helper for that part; see
+/// that file's own doc comment.
 #[allow(clippy::too_many_arguments)]
 pub fn write_config(
     dir: &Path,
@@ -426,11 +451,9 @@ pub fn write_config(
     tunnel_address: &str,
     private_key_path: &Path,
     peer_public_key: &str,
-    // `None` omits the field entirely, so `config.rs`'s own
-    // `default_rekey_secs` (120s) applies -- `Some(n)` overrides it,
-    // used by `veth_rekey.rs` to force a real rekey to happen well
-    // within a test's own timeout rather than waiting two minutes.
-    rekey_interval_secs: Option<u64>,
+    // No longer meaningful (see doc comment above) -- accepted only so
+    // every existing call site keeps compiling unchanged.
+    _rekey_interval_secs: Option<u64>,
     scheduler: SchedulerOverrides,
     links: &[LinkSpec],
     control_socket_path: &Path,
@@ -445,16 +468,6 @@ pub fn write_config(
     toml.push_str("[tunnel]\n");
     toml.push_str(&format!("name = \"{tunnel_name}\"\n"));
     toml.push_str(&format!("address = \"{tunnel_address}\"\n\n"));
-    toml.push_str("[crypto]\n");
-    toml.push_str(&format!(
-        "private_key_file = \"{}\"\n",
-        private_key_path.display()
-    ));
-    toml.push_str(&format!("peer_public_key = \"{peer_public_key}\"\n"));
-    if let Some(secs) = rekey_interval_secs {
-        toml.push_str(&format!("rekey_interval_secs = {secs}\n"));
-    }
-    toml.push('\n');
     // All flags share one `[scheduler]` table -- TOML doesn't allow
     // re-declaring the same table twice, so this has to be one
     // conditional block rather than one per flag.
@@ -515,6 +528,15 @@ pub fn write_config(
         if let Some(remote) = &link.remote_addr {
             toml.push_str(&format!("remote_addr = \"{remote}\"\n"));
         }
+        // Per-link WireGuard key material (`config::LinkConfig`'s own
+        // `private_key_file`/`peer_public_key`, see the doc comment
+        // above) -- the same keypair reused across every link in this
+        // call, which is fine for every existing caller.
+        toml.push_str(&format!(
+            "private_key_file = \"{}\"\n",
+            private_key_path.display()
+        ));
+        toml.push_str(&format!("peer_public_key = \"{peer_public_key}\"\n"));
         toml.push('\n');
     }
 
