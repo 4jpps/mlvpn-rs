@@ -10,6 +10,20 @@ For implementation detail beyond what's here, read the code -- most
 modules and non-trivial functions have doc comments explaining the
 design, and `ARCHITECTURE.md` covers the system as a whole.
 
+## [0.7.1] - 2026-09-14
+
+### Added
+
+- **`mlvpn-tui`'s Links tab now shows which link is actually primary.** A new "Role" column shows "Primary" (bold green) on whichever link `Scheduler::primary()` currently points at, and "Failover" (muted) on every other link -- but only when `primary_link_mode`/`follow_peer_primary` is actually active; under plain SWRR (bonded, no single-primary concept) both tags stay blank rather than mislabeling a link genuinely carrying its own real share of traffic as a "failover" standby. `LinkSnapshot` gains a new `is_primary` field (backward-compatible: `#[serde(default)]`, defaults to `false`) to carry this over the control socket. Motivated directly by a real troubleshooting session where confirming which link was actually selected required diffing raw `tx_bytes` counters by hand across two control-socket polls.
+
+### Fixed
+
+- Corrected `Cargo.toml`'s package description, which still said "Noise-encrypted tunnel" -- stale since the v0.7.0 WireGuard-per-link rewrite; now says "WireGuard-encrypted".
+
+### Reverted
+
+- **`mlvpnd self-test --tunnel`'s adaptive bandwidth ramp.** A same-night attempt to replace the tunnel-level self-test's fixed `MAX_SEND_RATE_MBPS = 150` pacing cap with the same adaptive ramp mechanism already proven for the per-link self-test (motivated by real active-bandwidth-probing data showing ~400 Mbps of real per-link capacity, far above the old fixed cap) was tested directly against live production hardware and reverted: it converged to a much lower, misleading throughput number (~3-6 Mbps) than the simple fixed-rate approach it was meant to replace, for reasons that remain unexplained after two independent attempts (1-second and 3-second probe-step durations both hit the identical cliff at the same target rate). `tunneltest.rs` is back to its exact pre-attempt behavior; both the attempt and its ruled-out follow-up are preserved as a permanent doc comment on `MAX_SEND_RATE_MBPS` so a future try doesn't re-discover the same dead end from scratch.
+
 ## [0.7.0] - 2026-09-13
 
 ### Changed
