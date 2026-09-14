@@ -104,10 +104,20 @@ const DONE_RETRY_COUNT: u32 = 4;
 const RESULT_GRACE: Duration = Duration::from_secs(8);
 
 /// Duration of each `adaptive_bandwidth_ramp` probe step in `run_test`'s
-/// upload leg -- matches `tunnel::adaptive_bandwidth_ramp`'s own callers
-/// (`run_throughput_test_leg_upload`, `active_bandwidth_prober`), which
-/// use the same 1-second step length for the per-link ramp.
-const RAMP_STEP_DURATION: Duration = Duration::from_secs(1);
+/// upload leg. Deliberately longer than `tunnel::adaptive_bandwidth_ramp`'s
+/// other callers (`run_throughput_test_leg_upload`, `active_bandwidth_prober`,
+/// both 1 second): those measure raw UDP directly on one link's own
+/// socket, with no scheduler or reorder buffer in the path. This
+/// measures through the real bonded tunnel -- the SWRR scheduler
+/// splitting across links and the reorder buffer holding packets for
+/// out-of-order delivery both need real time to settle, and confirmed
+/// via a real diagnostic run (2026-09-14) that a 1-second window made
+/// even a modest 16 Mbps target look like a real ceiling (only ~72%
+/// delivered) despite a full 30-second stream at 150 Mbps running
+/// perfectly clean moments earlier on the same path. 3 seconds gives
+/// that settling cost room to become a small fraction of the
+/// measurement instead of dominating it.
+const RAMP_STEP_DURATION: Duration = Duration::from_secs(3);
 
 /// How long to wait for a ramp step's `ResultPayload` reply after
 /// `send_stream` returns for that step. `send_stream` itself already
@@ -115,7 +125,7 @@ const RAMP_STEP_DURATION: Duration = Duration::from_secs(1);
 /// DONE_RETRY_DELAY` (the done-packet retry spread) before returning, so
 /// this only needs to cover the reply's own network round-trip, not that
 /// whole spread again.
-const RAMP_STEP_REPLY_TIMEOUT: Duration = Duration::from_secs(2);
+const RAMP_STEP_REPLY_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Plain (unauthenticated at this layer -- see the module doc comment
 /// for why that's fine) app-level payload carried by every packet of a
@@ -461,6 +471,18 @@ pub(crate) async fn run_test(
     })
     .await;
     let target_mbps = ramp.confirmed_mbps;
+    for step in &ramp.steps {
+        tracing::warn!(
+            target_mbps = step.target_mbps,
+            achieved_mbps = ?step.achieved_mbps,
+            clean = step.clean,
+            "tunnel-level self-test ramp step (temporary diagnostic)"
+        );
+    }
+    tracing::warn!(
+        confirmed_mbps = target_mbps,
+        "tunnel-level self-test ramp converged (temporary diagnostic)"
+    );
 
     let queue_drops_before = outbound_dropped_total.load(Ordering::Relaxed);
     send_stream(
