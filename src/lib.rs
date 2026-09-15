@@ -15,6 +15,7 @@ pub mod crypto;
 pub mod diag;
 pub mod diagnostics;
 pub mod error;
+pub mod fec;
 pub mod firewall;
 pub mod ipc;
 pub mod link;
