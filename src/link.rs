@@ -763,6 +763,12 @@ impl Link {
         })
     }
 
+    /// This link's own lifetime count of datagrams its `WgTunnel`
+    /// rejected outright -- see `WgTunnel::rejected_count`'s doc comment.
+    pub fn wg_rejected_count(&self) -> u64 {
+        self.wg.rejected_count()
+    }
+
     /// Bundle this link's shareable state for its per-link tasks
     /// (`link_receiver`, `link_prober` in `tunnel.rs`). See
     /// `LinkHandle`'s doc comment for why tasks capture this once

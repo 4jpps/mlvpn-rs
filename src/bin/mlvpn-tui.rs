@@ -774,7 +774,26 @@ fn link_row(l: &LinkSnapshot, any_primary: bool) -> Row<'static> {
         )
     };
 
-    let tx_rx_text = format!("{} / {}", fmt_bytes(l.tx_bytes), fmt_bytes(l.rx_bytes));
+    let tx_rx_line = Line::from(format!(
+        "{} / {}",
+        fmt_bytes(l.tx_bytes),
+        fmt_bytes(l.rx_bytes)
+    ));
+    // `wg_rejected_total` -- see `LinkSnapshot::wg_rejected_total`'s doc
+    // comment -- is a diagnostic counter, not a normal operating metric,
+    // so it's only shown (muted) once it's actually nonzero, keeping a
+    // healthy link's cell exactly as it looked before this field existed.
+    let tx_rx_cell = if l.wg_rejected_total > 0 {
+        Cell::from(Text::from(vec![
+            tx_rx_line,
+            Line::from(Span::styled(
+                format!("wg rejected: {}", l.wg_rejected_total),
+                Style::default().fg(Color::Red),
+            )),
+        ]))
+    } else {
+        Cell::from(Text::from(tx_rx_line))
+    };
 
     Row::new(vec![
         Cell::from(l.name.clone()),
@@ -783,7 +802,7 @@ fn link_row(l: &LinkSnapshot, any_primary: bool) -> Row<'static> {
         Cell::from(fmt_duration_ms(l.state_duration_ms)),
         Cell::from(l.remote_addr.clone().unwrap_or_else(|| "-".to_string())),
         Cell::from(format!("{:.2}", l.score)).style(score_style(l.score)),
-        Cell::from(tx_rx_text),
+        tx_rx_cell,
         Cell::from(local_line),
         Cell::from(peer_line),
     ])
@@ -1003,7 +1022,11 @@ fn draw_outbound_queue_panel(f: &mut Frame, area: Rect, daemon: &DaemonSnapshot)
 
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Length(1)])
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
         .split(inner);
 
     let ratio = if daemon.outbound_queue_capacity > 0 {
@@ -1040,6 +1063,24 @@ fn draw_outbound_queue_panel(f: &mut Frame, area: Rect, daemon: &DaemonSnapshot)
         ),
     ]);
     f.render_widget(Paragraph::new(dropped_line), rows[1]);
+
+    // Sum of every link's own `wg_rejected_total` -- see
+    // `LinkSnapshot::wg_rejected_total`'s doc comment. Distinct from
+    // `outbound_queue_dropped_total` above: that counts frames this
+    // process never even got to encrypt/send (queue full); this counts
+    // datagrams the peer's decapsulate rejected on receive (bad MAC,
+    // replay-window miss, garbled data) -- a class of loss neither the
+    // outbound queue nor the TUN device's own counters can see.
+    let wg_rejected_style = if daemon.wg_rejected_total > 0 {
+        Style::default().fg(COLOR_BAD)
+    } else {
+        Style::default().fg(COLOR_MUTED)
+    };
+    let wg_rejected_line = Line::from(vec![
+        Span::raw("WG rejected (all links): "),
+        Span::styled(daemon.wg_rejected_total.to_string(), wg_rejected_style),
+    ]);
+    f.render_widget(Paragraph::new(wg_rejected_line), rows[2]);
 }
 
 fn draw_tun_panel(f: &mut Frame, area: Rect, tun: &TunSnapshot) {

@@ -10,6 +10,12 @@ For implementation detail beyond what's here, read the code -- most
 modules and non-trivial functions have doc comments explaining the
 design, and `ARCHITECTURE.md` covers the system as a whole.
 
+## [0.7.2] - 2026-09-14
+
+### Added
+
+- **New diagnostic counter: `wg_rejected_total`, per link and daemon-wide.** Every incoming UDP datagram is fed to boringtun's `WgTunnel::decapsulate`; until now, if boringtun rejected one outright (bad MAC, replay-window miss, garbled/oversized data), that rejection was silently swallowed after a `tracing::debug!` line and never counted anywhere -- invisible to `outbound_queue_dropped_total` and the TUN device's own `rx_dropped`/`tx_dropped`, since the rejection happens inside boringtun before a frame is ever handed to those layers. Added a lifetime `AtomicU64` on `WgTunnel` (`src/wireguard.rs`), incremented on every `TunnResult::Err` and oversized-datagram rejection in `decapsulate`, surfaced per link via `LinkSnapshot::wg_rejected_total` and daemon-wide (sum across links) via `DaemonSnapshot::wg_rejected_total`. Shown in `mlvpn-tui`'s Links tab (a red "wg rejected: N" line under Tx/Rx, only once nonzero) and its Outbound Queue panel ("WG rejected (all links)"), and in `mlvpnd diag-dump`'s text output. Motivated directly by a live investigation finding real TCP-level loss (~15% retransmission under load, confirmed via `ss -tin`) with every pre-existing counter reading zero -- this closes that specific blind spot so a future round of the same investigation can tell whether boringtun's own rejection path is the actual cause.
+
 ## [0.7.1] - 2026-09-14
 
 ### Added

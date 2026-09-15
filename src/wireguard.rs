@@ -65,6 +65,7 @@
 use crate::error::{MlvpnError, Result};
 use boringtun::noise::{Tunn, TunnResult};
 use boringtun::x25519;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 /// The outcome of feeding one received datagram to `WgTunnel::decapsulate`.
@@ -183,6 +184,18 @@ pub struct WgTunnel {
     // wired up, or whether a plain `&mut self` is achievable there
     // instead.
     inner: Mutex<Tunn>,
+    /// Lifetime count of datagrams `decapsulate` rejected outright
+    /// (`TunnResult::Err` -- bad MAC, replay-window miss, garbled data,
+    /// oversized datagram). This class of loss was previously invisible
+    /// to every one of mlvpn's own diagnostics: it never touches
+    /// `outbound_queue_dropped_total` or the TUN device's `rx_dropped`/
+    /// `tx_dropped` (both stay clean, since the rejection happens before
+    /// a frame is ever handed to those layers), and the only trace was a
+    /// `tracing::debug!` line -- added 2026-09-14 to give this real
+    /// visibility after a live investigation found real TCP-level loss
+    /// (~15% retransmission under load) with every existing counter
+    /// reading zero. See `decapsulate`'s own `TunnResult::Err` arm.
+    rejected_total: AtomicU64,
 }
 
 impl WgTunnel {
@@ -218,7 +231,14 @@ impl WgTunnel {
         );
         Ok(Self {
             inner: Mutex::new(tunn),
+            rejected_total: AtomicU64::new(0),
         })
+    }
+
+    /// Lifetime count of datagrams this link's `decapsulate` has rejected
+    /// outright -- see `rejected_total`'s doc comment for why this exists.
+    pub fn rejected_count(&self) -> u64 {
+        self.rejected_total.load(Ordering::Relaxed)
     }
 
     /// Wraps `plaintext` (mlvpn's own already-serialized frame) into a
@@ -273,6 +293,7 @@ impl WgTunnel {
         // see `MAX_WG_PACKET`'s doc comment) runs on unauthenticated,
         // peer/attacker-controlled input.
         if datagram.len() > MAX_WG_PACKET {
+            self.rejected_total.fetch_add(1, Ordering::Relaxed);
             return Err(MlvpnError::Protocol(format!(
                 "wg decapsulate: datagram too large ({} bytes, max {})",
                 datagram.len(),
@@ -283,7 +304,10 @@ impl WgTunnel {
         let mut tunn = self.inner.lock().unwrap();
         match tunn.decapsulate(None, datagram, &mut buf) {
             TunnResult::Done => Ok(DecapsulateOutcome::Consumed),
-            TunnResult::Err(e) => Err(MlvpnError::Protocol(format!("wg decapsulate: {e:?}"))),
+            TunnResult::Err(e) => {
+                self.rejected_total.fetch_add(1, Ordering::Relaxed);
+                Err(MlvpnError::Protocol(format!("wg decapsulate: {e:?}")))
+            }
             TunnResult::WriteToNetwork(bytes) => Ok(DecapsulateOutcome::SendReply(bytes.to_vec())),
             TunnResult::WriteToTunnelV4(bytes, _) => {
                 Ok(DecapsulateOutcome::Frame(unwrap_fake_ipv4(bytes)?))

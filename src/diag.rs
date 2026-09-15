@@ -71,8 +71,8 @@ pub fn format_dump(snapshot: &Snapshot, trigger: &str) -> String {
                 .unwrap_or_else(|| "n/a".to_string()),
         ));
         out.push_str(&format!(
-            "  totals: tx_bytes={} rx_bytes={} tx_packets={} rx_packets={}\n\n",
-            l.tx_bytes, l.rx_bytes, l.tx_packets, l.rx_packets,
+            "  totals: tx_bytes={} rx_bytes={} tx_packets={} rx_packets={} wg_rejected={}\n\n",
+            l.tx_bytes, l.rx_bytes, l.tx_packets, l.rx_packets, l.wg_rejected_total,
         ));
     }
 
@@ -86,6 +86,10 @@ pub fn format_dump(snapshot: &Snapshot, trigger: &str) -> String {
     out.push_str(&format!(
         "outbound_queue: {}/{} (dropped_lifetime={})\n",
         d.outbound_queue_len, d.outbound_queue_capacity, d.outbound_queue_dropped_total
+    ));
+    out.push_str(&format!(
+        "wg_rejected_total (all links): {}\n",
+        d.wg_rejected_total
     ));
     out.push_str(&format!(
         "tun({}): rx_bytes={} tx_bytes={} rx_errors={} tx_errors={} rx_dropped={} \
@@ -194,6 +198,7 @@ mod tests {
             local_confirmed_ceiling_mbps: None,
             local_consecutive_hits: 0,
             local_consecutive_misses: 5,
+            wg_rejected_total: 0,
             peer_name: Some("lte0".to_string()),
             peer_state: Some("up".to_string()),
             peer_rtt_ms: Some(25.0),
@@ -214,6 +219,7 @@ mod tests {
                 outbound_queue_len: 0,
                 outbound_queue_capacity: 1024,
                 outbound_queue_dropped_total: 0,
+                wg_rejected_total: 0,
                 tun: TunSnapshot {
                     iface: "mlvpn0".to_string(),
                     rx_bytes: Some(1_000_000),

@@ -115,6 +115,14 @@ pub struct DaemonSnapshot {
     /// `peer_version`). `None` until the first `VersionInfo` arrives.
     #[serde(default)]
     pub peer_tunnel_mtu: Option<u16>,
+    /// Sum of every link's `LinkSnapshot::wg_rejected_total` -- see that
+    /// field's doc comment. Added alongside the per-link counters
+    /// 2026-09-14 while investigating real TCP-level loss (~15%
+    /// retransmission under load) that every pre-existing counter
+    /// (`outbound_queue_dropped_total`, `tun.rx_dropped`/`tx_dropped`)
+    /// failed to explain.
+    #[serde(default)]
+    pub wg_rejected_total: u64,
 }
 
 /// Host-wide load/memory/uptime, independent of anything tunnel- or
@@ -222,6 +230,15 @@ pub struct LinkSnapshot {
     /// misses in a row" ahead of a state transition actually firing.
     pub local_consecutive_hits: u32,
     pub local_consecutive_misses: u32,
+    /// This link's own lifetime count of datagrams its `WgTunnel`
+    /// (`src/wireguard.rs`) rejected outright -- bad MAC, replay-window
+    /// miss, garbled/oversized data. Previously invisible to every
+    /// existing counter (`outbound_queue_dropped_total`, the TUN
+    /// device's `rx_dropped`/`tx_dropped`): the rejection happens inside
+    /// boringtun, before a frame is ever handed to those layers. Added
+    /// 2026-09-14 -- see `WgTunnel::rejected_total`'s doc comment.
+    #[serde(default)]
+    pub wg_rejected_total: u64,
 
     // Peer-reported -- their view of the same physical link, received
     // over the wire via a `StatsShare` frame (see `protocol.rs`). `None`
@@ -408,6 +425,7 @@ mod tests {
             local_confirmed_ceiling_mbps: Some(180.0),
             local_consecutive_hits: 12,
             local_consecutive_misses: 0,
+            wg_rejected_total: 3,
             peer_name: None,
             peer_state: None,
             peer_rtt_ms: None,
@@ -429,6 +447,7 @@ mod tests {
         assert_eq!(back.rx_bytes, 2_000_000);
         assert_eq!(back.tx_packets, 700);
         assert_eq!(back.rx_packets, 1400);
+        assert_eq!(back.wg_rejected_total, 3);
     }
 
     /// `DaemonSnapshot` picks up new fields far less often than
@@ -441,6 +460,7 @@ mod tests {
             outbound_queue_len: 12,
             outbound_queue_capacity: 256,
             outbound_queue_dropped_total: 7,
+            wg_rejected_total: 4,
             tun: TunSnapshot {
                 iface: "mlvpn0".to_string(),
                 rx_bytes: Some(1_000),
@@ -468,6 +488,7 @@ mod tests {
         assert_eq!(back.outbound_queue_len, 12);
         assert_eq!(back.outbound_queue_capacity, 256);
         assert_eq!(back.outbound_queue_dropped_total, 7);
+        assert_eq!(back.wg_rejected_total, 4);
         assert_eq!(back.tun.iface, "mlvpn0");
         assert_eq!(back.tun.rx_bytes, Some(1_000));
         assert_eq!(back.tun.tx_errors, None);
