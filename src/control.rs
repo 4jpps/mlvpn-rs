@@ -804,50 +804,73 @@ pub const FALLBACK_MTU_WHEN_NOTHING_DETECTED: u16 = 1400;
 /// wrong in given the user asked for this to auto-adjust for
 /// *throughput*, not just raw MTU size: a black-holed PMTUD stall costs
 /// far more throughput than a few bytes of headroom ever would.
+///
+/// `fec_reservation` (from `fec::mtu_reservation_bytes`, zero unless
+/// `scheduler.fec_enabled`) is subtracted from whatever budget the rest
+/// of this function arrives at -- *after* any configured ceiling is
+/// applied, not folded into the physical overhead. A `FecParity` frame's
+/// payload is the group's longest member plus a fixed per-group header
+/// (83 bytes at the default `fec_group_size = 8`); without reserving
+/// that, every parity frame covering real bulk traffic would exceed the
+/// path MTU and fragment, which makes it *less* likely to arrive than
+/// the data it exists to protect. Subtracting it last also preserves the
+/// property an operator pins `tunnel.mtu` to get in the first place: two
+/// peers that agree on a tunnel MTU without FEC still agree with FEC on,
+/// since both subtract the same reservation from the same ceiling.
 pub fn effective_tunnel_mtu(
     cfg: &crate::config::TunnelConfig,
     detected_mtus: &[Option<u32>],
+    fec_reservation: u16,
 ) -> u16 {
     let outer_overhead = crate::protocol::HEADER_LEN as u32
         + crate::wireguard::WG_OVERHEAD_BYTES
         + crate::wireguard::FAKE_IPV4_HEADER_LEN as u32
         + 48;
 
-    let Some(detected_min) = detected_mtus.iter().filter_map(|m| *m).min() else {
-        return cfg.mtu.unwrap_or(FALLBACK_MTU_WHEN_NOTHING_DETECTED);
+    // The tunnel MTU before FEC's own reservation is taken out of it.
+    let pre_fec = {
+        let Some(detected_min) = detected_mtus.iter().filter_map(|m| *m).min() else {
+            return cfg
+                .mtu
+                .unwrap_or(FALLBACK_MTU_WHEN_NOTHING_DETECTED)
+                .saturating_sub(fec_reservation)
+                .max(576);
+        };
+
+        let safe_mtu = detected_min
+            .saturating_sub(outer_overhead)
+            .min(u16::MAX as u32) as u16;
+
+        match cfg.mtu {
+            Some(ceiling) if ceiling <= safe_mtu => ceiling,
+            Some(ceiling) => {
+                // Never clamp below the config-time floor already enforced
+                // in config.rs's validate() (>= 576, the IPv6 minimum-MTU
+                // guarantee) -- an unusually small detected physical MTU
+                // should surface as a visible problem, not silently produce
+                // a tunnel MTU so small it can't carry a minimum-size IPv6
+                // packet at all.
+                let clamped = safe_mtu.max(576);
+                tracing::warn!(
+                    configured = ceiling,
+                    detected_min_physical_mtu = detected_min,
+                    clamped_to = clamped,
+                    "tunnel.mtu exceeds what the bonded links' physical interfaces can carry \
+                     without fragmentation; auto-clamping down for this run (edit tunnel.mtu \
+                     in the config to make this permanent and silence this warning)"
+                );
+                clamped
+            }
+            // No configured ceiling: use the full detected-safe value
+            // directly, including upward from any previous run -- this is
+            // the actual fix for the reported throughput regression (the
+            // old code's `cfg.mtu` defaulted to 1400 and this branch never
+            // existed, so a real 1500-MTU link was never used past 1400).
+            None => safe_mtu.max(576),
+        }
     };
 
-    let safe_mtu = detected_min
-        .saturating_sub(outer_overhead)
-        .min(u16::MAX as u32) as u16;
-
-    match cfg.mtu {
-        Some(ceiling) if ceiling <= safe_mtu => ceiling,
-        Some(ceiling) => {
-            // Never clamp below the config-time floor already enforced
-            // in config.rs's validate() (>= 576, the IPv6 minimum-MTU
-            // guarantee) -- an unusually small detected physical MTU
-            // should surface as a visible problem, not silently produce
-            // a tunnel MTU so small it can't carry a minimum-size IPv6
-            // packet at all.
-            let clamped = safe_mtu.max(576);
-            tracing::warn!(
-                configured = ceiling,
-                detected_min_physical_mtu = detected_min,
-                clamped_to = clamped,
-                "tunnel.mtu exceeds what the bonded links' physical interfaces can carry \
-                 without fragmentation; auto-clamping down for this run (edit tunnel.mtu \
-                 in the config to make this permanent and silence this warning)"
-            );
-            clamped
-        }
-        // No configured ceiling: use the full detected-safe value
-        // directly, including upward from any previous run -- this is
-        // the actual fix for the reported throughput regression (the
-        // old code's `cfg.mtu` defaulted to 1400 and this branch never
-        // existed, so a real 1500-MTU link was never used past 1400).
-        None => safe_mtu.max(576),
-    }
+    pre_fec.saturating_sub(fec_reservation).max(576)
 }
 
 /// How often `mtu_monitor_loop` re-checks whether the live TUN device's
@@ -920,6 +943,11 @@ pub(crate) async fn mtu_monitor_loop(
     bind_interfaces: Vec<String>,
     live_mtu: std::sync::Arc<std::sync::atomic::AtomicU16>,
     mtu_resizer: crate::link::MtuResizer,
+    // Bytes to hold back for FEC parity frames -- see
+    // `effective_tunnel_mtu`. Fixed for the daemon's lifetime (it is
+    // derived purely from static config), so it is passed once rather
+    // than recomputed each tick.
+    fec_reservation: u16,
 ) {
     let mut tick = tokio::time::interval(std::time::Duration::from_secs(MTU_MONITOR_INTERVAL_SECS));
     let mut failures = ResizeFailureLatch::default();
@@ -930,7 +958,7 @@ pub(crate) async fn mtu_monitor_loop(
             .iter()
             .map(|ifname| crate::link::query_interface_mtu(ifname))
             .collect();
-        let recomputed = effective_tunnel_mtu(&tunnel_cfg, &detected);
+        let recomputed = effective_tunnel_mtu(&tunnel_cfg, &detected, fec_reservation);
         let current = live_mtu.load(std::sync::atomic::Ordering::Relaxed);
 
         if !mtu_resize_needed(current, recomputed) {
@@ -1304,7 +1332,7 @@ mod tests {
             + crate::wireguard::FAKE_IPV4_HEADER_LEN as u32
             + 48;
         assert_eq!(
-            effective_tunnel_mtu(&cfg, &detected) as u32,
+            effective_tunnel_mtu(&cfg, &detected, 0) as u32,
             1500 - expected_overhead
         );
     }
@@ -1322,21 +1350,53 @@ mod tests {
                 + crate::wireguard::FAKE_IPV4_HEADER_LEN as u32
                 + 48,
         ) as u16;
-        assert_eq!(effective_tunnel_mtu(&cfg, &detected), expected);
+        assert_eq!(effective_tunnel_mtu(&cfg, &detected, 0), expected);
     }
 
     #[test]
     fn no_configured_ceiling_and_nothing_detected_falls_back_to_a_conservative_default() {
         let cfg = test_tunnel_config(None);
-        assert_eq!(effective_tunnel_mtu(&cfg, &[]), 1400);
-        assert_eq!(effective_tunnel_mtu(&cfg, &[None]), 1400);
+        assert_eq!(effective_tunnel_mtu(&cfg, &[], 0), 1400);
+        assert_eq!(effective_tunnel_mtu(&cfg, &[None], 0), 1400);
     }
 
     #[test]
     fn configured_ceiling_still_clamps_down() {
         let cfg = test_tunnel_config(Some(1400));
         let detected = [Some(1300u32)];
-        assert!(effective_tunnel_mtu(&cfg, &detected) < 1400);
+        assert!(effective_tunnel_mtu(&cfg, &detected, 0) < 1400);
+    }
+
+    /// A FecParity frame is `parity_frame_overhead_bytes` larger than
+    /// the largest Data frame it covers, so the tunnel MTU has to come
+    /// down by exactly that much for it to still fit the path -- see
+    /// `effective_tunnel_mtu`'s doc comment.
+    #[test]
+    fn fec_reservation_shrinks_the_effective_mtu_by_exactly_the_parity_overhead() {
+        let cfg = test_tunnel_config(None);
+        let detected = [Some(1500u32)];
+        let reservation = crate::fec::parity_frame_overhead_bytes(8);
+        assert_eq!(
+            effective_tunnel_mtu(&cfg, &detected, 0) - reservation,
+            effective_tunnel_mtu(&cfg, &detected, reservation)
+        );
+    }
+
+    /// A configured ceiling that fits *without* FEC but not *with* it
+    /// must be clamped down, not silently honoured -- that was the
+    /// production case (mtu pinned to 1368) where every parity frame
+    /// would otherwise have gone out over the path MTU.
+    #[test]
+    fn a_configured_ceiling_is_clamped_when_fec_no_longer_leaves_room() {
+        let cfg = test_tunnel_config(Some(1368));
+        let detected = [Some(1500u32)];
+        let reservation = crate::fec::parity_frame_overhead_bytes(8);
+        assert_eq!(effective_tunnel_mtu(&cfg, &detected, 0), 1368);
+        let with_fec = effective_tunnel_mtu(&cfg, &detected, reservation);
+        assert!(with_fec < 1368);
+        // And the parity frame it now has to carry fits the same budget
+        // a full-size Data frame used before FEC was turned on.
+        assert!(with_fec + reservation <= 1368);
     }
 
     #[test]

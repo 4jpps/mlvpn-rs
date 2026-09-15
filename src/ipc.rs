@@ -136,11 +136,16 @@ pub struct DaemonSnapshot {
     /// `docs/superpowers/specs/2026-09-15-single-erasure-fec-design.md`.
     #[serde(default)]
     pub fec_recovered_total: u64,
-    /// Lifetime count of FEC groups that could NOT be recovered (2+
-    /// members missing, or the parity frame itself never arrived and
-    /// the group expired) -- the disclosed limit of single-erasure
-    /// parity, see the design doc's own "Known, accepted limitation"
-    /// section. Real loss reaching TCP corresponds to this counter, not
+    /// Lifetime count of FEC groups FEC could not help with: on the
+    /// receive side, 2+ members missing, or exactly one missing whose
+    /// group-mates can no longer be XORed back together (their
+    /// plaintexts aged out before the parity frame landed) -- the
+    /// disclosed limit of single-erasure parity, see the design doc's
+    /// own "Known, accepted limitation" section. Also incremented on the
+    /// *send* side for a group whose parity frame would have exceeded
+    /// the live tunnel MTU and was therefore skipped rather than
+    /// fragmented (only reachable if the live MTU shrinks mid-group).
+    /// Real loss reaching TCP corresponds to this counter, not
     /// `fec_recovered_total`.
     #[serde(default)]
     pub fec_unrecoverable_total: u64,

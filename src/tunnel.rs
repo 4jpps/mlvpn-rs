@@ -541,10 +541,13 @@ pub async fn run(
     )));
 
     // Shared across both links (a FEC group's members can arrive on
-    // either physical link), same reasoning as `reorder` above.
+    // either physical link), same reasoning as `reorder` above. Its own
+    // retention is deliberately NOT derived from `reorder_window_ms`:
+    // see `fec::PAYLOAD_TTL`'s doc comment for why those are unrelated
+    // timescales. Built unconditionally (it is empty and never touched
+    // when FEC is disabled) so nothing downstream needs an Option.
     let fec_recovery = Arc::new(AsyncMutex::new(fec::FecRecoveryBuffer::new(
         params.scheduler_cfg.fec_group_size,
-        Duration::from_millis(params.scheduler_cfg.reorder_window_ms),
     )));
     let fec_recovered_total = Arc::new(AtomicU64::new(0));
     let fec_unrecoverable_total = Arc::new(AtomicU64::new(0));
@@ -841,6 +844,7 @@ pub async fn run(
         let bind_interfaces = params.bind_interfaces.clone();
         let live_mtu = live_mtu.clone();
         let mtu_resizer = params.mtu_resizer.clone();
+        let fec_reservation = fec::mtu_reservation_bytes(&params.scheduler_cfg);
         handles.push(tokio::spawn(async move {
             control::mtu_monitor_loop(
                 tunnel_cfg,
@@ -848,6 +852,7 @@ pub async fn run(
                 bind_interfaces,
                 live_mtu,
                 mtu_resizer,
+                fec_reservation,
             )
             .await;
         }));
@@ -859,6 +864,8 @@ pub async fn run(
         let redundant_mode = params.scheduler_cfg.redundant_mode;
         let fec_enabled = params.scheduler_cfg.fec_enabled;
         let fec_group_size = params.scheduler_cfg.fec_group_size;
+        let live_mtu = live_mtu.clone();
+        let fec_unrecoverable_total = fec_unrecoverable_total.clone();
         handles.push(tokio::spawn(async move {
             outbound_sender(
                 outbound_rx,
@@ -867,6 +874,8 @@ pub async fn run(
                 redundant_mode,
                 fec_enabled,
                 fec_group_size,
+                live_mtu,
+                fec_unrecoverable_total,
             )
             .await;
         }));
@@ -900,7 +909,7 @@ pub async fn run(
         }));
     }
 
-    {
+    if params.scheduler_cfg.fec_enabled {
         let fec_recovery = fec_recovery.clone();
         handles.push(tokio::spawn(async move {
             fec_expiry_loop(fec_recovery).await;
@@ -1098,6 +1107,7 @@ async fn tun_reader(
 /// task rather than `tun_reader` calling `send_scheduled`/`send_redundant`
 /// directly. Returns once `tx` (held by `tun_reader`) is dropped, i.e.
 /// only during shutdown.
+#[allow(clippy::too_many_arguments)]
 async fn outbound_sender(
     mut rx: mpsc::Receiver<OutboundFrame>,
     links: Links,
@@ -1105,8 +1115,20 @@ async fn outbound_sender(
     redundant_mode: bool,
     fec_enabled: bool,
     fec_group_size: u8,
+    mtu: LiveMtu,
+    fec_unrecoverable_total: Arc<AtomicU64>,
 ) {
     let mut fec_sender = fec_enabled.then(|| crate::fec::FecSender::new(fec_group_size));
+    // What a parity frame is allowed to cost beyond the tunnel MTU: the
+    // exact same number of bytes `control::effective_tunnel_mtu` already
+    // reserved out of the tunnel MTU for this group size, so a parity
+    // frame covering full-MTU members lands on the wire at the same
+    // total size a Data frame did before FEC was enabled.
+    let parity_headroom = if fec_enabled {
+        crate::fec::parity_frame_overhead_bytes(fec_group_size) as usize
+    } else {
+        0
+    };
     while let Some(frame) = rx.recv().await {
         if redundant_mode {
             send_redundant(&links, &frame.plaintext).await;
@@ -1117,6 +1139,27 @@ async fn outbound_sender(
         if let Some(sender) = fec_sender.as_mut() {
             if let Some(parity) = sender.accumulate(seq, &frame.plaintext) {
                 let parity_bytes = parity.encode();
+                // Belt-and-braces against the MTU reservation being
+                // momentarily wrong: `mtu_monitor_loop` can *shrink* the
+                // live tunnel MTU (a link reconnecting on smaller
+                // hardware) after a group has already accumulated
+                // members sized for the old, larger one. Sending an
+                // oversized parity frame is strictly worse than sending
+                // none at all -- it either gets fragmented (needing
+                // *both* fragments to survive, making it less likely to
+                // arrive than the data it protects) or fails outright --
+                // so drop it and count the group as one FEC could not
+                // help with.
+                let budget = mtu.load(Ordering::Relaxed) as usize + parity_headroom;
+                if parity_bytes.len() > budget {
+                    fec_unrecoverable_total.fetch_add(1, Ordering::Relaxed);
+                    tracing::debug!(
+                        parity_bytes = parity_bytes.len(),
+                        budget,
+                        "skipping an oversized FEC parity frame (tunnel MTU shrank mid-group)"
+                    );
+                    continue;
+                }
                 let parity_seq = next_send_seq();
                 send_scheduled(
                     &links,
@@ -2508,7 +2551,38 @@ async fn handle_incoming(
             // handles the frame next, since `FecRecoveryBuffer` needs to
             // see every arriving member to ever recover a *different*
             // missing one later.
-            fec_recovery.lock().await.observe_data(hdr.seq, &plaintext);
+            //
+            // Guarded on `cfg.fec_enabled` so a default-config daemon
+            // genuinely pays nothing for a feature it isn't using: with
+            // FEC off this skips a shared async-Mutex acquisition (a
+            // cross-link contention point both `link_receiver` tasks
+            // would otherwise hit on every single packet), a full heap
+            // copy of the plaintext, and a HashMap insert -- on exactly
+            // the hot path v0.6.1-v0.6.4 spent a whole release cycle
+            // stripping per-packet locks out of.
+            //
+            // When it *is* enabled, `observe_data`'s return value is the
+            // duplicate guard: `false` means FEC already reconstructed
+            // and delivered this seq (its parity frame beat the real
+            // copy through a slower link), so delivering it now would
+            // put a byte-identical duplicate IP packet into the TUN
+            // device -- dup-ACKs, spurious fast retransmit, the exact
+            // congestion behavior this feature exists to reduce.
+            if cfg.fec_enabled {
+                // Scoped binding, not an inline condition: the guard is
+                // explicitly dropped before any other lock below is
+                // touched, keeping this module's "every lock
+                // acquisition is a scoped temporary, never nested"
+                // invariant obvious rather than dependent on temporary
+                // -scope rules.
+                let deliver = {
+                    let mut buf = fec_recovery.lock().await;
+                    buf.observe_data(hdr.seq, &plaintext)
+                };
+                if !deliver {
+                    return;
+                }
+            }
             // Cheap, uncontended std::sync::Mutex lock (same pattern
             // established by this project's earlier select_fast and
             // reorder_tuning_loop fixes) -- read once per packet, not
@@ -2541,6 +2615,15 @@ async fn handle_incoming(
             }
         }
         PacketType::FecParity => {
+            if !cfg.fec_enabled {
+                // A peer with FEC on talking to a receiver with it off:
+                // nothing here can help (nothing is being observed to
+                // reconstruct against), and running the machinery anyway
+                // would both cost the hot-path lock #2 exists to avoid
+                // and report every group as unrecoverable. Drop it the
+                // same way any other unwanted frame type is dropped.
+                return;
+            }
             let Ok(parity) = crate::protocol::FecParityPayload::decode(&plaintext) else {
                 tracing::debug!("malformed FecParity payload, ignoring");
                 return;
@@ -3179,18 +3262,34 @@ async fn reorder_flush(reorder: Arc<AsyncMutex<ReorderBuffer>>, tun: Arc<AsyncDe
     }
 }
 
-/// Periodically ages out `FecRecoveryBuffer`'s observed-frame entries --
-/// mirrors `reorder_flush`'s own 10ms cadence/reasoning, just for a
-/// different buffer. `fec_recovery` is its own independent lock (never
-/// shared with `reorder`'s), so unlike `reorder_flush` there's no
-/// per-packet contention to dodge here -- a plain `.lock().await` is
-/// fine. No-op (near-zero cost) when FEC is disabled or the buffer is
-/// empty.
+/// How often `fec_expiry_loop` runs its maintenance pass.
+const FEC_EXPIRY_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Periodically ages out `FecRecoveryBuffer`'s retained plaintexts and
+/// rotates its seen-seq generations. Only spawned when
+/// `scheduler.fec_enabled` is set (see `run`), so a default-config
+/// daemon doesn't even have this task.
+///
+/// `try_lock()`, not `.lock().await`, for exactly the reason
+/// `reorder_flush` was switched to it in v0.6.4: this lock *is* taken
+/// on the per-packet receive path (`handle_incoming`'s `observe_data`
+/// call, on both links' receiver tasks), so a blocking acquisition here
+/// every 10ms would inject a contention point into the hot path purely
+/// to do housekeeping. Skipping a contended tick is free: everything
+/// this buffer relies on for its memory bound is also enforced inline
+/// on insert (`MAX_PAYLOADS`, `MAX_SEEN_PER_GENERATION`), so a missed
+/// tick only means state is remembered slightly longer.
+///
+/// Cadence is much slower than `reorder_flush`'s 10ms: nothing is
+/// waiting on this (unlike a reorder-buffer straggler, which delays
+/// real delivery), and the timescales it manages are seconds.
 async fn fec_expiry_loop(fec_recovery: Arc<AsyncMutex<fec::FecRecoveryBuffer>>) {
-    let mut tick = interval(Duration::from_millis(10));
+    let mut tick = interval(FEC_EXPIRY_INTERVAL);
     loop {
         tick.tick().await;
-        fec_recovery.lock().await.expire_stale(Instant::now());
+        if let Ok(mut buf) = fec_recovery.try_lock() {
+            buf.tick(Instant::now());
+        }
     }
 }
 

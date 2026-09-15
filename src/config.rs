@@ -169,6 +169,33 @@ pub struct SchedulerConfig {
     /// and combining them spends bandwidth on FEC parity that
     /// `redundant_mode`'s full duplication already makes redundant. See
     /// `docs/superpowers/specs/2026-09-15-single-erasure-fec-design.md`.
+    ///
+    /// **Interaction with `primary_link_mode`, worth understanding
+    /// before enabling both.** The whole reason groups are formed in
+    /// sequential send order rather than per link is that SWRR bonding
+    /// spreads a group's members across every Up link, so a loss burst
+    /// confined to one link takes only some of a group's members and
+    /// the parity frame (itself independently scheduled) usually
+    /// survives on another link. Under `primary_link_mode` there is no
+    /// such spread: every member *and* the parity frame go out the one
+    /// primary link, so a burst on that link takes the whole group
+    /// together and the group is unrecoverable by construction -- while
+    /// still costing the full `1/fec_group_size` bandwidth overhead.
+    /// FEC still earns its keep against *isolated, independent* single
+    /// packet losses on the primary link, and against the bonded/SWRR
+    /// periods after `primary_link_mode` fails over, which is why this
+    /// combination is documented rather than rejected in `validate()`.
+    /// But do not expect it to help with burst loss on a single-link
+    /// path -- watch `fec_recovered_total` vs `fec_unrecoverable_total`
+    /// (both in `mlvpn-tui` and `mlvpnd diag-dump`) to see which regime
+    /// a real deployment is actually in before leaving it on.
+    ///
+    /// Also note this raises the tunnel MTU's own overhead: a parity
+    /// frame is larger than the Data frames it covers, so
+    /// `control::effective_tunnel_mtu` reserves `1 + 10*fec_group_size
+    /// + 2` bytes (83 at the default group size) out of the tunnel MTU
+    /// while this is on. Both peers must therefore enable FEC with the
+    /// same `fec_group_size` to keep their tunnel MTUs matching.
     #[serde(default)]
     pub fec_enabled: bool,
     /// How many sequential Data frames share one FEC parity frame.
@@ -774,6 +801,12 @@ impl Config {
             ));
         }
 
+        // The `<= 255` half of this range is structurally unreachable
+        // (the field is a `u8`, so 256 fails at TOML parse time and
+        // never reaches here). Kept deliberately: it documents the
+        // wire format's own limit (`FecParityPayload`'s `group_size`
+        // byte) at the point a reader looks for the valid range, and it
+        // stays correct if the field's type ever widens.
         if self.scheduler.fec_enabled && !(2..=255).contains(&self.scheduler.fec_group_size) {
             return Err(MlvpnError::Config(format!(
                 "scheduler.fec_group_size ({}) must be between 2 and 255",

@@ -698,6 +698,9 @@ async fn run(cfg: Config, log_ring: Arc<LogRing>) -> anyhow::Result<()> {
     let effective_mtu = control::effective_tunnel_mtu(
         &cfg.tunnel,
         &links.iter().map(|l| l.physical_mtu).collect::<Vec<_>>(),
+        // Holds back room for FEC parity frames, which are larger than
+        // the Data frames they cover; zero unless scheduler.fec_enabled.
+        mlvpn::fec::mtu_reservation_bytes(&cfg.scheduler),
     );
     let tun = open_tun(&cfg.tunnel, effective_mtu)?;
 
