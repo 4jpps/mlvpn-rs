@@ -210,6 +210,7 @@ use crate::config::{Mode, SchedulerConfig};
 use crate::control;
 use crate::crypto;
 use crate::error::{MlvpnError, Result};
+use crate::fec;
 use crate::link::{self, is_interface_gone_error, Link, LinkHandle, LinkScore, LinkState, Links};
 use crate::monitor::{self, ProbeTracker};
 use crate::peerstats::PeerStatsTable;
@@ -539,6 +540,15 @@ pub async fn run(
         params.scheduler_cfg.reorder_window_ms,
     )));
 
+    // Shared across both links (a FEC group's members can arrive on
+    // either physical link), same reasoning as `reorder` above.
+    let fec_recovery = Arc::new(AsyncMutex::new(fec::FecRecoveryBuffer::new(
+        params.scheduler_cfg.fec_group_size,
+        Duration::from_millis(params.scheduler_cfg.reorder_window_ms),
+    )));
+    let fec_recovered_total = Arc::new(AtomicU64::new(0));
+    let fec_unrecoverable_total = Arc::new(AtomicU64::new(0));
+
     // One ProbeTracker per link, shared between that link's receiver and
     // prober tasks: the prober records when a probe was sent
     // (`record_sent`) and the receiver records when its reply comes back
@@ -641,6 +651,9 @@ pub async fn run(
             let scheduler = scheduler.clone();
             let tun = tun.clone();
             let reorder = reorder.clone();
+            let fec_recovery = fec_recovery.clone();
+            let fec_recovered_total = fec_recovered_total.clone();
+            let fec_unrecoverable_total = fec_unrecoverable_total.clone();
             let cfg = params.scheduler_cfg.clone();
             let tracker = tracker.clone();
             let peer_stats = peer_stats.clone();
@@ -662,6 +675,9 @@ pub async fn run(
                     scheduler,
                     tun,
                     reorder,
+                    fec_recovery,
+                    fec_recovered_total,
+                    fec_unrecoverable_total,
                     cfg,
                     tracker,
                     peer_stats,
@@ -712,6 +728,8 @@ pub async fn run(
         let peer_mtu = peer_mtu.clone();
         let mtu = live_mtu.clone();
         let scheduler = scheduler.clone();
+        let fec_recovered_total = fec_recovered_total.clone();
+        let fec_unrecoverable_total = fec_unrecoverable_total.clone();
         handles.push(tokio::spawn(async move {
             control::serve(
                 path,
@@ -726,6 +744,8 @@ pub async fn run(
                 mtu,
                 peer_mtu,
                 scheduler,
+                fec_recovered_total,
+                fec_unrecoverable_total,
             )
             .await;
         }));
@@ -747,6 +767,8 @@ pub async fn run(
             mtu: live_mtu.clone(),
             peer_mtu: peer_mtu.clone(),
             scheduler: scheduler.clone(),
+            fec_recovered_total: fec_recovered_total.clone(),
+            fec_unrecoverable_total: fec_unrecoverable_total.clone(),
         };
         handles.push(tokio::spawn(async move {
             // NOTE(task 5): same `SessionMeta`/`session` removal as
@@ -805,6 +827,8 @@ pub async fn run(
             mtu: live_mtu.clone(),
             peer_mtu: peer_mtu.clone(),
             scheduler: scheduler.clone(),
+            fec_recovered_total: fec_recovered_total.clone(),
+            fec_unrecoverable_total: fec_unrecoverable_total.clone(),
         };
         handles.push(tokio::spawn(async move {
             control::diagnostics_watch_loop(watch, links, diag_ctx).await;
@@ -873,6 +897,13 @@ pub async fn run(
         let tun = tun.clone();
         handles.push(tokio::spawn(async move {
             reorder_flush(reorder, tun).await;
+        }));
+    }
+
+    {
+        let fec_recovery = fec_recovery.clone();
+        handles.push(tokio::spawn(async move {
+            fec_expiry_loop(fec_recovery).await;
         }));
     }
 
@@ -1330,6 +1361,9 @@ async fn link_receiver(
     scheduler: Arc<std::sync::Mutex<Scheduler>>,
     tun: Arc<AsyncDevice>,
     reorder: Arc<AsyncMutex<ReorderBuffer>>,
+    fec_recovery: Arc<AsyncMutex<fec::FecRecoveryBuffer>>,
+    fec_recovered_total: Arc<AtomicU64>,
+    fec_unrecoverable_total: Arc<AtomicU64>,
     cfg: SchedulerConfig,
     tracker: Arc<AsyncMutex<ProbeTracker>>,
     peer_stats: Arc<PeerStatsTable>,
@@ -1366,6 +1400,9 @@ async fn link_receiver(
                     &scheduler,
                     &tun,
                     &reorder,
+                    &fec_recovery,
+                    &fec_recovered_total,
+                    &fec_unrecoverable_total,
                     &cfg,
                     &tracker,
                     &peer_stats,
@@ -2397,6 +2434,9 @@ async fn handle_incoming(
     scheduler: &Arc<std::sync::Mutex<Scheduler>>,
     tun: &Arc<AsyncDevice>,
     reorder: &Arc<AsyncMutex<ReorderBuffer>>,
+    fec_recovery: &Arc<AsyncMutex<fec::FecRecoveryBuffer>>,
+    fec_recovered_total: &Arc<AtomicU64>,
+    fec_unrecoverable_total: &Arc<AtomicU64>,
     cfg: &SchedulerConfig,
     tracker: &Arc<AsyncMutex<ProbeTracker>>,
     peer_stats: &Arc<PeerStatsTable>,
@@ -2463,6 +2503,12 @@ async fn handle_incoming(
 
     match hdr.ptype {
         PacketType::Data => {
+            // Every real Data frame is a potential FEC group member --
+            // this has to run regardless of which delivery branch below
+            // handles the frame next, since `FecRecoveryBuffer` needs to
+            // see every arriving member to ever recover a *different*
+            // missing one later.
+            fec_recovery.lock().await.observe_data(hdr.seq, &plaintext);
             // Cheap, uncontended std::sync::Mutex lock (same pattern
             // established by this project's earlier select_fast and
             // reorder_tuning_loop fixes) -- read once per packet, not
@@ -2492,6 +2538,39 @@ async fn handle_incoming(
                 for pkt in ready {
                     let _ = tun.send(&pkt).await;
                 }
+            }
+        }
+        PacketType::FecParity => {
+            let Ok(parity) = crate::protocol::FecParityPayload::decode(&plaintext) else {
+                tracing::debug!("malformed FecParity payload, ignoring");
+                return;
+            };
+            let outcome = fec_recovery.lock().await.try_recover(&parity);
+            match outcome {
+                fec::RecoveryOutcome::Recovered { seq, plaintext } => {
+                    fec_recovered_total.fetch_add(1, Ordering::Relaxed);
+                    // Mirrors the Data arm's own settled-primary/buffered
+                    // delivery branch exactly -- a recovered frame is
+                    // delivered the same way a real Data frame with the
+                    // same `seq` would have been.
+                    if scheduler.lock().unwrap().primary().is_some() {
+                        reorder.lock().await.note_delivered(seq);
+                        let _ = tun.send(&plaintext).await;
+                    } else {
+                        let ready = {
+                            let mut ro = reorder.lock().await;
+                            ro.insert(seq, plaintext);
+                            ro.drain_ready()
+                        };
+                        for pkt in ready {
+                            let _ = tun.send(&pkt).await;
+                        }
+                    }
+                }
+                fec::RecoveryOutcome::Unrecoverable => {
+                    fec_unrecoverable_total.fetch_add(1, Ordering::Relaxed);
+                }
+                fec::RecoveryOutcome::AlreadyComplete => {}
             }
         }
         PacketType::Probe => {
@@ -2718,14 +2797,6 @@ async fn handle_incoming(
         }
         PacketType::HandshakeInit | PacketType::HandshakeResp => {
             unreachable!("filtered out above")
-        }
-        PacketType::FecParity => {
-            // Wire format only for now (single-erasure FEC plan, task 1
-            // of 7) -- receive-side reconstruction lands in a later task
-            // once `fec.rs` exists. Until then, an incoming FecParity
-            // frame is a no-op here, the same degrade-gracefully
-            // behavior a peer with `fec_enabled` talking to one without
-            // it would need anyway.
         }
     }
 }
@@ -3105,6 +3176,21 @@ async fn reorder_flush(reorder: Arc<AsyncMutex<ReorderBuffer>>, tun: Arc<AsyncDe
         for pkt in ready {
             let _ = tun.send(&pkt).await;
         }
+    }
+}
+
+/// Periodically ages out `FecRecoveryBuffer`'s observed-frame entries --
+/// mirrors `reorder_flush`'s own 10ms cadence/reasoning, just for a
+/// different buffer. `fec_recovery` is its own independent lock (never
+/// shared with `reorder`'s), so unlike `reorder_flush` there's no
+/// per-packet contention to dodge here -- a plain `.lock().await` is
+/// fine. No-op (near-zero cost) when FEC is disabled or the buffer is
+/// empty.
+async fn fec_expiry_loop(fec_recovery: Arc<AsyncMutex<fec::FecRecoveryBuffer>>) {
+    let mut tick = interval(Duration::from_millis(10));
+    loop {
+        tick.tick().await;
+        fec_recovery.lock().await.expire_stale(Instant::now());
     }
 }
 

@@ -79,6 +79,8 @@ pub(crate) async fn serve(
     mtu: LiveMtu,
     peer_mtu: PeerMtu,
     scheduler: Arc<std::sync::Mutex<Scheduler>>,
+    fec_recovered_total: Arc<AtomicU64>,
+    fec_unrecoverable_total: Arc<AtomicU64>,
 ) {
     if let Some(parent) = path.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
@@ -169,6 +171,8 @@ pub(crate) async fn serve(
         let mtu = mtu.clone();
         let peer_mtu = peer_mtu.clone();
         let scheduler = scheduler.clone();
+        let fec_recovered_total = fec_recovered_total.clone();
+        let fec_unrecoverable_total = fec_unrecoverable_total.clone();
         tokio::spawn(async move {
             serve_client(
                 stream,
@@ -183,6 +187,8 @@ pub(crate) async fn serve(
                 mtu,
                 peer_mtu,
                 scheduler,
+                fec_recovered_total,
+                fec_unrecoverable_total,
             )
             .await;
         });
@@ -203,6 +209,8 @@ async fn serve_client(
     mtu: LiveMtu,
     peer_mtu: PeerMtu,
     scheduler: Arc<std::sync::Mutex<Scheduler>>,
+    fec_recovered_total: Arc<AtomicU64>,
+    fec_unrecoverable_total: Arc<AtomicU64>,
 ) {
     let mut tick = interval(Duration::from_millis(SNAPSHOT_INTERVAL_MS));
     // Per-connection cursor into `log_ring` -- each connected client
@@ -226,6 +234,8 @@ async fn serve_client(
             &mtu,
             &peer_mtu,
             &scheduler,
+            &fec_recovered_total,
+            &fec_unrecoverable_total,
         )
         .await;
         last_log_seq = new_last_log_seq;
@@ -253,6 +263,8 @@ async fn build_snapshot(
     mtu: &LiveMtu,
     peer_mtu: &PeerMtu,
     scheduler: &Arc<std::sync::Mutex<Scheduler>>,
+    fec_recovered_total: &AtomicU64,
+    fec_unrecoverable_total: &AtomicU64,
 ) -> (Snapshot, u64) {
     let snap = link::snapshot_links(links).await;
     // `Scheduler::primary()` returns `None` under plain SWRR (no single
@@ -339,10 +351,8 @@ async fn build_snapshot(
             outbound_queue_dropped_total: outbound_dropped_total.load(Ordering::Relaxed),
             wg_rejected_total,
             wg_substituted_total,
-            // TODO(task 6): wired to the real Arc<AtomicU64> counters once
-            // the receive-side FEC integration exists.
-            fec_recovered_total: 0,
-            fec_unrecoverable_total: 0,
+            fec_recovered_total: fec_recovered_total.load(Ordering::Relaxed),
+            fec_unrecoverable_total: fec_unrecoverable_total.load(Ordering::Relaxed),
             tun: TunSnapshot {
                 iface: tunnel_name.to_string(),
                 rx_bytes: tun_stats.rx_bytes,
@@ -392,6 +402,8 @@ pub(crate) struct DiagContext {
     pub(crate) mtu: LiveMtu,
     pub(crate) peer_mtu: PeerMtu,
     pub(crate) scheduler: Arc<std::sync::Mutex<Scheduler>>,
+    pub(crate) fec_recovered_total: Arc<AtomicU64>,
+    pub(crate) fec_unrecoverable_total: Arc<AtomicU64>,
 }
 
 /// Bind the command socket and serve `ipc::Command` requests until the
@@ -724,6 +736,8 @@ async fn run_diag_dump_command(links: &Links, diag_ctx: &DiagContext) -> Command
         &diag_ctx.mtu,
         &diag_ctx.peer_mtu,
         &diag_ctx.scheduler,
+        &diag_ctx.fec_recovered_total,
+        &diag_ctx.fec_unrecoverable_total,
     )
     .await;
     let text = diag::format_dump(&snapshot, "manual (mlvpnd diag-dump)");
@@ -1003,6 +1017,8 @@ pub(crate) async fn diagnostics_watch_loop(
             &diag_ctx.mtu,
             &diag_ctx.peer_mtu,
             &diag_ctx.scheduler,
+            &diag_ctx.fec_recovered_total,
+            &diag_ctx.fec_unrecoverable_total,
         )
         .await;
 
