@@ -21,6 +21,21 @@
 //! these tests, not the client's -- see `handle_incoming`'s `FecParity`
 //! arm in `tunnel.rs`).
 //!
+//! **Timing model.** These tests are only meaningful if a whole group's
+//! worth of traffic, plus its parity frame, completes inside
+//! `fec::PAYLOAD_TTL` -- the window during which the receiver still
+//! holds each arrived member's plaintext and can therefore tell "this
+//! member is genuinely missing" from "this member arrived and its
+//! plaintext has since aged out." Past that window every member reads as
+//! already-handled and no group is recoverable (by design: guessing
+//! there would re-deliver an already-delivered packet). Every deliberate
+//! delay below is therefore kept well inside `GROUP_BUDGET`, and
+//! `group_budget_fits_the_recovery_window` asserts that relationship
+//! against the real constant rather than leaving it to a comment that
+//! can drift -- which is exactly how the first version of this file
+//! ended up with a 500ms mid-group sleep against a 50ms recovery window,
+//! unable to pass as written.
+//!
 //! See `tests/support/mod.rs`'s module doc comment for what this needs
 //! (root, `iproute2` incl. `tc`, the `mlvpn` system user). Run with:
 //!
@@ -44,6 +59,37 @@ use support::{
 };
 
 const FEC_GROUP_SIZE: u8 = 4;
+
+/// How long a test may take between a group's first member going out and
+/// its parity frame arriving. Comfortably inside `fec::PAYLOAD_TTL` (see
+/// the module doc comment); the assertion in
+/// `group_budget_fits_the_recovery_window` keeps it that way.
+const GROUP_BUDGET: Duration = Duration::from_millis(1200);
+
+/// How long netem stays installed while the frame(s) it is meant to eat
+/// go out. `ping` emits its single echo request essentially immediately
+/// on startup, so this is generous margin rather than a tight race --
+/// and it is the single largest component of `GROUP_BUDGET`, which is
+/// why it is a named constant rather than a literal at each call site.
+const LOSS_WINDOW: Duration = Duration::from_millis(300);
+
+/// Guards the module doc comment's own timing claim: the deliberate
+/// delays these tests introduce have to fit inside the receiver's real
+/// recovery window, or the single-loss test cannot pass and the two-loss
+/// test passes only vacuously ("everything aged out" rather than
+/// "exactly two members missing").
+#[test]
+fn group_budget_fits_the_recovery_window() {
+    assert!(
+        GROUP_BUDGET < mlvpn::fec::PAYLOAD_TTL,
+        "GROUP_BUDGET ({GROUP_BUDGET:?}) must stay inside fec::PAYLOAD_TTL ({:?})",
+        mlvpn::fec::PAYLOAD_TTL
+    );
+    assert!(
+        LOSS_WINDOW * 2 < GROUP_BUDGET,
+        "the loss windows alone must not consume the whole group budget"
+    );
+}
 
 /// Runs `ping -c 1 -W <wait_secs> <host>` inside network namespace `ns`,
 /// blocking until it exits. A plain wrapper around `Command` (rather than
@@ -204,9 +250,12 @@ async fn single_dropped_frame_in_group_is_recovered() {
     let baseline_recovered = baseline.daemon.fec_recovered_total;
     let baseline_unrecoverable = baseline.daemon.fec_unrecoverable_total;
 
-    // Member 1: sent and arrives normally, no loss yet.
+    // Member 1: sent and arrives normally, no loss yet. `-W 2` rather
+    // than a longer wait: a ping that somehow hangs here would eat the
+    // group's own recovery budget before members 3/4 ever go out.
+    let group_started = std::time::Instant::now();
     let status =
-        ping_once(&rig.ns_client_name, SERVER_TUNNEL_HOST, "5").expect("run ping for member 1");
+        ping_once(&rig.ns_client_name, SERVER_TUNNEL_HOST, "2").expect("run ping for member 1");
     assert!(status.success(), "member 1's ping should succeed cleanly");
 
     // Force exactly one frame's worth of loss on the client's own egress
@@ -243,10 +292,12 @@ async fn single_dropped_frame_in_group_is_recovered() {
 
     // Give member 2's echo request time to actually be read off the TUN
     // device and transmitted (and thus genuinely dropped by netem)
-    // before removing the qdisc -- `ping` sends its single request
-    // essentially immediately on startup, so this is generous margin,
-    // not a tight race.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // before removing the qdisc. Deliberately short: everything from
+    // member 1 to the parity frame has to land inside the receiver's
+    // `fec::PAYLOAD_TTL`, or member 1/3/4's plaintexts age out and the
+    // group becomes unrecoverable no matter how cleanly exactly one
+    // member was lost. See `GROUP_BUDGET`.
+    tokio::time::sleep(LOSS_WINDOW).await;
 
     Command::new("ip")
         .args([
@@ -267,11 +318,23 @@ async fn single_dropped_frame_in_group_is_recovered() {
     // transmission is what makes `FecSender::accumulate` complete the
     // group and emit the parity frame right behind it.
     let status =
-        ping_once(&rig.ns_client_name, SERVER_TUNNEL_HOST, "5").expect("run ping for member 3");
+        ping_once(&rig.ns_client_name, SERVER_TUNNEL_HOST, "2").expect("run ping for member 3");
     assert!(status.success(), "member 3's ping should succeed cleanly");
     let status =
-        ping_once(&rig.ns_client_name, SERVER_TUNNEL_HOST, "5").expect("run ping for member 4");
+        ping_once(&rig.ns_client_name, SERVER_TUNNEL_HOST, "2").expect("run ping for member 4");
     assert!(status.success(), "member 4's ping should succeed cleanly");
+
+    // The group (and therefore its parity frame) completed inside the
+    // receiver's own recovery window -- otherwise the assertions below
+    // would be testing the aged-out path, not the recovery path, and a
+    // failure would be a misleading "FEC is broken" rather than "this
+    // machine was too slow to drive the scenario."
+    let elapsed = group_started.elapsed();
+    assert!(
+        elapsed < GROUP_BUDGET,
+        "the whole group took {elapsed:?}, past this test's own {GROUP_BUDGET:?} budget -- \
+         the result below would not be meaningful"
+    );
 
     // Now member 2's echo-request should get reconstructed on the
     // server (once the parity frame arrives right after member 4) and
@@ -326,18 +389,25 @@ async fn two_dropped_frames_in_group_are_unrecoverable() {
     let baseline_unrecoverable = baseline.daemon.fec_unrecoverable_total;
 
     // Member 1: arrives normally.
+    let group_started = std::time::Instant::now();
     let status =
-        ping_once(&rig.ns_client_name, SERVER_TUNNEL_HOST, "5").expect("run ping for member 1");
+        ping_once(&rig.ns_client_name, SERVER_TUNNEL_HOST, "2").expect("run ping for member 1");
     assert!(status.success(), "member 1's ping should succeed cleanly");
 
     // Force loss spanning exactly members 2 AND 3 -- two missing members
     // in a group of 4 is beyond single-erasure parity's own disclosed
     // limit (see `fec.rs::RecoveryOutcome::Unrecoverable`), so neither
-    // should ever be recovered. Both pings are run blocking with a short
-    // wait: they're expected to genuinely fail (matches today's
-    // pre-FEC behavior for this case), so there's no delayed-recovery
-    // reply to wait around for the way the single-loss test's member 2
-    // needed a background thread for.
+    // should ever be recovered.
+    //
+    // Both are run on background threads rather than blocking in turn:
+    // each is expected to genuinely time out, and serializing two real
+    // ping timeouts here would push the parity frame past the receiver's
+    // `fec::PAYLOAD_TTL`, at which point member 1 and 4 would have aged
+    // out too and this test would pass for the wrong reason -- "the
+    // whole group is stale," not "exactly two members are missing."
+    // (Two concurrent pings from the same namespace are distinguishable
+    // to the kernel by their own ICMP ids, so they are still two
+    // separate, individually-lost Data frames.)
     Command::new("ip")
         .args([
             "netns",
@@ -356,18 +426,15 @@ async fn two_dropped_frames_in_group_are_unrecoverable() {
         .status()
         .expect("add netem loss to client's veth");
 
-    let member2_status =
-        ping_once(&rig.ns_client_name, SERVER_TUNNEL_HOST, "3").expect("run ping for member 2");
-    assert!(
-        !member2_status.success(),
-        "member 2 should be genuinely lost (2-loss groups are unrecoverable)"
-    );
-    let member3_status =
-        ping_once(&rig.ns_client_name, SERVER_TUNNEL_HOST, "3").expect("run ping for member 3");
-    assert!(
-        !member3_status.success(),
-        "member 3 should be genuinely lost (2-loss groups are unrecoverable)"
-    );
+    let ns_for_member2 = rig.ns_client_name.clone();
+    let member2 = std::thread::spawn(move || ping_once(&ns_for_member2, SERVER_TUNNEL_HOST, "2"));
+    let ns_for_member3 = rig.ns_client_name.clone();
+    let member3 = std::thread::spawn(move || ping_once(&ns_for_member3, SERVER_TUNNEL_HOST, "2"));
+
+    // Long enough for both echo requests to have gone out (and been
+    // eaten by netem), short enough to leave the group inside its
+    // budget.
+    tokio::time::sleep(LOSS_WINDOW).await;
 
     Command::new("ip")
         .args([
@@ -388,11 +455,38 @@ async fn two_dropped_frames_in_group_are_unrecoverable() {
     // the parity frame -- which the server should find unrecoverable
     // (2 of 4 members missing) rather than crash/hang/corrupt anything.
     let status =
-        ping_once(&rig.ns_client_name, SERVER_TUNNEL_HOST, "5").expect("run ping for member 4");
+        ping_once(&rig.ns_client_name, SERVER_TUNNEL_HOST, "2").expect("run ping for member 4");
     assert!(
         status.success(),
         "member 4's ping should still succeed normally -- a FEC failure for this group \
          must not block delivery of what did arrive"
+    );
+
+    let elapsed = group_started.elapsed();
+    assert!(
+        elapsed < GROUP_BUDGET,
+        "the whole group took {elapsed:?}, past this test's own {GROUP_BUDGET:?} budget -- \
+         the unrecoverable result below would be for the wrong reason (everything aged out)"
+    );
+
+    // Both lost members really did fail to get a reply -- collected only
+    // now, since neither was ever going to answer and blocking on them
+    // earlier is what would have blown the group budget.
+    assert!(
+        !member2
+            .join()
+            .expect("member 2's ping thread panicked")
+            .expect("run ping for member 2")
+            .success(),
+        "member 2 should be genuinely lost (2-loss groups are unrecoverable)"
+    );
+    assert!(
+        !member3
+            .join()
+            .expect("member 3's ping thread panicked")
+            .expect("run ping for member 3")
+            .success(),
+        "member 3 should be genuinely lost (2-loss groups are unrecoverable)"
     );
 
     let snapshot = poll_snapshot_until(&rig.server_ctl, Duration::from_secs(5), |s| {
