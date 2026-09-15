@@ -196,6 +196,24 @@ pub struct WgTunnel {
     /// (~15% retransmission under load) with every existing counter
     /// reading zero. See `decapsulate`'s own `TunnResult::Err` arm.
     rejected_total: AtomicU64,
+    /// Lifetime count of `encapsulate` calls that were handed real
+    /// mlvpn plaintext but, per `boringtun::noise::Tunn::encapsulate`'s
+    /// own source (confirmed by direct inspection, `src/noise/mod.rs`),
+    /// had no current valid session at that moment -- so the plaintext
+    /// was queued *internally* by boringtun and a handshake-initiation
+    /// datagram was written to the network *instead*. `encapsulate`'s
+    /// caller (`wg_send`) sees an ordinary `Ok(())` in this case,
+    /// identical to a real successful send: `TunnResult::WriteToNetwork`
+    /// covers both outcomes, and mlvpn's own `LinkStats::record_tx` still
+    /// increments as if the frame was actually transmitted. This counter
+    /// distinguishes the two by checking the outgoing datagram's own
+    /// WireGuard message-type field (a data packet is type 4; anything
+    /// else here means the real frame was substituted) -- added
+    /// 2026-09-15 after `wg_rejected_total` (the receive-side rejection
+    /// counter, added the same night) stayed at zero through two real
+    /// loss-reproducing load tests, ruling out receive-side rejection
+    /// and motivating a look at the send side instead.
+    substituted_total: AtomicU64,
 }
 
 impl WgTunnel {
@@ -232,6 +250,7 @@ impl WgTunnel {
         Ok(Self {
             inner: Mutex::new(tunn),
             rejected_total: AtomicU64::new(0),
+            substituted_total: AtomicU64::new(0),
         })
     }
 
@@ -239,6 +258,13 @@ impl WgTunnel {
     /// outright -- see `rejected_total`'s doc comment for why this exists.
     pub fn rejected_count(&self) -> u64 {
         self.rejected_total.load(Ordering::Relaxed)
+    }
+
+    /// Lifetime count of `encapsulate` calls whose real plaintext was
+    /// silently substituted with a handshake datagram -- see
+    /// `substituted_total`'s doc comment.
+    pub fn substituted_count(&self) -> u64 {
+        self.substituted_total.load(Ordering::Relaxed)
     }
 
     /// Wraps `plaintext` (mlvpn's own already-serialized frame) into a
@@ -267,7 +293,23 @@ impl WgTunnel {
         let mut buf = vec![0u8; buf_len];
         let mut tunn = self.inner.lock().unwrap();
         match tunn.encapsulate(&wrapped, &mut buf) {
-            TunnResult::WriteToNetwork(bytes) => Ok(bytes.to_vec()),
+            TunnResult::WriteToNetwork(bytes) => {
+                // Message type is a little-endian u32 at offset 0 of every
+                // WireGuard datagram (confirmed against boringtun-0.7.1's
+                // own wire-format constants: 1=handshake init, 2=handshake
+                // response, 3=cookie reply, 4=data). Anything but 4 here
+                // means boringtun had no current session and substituted
+                // a control datagram for our real plaintext -- see
+                // `substituted_total`'s doc comment.
+                const WG_MSG_TYPE_DATA: u32 = 4;
+                let is_data = bytes.len() >= 4
+                    && u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+                        == WG_MSG_TYPE_DATA;
+                if !is_data {
+                    self.substituted_total.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(bytes.to_vec())
+            }
             TunnResult::Err(e) => Err(MlvpnError::Protocol(format!("wg encapsulate: {e:?}"))),
             TunnResult::Done => Err(MlvpnError::Protocol(
                 "wg encapsulate: handshake not yet complete".into(),

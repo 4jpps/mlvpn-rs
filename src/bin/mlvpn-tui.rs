@@ -779,21 +779,25 @@ fn link_row(l: &LinkSnapshot, any_primary: bool) -> Row<'static> {
         fmt_bytes(l.tx_bytes),
         fmt_bytes(l.rx_bytes)
     ));
-    // `wg_rejected_total` -- see `LinkSnapshot::wg_rejected_total`'s doc
-    // comment -- is a diagnostic counter, not a normal operating metric,
-    // so it's only shown (muted) once it's actually nonzero, keeping a
-    // healthy link's cell exactly as it looked before this field existed.
-    let tx_rx_cell = if l.wg_rejected_total > 0 {
-        Cell::from(Text::from(vec![
-            tx_rx_line,
-            Line::from(Span::styled(
-                format!("wg rejected: {}", l.wg_rejected_total),
-                Style::default().fg(Color::Red),
-            )),
-        ]))
-    } else {
-        Cell::from(Text::from(tx_rx_line))
-    };
+    // `wg_rejected_total`/`wg_substituted_total` -- see their doc
+    // comments on `LinkSnapshot` -- are diagnostic counters, not normal
+    // operating metrics, so each is only shown (red) once it's actually
+    // nonzero, keeping a healthy link's cell exactly as it looked before
+    // these fields existed.
+    let mut tx_rx_lines = vec![tx_rx_line];
+    if l.wg_rejected_total > 0 {
+        tx_rx_lines.push(Line::from(Span::styled(
+            format!("wg rejected: {}", l.wg_rejected_total),
+            Style::default().fg(Color::Red),
+        )));
+    }
+    if l.wg_substituted_total > 0 {
+        tx_rx_lines.push(Line::from(Span::styled(
+            format!("wg substituted: {}", l.wg_substituted_total),
+            Style::default().fg(Color::Red),
+        )));
+    }
+    let tx_rx_cell = Cell::from(Text::from(tx_rx_lines));
 
     Row::new(vec![
         Cell::from(l.name.clone()),
@@ -1064,23 +1068,36 @@ fn draw_outbound_queue_panel(f: &mut Frame, area: Rect, daemon: &DaemonSnapshot)
     ]);
     f.render_widget(Paragraph::new(dropped_line), rows[1]);
 
-    // Sum of every link's own `wg_rejected_total` -- see
-    // `LinkSnapshot::wg_rejected_total`'s doc comment. Distinct from
-    // `outbound_queue_dropped_total` above: that counts frames this
-    // process never even got to encrypt/send (queue full); this counts
-    // datagrams the peer's decapsulate rejected on receive (bad MAC,
-    // replay-window miss, garbled data) -- a class of loss neither the
-    // outbound queue nor the TUN device's own counters can see.
-    let wg_rejected_style = if daemon.wg_rejected_total > 0 {
-        Style::default().fg(COLOR_BAD)
-    } else {
-        Style::default().fg(COLOR_MUTED)
+    // Sum of every link's own `wg_rejected_total`/`wg_substituted_total`
+    // -- see their doc comments on `LinkSnapshot`. Both distinct from
+    // `outbound_queue_dropped_total` above (that counts frames this
+    // process never even got to encrypt/send, queue full): rejected
+    // counts datagrams the peer's decapsulate rejected on receive (bad
+    // MAC, replay-window miss, garbled data); substituted counts
+    // encapsulate calls that silently swapped a real frame for a
+    // handshake datagram instead of sending it. Neither is visible to
+    // the outbound queue or TUN device's own counters. Combined onto one
+    // line since this panel's fixed height has no room for a fourth row.
+    let wg_style = |v: u64| {
+        if v > 0 {
+            Style::default().fg(COLOR_BAD)
+        } else {
+            Style::default().fg(COLOR_MUTED)
+        }
     };
-    let wg_rejected_line = Line::from(vec![
-        Span::raw("WG rejected (all links): "),
-        Span::styled(daemon.wg_rejected_total.to_string(), wg_rejected_style),
+    let wg_line = Line::from(vec![
+        Span::raw("WG rejected/substituted: "),
+        Span::styled(
+            daemon.wg_rejected_total.to_string(),
+            wg_style(daemon.wg_rejected_total),
+        ),
+        Span::raw(" / "),
+        Span::styled(
+            daemon.wg_substituted_total.to_string(),
+            wg_style(daemon.wg_substituted_total),
+        ),
     ]);
-    f.render_widget(Paragraph::new(wg_rejected_line), rows[2]);
+    f.render_widget(Paragraph::new(wg_line), rows[2]);
 }
 
 fn draw_tun_panel(f: &mut Frame, area: Rect, tun: &TunSnapshot) {

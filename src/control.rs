@@ -288,6 +288,7 @@ async fn build_snapshot(
                 local_consecutive_hits: link.stats.consecutive_hits,
                 local_consecutive_misses: link.stats.consecutive_misses,
                 wg_rejected_total: link.wg_rejected_count(),
+                wg_substituted_total: link.wg_substituted_count(),
                 peer_name: peer.as_ref().map(|p| p.name.clone()),
                 peer_state: peer
                     .as_ref()
@@ -304,6 +305,7 @@ async fn build_snapshot(
         .collect::<Vec<LinkSnapshot>>();
 
     let wg_rejected_total: u64 = link_snapshots.iter().map(|l| l.wg_rejected_total).sum();
+    let wg_substituted_total: u64 = link_snapshots.iter().map(|l| l.wg_substituted_total).sum();
 
     // `max_capacity` is fixed (OUTBOUND_QUEUE_CAPACITY) for the channel's
     // whole lifetime; `capacity` is the number of currently-free slots,
@@ -336,6 +338,7 @@ async fn build_snapshot(
             outbound_queue_capacity: outbound_queue_capacity as u64,
             outbound_queue_dropped_total: outbound_dropped_total.load(Ordering::Relaxed),
             wg_rejected_total,
+            wg_substituted_total,
             tun: TunSnapshot {
                 iface: tunnel_name.to_string(),
                 rx_bytes: tun_stats.rx_bytes,

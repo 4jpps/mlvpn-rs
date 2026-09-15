@@ -769,6 +769,13 @@ impl Link {
         self.wg.rejected_count()
     }
 
+    /// This link's own lifetime count of `encapsulate` calls whose real
+    /// plaintext was silently substituted with a handshake datagram --
+    /// see `WgTunnel::substituted_count`'s doc comment.
+    pub fn wg_substituted_count(&self) -> u64 {
+        self.wg.substituted_count()
+    }
+
     /// Bundle this link's shareable state for its per-link tasks
     /// (`link_receiver`, `link_prober` in `tunnel.rs`). See
     /// `LinkHandle`'s doc comment for why tasks capture this once

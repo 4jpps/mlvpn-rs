@@ -123,6 +123,13 @@ pub struct DaemonSnapshot {
     /// failed to explain.
     #[serde(default)]
     pub wg_rejected_total: u64,
+    /// Sum of every link's `LinkSnapshot::wg_substituted_total` -- see
+    /// that field's doc comment. Added the same night as
+    /// `wg_rejected_total` after that counter stayed at zero through two
+    /// real loss-reproducing load tests, ruling out receive-side
+    /// rejection and motivating a look at the send side instead.
+    #[serde(default)]
+    pub wg_substituted_total: u64,
 }
 
 /// Host-wide load/memory/uptime, independent of anything tunnel- or
@@ -239,6 +246,16 @@ pub struct LinkSnapshot {
     /// 2026-09-14 -- see `WgTunnel::rejected_total`'s doc comment.
     #[serde(default)]
     pub wg_rejected_total: u64,
+    /// This link's own lifetime count of `WgTunnel::encapsulate` calls
+    /// whose real plaintext was silently substituted with a handshake
+    /// datagram instead of actually being sent -- boringtun's own
+    /// `TunnResult::WriteToNetwork` covers both a genuine data send and
+    /// this substitution identically, so `wg_send`'s caller (including
+    /// `LinkStats::record_tx`) sees a completely normal successful send
+    /// either way. See `WgTunnel::substituted_total`'s doc comment for
+    /// the full boringtun-source-level explanation. Added 2026-09-15.
+    #[serde(default)]
+    pub wg_substituted_total: u64,
 
     // Peer-reported -- their view of the same physical link, received
     // over the wire via a `StatsShare` frame (see `protocol.rs`). `None`
@@ -426,6 +443,7 @@ mod tests {
             local_consecutive_hits: 12,
             local_consecutive_misses: 0,
             wg_rejected_total: 3,
+            wg_substituted_total: 2,
             peer_name: None,
             peer_state: None,
             peer_rtt_ms: None,
@@ -448,6 +466,7 @@ mod tests {
         assert_eq!(back.tx_packets, 700);
         assert_eq!(back.rx_packets, 1400);
         assert_eq!(back.wg_rejected_total, 3);
+        assert_eq!(back.wg_substituted_total, 2);
     }
 
     /// `DaemonSnapshot` picks up new fields far less often than
@@ -461,6 +480,7 @@ mod tests {
             outbound_queue_capacity: 256,
             outbound_queue_dropped_total: 7,
             wg_rejected_total: 4,
+            wg_substituted_total: 5,
             tun: TunSnapshot {
                 iface: "mlvpn0".to_string(),
                 rx_bytes: Some(1_000),
@@ -489,6 +509,7 @@ mod tests {
         assert_eq!(back.outbound_queue_capacity, 256);
         assert_eq!(back.outbound_queue_dropped_total, 7);
         assert_eq!(back.wg_rejected_total, 4);
+        assert_eq!(back.wg_substituted_total, 5);
         assert_eq!(back.tun.iface, "mlvpn0");
         assert_eq!(back.tun.rx_bytes, Some(1_000));
         assert_eq!(back.tun.tx_errors, None);

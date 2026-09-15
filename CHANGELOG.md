@@ -10,6 +10,12 @@ For implementation detail beyond what's here, read the code -- most
 modules and non-trivial functions have doc comments explaining the
 design, and `ARCHITECTURE.md` covers the system as a whole.
 
+## [0.7.3] - 2026-09-15
+
+### Added
+
+- **New diagnostic counter: `wg_substituted_total`, per link and daemon-wide.** Direct inspection of `boringtun-0.7.1`'s own source (`Tunn::encapsulate`, `src/noise/mod.rs`) found a real, previously invisible loss path: when a link has no current valid WireGuard session at the moment `encapsulate` is called, boringtun queues the real plaintext *internally* and writes a handshake-initiation datagram to the network *instead* -- but both outcomes return the identical `TunnResult::WriteToNetwork`, so `wg_send`'s caller sees an ordinary successful send either way, and `LinkStats::record_tx` increments as if the frame was actually delivered even when it wasn't. `WgTunnel::encapsulate` (`src/wireguard.rs`) now checks the outgoing datagram's own WireGuard message-type field (a little-endian u32 at offset 0; 4 = data, anything else = a substituted control packet) and counts every substitution. Surfaced per link via `LinkSnapshot::wg_substituted_total` and daemon-wide via `DaemonSnapshot::wg_substituted_total`, shown in `mlvpn-tui` (a red "wg substituted: N" line in the Links tab, and folded into the Outbound Queue panel's "WG rejected/substituted: R / S" line) and in `mlvpnd diag-dump`'s text output. Added directly after `wg_rejected_total` (0.7.2) stayed at zero through two real loss-reproducing load tests on live production hardware, ruling out receive-side rejection and motivating a look at the send side instead.
+
 ## [0.7.2] - 2026-09-14
 
 ### Added
