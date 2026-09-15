@@ -413,6 +413,12 @@ pub struct SchedulerOverrides {
     /// `None` omits the field, leaving the config default in place.
     /// `Config::validate` enforces a 30s floor regardless.
     pub active_bandwidth_probe_interval_secs: Option<u64>,
+    /// Used by `veth_fec.rs` to exercise `scheduler.fec_enabled`.
+    pub fec_enabled: bool,
+    /// Overrides `scheduler.fec_group_size` (config.rs's own default is
+    /// 8) -- `None` omits the field, leaving the config default in
+    /// place. Only meaningful alongside `fec_enabled: true`.
+    pub fec_group_size: Option<u8>,
 }
 
 /// Writes a minimal-but-complete `mlvpnd` TOML config to `dir`. The
@@ -479,6 +485,8 @@ pub fn write_config(
         || scheduler.auto_tune_ewma_alpha
         || scheduler.active_bandwidth_probing
         || scheduler.active_bandwidth_probe_interval_secs.is_some()
+        || scheduler.fec_enabled
+        || scheduler.fec_group_size.is_some()
     {
         toml.push_str("[scheduler]\n");
         if scheduler.redundant_mode {
@@ -504,6 +512,12 @@ pub fn write_config(
         }
         if let Some(secs) = scheduler.active_bandwidth_probe_interval_secs {
             toml.push_str(&format!("active_bandwidth_probe_interval_secs = {secs}\n"));
+        }
+        if scheduler.fec_enabled {
+            toml.push_str("fec_enabled = true\n");
+        }
+        if let Some(size) = scheduler.fec_group_size {
+            toml.push_str(&format!("fec_group_size = {size}\n"));
         }
         toml.push('\n');
     }
