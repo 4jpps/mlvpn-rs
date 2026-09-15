@@ -2689,6 +2689,14 @@ async fn handle_incoming(
         PacketType::HandshakeInit | PacketType::HandshakeResp => {
             unreachable!("filtered out above")
         }
+        PacketType::FecParity => {
+            // Wire format only for now (single-erasure FEC plan, task 1
+            // of 7) -- receive-side reconstruction lands in a later task
+            // once `fec.rs` exists. Until then, an incoming FecParity
+            // frame is a no-op here, the same degrade-gracefully
+            // behavior a peer with `fec_enabled` talking to one without
+            // it would need anyway.
+        }
     }
 }
 

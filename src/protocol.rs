@@ -118,6 +118,14 @@ pub enum PacketType {
     /// precisely when it's the thing failing to arrive at all. See
     /// `VersionInfoPayload`.
     VersionInfo = 14,
+    /// One XOR parity frame covering a group of `fec_group_size`
+    /// sequential real Data frames -- see `fec.rs`. Payload is a
+    /// `FecParityPayload`. Only ever sent when `scheduler.fec_enabled`
+    /// is true; an older peer that doesn't recognize this variant hits
+    /// the existing unrecognized-`ptype` path (silently dropped), the
+    /// same degrade-gracefully behavior every other unrecognized frame
+    /// type already gets.
+    FecParity = 15,
 }
 
 impl PacketType {
@@ -139,6 +147,7 @@ impl PacketType {
             12 => Self::ThroughputTestResult,
             13 => Self::ThroughputTestReverseRequest,
             14 => Self::VersionInfo,
+            15 => Self::FecParity,
             other => {
                 return Err(MlvpnError::Protocol(format!(
                     "unknown packet type byte {other}"
@@ -455,6 +464,84 @@ impl VersionInfoPayload {
             version,
             tunnel_mtu,
             primary_link_name,
+        })
+    }
+}
+
+/// Payload of a `FecParity` frame -- one XOR parity share covering
+/// `member_seqs.len()` sequential real Data frames. See `fec.rs` for
+/// how this is produced (sender) and consumed (receiver).
+///
+/// Variable-length (unlike every other payload in this file): the
+/// number of members is `scheduler.fec_group_size`, itself configurable
+/// (2..=255), and `parity`'s length is the longest member frame's own
+/// length, which varies with real traffic (a TCP ACK-only packet vs. a
+/// full-MTU segment). Self-describing on the wire (its own encoded
+/// `member_seqs.len()`, not a value from local config) so a receiver
+/// parses correctly even if its own `fec_group_size` differs from the
+/// sender's, or if `fec_enabled` is only turned on on one side during a
+/// rolling upgrade.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FecParityPayload {
+    pub member_seqs: Vec<u64>,
+    pub member_lens: Vec<u16>,
+    pub parity: Vec<u8>,
+}
+
+impl FecParityPayload {
+    pub fn encode(&self) -> Vec<u8> {
+        let group_size = self.member_seqs.len() as u8;
+        let mut out = Vec::with_capacity(1 + self.member_seqs.len() * 10 + 2 + self.parity.len());
+        out.push(group_size);
+        for &seq in &self.member_seqs {
+            out.extend_from_slice(&seq.to_be_bytes());
+        }
+        for &len in &self.member_lens {
+            out.extend_from_slice(&len.to_be_bytes());
+        }
+        out.extend_from_slice(&(self.parity.len() as u16).to_be_bytes());
+        out.extend_from_slice(&self.parity);
+        out
+    }
+
+    pub fn decode(buf: &[u8]) -> Result<Self> {
+        if buf.is_empty() {
+            return Err(MlvpnError::Protocol("fec parity payload empty".into()));
+        }
+        let group_size = buf[0] as usize;
+        let seqs_end = 1 + group_size * 8;
+        let lens_end = seqs_end + group_size * 2;
+        if buf.len() < lens_end + 2 {
+            return Err(MlvpnError::Protocol(
+                "fec parity payload too short for its own declared group_size".into(),
+            ));
+        }
+        let mut member_seqs = Vec::with_capacity(group_size);
+        for i in 0..group_size {
+            let start = 1 + i * 8;
+            member_seqs.push(u64::from_be_bytes(
+                buf[start..start + 8].try_into().unwrap(),
+            ));
+        }
+        let mut member_lens = Vec::with_capacity(group_size);
+        for i in 0..group_size {
+            let start = seqs_end + i * 2;
+            member_lens.push(u16::from_be_bytes(
+                buf[start..start + 2].try_into().unwrap(),
+            ));
+        }
+        let parity_len =
+            u16::from_be_bytes(buf[lens_end..lens_end + 2].try_into().unwrap()) as usize;
+        if buf.len() < lens_end + 2 + parity_len {
+            return Err(MlvpnError::Protocol(
+                "fec parity payload shorter than its own declared parity_len".into(),
+            ));
+        }
+        let parity = buf[lens_end + 2..lens_end + 2 + parity_len].to_vec();
+        Ok(Self {
+            member_seqs,
+            member_lens,
+            parity,
         })
     }
 }
@@ -836,5 +923,49 @@ mod version_info_payload_tests {
             payload.primary_link_name_str().unwrap().len(),
             VersionInfoPayload::LINK_NAME_LEN
         );
+    }
+}
+
+#[cfg(test)]
+mod fec_parity_payload_tests {
+    use super::*;
+
+    #[test]
+    fn fec_parity_payload_round_trips() {
+        let payload = FecParityPayload {
+            member_seqs: vec![100, 101, 102, 103, 104, 105, 106, 107],
+            member_lens: vec![64, 128, 64, 1400, 64, 64, 64, 512],
+            parity: vec![0xAB; 1400],
+        };
+        let encoded = payload.encode();
+        let decoded = FecParityPayload::decode(&encoded).expect("decode");
+        assert_eq!(decoded.member_seqs, payload.member_seqs);
+        assert_eq!(decoded.member_lens, payload.member_lens);
+        assert_eq!(decoded.parity, payload.parity);
+    }
+
+    #[test]
+    fn fec_parity_payload_decode_rejects_truncated_buffer() {
+        let payload = FecParityPayload {
+            member_seqs: vec![1, 2],
+            member_lens: vec![10, 20],
+            parity: vec![0u8; 20],
+        };
+        let mut encoded = payload.encode();
+        encoded.truncate(encoded.len() - 5);
+        assert!(FecParityPayload::decode(&encoded).is_err());
+    }
+
+    #[test]
+    fn packet_type_fec_parity_round_trips_through_header() {
+        let mut buf = Vec::new();
+        Header {
+            ptype: PacketType::FecParity,
+            link_id: 0,
+            seq: 42,
+        }
+        .encode(&mut buf);
+        let (hdr, _) = Header::decode(&buf).expect("decode");
+        assert_eq!(hdr.ptype, PacketType::FecParity);
     }
 }
