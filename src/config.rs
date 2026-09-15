@@ -157,6 +157,30 @@ pub struct SchedulerConfig {
     /// genuine replay attack.
     #[serde(default)]
     pub redundant_mode: bool,
+    /// Opt-in: XOR single-erasure forward error correction for real Data
+    /// traffic. Groups of `fec_group_size` sequential outgoing Data
+    /// frames get one extra parity frame; a group missing exactly one
+    /// member gets reconstructed on receive without waiting for TCP's
+    /// own retransmission. Off by default -- this is a real, new
+    /// bandwidth cost (1/fec_group_size extra traffic) that shouldn't
+    /// appear on an existing deployment without an explicit choice.
+    /// Mutually exclusive with `redundant_mode` (checked in
+    /// `Config::validate`) -- both are strategies for the same problem,
+    /// and combining them spends bandwidth on FEC parity that
+    /// `redundant_mode`'s full duplication already makes redundant. See
+    /// `docs/superpowers/specs/2026-09-15-single-erasure-fec-design.md`.
+    #[serde(default)]
+    pub fec_enabled: bool,
+    /// How many sequential Data frames share one FEC parity frame.
+    /// Must be 2..=255 (validated in `Config::validate`) -- the wire
+    /// format's own `group_size` field is a `u8` (`protocol::
+    /// FecParityPayload`). Lower values recover more of the isolated
+    /// single-packet losses that occur alongside real network bursts,
+    /// at higher bandwidth cost (`1/fec_group_size` extra traffic);
+    /// higher values cost less but recover less. Only meaningful when
+    /// `fec_enabled` is true.
+    #[serde(default = "default_fec_group_size")]
+    pub fec_group_size: u8,
     /// Opt-in: instead of splitting traffic across every currently-Up
     /// link via SWRR proportional to monitor::score(), send everything
     /// over whichever single link currently looks fastest, failing
@@ -344,6 +368,9 @@ fn default_reorder_ms() -> u64 {
 fn default_ewma_alpha() -> f64 {
     0.2
 }
+fn default_fec_group_size() -> u8 {
+    8
+}
 fn default_reorder_window_min_ms() -> u64 {
     10
 }
@@ -377,6 +404,8 @@ impl Default for SchedulerConfig {
             reorder_window_ms: default_reorder_ms(),
             ewma_alpha: default_ewma_alpha(),
             redundant_mode: false,
+            fec_enabled: false,
+            fec_group_size: default_fec_group_size(),
             primary_link_mode: false,
             follow_peer_primary: false,
             auto_tune_reorder_window: false,
@@ -736,6 +765,22 @@ impl Config {
             ));
         }
 
+        if self.scheduler.fec_enabled && self.scheduler.redundant_mode {
+            return Err(MlvpnError::Config(
+                "scheduler.fec_enabled and scheduler.redundant_mode cannot both be true -- both \
+                 are strategies for recovering lost frames, and combining them spends bandwidth \
+                 on FEC parity that redundant_mode's full duplication already makes redundant"
+                    .into(),
+            ));
+        }
+
+        if self.scheduler.fec_enabled && !(2..=255).contains(&self.scheduler.fec_group_size) {
+            return Err(MlvpnError::Config(format!(
+                "scheduler.fec_group_size ({}) must be between 2 and 255",
+                self.scheduler.fec_group_size
+            )));
+        }
+
         if self.scheduler.reorder_window_min_ms > self.scheduler.reorder_window_max_ms {
             return Err(MlvpnError::Config(format!(
                 "scheduler.reorder_window_min_ms ({}) must be <= reorder_window_max_ms ({})",
@@ -975,6 +1020,49 @@ mod tests {
     fn redundant_mode_alone_is_still_accepted() {
         let mut cfg = minimal_valid_config();
         cfg.scheduler.redundant_mode = true;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn fec_enabled_defaults_to_false_and_group_size_to_eight() {
+        let toml_str = r#"
+        mode = "client"
+        [tunnel]
+        name = "mlvpn0"
+        address = "10.200.0.1/30"
+        [[links]]
+        name = "a"
+        bind_interface = "eth0"
+        local_port = 6900
+        private_key_file = "/tmp/a.key"
+        peer_public_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+    "#;
+        let cfg: Config = toml::from_str(toml_str).expect("parse");
+        assert!(!cfg.scheduler.fec_enabled);
+        assert_eq!(cfg.scheduler.fec_group_size, 8);
+    }
+
+    #[test]
+    fn fec_enabled_and_redundant_mode_together_is_rejected() {
+        let mut cfg = minimal_valid_config();
+        cfg.scheduler.fec_enabled = true;
+        cfg.scheduler.redundant_mode = true;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn fec_group_size_below_two_is_rejected() {
+        let mut cfg = minimal_valid_config();
+        cfg.scheduler.fec_enabled = true;
+        cfg.scheduler.fec_group_size = 1;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn fec_group_size_within_range_is_accepted() {
+        let mut cfg = minimal_valid_config();
+        cfg.scheduler.fec_enabled = true;
+        cfg.scheduler.fec_group_size = 16;
         assert!(cfg.validate().is_ok());
     }
 
