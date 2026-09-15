@@ -621,7 +621,7 @@ fn draw_overview_tab(f: &mut Frame, area: Rect, state: &SharedState) {
 
     let daemon_rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(5), Constraint::Length(5)])
+        .constraints([Constraint::Length(6), Constraint::Length(5)])
         .split(rows[1]);
     let top_cols = Layout::default()
         .direction(Direction::Horizontal)
@@ -938,7 +938,7 @@ fn draw_daemon_tab(f: &mut Frame, area: Rect, state: &SharedState) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(4),
-            Constraint::Length(4),
+            Constraint::Length(6),
             Constraint::Length(5),
             Constraint::Length(5),
             Constraint::Min(0),
@@ -1030,6 +1030,7 @@ fn draw_outbound_queue_panel(f: &mut Frame, area: Rect, daemon: &DaemonSnapshot)
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(1),
+            Constraint::Length(1),
         ])
         .split(inner);
 
@@ -1098,6 +1099,26 @@ fn draw_outbound_queue_panel(f: &mut Frame, area: Rect, daemon: &DaemonSnapshot)
         ),
     ]);
     f.render_widget(Paragraph::new(wg_line), rows[2]);
+
+    // Lifetime single-erasure FEC counters (`fec.rs`) -- only ever
+    // nonzero when `scheduler.fec_enabled` is true. Unlike every other
+    // counter in this panel, a nonzero `fec_recovered_total` is a GOOD
+    // sign (FEC is doing its job), so it's always styled `COLOR_GOOD`
+    // rather than the red/muted `wg_style` used for `fec_unrecoverable_total`
+    // (real loss reaching TCP despite FEC).
+    let fec_line = Line::from(vec![
+        Span::raw("FEC recovered/unrecoverable: "),
+        Span::styled(
+            daemon.fec_recovered_total.to_string(),
+            Style::default().fg(COLOR_GOOD),
+        ),
+        Span::raw(" / "),
+        Span::styled(
+            daemon.fec_unrecoverable_total.to_string(),
+            wg_style(daemon.fec_unrecoverable_total),
+        ),
+    ]);
+    f.render_widget(Paragraph::new(fec_line), rows[3]);
 }
 
 fn draw_tun_panel(f: &mut Frame, area: Rect, tun: &TunSnapshot) {

@@ -130,6 +130,20 @@ pub struct DaemonSnapshot {
     /// rejection and motivating a look at the send side instead.
     #[serde(default)]
     pub wg_substituted_total: u64,
+    /// Lifetime count of Data frames successfully reconstructed by
+    /// single-erasure FEC (`fec.rs`) -- only ever nonzero when
+    /// `scheduler.fec_enabled` is true. See
+    /// `docs/superpowers/specs/2026-09-15-single-erasure-fec-design.md`.
+    #[serde(default)]
+    pub fec_recovered_total: u64,
+    /// Lifetime count of FEC groups that could NOT be recovered (2+
+    /// members missing, or the parity frame itself never arrived and
+    /// the group expired) -- the disclosed limit of single-erasure
+    /// parity, see the design doc's own "Known, accepted limitation"
+    /// section. Real loss reaching TCP corresponds to this counter, not
+    /// `fec_recovered_total`.
+    #[serde(default)]
+    pub fec_unrecoverable_total: u64,
 }
 
 /// Host-wide load/memory/uptime, independent of anything tunnel- or
@@ -481,6 +495,8 @@ mod tests {
             outbound_queue_dropped_total: 7,
             wg_rejected_total: 4,
             wg_substituted_total: 5,
+            fec_recovered_total: 9,
+            fec_unrecoverable_total: 2,
             tun: TunSnapshot {
                 iface: "mlvpn0".to_string(),
                 rx_bytes: Some(1_000),
@@ -510,6 +526,8 @@ mod tests {
         assert_eq!(back.outbound_queue_dropped_total, 7);
         assert_eq!(back.wg_rejected_total, 4);
         assert_eq!(back.wg_substituted_total, 5);
+        assert_eq!(back.fec_recovered_total, 9);
+        assert_eq!(back.fec_unrecoverable_total, 2);
         assert_eq!(back.tun.iface, "mlvpn0");
         assert_eq!(back.tun.rx_bytes, Some(1_000));
         assert_eq!(back.tun.tx_errors, None);

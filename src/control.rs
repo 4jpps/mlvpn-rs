@@ -339,6 +339,10 @@ async fn build_snapshot(
             outbound_queue_dropped_total: outbound_dropped_total.load(Ordering::Relaxed),
             wg_rejected_total,
             wg_substituted_total,
+            // TODO(task 6): wired to the real Arc<AtomicU64> counters once
+            // the receive-side FEC integration exists.
+            fec_recovered_total: 0,
+            fec_unrecoverable_total: 0,
             tun: TunSnapshot {
                 iface: tunnel_name.to_string(),
                 rx_bytes: tun_stats.rx_bytes,

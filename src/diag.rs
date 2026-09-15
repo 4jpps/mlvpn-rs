@@ -101,6 +101,11 @@ pub fn format_dump(snapshot: &Snapshot, trigger: &str) -> String {
         "wg_substituted_total (all links): {}\n",
         d.wg_substituted_total
     ));
+    out.push_str(&format!("fec_recovered_total: {}\n", d.fec_recovered_total));
+    out.push_str(&format!(
+        "fec_unrecoverable_total: {}\n",
+        d.fec_unrecoverable_total
+    ));
     out.push_str(&format!(
         "tun({}): rx_bytes={} tx_bytes={} rx_errors={} tx_errors={} rx_dropped={} \
          tx_dropped={}\n",
@@ -232,6 +237,8 @@ mod tests {
                 outbound_queue_dropped_total: 0,
                 wg_rejected_total: 0,
                 wg_substituted_total: 0,
+                fec_recovered_total: 0,
+                fec_unrecoverable_total: 0,
                 tun: TunSnapshot {
                     iface: "mlvpn0".to_string(),
                     rx_bytes: Some(1_000_000),
