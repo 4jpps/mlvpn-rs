@@ -833,8 +833,18 @@ pub async fn run(
         let links = links.clone();
         let scheduler = scheduler.clone();
         let redundant_mode = params.scheduler_cfg.redundant_mode;
+        let fec_enabled = params.scheduler_cfg.fec_enabled;
+        let fec_group_size = params.scheduler_cfg.fec_group_size;
         handles.push(tokio::spawn(async move {
-            outbound_sender(outbound_rx, links, scheduler, redundant_mode).await;
+            outbound_sender(
+                outbound_rx,
+                links,
+                scheduler,
+                redundant_mode,
+                fec_enabled,
+                fec_group_size,
+            )
+            .await;
         }));
     }
 
@@ -1062,12 +1072,30 @@ async fn outbound_sender(
     links: Links,
     scheduler: Arc<std::sync::Mutex<Scheduler>>,
     redundant_mode: bool,
+    fec_enabled: bool,
+    fec_group_size: u8,
 ) {
+    let mut fec_sender = fec_enabled.then(|| crate::fec::FecSender::new(fec_group_size));
     while let Some(frame) = rx.recv().await {
         if redundant_mode {
             send_redundant(&links, &frame.plaintext).await;
-        } else {
-            send_scheduled(&links, &scheduler, &frame.plaintext).await;
+            continue;
+        }
+        let seq = next_send_seq();
+        send_scheduled(&links, &scheduler, PacketType::Data, seq, &frame.plaintext).await;
+        if let Some(sender) = fec_sender.as_mut() {
+            if let Some(parity) = sender.accumulate(seq, &frame.plaintext) {
+                let parity_bytes = parity.encode();
+                let parity_seq = next_send_seq();
+                send_scheduled(
+                    &links,
+                    &scheduler,
+                    PacketType::FecParity,
+                    parity_seq,
+                    &parity_bytes,
+                )
+                .await;
+            }
         }
     }
 }
@@ -1116,6 +1144,8 @@ async fn outbound_queue_drop_reporter(dropped_total: Arc<AtomicU64>) {
 async fn send_scheduled(
     links: &Links,
     scheduler: &Arc<std::sync::Mutex<Scheduler>>,
+    ptype: PacketType,
+    seq: u64,
     plaintext: &[u8],
 ) {
     // Not the real on-wire size (WireGuard adds its own AEAD overhead on
@@ -1176,9 +1206,9 @@ async fn send_scheduled(
 
     let mut frame = Vec::with_capacity(frame_len);
     Header {
-        ptype: PacketType::Data,
+        ptype,
         link_id,
-        seq: next_send_seq(),
+        seq,
     }
     .encode(&mut frame);
     frame.extend_from_slice(plaintext);
