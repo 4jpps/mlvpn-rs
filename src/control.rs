@@ -845,6 +845,17 @@ pub fn effective_tunnel_mtu(
     cfg: &crate::config::TunnelConfig,
     detected_mtus: &[Option<u32>],
     fec_reservation: u16,
+    // `Some(idx)`: this tunnel is in `scheduler.primary_link_mode`/
+    // `follow_peer_primary` and `Scheduler::primary()` currently
+    // returns `Some(idx)` -- use only that one link's detected physical
+    // MTU, since it is the only link actually carrying traffic right
+    // now. `None`: plain bonded/SWRR mode, or no primary has been
+    // chosen yet (including the one-shot startup call in main.rs,
+    // before any `Scheduler` exists) -- unchanged, min-across-every-
+    // configured-link behavior. See
+    // docs/superpowers/specs/2026-09-16-primary-aware-peer-mtu-design.md
+    // §1.
+    primary_idx: Option<usize>,
 ) -> u16 {
     let floor = if cfg.address6.is_some() {
         MTU_FLOOR_DUAL_STACK
@@ -859,7 +870,11 @@ pub fn effective_tunnel_mtu(
 
     // The tunnel MTU before FEC's own reservation is taken out of it.
     let pre_fec = {
-        let Some(detected_min) = detected_mtus.iter().filter_map(|m| *m).min() else {
+        let detected_value: Option<u32> = match primary_idx {
+            Some(idx) => detected_mtus.get(idx).copied().flatten(),
+            None => detected_mtus.iter().filter_map(|m| *m).min(),
+        };
+        let Some(detected_min) = detected_value else {
             return cfg
                 .mtu
                 .unwrap_or(FALLBACK_MTU_WHEN_NOTHING_DETECTED)
@@ -1014,7 +1029,7 @@ pub(crate) async fn mtu_monitor_loop(
             .iter()
             .map(|ifname| crate::link::query_interface_mtu(ifname))
             .collect();
-        let recomputed = effective_tunnel_mtu(&tunnel_cfg, &detected, fec_reservation);
+        let recomputed = effective_tunnel_mtu(&tunnel_cfg, &detected, fec_reservation, None);
         let current = live_mtu.load(std::sync::atomic::Ordering::Relaxed);
 
         if !mtu_resize_needed(current, recomputed) {
@@ -1394,7 +1409,7 @@ mod tests {
         cfg.address6 = Some("fd00:200::1/64".to_string());
         let detected = [Some(1480u32)]; // matches home-bgp's real tmobile physical MTU
         let fec_reservation = crate::fec::parity_frame_overhead_bytes(16); // = 163
-        let result = effective_tunnel_mtu(&cfg, &detected, fec_reservation);
+        let result = effective_tunnel_mtu(&cfg, &detected, fec_reservation, None);
         assert!(
             result >= MTU_FLOOR_DUAL_STACK,
             "dual-stack tunnel MTU {result} must never drop below the real IPv6 minimum \
@@ -1412,7 +1427,7 @@ mod tests {
         let cfg = test_tunnel_config(Some(600));
         let detected = [Some(700u32)];
         let large_fec_reservation = 200u16;
-        let result = effective_tunnel_mtu(&cfg, &detected, large_fec_reservation);
+        let result = effective_tunnel_mtu(&cfg, &detected, large_fec_reservation, None);
         assert_eq!(
             result, MTU_FLOOR_IPV4_ONLY,
             "an IPv4-only tunnel should still floor at 576, not be forced up to 1280"
@@ -1428,7 +1443,7 @@ mod tests {
             + crate::wireguard::FAKE_IPV4_HEADER_LEN as u32
             + 48;
         assert_eq!(
-            effective_tunnel_mtu(&cfg, &detected, 0) as u32,
+            effective_tunnel_mtu(&cfg, &detected, 0, None) as u32,
             1500 - expected_overhead
         );
     }
@@ -1446,21 +1461,21 @@ mod tests {
                 + crate::wireguard::FAKE_IPV4_HEADER_LEN as u32
                 + 48,
         ) as u16;
-        assert_eq!(effective_tunnel_mtu(&cfg, &detected, 0), expected);
+        assert_eq!(effective_tunnel_mtu(&cfg, &detected, 0, None), expected);
     }
 
     #[test]
     fn no_configured_ceiling_and_nothing_detected_falls_back_to_a_conservative_default() {
         let cfg = test_tunnel_config(None);
-        assert_eq!(effective_tunnel_mtu(&cfg, &[], 0), 1400);
-        assert_eq!(effective_tunnel_mtu(&cfg, &[None], 0), 1400);
+        assert_eq!(effective_tunnel_mtu(&cfg, &[], 0, None), 1400);
+        assert_eq!(effective_tunnel_mtu(&cfg, &[None], 0, None), 1400);
     }
 
     #[test]
     fn configured_ceiling_still_clamps_down() {
         let cfg = test_tunnel_config(Some(1400));
         let detected = [Some(1300u32)];
-        assert!(effective_tunnel_mtu(&cfg, &detected, 0) < 1400);
+        assert!(effective_tunnel_mtu(&cfg, &detected, 0, None) < 1400);
     }
 
     /// A FecParity frame is `parity_frame_overhead_bytes` larger than
@@ -1473,8 +1488,8 @@ mod tests {
         let detected = [Some(1500u32)];
         let reservation = crate::fec::parity_frame_overhead_bytes(8);
         assert_eq!(
-            effective_tunnel_mtu(&cfg, &detected, 0) - reservation,
-            effective_tunnel_mtu(&cfg, &detected, reservation)
+            effective_tunnel_mtu(&cfg, &detected, 0, None) - reservation,
+            effective_tunnel_mtu(&cfg, &detected, reservation, None)
         );
     }
 
@@ -1487,12 +1502,59 @@ mod tests {
         let cfg = test_tunnel_config(Some(1368));
         let detected = [Some(1500u32)];
         let reservation = crate::fec::parity_frame_overhead_bytes(8);
-        assert_eq!(effective_tunnel_mtu(&cfg, &detected, 0), 1368);
-        let with_fec = effective_tunnel_mtu(&cfg, &detected, reservation);
+        assert_eq!(effective_tunnel_mtu(&cfg, &detected, 0, None), 1368);
+        let with_fec = effective_tunnel_mtu(&cfg, &detected, reservation, None);
         assert!(with_fec < 1368);
         // And the parity frame it now has to carry fits the same budget
         // a full-size Data frame used before FEC was turned on.
         assert!(with_fec + reservation <= 1368);
+    }
+
+    /// `Some(idx)` selects only that one link's detected physical MTU,
+    /// ignoring a *worse* value at a different index -- the core new
+    /// behavior this task adds. Matches this project's own home-bgp/
+    /// cloud-bgp topology: index 0 (comcast, 1500) vs index 1 (tmobile,
+    /// 1480) -- if index 0 is primary, the worse tmobile value must not
+    /// drag the tunnel MTU down.
+    #[test]
+    fn primary_idx_some_uses_only_that_links_detected_mtu() {
+        let cfg = test_tunnel_config(None);
+        let detected = [Some(1500u32), Some(1480u32)];
+        let using_comcast = effective_tunnel_mtu(&cfg, &detected, 0, Some(0));
+        let using_tmobile = effective_tunnel_mtu(&cfg, &detected, 0, Some(1));
+        assert!(
+            using_comcast > using_tmobile,
+            "primary_idx=Some(0) (the 1500-MTU link) must yield a larger tunnel MTU than \
+             primary_idx=Some(1) (the 1480-MTU link), but got {using_comcast} vs {using_tmobile}"
+        );
+        // And it must match plain bonded mode -- min-across-all -- when
+        // the primary happens to be the worse link.
+        let bonded = effective_tunnel_mtu(&cfg, &detected, 0, None);
+        assert_eq!(
+            using_tmobile, bonded,
+            "primary_idx=Some(1) selecting the worse (1480) link should produce the same result \
+             as bonded mode's own min-across-all-links, since 1480 is already the minimum"
+        );
+    }
+
+    /// `Some(idx)` pointing at an index whose own detected MTU is `None`
+    /// (or out of range) falls back to the same "nothing detected"
+    /// handling as an entirely empty `detected_mtus` slice -- it must not
+    /// panic, and must not silently fall back to scanning every other
+    /// link (that would defeat the whole point of primary-only selection).
+    #[test]
+    fn primary_idx_some_with_undetected_link_falls_back_to_nothing_detected_branch() {
+        let cfg = test_tunnel_config(None);
+        let detected = [None, Some(1480u32)];
+        let result = effective_tunnel_mtu(&cfg, &detected, 0, Some(0));
+        assert_eq!(
+            result, FALLBACK_MTU_WHEN_NOTHING_DETECTED,
+            "primary_idx pointing at a link with no detected MTU must use the conservative \
+             fallback, not fall through to link 1's 1480"
+        );
+        // Out-of-range index behaves the same way.
+        let out_of_range = effective_tunnel_mtu(&cfg, &detected, 0, Some(5));
+        assert_eq!(out_of_range, FALLBACK_MTU_WHEN_NOTHING_DETECTED);
     }
 
     #[test]

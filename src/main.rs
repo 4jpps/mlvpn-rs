@@ -701,6 +701,10 @@ async fn run(cfg: Config, log_ring: Arc<LogRing>) -> anyhow::Result<()> {
         // Holds back room for FEC parity frames, which are larger than
         // the Data frames they cover; zero unless scheduler.fec_enabled.
         mlvpn::fec::mtu_reservation_bytes(&cfg.scheduler),
+        // No Scheduler exists yet at startup -- always the bonded
+        // min-across-all-links computation here; primary-aware selection
+        // only applies once mtu_monitor_loop is running (see Task 3).
+        None,
     );
     let tun = open_tun(&cfg.tunnel, effective_mtu)?;
 
