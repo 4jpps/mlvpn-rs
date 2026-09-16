@@ -201,10 +201,13 @@ pub struct WgTunnel {
     /// own source (confirmed by direct inspection, `src/noise/mod.rs`),
     /// had no current valid session at that moment -- so the plaintext
     /// was queued *internally* by boringtun and a handshake-initiation
-    /// datagram was written to the network *instead*. `encapsulate`'s
-    /// caller (`wg_send`) sees an ordinary `Ok(())` in this case,
-    /// identical to a real successful send: `TunnResult::WriteToNetwork`
-    /// covers both outcomes, and mlvpn's own `LinkStats::record_tx` still
+    /// datagram was written to the network *instead*. `TunnResult::
+    /// WriteToNetwork` covers both outcomes indistinguishably, so
+    /// `encapsulate` reports the difference to its caller explicitly via
+    /// the `bool` in its `(Vec<u8>, bool)` return (added 2026-09-15 --
+    /// before that, `wg_send` saw an ordinary `Ok(())` identical to a
+    /// real send, which let `tunnel::outbound_sender` accumulate phantom
+    /// FEC group members). mlvpn's own `LinkStats::record_tx` still
     /// increments as if the frame was actually transmitted. This counter
     /// distinguishes the two by checking the outgoing datagram's own
     /// WireGuard message-type field (a data packet is type 4; anything
@@ -280,7 +283,18 @@ impl WgTunnel {
     /// real WireGuard's own behavior when userspace tries to send before
     /// a tunnel is up, and is why this method's contract is "a datagram
     /// ready to send" rather than "a datagram carrying this exact frame".
-    pub fn encapsulate(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
+    ///
+    /// Returns `(datagram, carries_plaintext)`: the bool is `true` only
+    /// when the returned datagram is a real WireGuard *data* message
+    /// genuinely carrying `plaintext`, and `false` when boringtun
+    /// substituted a handshake/control datagram instead (the same
+    /// condition `substituted_total` counts). Callers that track a frame
+    /// as "sent" for correctness -- notably `tunnel::outbound_sender`'s
+    /// FEC group accumulation, which would otherwise record a phantom
+    /// group member the peer can never observe, permanently burning that
+    /// group's single-erasure recovery budget -- must gate on this bool
+    /// rather than on `Ok(..)` alone.
+    pub fn encapsulate(&self, plaintext: &[u8]) -> Result<(Vec<u8>, bool)> {
         let wrapped = wrap_fake_ipv4(plaintext)?;
         // WG overhead + slack, but never smaller than the largest
         // possible outbound message (a 148-byte handshake initiation,
@@ -308,7 +322,11 @@ impl WgTunnel {
                 if !is_data {
                     self.substituted_total.fetch_add(1, Ordering::Relaxed);
                 }
-                Ok(bytes.to_vec())
+                // Same `is_data` check drives both the diagnostic counter
+                // above and the caller-visible bool -- deliberately one
+                // shared computation, never two parallel ones that could
+                // drift apart.
+                Ok((bytes.to_vec(), is_data))
             }
             TunnResult::Err(e) => Err(MlvpnError::Protocol(format!("wg encapsulate: {e:?}"))),
             TunnResult::Done => Err(MlvpnError::Protocol(
@@ -421,7 +439,12 @@ mod tests {
         // Client wants to send real data immediately; no session exists
         // yet, so boringtun queues the plaintext internally and instead
         // hands back a handshake-initiation datagram to send first.
-        let handshake_init = client.encapsulate(plaintext).unwrap();
+        let (handshake_init, carries_plaintext) = client.encapsulate(plaintext).unwrap();
+        assert!(
+            !carries_plaintext,
+            "a pre-session encapsulate must report false: the datagram is a handshake \
+             initiation, not our plaintext"
+        );
 
         // Server processes the handshake init and produces a handshake
         // response that must go back to the client.
@@ -445,7 +468,11 @@ mod tests {
 
         // Now both sides have an established session -- send a real
         // frame client -> server and confirm it round-trips exactly.
-        let datagram = client.encapsulate(plaintext).unwrap();
+        let (datagram, carries_plaintext) = client.encapsulate(plaintext).unwrap();
+        assert!(
+            carries_plaintext,
+            "with a session established, encapsulate must report true"
+        );
         let received = match server.decapsulate(&datagram).unwrap() {
             DecapsulateOutcome::Frame(bytes) => bytes,
             other => panic!("expected Frame, got {other:?}"),
@@ -454,12 +481,73 @@ mod tests {
 
         // And the reverse direction too, since mlvpn's real traffic is
         // bidirectional over the same established session.
-        let reply_datagram = server.encapsulate(plaintext).unwrap();
+        let (reply_datagram, carries_plaintext) = server.encapsulate(plaintext).unwrap();
+        assert!(
+            carries_plaintext,
+            "the responder's own post-handshake encapsulate must report true too"
+        );
         let received_by_client = match client.decapsulate(&reply_datagram).unwrap() {
             DecapsulateOutcome::Frame(bytes) => bytes,
             other => panic!("expected Frame, got {other:?}"),
         };
         assert_eq!(received_by_client, plaintext);
+    }
+
+    /// The specific regression this bool exists for: `encapsulate` must
+    /// distinguish "this datagram carries your plaintext" from "boringtun
+    /// substituted a handshake datagram for it", and that bool must agree
+    /// with `substituted_count`'s own movement on every single call --
+    /// they are computed from one shared check on purpose.
+    ///
+    /// Before this, `tunnel::outbound_sender` accumulated every Data
+    /// frame into its FEC group regardless, so every frame handed to a
+    /// link that was mid-handshake/rekey became a phantom group member
+    /// the peer could never observe, permanently burning the group's one
+    /// recoverable erasure.
+    #[test]
+    fn encapsulate_reports_whether_the_datagram_carries_the_plaintext() {
+        let (client_priv, client_pub) = generate_test_keypair();
+        let (server_priv, server_pub) = generate_test_keypair();
+
+        let client = WgTunnel::new(client_priv, server_pub, true).unwrap();
+        let server = WgTunnel::new(server_priv, client_pub, false).unwrap();
+
+        let plaintext = b"payload that must not become a phantom FEC member";
+
+        // No session yet -> substitution.
+        assert_eq!(client.substituted_count(), 0);
+        let (handshake_init, carried) = client.encapsulate(plaintext).unwrap();
+        assert!(!carried);
+        assert_eq!(
+            client.substituted_count(),
+            1,
+            "the bool and the diagnostic counter must move together"
+        );
+
+        // Complete the handshake.
+        let reply = match server.decapsulate(&handshake_init).unwrap() {
+            DecapsulateOutcome::SendReply(bytes) => bytes,
+            other => panic!("expected SendReply, got {other:?}"),
+        };
+        let keepalive = match client.decapsulate(&reply).unwrap() {
+            DecapsulateOutcome::SendReply(bytes) => bytes,
+            other => panic!("expected SendReply, got {other:?}"),
+        };
+        assert!(matches!(
+            server.decapsulate(&keepalive).unwrap(),
+            DecapsulateOutcome::Consumed
+        ));
+
+        // Session established -> real data transmission, and the
+        // substitution counter must stay where it was.
+        let before = client.substituted_count();
+        let (datagram, carried) = client.encapsulate(plaintext).unwrap();
+        assert!(carried);
+        assert_eq!(client.substituted_count(), before);
+        match server.decapsulate(&datagram).unwrap() {
+            DecapsulateOutcome::Frame(bytes) => assert_eq!(bytes, plaintext),
+            other => panic!("expected Frame, got {other:?}"),
+        }
     }
 
     /// `tick()` on a session with nothing queued and no handshake attempt

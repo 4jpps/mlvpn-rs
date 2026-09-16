@@ -348,20 +348,30 @@ impl LinkHandle {
     /// retry, the same way real WireGuard relies on the *upper* protocol
     /// (TCP, or here, mlvpn's own retry/ack behavior) to notice loss and
     /// resend rather than solving it at this layer.
-    pub async fn wg_send(&self, frame: &[u8]) -> Result<()> {
+    ///
+    /// The returned `bool` (propagated straight from
+    /// `WgTunnel::encapsulate`) is `true` only when the datagram actually
+    /// put on the wire genuinely carried `frame`, and `false` when
+    /// boringtun substituted a handshake datagram for it. `Ok(false)` is
+    /// still a successful socket write -- it just means *this* frame did
+    /// not reach the wire. Callers that don't care (probes, stats
+    /// broadcasts, throughput-test traffic -- nothing whose correctness
+    /// depends on the peer observing this exact frame) may ignore it;
+    /// FEC group accumulation must not.
+    pub async fn wg_send(&self, frame: &[u8]) -> Result<bool> {
         let remote = self.remote.ok_or_else(|| {
             MlvpnError::Protocol(format!(
                 "wg_send: link '{}' has no remote address to send to yet",
                 self.config.name
             ))
         })?;
-        let datagram = self.wg.encapsulate(frame)?;
+        let (datagram, carries_frame) = self.wg.encapsulate(frame)?;
         let socket = self.current_socket().await;
         socket
             .send_to(&datagram, remote)
             .await
             .map_err(MlvpnError::Io)?;
-        Ok(())
+        Ok(carries_frame)
     }
 
     /// Receive one raw datagram off this link's *current* socket and
@@ -1883,9 +1893,18 @@ mod tests {
         // doc comment); give the client's background drain task time to
         // finish the handshake exchange before retrying with the real
         // frame.
-        client_handle.wg_send(&frame).await.unwrap();
+        // ... and that first call is exactly the case `wg_send`'s bool
+        // exists to surface: the socket write succeeded, but what went
+        // out was a handshake initiation, not this frame.
+        assert!(
+            !client_handle.wg_send(&frame).await.unwrap(),
+            "the handshake-triggering send must report that it did not carry the frame"
+        );
         tokio::time::sleep(Duration::from_millis(200)).await;
-        client_handle.wg_send(&frame).await.unwrap();
+        assert!(
+            client_handle.wg_send(&frame).await.unwrap(),
+            "once the session is up, wg_send must report a real transmission"
+        );
 
         let (received, from) = tokio::time::timeout(Duration::from_secs(5), server_recv)
             .await

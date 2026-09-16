@@ -1135,7 +1135,22 @@ async fn outbound_sender(
             continue;
         }
         let seq = next_send_seq();
-        send_scheduled(&links, &scheduler, PacketType::Data, seq, &frame.plaintext).await;
+        let sent =
+            send_scheduled(&links, &scheduler, PacketType::Data, seq, &frame.plaintext).await;
+        // Only a frame that genuinely reached the wire may join the
+        // current FEC group. A frame that was dropped here (no link
+        // available) or whose payload boringtun substituted with a
+        // handshake datagram (every WireGuard handshake/rekey) is one the
+        // receiver can never observe -- accumulating it anyway made it a
+        // phantom group member that permanently consumed the group's one
+        // erasure, so a later *real* loss in the same group became
+        // unrecoverable, and a group whose phantom was its only missing
+        // seq would "reconstruct" and inject into the TUN device a
+        // datagram the peer never sent (observed live as a fabricated
+        // IPv6 Router Solicitation).
+        if !sent {
+            continue;
+        }
         if let Some(sender) = fec_sender.as_mut() {
             if let Some(parity) = sender.accumulate(seq, &frame.plaintext) {
                 let parity_bytes = parity.encode();
@@ -1161,7 +1176,12 @@ async fn outbound_sender(
                     continue;
                 }
                 let parity_seq = next_send_seq();
-                send_scheduled(
+                // Return value deliberately ignored: a parity frame is
+                // not itself a group member, so a failed/substituted
+                // parity send simply means the receiver never sees it and
+                // the group times out as unrecoverable -- already the
+                // correct existing behavior, nothing to gate.
+                let _ = send_scheduled(
                     &links,
                     &scheduler,
                     PacketType::FecParity,
@@ -1215,13 +1235,23 @@ async fn outbound_queue_drop_reporter(dropped_total: Arc<AtomicU64>) {
 /// Normal (non-redundant) send path: ask the `Scheduler` for exactly one
 /// link and send there. Split out of `tun_reader` purely to keep that
 /// loop body readable now that it branches on `redundant_mode`.
+///
+/// Returns whether `plaintext` genuinely reached the wire: `false` for
+/// every "no link available to send on" early return, for a failed
+/// `wg_send`, and for a `wg_send` that succeeded at the socket level but
+/// whose payload boringtun substituted with a handshake datagram (see
+/// `LinkHandle::wg_send`). `outbound_sender` gates FEC group
+/// accumulation on this -- a frame counted as a group member the peer
+/// never saw is a phantom that permanently consumes the group's single
+/// erasure, making a later *real* loss unrecoverable or, worse, letting
+/// FEC "reconstruct" and deliver a datagram that was never transmitted.
 async fn send_scheduled(
     links: &Links,
     scheduler: &Arc<std::sync::Mutex<Scheduler>>,
     ptype: PacketType,
     seq: u64,
     plaintext: &[u8],
-) {
+) -> bool {
     // Not the real on-wire size (WireGuard adds its own AEAD overhead on
     // top, invisibly to this layer), but the same approximation the old
     // shared-session design used for the scheduler's own cap-check
@@ -1253,11 +1283,11 @@ async fn send_scheduled(
     };
     let Some(idx) = chosen_idx else {
         tracing::warn!("no link available to send on; dropping packet");
-        return;
+        return false;
     };
     let Some(link_mutex) = links.get(idx) else {
         tracing::warn!("no link available to send on; dropping packet");
-        return;
+        return false;
     };
 
     // Only *now*, having already picked a winner, do we lock a link at
@@ -1275,7 +1305,7 @@ async fn send_scheduled(
     };
     let Some((link_id, handle, link_name)) = chosen else {
         tracing::warn!("no link available to send on; dropping packet");
-        return;
+        return false;
     };
 
     let mut frame = Vec::with_capacity(frame_len);
@@ -1288,17 +1318,26 @@ async fn send_scheduled(
     frame.extend_from_slice(plaintext);
 
     match handle.wg_send(&frame).await {
-        Ok(()) => {
+        Ok(carried) => {
             // Re-lock just the winning link, only on success, purely to
             // update the lifetime tx counters -- everything else in this
             // function already released `link_mutex` before the `.await`
             // above (see the comment on `chosen` for why), so this is one
             // more short lock on one link, not a scan over every
             // candidate that didn't win.
+            //
+            // Deliberately unconditional on `carried`: `record_tx`'s own
+            // "bytes this link put on the wire" semantics are unchanged
+            // by this fix (a substituted handshake datagram really was
+            // transmitted, just not carrying this frame). That stat being
+            // slightly optimistic during a handshake is a separate,
+            // pre-existing concern -- only the returned bool is new.
             link_mutex.lock().await.stats.record_tx(frame_len as u64);
+            carried
         }
         Err(e) => {
             tracing::debug!(link = %link_name, error = %e, "send failed");
+            false
         }
     }
 }
@@ -1368,7 +1407,11 @@ async fn send_redundant(links: &Links, plaintext: &[u8]) {
         .encode(&mut frame);
         frame.extend_from_slice(plaintext);
         match handle.wg_send(&frame).await {
-            Ok(()) => {
+            // Redundant mode has no FEC group to corrupt (FEC and
+            // redundant mode are mutually exclusive send paths in
+            // `outbound_sender`), so `wg_send`'s new bool is irrelevant
+            // here -- `record_tx` keeps its existing semantics.
+            Ok(_carried) => {
                 // `link_id` is always the live link's own Vec index (see
                 // main.rs's `Link::bind(id, ...)` call site: id is
                 // assigned from the config Vec's own position), so this
@@ -2464,7 +2507,12 @@ pub(crate) async fn send_throughput_test_reverse_request(
     }
     .encode(&mut out);
     out.extend_from_slice(&payload);
-    handle.wg_send(&out).await
+    // Discard `wg_send`'s "did this frame really reach the wire" bool:
+    // this function's own `Result<()>` contract is unchanged, and the
+    // throughput-test protocol already tolerates a lost request (the
+    // caller times out waiting for the reverse stream and reports no
+    // result) rather than needing per-frame delivery confirmation.
+    handle.wg_send(&out).await.map(|_| ())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2988,7 +3036,11 @@ async fn send_probe(
     frame.extend_from_slice(&payload);
 
     match handle.wg_send(&frame).await {
-        Ok(()) => {
+        // A Probe belongs to no FEC group, and the probe tracker's own
+        // loss accounting already treats an unanswered probe as lost --
+        // which is exactly what a substituted (handshake) send produces,
+        // so no separate handling is needed for `wg_send`'s new bool.
+        Ok(_carried) => {
             tracker.record_sent(probe_seq);
             ProbeSendOutcome::Sent
         }
@@ -3442,6 +3494,33 @@ async fn reorder_tuning_loop(
             );
             ro.set_window(suggested);
         }
+    }
+}
+
+#[cfg(test)]
+mod send_scheduled_tests {
+    use super::*;
+
+    /// The "no link available to send on" early return must report
+    /// `false`, not silently look like a successful send -- that return
+    /// value is what stops `outbound_sender` from accumulating a dropped
+    /// frame into its FEC group as a phantom member (see
+    /// `send_scheduled`'s own doc comment).
+    ///
+    /// An empty `Links` reaches the first of the three early returns:
+    /// `Scheduler::select_fast` has nothing cached, and the
+    /// `snapshot_scores` fallback has no candidates either, so no index
+    /// is chosen. The other two early returns need a live, bound `Link`
+    /// to construct and are covered by the veth integration tests.
+    #[tokio::test]
+    async fn send_scheduled_reports_false_when_no_link_is_available() {
+        let links: link::Links = Arc::new(Vec::new());
+        let scheduler = Arc::new(std::sync::Mutex::new(Scheduler::new()));
+        let sent = send_scheduled(&links, &scheduler, PacketType::Data, 1, b"payload").await;
+        assert!(
+            !sent,
+            "a dropped packet must never be reported as transmitted"
+        );
     }
 }
 
