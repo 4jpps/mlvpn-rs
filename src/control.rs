@@ -784,6 +784,36 @@ const MTU_FLOOR_IPV4_ONLY: u16 = 576;
 /// this fix -- not a guess.
 const MTU_FLOOR_DUAL_STACK: u16 = 1280;
 
+/// Folds the peer's own advertised live tunnel MTU (`PeerMtu`, fed from
+/// the periodic authenticated `VersionInfo` exchange) into this side's
+/// own locally computed value, so both peers always converge on the
+/// lower of whatever either side can currently support -- see
+/// docs/superpowers/specs/2026-09-16-primary-aware-peer-mtu-design.md
+/// §2.
+///
+/// `peer_advertised`'s raw wire value of `0` means the peer's own
+/// `VersionInfoPayload::decode` never actually received this field at
+/// all (an older `mlvpnd` build whose wire buffer predates it) -- not a
+/// real MTU any host could ever legitimately advertise (every floor
+/// this project enforces is well above zero). Treated identically to
+/// `None`: "peer has no opinion", use `local` as-is. Without this
+/// filter, pairing with an old peer would permanently floor the tunnel
+/// MTU the moment this function's caller started trusting `peer_advertised`.
+///
+/// Not yet called from non-test code -- `mtu_monitor_loop` wires this in
+/// as its own follow-up task. `#[allow(dead_code)]` is needed because
+/// `clippy --all-targets`/`cargo build` check the plain `lib` target
+/// (without `cfg(test)`) in addition to the unit-test target, and this
+/// function's only caller right now is its own test module; remove this
+/// attribute once that follow-up task lands.
+#[allow(dead_code)]
+pub(crate) fn negotiate_tunnel_mtu(local: u16, peer_advertised: Option<u16>) -> u16 {
+    match peer_advertised {
+        Some(peer) if peer != 0 => local.min(peer),
+        _ => local,
+    }
+}
+
 /// Picks the MTU actually used for the TUN device and outgoing packet
 /// sizing: when `tunnel.mtu` is configured, the smaller of that ceiling
 /// and a safe value derived from every bonded link's real physical
@@ -1591,5 +1621,44 @@ mod tests {
         assert_eq!(latch.record_success(), Some(2));
         // And the latch is armed again for the next streak.
         assert!(latch.record_failure(1452));
+    }
+
+    /// No peer data at all (before the first `VersionInfo` arrives, or the
+    /// peer has never sent one) -- use the local value unchanged.
+    #[test]
+    fn negotiate_tunnel_mtu_with_no_peer_data_uses_local() {
+        assert_eq!(negotiate_tunnel_mtu(1400, None), 1400);
+    }
+
+    /// A peer-advertised `0` -- what `VersionInfoPayload::decode` produces
+    /// for a peer whose wire buffer predates this field -- must be treated
+    /// as "no opinion", never used to floor the local value. Regression
+    /// test for the old-peer interop hazard described in
+    /// docs/superpowers/specs/2026-09-16-primary-aware-peer-mtu-design.md §3.
+    #[test]
+    fn negotiate_tunnel_mtu_ignores_a_zero_peer_value() {
+        assert_eq!(negotiate_tunnel_mtu(1400, Some(0)), 1400);
+    }
+
+    /// A genuinely smaller peer value wins -- the local side pulls its own
+    /// MTU down to match, even though nothing about its own local link
+    /// capacity changed.
+    #[test]
+    fn negotiate_tunnel_mtu_picks_the_smaller_peer_value() {
+        assert_eq!(negotiate_tunnel_mtu(1400, Some(1200)), 1200);
+    }
+
+    /// A genuinely larger peer value does NOT win -- the local side never
+    /// rises above what it itself can support, only ever the minimum of
+    /// the two.
+    #[test]
+    fn negotiate_tunnel_mtu_does_not_rise_above_the_local_value() {
+        assert_eq!(negotiate_tunnel_mtu(1200, Some(1400)), 1200);
+    }
+
+    /// Equal values are a no-op either way.
+    #[test]
+    fn negotiate_tunnel_mtu_equal_values_is_a_no_op() {
+        assert_eq!(negotiate_tunnel_mtu(1368, Some(1368)), 1368);
     }
 }
