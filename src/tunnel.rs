@@ -838,6 +838,17 @@ pub async fn run(
         }));
     }
 
+    // The TCP counterpart to the UDP listener spawned just above -- see
+    // `tunneltest::run_tcp_listener`'s own doc comment. Same
+    // not-gated-on-`[command] enabled` reasoning applies here too.
+    {
+        let tunnel_local_addr = params.tunnel_local_addr;
+        let tunnel_test_ctx = tunnel_test_ctx.clone();
+        handles.push(tokio::spawn(async move {
+            crate::tunneltest::run_tcp_listener(tunnel_local_addr, tunnel_test_ctx).await;
+        }));
+    }
+
     if let Some(watch) = params.diagnostics_watch.clone() {
         let links = links.clone();
         let diag_ctx = control::DiagContext {

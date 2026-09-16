@@ -228,15 +228,9 @@ impl ResultPayload {
 /// connection is a stranger testing us fresh" apart from "this is the
 /// autonomous reverse leg of a test *we* initiated" via
 /// `TunnelTestContext::forward_result` -- see that type's doc comment.
-///
-/// Not yet wired into any send/receive logic or the CLI -- pure
-/// wire-protocol primitives only, consumed by a later task.
-#[allow(dead_code)]
 const TCP_HEADER_LEN: usize = 5;
-#[allow(dead_code)]
 const TCP_FLAG_BIDIRECTIONAL_REQUESTED: u8 = 0b1;
 
-#[allow(dead_code)]
 fn encode_tcp_header(test_id: u32, bidirectional_requested: bool) -> [u8; TCP_HEADER_LEN] {
     let mut out = [0u8; TCP_HEADER_LEN];
     out[0..4].copy_from_slice(&test_id.to_be_bytes());
@@ -248,7 +242,6 @@ fn encode_tcp_header(test_id: u32, bidirectional_requested: bool) -> [u8; TCP_HE
     out
 }
 
-#[allow(dead_code)]
 fn decode_tcp_header(buf: &[u8]) -> Option<(u32, bool)> {
     if buf.len() < TCP_HEADER_LEN {
         return None;
@@ -262,19 +255,13 @@ fn decode_tcp_header(buf: &[u8]) -> Option<(u32, bool)> {
 /// it has read the connector's stream to EOF -- the TCP path's
 /// equivalent of `ResultPayload`, with an added real retransmit count
 /// (`read_tcp_retransmits`) the UDP path has no equivalent of.
-///
-/// Not yet wired into any send/receive logic or the CLI -- pure
-/// wire-protocol primitives only, consumed by a later task.
-#[allow(dead_code)]
 const TCP_RESULT_LEN: usize = 8 + 4;
 
-#[allow(dead_code)]
 struct TcpResultPayload {
     achieved_mbps: f64,
     retransmits: u32,
 }
 
-#[allow(dead_code)]
 impl TcpResultPayload {
     fn encode(&self) -> [u8; TCP_RESULT_LEN] {
         let mut out = [0u8; TCP_RESULT_LEN];
@@ -301,10 +288,6 @@ impl TcpResultPayload {
 /// number. Returns 0 on any failure (e.g. a platform without
 /// `TCP_INFO`) rather than propagating an error -- this is diagnostic
 /// enrichment, not load-bearing for the test's own success/failure.
-///
-/// Not yet wired into any send/receive logic or the CLI -- pure
-/// wire-protocol primitive only, consumed by a later task.
-#[allow(dead_code)]
 fn read_tcp_retransmits(stream: &tokio::net::TcpStream) -> u32 {
     use std::os::unix::io::AsRawFd;
     let mut info: libc::tcp_info = unsafe { std::mem::zeroed() };
@@ -723,6 +706,174 @@ pub(crate) async fn run_listener(
                 .await;
             });
         }
+    }
+}
+
+/// Runs one TCP leg's *sender* side: connects to
+/// `peer_addr:TUNNEL_TEST_PORT`, writes the header (test_id +
+/// bidirectional-request flag), streams bulk data for `duration` at
+/// whatever rate the kernel's own TCP congestion control allows (no
+/// custom pacing -- see this module's doc comment for why that's
+/// deliberate), half-closes, then reads the receiver's
+/// `TcpResultPayload` reply off the still-open read half. Used both for
+/// the upload leg `run_test`-equivalent initiates directly, and for the
+/// autonomous reverse/download leg `run_tcp_listener` spawns.
+async fn run_tcp_upload_leg(
+    peer_addr: SocketAddr,
+    test_id: u32,
+    duration: Duration,
+    bidirectional_requested: bool,
+) -> Option<(f64, u32)> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut stream = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::net::TcpStream::connect(peer_addr),
+    )
+    .await
+    .ok()?
+    .ok()?;
+
+    stream
+        .write_all(&encode_tcp_header(test_id, bidirectional_requested))
+        .await
+        .ok()?;
+
+    // Fixed byte pattern, cheap to generate -- same reasoning as the
+    // UDP path's payload, content doesn't matter for a throughput test.
+    let chunk = vec![0u8; 65536];
+    let deadline = Instant::now() + duration;
+    while Instant::now() < deadline {
+        stream.write_all(&chunk).await.ok()?;
+    }
+    stream.shutdown().await.ok()?;
+
+    let mut buf = [0u8; TCP_RESULT_LEN];
+    tokio::time::timeout(RESULT_GRACE, stream.read_exact(&mut buf))
+        .await
+        .ok()?
+        .ok()?;
+    let result = TcpResultPayload::decode(&buf)?;
+    Some((result.achieved_mbps, result.retransmits))
+}
+
+/// Handles one accepted TCP connection on the persistent listener:
+/// reads the header, reads the stream to EOF, measures real throughput
+/// and retransmits, and either (a) delivers the result locally via
+/// `TunnelTestContext` if this is recognized as our own reverse leg
+/// completing (returns `None`, caller does nothing further -- exactly
+/// mirrors the UDP `run_listener`'s `delivered_locally` branch), or (b)
+/// replies over the wire with a `TcpResultPayload` since a stranger is
+/// genuinely testing us fresh (returns `Some((test_id,
+/// bidirectional_requested))` so the caller can spawn a reverse leg).
+async fn handle_tcp_incoming(
+    mut stream: tokio::net::TcpStream,
+    peer: SocketAddr,
+    tunnel_test_ctx: &Arc<TunnelTestContext>,
+) -> Option<(u32, bool)> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut header_buf = [0u8; TCP_HEADER_LEN];
+    stream.read_exact(&mut header_buf).await.ok()?;
+    let (test_id, bidirectional_requested) = decode_tcp_header(&header_buf)?;
+
+    let start = Instant::now();
+    let mut buf = vec![0u8; 65536];
+    let mut bytes_read: u64 = 0;
+    loop {
+        match stream.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(n) => bytes_read += n as u64,
+            Err(_) => return None,
+        }
+    }
+    let elapsed_secs = start.elapsed().as_secs_f64();
+    let achieved_mbps = compute_achieved_mbps(bytes_read, elapsed_secs);
+    let retransmits = read_tcp_retransmits(&stream);
+
+    let delivered_locally = tunnel_test_ctx.forward_result(
+        test_id,
+        TunnelTestLegResult {
+            achieved_mbps,
+            // TCP has no outbound-queue-drop-delta equivalent -- see
+            // the spec's CLI-output section. Always 0 for a TCP leg;
+            // the printing layer (Task 3) knows to skip this line for
+            // TCP results rather than print a misleading "0 dropped".
+            peer_queue_drops: 0,
+        },
+    );
+    if delivered_locally {
+        return None;
+    }
+
+    tracing::info!(%peer, achieved_mbps, retransmits, "tunnel-level TCP self-test stream received");
+    let result = TcpResultPayload {
+        achieved_mbps,
+        retransmits,
+    }
+    .encode();
+    let _ = stream.write_all(&result).await;
+
+    Some((test_id, bidirectional_requested))
+}
+
+/// Persistent TCP accept loop, the TCP counterpart to `run_listener`'s
+/// UDP loop -- bound to the same `TUNNEL_TEST_PORT` on the TUN device's
+/// own local address, spawned alongside it whenever `[command] enabled
+/// = true`. Each accepted connection is handled on its own task
+/// (`handle_tcp_incoming`); a connection recognized as our own reverse
+/// leg ends there, one recognized as a fresh test from a peer spawns
+/// `run_tcp_upload_leg` back to them if they asked for a bidirectional
+/// test -- mirroring `run_listener`'s own UDP branch exactly.
+pub(crate) async fn run_tcp_listener(
+    tunnel_local_addr: IpAddr,
+    tunnel_test_ctx: Arc<TunnelTestContext>,
+) {
+    let bind_addr = SocketAddr::new(tunnel_local_addr, TUNNEL_TEST_PORT);
+    let listener = match tokio::net::TcpListener::bind(bind_addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                addr = %bind_addr,
+                "failed to bind tunnel-level TCP self-test listener; \
+                 `mlvpnd self-test --tunnel --protocol tcp` will be unavailable against this host"
+            );
+            return;
+        }
+    };
+    tracing::info!(addr = %bind_addr, "tunnel-level TCP self-test listener bound");
+
+    loop {
+        let (stream, peer) = match listener.accept().await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::debug!(error = %e, "tunnel-level TCP self-test listener accept error");
+                continue;
+            }
+        };
+        let tunnel_test_ctx = tunnel_test_ctx.clone();
+        tokio::spawn(async move {
+            let Some((test_id, bidirectional_requested)) =
+                handle_tcp_incoming(stream, peer, &tunnel_test_ctx).await
+            else {
+                return;
+            };
+            if bidirectional_requested {
+                // Same "reverse_target" reasoning as the UDP path: land
+                // on the connector's *persistent* listener (well-known
+                // TUNNEL_TEST_PORT), not the ephemeral port this
+                // connection came from.
+                let reverse_target = SocketAddr::new(peer.ip(), TUNNEL_TEST_PORT);
+                // Duration isn't carried in the TCP header (unlike the
+                // UDP DataPayload, which mirrors it per-packet) -- the
+                // reverse leg reuses a fixed default matching this
+                // module's own RESULT_GRACE-relative conventions. See
+                // Task 3's note on why this is an acceptable
+                // simplification for this feature's actual use case.
+                run_tcp_upload_leg(reverse_target, test_id, Duration::from_secs(10), false).await;
+            }
+        });
     }
 }
 
