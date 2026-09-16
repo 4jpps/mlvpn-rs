@@ -845,6 +845,8 @@ pub async fn run(
         let live_mtu = live_mtu.clone();
         let mtu_resizer = params.mtu_resizer.clone();
         let fec_reservation = fec::mtu_reservation_bytes(&params.scheduler_cfg);
+        let scheduler = scheduler.clone();
+        let peer_mtu = peer_mtu.clone();
         handles.push(tokio::spawn(async move {
             control::mtu_monitor_loop(
                 tunnel_cfg,
@@ -853,6 +855,8 @@ pub async fn run(
                 live_mtu,
                 mtu_resizer,
                 fec_reservation,
+                scheduler,
+                peer_mtu,
             )
             .await;
         }));

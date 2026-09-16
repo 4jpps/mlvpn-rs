@@ -800,13 +800,6 @@ const MTU_FLOOR_DUAL_STACK: u16 = 1280;
 /// filter, pairing with an old peer would permanently floor the tunnel
 /// MTU the moment this function's caller started trusting `peer_advertised`.
 ///
-/// Not yet called from non-test code -- `mtu_monitor_loop` wires this in
-/// as its own follow-up task. `#[allow(dead_code)]` is needed because
-/// `clippy --all-targets`/`cargo build` check the plain `lib` target
-/// (without `cfg(test)`) in addition to the unit-test target, and this
-/// function's only caller right now is its own test module; remove this
-/// attribute once that follow-up task lands.
-#[allow(dead_code)]
 pub(crate) fn negotiate_tunnel_mtu(local: u16, peer_advertised: Option<u16>) -> u16 {
     match peer_advertised {
         Some(peer) if peer != 0 => local.min(peer),
@@ -975,11 +968,14 @@ pub fn effective_tunnel_mtu(
 }
 
 /// How often `mtu_monitor_loop` re-checks whether the live TUN device's
-/// MTU still matches what the bonded links can actually carry. A
-/// separate knob from `DIAGNOSTICS_WATCH_INTERVAL_SECS` -- the two
-/// concerns are unrelated and shouldn't share a setting just because
-/// both are periodic background checks.
-const MTU_MONITOR_INTERVAL_SECS: u64 = 30;
+/// MTU still matches what the bonded links can actually carry. Lowered
+/// from the original 30s to 3s (2026-09-16) so a `primary_link_mode`
+/// failover is reflected in the live tunnel MTU within a few seconds
+/// rather than up to half a minute -- the check itself is a cheap,
+/// purely local ioctl per configured link (`query_interface_mtu`), no
+/// network I/O, so polling 10x more often costs nothing meaningful. See
+/// docs/superpowers/specs/2026-09-16-primary-aware-peer-mtu-design.md §4.
+const MTU_MONITOR_INTERVAL_SECS: u64 = 3;
 
 fn mtu_resize_needed(current: u16, recomputed: u16) -> bool {
     current != recomputed
@@ -1038,6 +1034,13 @@ impl ResizeFailureLatch {
 /// tunnel MTU is one value derived from the minimum across all links,
 /// so one task owns resizing it rather than each link's own prober
 /// racing to do so.
+// 8 parameters trips clippy::too_many_arguments (7-arg default threshold);
+// each one is independently meaningful (config, TUN device identity, the
+// links to probe, the live/target MTU state, the resizer, FEC overhead,
+// and now the primary-link scheduler + peer-advertised MTU this task
+// negotiates against) and bundling them into a struct purely to satisfy
+// this lint isn't worth it for a function with exactly one caller.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn mtu_monitor_loop(
     tunnel_cfg: crate::config::TunnelConfig,
     tun_ifname: String,
@@ -1049,6 +1052,16 @@ pub(crate) async fn mtu_monitor_loop(
     // derived purely from static config), so it is passed once rather
     // than recomputed each tick.
     fec_reservation: u16,
+    // Read once per tick via `.primary()` to select this tunnel's
+    // currently-active link, if any -- see `effective_tunnel_mtu`'s
+    // `primary_idx` parameter (Task 1) and
+    // docs/superpowers/specs/2026-09-16-primary-aware-peer-mtu-design.md
+    // §1.
+    scheduler: std::sync::Arc<std::sync::Mutex<crate::scheduler::Scheduler>>,
+    // The peer's own most recently advertised live tunnel MTU, fed from
+    // the periodic `VersionInfo` wire exchange -- see
+    // `negotiate_tunnel_mtu` (Task 2) and design doc §2.
+    peer_mtu: crate::tunnel::PeerMtu,
 ) {
     let mut tick = tokio::time::interval(std::time::Duration::from_secs(MTU_MONITOR_INTERVAL_SECS));
     let mut failures = ResizeFailureLatch::default();
@@ -1059,7 +1072,10 @@ pub(crate) async fn mtu_monitor_loop(
             .iter()
             .map(|ifname| crate::link::query_interface_mtu(ifname))
             .collect();
-        let recomputed = effective_tunnel_mtu(&tunnel_cfg, &detected, fec_reservation, None);
+        let primary_idx = scheduler.lock().unwrap().primary();
+        let local = effective_tunnel_mtu(&tunnel_cfg, &detected, fec_reservation, primary_idx);
+        let peer_advertised = *peer_mtu.lock().unwrap();
+        let recomputed = negotiate_tunnel_mtu(local, peer_advertised);
         let current = live_mtu.load(std::sync::atomic::Ordering::Relaxed);
 
         if !mtu_resize_needed(current, recomputed) {
