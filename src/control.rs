@@ -765,6 +765,25 @@ async fn run_diag_dump_command(links: &Links, diag_ctx: &DiagContext) -> Command
 // only goes the other way).
 pub const FALLBACK_MTU_WHEN_NOTHING_DETECTED: u16 = 1400;
 
+/// IPv4's own minimum-reassembly-buffer floor (RFC 791) -- the correct
+/// floor for an IPv4-only tunnel (`cfg.address6.is_none()`).
+const MTU_FLOOR_IPV4_ONLY: u16 = 576;
+
+/// The real, mandatory minimum link MTU for any interface carrying IPv6
+/// (RFC 8200 §5: "IPv6 requires that every link in the internet have an
+/// MTU of 1280 octets or greater"). A prior version of this function's
+/// own comments incorrectly called `576` (IPv4's floor) "the IPv6
+/// minimum-MTU guarantee" -- that was simply wrong, and went unnoticed
+/// because nothing had ever pushed a real dual-stack tunnel's computed
+/// MTU low enough to matter until FEC's `fec_reservation` subtraction
+/// did, live, on both production hosts (both configure `address6`):
+/// `1368 - 163 = 1205` at `fec_group_size = 16` is below 1280, and the
+/// kernel correctly refused to bring the TUN device up with an IPv6
+/// address at that MTU (`EINVAL`), crash-looping `mlvpnd` on both ends
+/// simultaneously. Confirmed live via `journalctl` on both hosts before
+/// this fix -- not a guess.
+const MTU_FLOOR_DUAL_STACK: u16 = 1280;
+
 /// Picks the MTU actually used for the TUN device and outgoing packet
 /// sizing: when `tunnel.mtu` is configured, the smaller of that ceiling
 /// and a safe value derived from every bonded link's real physical
@@ -816,12 +835,23 @@ pub const FALLBACK_MTU_WHEN_NOTHING_DETECTED: u16 = 1400;
 /// the data it exists to protect. Subtracting it last also preserves the
 /// property an operator pins `tunnel.mtu` to get in the first place: two
 /// peers that agree on a tunnel MTU without FEC still agree with FEC on,
-/// since both subtract the same reservation from the same ceiling.
+/// since both subtract the same reservation from the same ceiling. If
+/// the dual-stack `floor` (below) ever leaves no room to subtract the
+/// full reservation, the reservation is honored only partially (see the
+/// `tracing::warn!` at this function's final line) -- the MTU never
+/// drops below what IPv6 requires, even at the cost of FEC parity frames
+/// no longer reliably fitting the path.
 pub fn effective_tunnel_mtu(
     cfg: &crate::config::TunnelConfig,
     detected_mtus: &[Option<u32>],
     fec_reservation: u16,
 ) -> u16 {
+    let floor = if cfg.address6.is_some() {
+        MTU_FLOOR_DUAL_STACK
+    } else {
+        MTU_FLOOR_IPV4_ONLY
+    };
+
     let outer_overhead = crate::protocol::HEADER_LEN as u32
         + crate::wireguard::WG_OVERHEAD_BYTES
         + crate::wireguard::FAKE_IPV4_HEADER_LEN as u32
@@ -834,7 +864,7 @@ pub fn effective_tunnel_mtu(
                 .mtu
                 .unwrap_or(FALLBACK_MTU_WHEN_NOTHING_DETECTED)
                 .saturating_sub(fec_reservation)
-                .max(576);
+                .max(floor);
         };
 
         let safe_mtu = detected_min
@@ -844,13 +874,13 @@ pub fn effective_tunnel_mtu(
         match cfg.mtu {
             Some(ceiling) if ceiling <= safe_mtu => ceiling,
             Some(ceiling) => {
-                // Never clamp below the config-time floor already enforced
-                // in config.rs's validate() (>= 576, the IPv6 minimum-MTU
-                // guarantee) -- an unusually small detected physical MTU
-                // should surface as a visible problem, not silently produce
-                // a tunnel MTU so small it can't carry a minimum-size IPv6
-                // packet at all.
-                let clamped = safe_mtu.max(576);
+                // Never clamp below `floor` -- an unusually small detected
+                // physical MTU should surface as a visible problem, not
+                // silently produce a tunnel MTU so small it can't carry a
+                // minimum-size packet for this tunnel's own address
+                // family (or, for a dual-stack tunnel, one so small the
+                // kernel outright refuses to configure IPv6 on it at all).
+                let clamped = safe_mtu.max(floor);
                 tracing::warn!(
                     configured = ceiling,
                     detected_min_physical_mtu = detected_min,
@@ -866,11 +896,37 @@ pub fn effective_tunnel_mtu(
             // the actual fix for the reported throughput regression (the
             // old code's `cfg.mtu` defaulted to 1400 and this branch never
             // existed, so a real 1500-MTU link was never used past 1400).
-            None => safe_mtu.max(576),
+            None => safe_mtu.max(floor),
         }
     };
 
-    pre_fec.saturating_sub(fec_reservation).max(576)
+    let final_mtu = pre_fec.saturating_sub(fec_reservation).max(floor);
+
+    // `saturating_sub` plus the `floor` above can silently absorb part
+    // (or all) of `fec_reservation` on a dual-stack tunnel with little
+    // headroom to spare -- the MTU itself is always safe (never below
+    // `floor`), but a `FecParity` frame sized against the *unreserved*
+    // `final_mtu` can then exceed what the physical path actually
+    // carries, defeating the whole reason `fec_reservation` exists
+    // (see this function's own doc comment). Surfacing this once here,
+    // rather than only via `outbound_sender`'s own per-frame oversize
+    // check, means an operator sees the real cause (not enough MTU
+    // headroom for this `fec_group_size`) instead of just watching
+    // `fec_unrecoverable_total` climb with no explanation.
+    if fec_reservation > 0 && pre_fec.saturating_sub(final_mtu) < fec_reservation {
+        tracing::warn!(
+            pre_fec_mtu = pre_fec,
+            fec_reservation,
+            floor,
+            final_mtu,
+            "scheduler.fec_group_size's parity-frame overhead could not be fully reserved at \
+             this tunnel MTU without dropping below the minimum this tunnel's address family \
+             requires -- FEC parity frames may exceed the real path MTU and fail to arrive; \
+             reduce fec_group_size or raise tunnel.mtu if the physical link allows it"
+        );
+    }
+
+    final_mtu
 }
 
 /// How often `mtu_monitor_loop` re-checks whether the live TUN device's
@@ -1321,6 +1377,46 @@ mod tests {
             clamp_mss: true,
             tx_queue_len: 4000,
         }
+    }
+
+    /// Reproduces the real production crash (confirmed live, both
+    /// home-bgp and cloud-bgp, 2026-09-16): a dual-stack tunnel
+    /// (`address6` configured) pinned to `mtu = 1368`, with
+    /// `fec_group_size = 16` reserving 163 bytes for parity framing.
+    /// Before this fix, the floor was a blanket 576 (IPv4's own
+    /// minimum), so `1368 - 163 = 1205` was accepted and handed to
+    /// `open_tun`, which the kernel then refused (`EINVAL`) because
+    /// 1205 is below IPv6's mandatory 1280-byte minimum link MTU
+    /// (RFC 8200) -- crash-looping `mlvpnd` on both ends simultaneously.
+    #[test]
+    fn dual_stack_tunnel_never_computes_below_the_real_ipv6_minimum() {
+        let mut cfg = test_tunnel_config(Some(1368));
+        cfg.address6 = Some("fd00:200::1/64".to_string());
+        let detected = [Some(1480u32)]; // matches home-bgp's real tmobile physical MTU
+        let fec_reservation = crate::fec::parity_frame_overhead_bytes(16); // = 163
+        let result = effective_tunnel_mtu(&cfg, &detected, fec_reservation);
+        assert!(
+            result >= MTU_FLOOR_DUAL_STACK,
+            "dual-stack tunnel MTU {result} must never drop below the real IPv6 minimum \
+             ({MTU_FLOOR_DUAL_STACK}) -- a smaller value crashes mlvpnd outright (EINVAL from \
+             the kernel), it doesn't just degrade throughput"
+        );
+    }
+
+    /// The same inputs, but IPv4-only (`address6: None`) -- confirms the
+    /// fix's `floor` selection didn't accidentally raise the IPv4-only
+    /// floor too (that would needlessly shrink real capacity for a
+    /// tunnel that was never subject to the IPv6 constraint at all).
+    #[test]
+    fn ipv4_only_tunnel_keeps_the_lower_576_floor() {
+        let cfg = test_tunnel_config(Some(600));
+        let detected = [Some(700u32)];
+        let large_fec_reservation = 200u16;
+        let result = effective_tunnel_mtu(&cfg, &detected, large_fec_reservation);
+        assert_eq!(
+            result, MTU_FLOOR_IPV4_ONLY,
+            "an IPv4-only tunnel should still floor at 576, not be forced up to 1280"
+        );
     }
 
     #[test]
