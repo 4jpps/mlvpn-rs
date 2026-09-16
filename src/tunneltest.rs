@@ -259,8 +259,13 @@ fn decode_tcp_header(buf: &[u8]) -> Option<(u32, bool, u32)> {
 
 /// Reply the receiver writes back over its still-open write half once
 /// it has read the connector's stream to EOF -- the TCP path's
-/// equivalent of `ResultPayload`, with an added real retransmit count
-/// (`read_tcp_retransmits`) the UDP path has no equivalent of.
+/// equivalent of `ResultPayload`. Still carries a `retransmits` field
+/// on the wire for backward compatibility, but per Finding 1 of the
+/// 2026-09-16 final-review fix this is now always the *receiver's*
+/// own (structurally always-zero, since a receiver only ever sends
+/// ACKs) `TCP_INFO` reading -- the sender no longer trusts this field
+/// and instead reports its own locally-measured, honest retransmit
+/// count directly (see `run_tcp_upload_leg`).
 const TCP_RESULT_LEN: usize = 8 + 4;
 
 struct TcpResultPayload {
@@ -332,10 +337,15 @@ pub(crate) struct TunnelTestLegResult {
     /// leg -- see the module doc comment's "Queue-drop visibility"
     /// section.
     pub(crate) peer_queue_drops: u64,
-    /// TCP-only: the real retransmit count the *receiver* of this leg
-    /// measured via `TCP_INFO`. `None` for a UDP leg (which has no
-    /// equivalent). Populated by `handle_tcp_incoming` when it delivers
-    /// a reverse leg's result locally.
+    /// Always `None` as of the 2026-09-16 final-review fix (see
+    /// Finding 1) -- see `TunnelTestOutcome::download_retransmits`'s
+    /// doc comment for the full reasoning. A receiver-measured retransmit
+    /// count is structurally meaningless (a receiver only ever sends
+    /// ACKs, never retransmitted data), and there is no wire path for
+    /// the reverse leg's real *sender*-side measurement (taken on the
+    /// peer, inside `run_tcp_listener`) to reach this side. This
+    /// field is kept for `TunnelTestLegResult`'s own shape/possible
+    /// future use, not populated with real data today.
     pub(crate) retransmits: Option<u32>,
 }
 
@@ -484,10 +494,25 @@ pub(crate) struct TunnelTestOutcome {
     pub(crate) local_queue_drops: u64,
     pub(crate) peer_queue_drops: Option<u64>,
     /// TCP-only (`None` for a UDP-protocol test): real retransmit
-    /// count the peer measured receiving our upload stream.
+    /// count WE measured, locally, via `TCP_INFO` on our own sending
+    /// socket right after `shutdown()` (see `run_tcp_upload_leg`) --
+    /// deliberately sender-side, not the receiver's echoed value
+    /// (which is structurally always 0, since a receiver only ever
+    /// sends ACKs -- confirmed empirically with real `netem`-induced
+    /// loss during the 2026-09-16 final review, Finding 1).
     pub(crate) upload_retransmits: Option<u32>,
-    /// TCP-only: real retransmit count we measured receiving the
-    /// peer's reverse stream.
+    /// TCP-only, and always `None` by design -- see Finding 1 of the
+    /// 2026-09-16 final-review fix. A retransmit count is only honest
+    /// when read from whichever side actually *sent* the data; for
+    /// the download/reverse leg that's the peer (running
+    /// `run_tcp_upload_leg` inside its own `run_tcp_listener`), and
+    /// there is no wire-protocol path to carry that peer-local
+    /// measurement back to us. Rather than report the *receiver's*
+    /// own (structurally always-zero, and therefore misleading)
+    /// `TCP_INFO` reading, this field is deliberately left
+    /// unpopulated -- a disclosed limitation, not a bug. The CLI
+    /// prints an explicit "unavailable" note for this leg instead of
+    /// silently showing 0.
     pub(crate) download_retransmits: Option<u32>,
 }
 
@@ -780,10 +805,22 @@ pub(crate) async fn run_listener(
 /// bidirectional-request flag), streams bulk data for `duration` at
 /// whatever rate the kernel's own TCP congestion control allows (no
 /// custom pacing -- see this module's doc comment for why that's
-/// deliberate), half-closes, then reads the receiver's
-/// `TcpResultPayload` reply off the still-open read half. Used both for
-/// the upload leg `run_test`-equivalent initiates directly, and for the
-/// autonomous reverse/download leg `run_tcp_listener` spawns.
+/// deliberate), half-closes, reads its *own* real retransmit count
+/// (see Finding 1 below), then reads the receiver's `TcpResultPayload`
+/// reply off the still-open read half. Used both for the upload leg
+/// `run_test`-equivalent initiates directly, and for the autonomous
+/// reverse/download leg `run_tcp_listener` spawns.
+///
+/// **Finding 1 of the 2026-09-16 final review**: the retransmit count
+/// returned here is read from *this* (the sender's) own socket, not
+/// the receiver's reply -- `tcpi_total_retrans` only ever counts
+/// retransmits of data *this side* sent, and a receiver in this
+/// protocol only ever sends ACKs (never retransmitted the way data
+/// segments are), so reading it on the receiver's socket is
+/// structurally always 0 regardless of real loss on the path.
+/// Confirmed empirically with a real loopback transfer under
+/// `netem loss 20%`/`30%`: `total_retrans` was nonzero and correct on
+/// the sender's own socket, exactly 0 on the receiver's, every time.
 async fn run_tcp_upload_leg(
     peer_addr: SocketAddr,
     test_id: u32,
@@ -813,18 +850,46 @@ async fn run_tcp_upload_leg(
     // UDP path's payload, content doesn't matter for a throughput test.
     let chunk = vec![0u8; 65536];
     let deadline = Instant::now() + duration;
-    while Instant::now() < deadline {
-        stream.write_all(&chunk).await.ok()?;
-    }
-    stream.shutdown().await.ok()?;
+    // Finding 3 of the 2026-09-16 final review: bound the whole
+    // write-loop-plus-shutdown sequence with a timeout, so a stalled
+    // `write_all` (e.g. the peer's receive window stuck at zero after
+    // it vanishes mid-test) can't hang this task forever. Generous --
+    // `duration + RESULT_GRACE` -- so it never cuts the legitimate
+    // steady-state case short; the loop's own `deadline` check is what
+    // normally ends it well within that bound.
+    let write_and_shutdown = tokio::time::timeout(duration + RESULT_GRACE, async {
+        while Instant::now() < deadline {
+            stream.write_all(&chunk).await.ok()?;
+        }
+        stream.shutdown().await.ok()
+    })
+    .await
+    .ok()
+    .flatten();
+    write_and_shutdown?;
 
+    // Finding 1: read our OWN retransmit count here, right after
+    // `shutdown()` (write half closed, but the kernel still reports
+    // this connection's full accumulated retransmit history) and
+    // before the socket goes away -- this is the honest, sender-side
+    // measurement; see this function's own doc comment above.
+    let local_retransmits = read_tcp_retransmits(&stream);
+
+    // Finding 2 of the 2026-09-16 final review: the old fixed
+    // `RESULT_GRACE` wait didn't scale with test duration, so on a
+    // genuinely slow/lossy path (the whole reason this tool exists)
+    // the receiver's reply -- which can't be sent until its entire
+    // kernel-buffered backlog has drained -- could easily arrive after
+    // an 8-second wait. Scaled to match the download leg's own
+    // existing `duration * 2 + RESULT_GRACE * 2` pattern in spirit:
+    // `duration + RESULT_GRACE`.
     let mut buf = [0u8; TCP_RESULT_LEN];
-    tokio::time::timeout(RESULT_GRACE, stream.read_exact(&mut buf))
+    tokio::time::timeout(duration + RESULT_GRACE, stream.read_exact(&mut buf))
         .await
         .ok()?
         .ok()?;
     let result = TcpResultPayload::decode(&buf)?;
-    Some((result.achieved_mbps, result.retransmits))
+    Some((result.achieved_mbps, local_retransmits))
 }
 
 /// Handles one accepted TCP connection on the persistent listener:
@@ -851,16 +916,44 @@ async fn handle_tcp_incoming(
     let start = Instant::now();
     let mut buf = vec![0u8; 65536];
     let mut bytes_read: u64 = 0;
-    loop {
-        match stream.read(&mut buf).await {
-            Ok(0) => break,
-            Ok(n) => bytes_read += n as u64,
-            Err(_) => return None,
+    // Finding 3 of the 2026-09-16 final review: bound the read-to-EOF
+    // loop with a timeout. Without this, a peer that vanishes mid-test
+    // without a clean FIN/RST (a peer restart or link failover mid-test
+    // -- both routine events on these hosts) leaves `stream.read()`
+    // blocked forever (no `SO_KEEPALIVE` is set), permanently leaking
+    // this task and its 64KB buffer on a daemon meant to run for weeks.
+    // We don't know the sender's intended duration until the header is
+    // decoded (just above), so the bound is derived from it here rather
+    // than being a fixed constant.
+    let read_timeout = Duration::from_secs(duration_secs as u64) + RESULT_GRACE;
+    let read_to_eof = tokio::time::timeout(read_timeout, async {
+        loop {
+            match stream.read(&mut buf).await {
+                Ok(0) => return Some(()),
+                Ok(n) => {
+                    bytes_read += n as u64;
+                }
+                Err(_) => return None,
+            }
+        }
+    })
+    .await;
+    match read_to_eof {
+        Ok(Some(())) => {}
+        Ok(None) => return None,
+        Err(_) => {
+            tracing::debug!(
+                %peer,
+                duration_secs,
+                "tunnel-level TCP self-test read loop timed out waiting for the \
+                 sender to finish or vanish -- abandoning this connection rather \
+                 than blocking forever"
+            );
+            return None;
         }
     }
     let elapsed_secs = start.elapsed().as_secs_f64();
     let achieved_mbps = compute_achieved_mbps(bytes_read, elapsed_secs);
-    let retransmits = read_tcp_retransmits(&stream);
 
     let delivered_locally = tunnel_test_ctx.forward_result(
         test_id,
@@ -871,17 +964,29 @@ async fn handle_tcp_incoming(
             // the printing layer (Task 3) knows to skip this line for
             // TCP results rather than print a misleading "0 dropped".
             peer_queue_drops: 0,
-            retransmits: Some(retransmits),
+            // Finding 1 of the 2026-09-16 final review: this function
+            // runs as the RECEIVER for any incoming connection,
+            // including a reverse/download leg -- a receiver-measured
+            // retransmit count is structurally always 0 (see
+            // `run_tcp_upload_leg`'s own doc comment) and there is no
+            // wire path for the reverse leg's real sender-side
+            // measurement to reach here. Always `None`; see
+            // `TunnelTestOutcome::download_retransmits`.
+            retransmits: None,
         },
     );
     if delivered_locally {
         return None;
     }
 
-    tracing::info!(%peer, achieved_mbps, retransmits, "tunnel-level TCP self-test stream received");
+    tracing::info!(%peer, achieved_mbps, "tunnel-level TCP self-test stream received");
     let result = TcpResultPayload {
         achieved_mbps,
-        retransmits,
+        // Structurally always 0 -- this side only ever sent ACKs, per
+        // Finding 1. Sent for wire-format compatibility only; the
+        // sender now ignores this field in favor of its own local,
+        // honest `TCP_INFO` read (see `run_tcp_upload_leg`).
+        retransmits: 0,
     }
     .encode();
     let _ = stream.write_all(&result).await;
@@ -891,8 +996,11 @@ async fn handle_tcp_incoming(
 
 /// Persistent TCP accept loop, the TCP counterpart to `run_listener`'s
 /// UDP loop -- bound to the same `TUNNEL_TEST_PORT` on the TUN device's
-/// own local address, spawned alongside it whenever `[command] enabled
-/// = true`. Each accepted connection is handled on its own task
+/// own local address, spawned unconditionally alongside it, regardless
+/// of `[command] enabled` -- see `run_listener`'s own doc comment (and
+/// its call site in `tunnel.rs`) for why: any daemon can be the
+/// *target* of a test even if it never intends to *initiate* one
+/// itself. Each accepted connection is handled on its own task
 /// (`handle_tcp_incoming`); a connection recognized as our own reverse
 /// leg ends there, one recognized as a fresh test from a peer spawns
 /// `run_tcp_upload_leg` back to them if they asked for a bidirectional

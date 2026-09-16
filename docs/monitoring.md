@@ -127,13 +127,14 @@ still available even when the self-test result itself times out.
 The link-level self-test above measures each physical link's own raw
 UDP capacity, bypassing the TUN device, the outbound queue, and the
 scheduler entirely. To instead measure the *whole bonded path* --
-real IP/UDP traffic actually routed through the tunnel, exercising the
-same queue and scheduler real Data traffic uses -- run:
+real traffic actually routed through the tunnel, exercising the same
+queue and scheduler real Data traffic uses -- run:
 
 ```sh
-mlvpnd self-test --config /etc/mlvpn/mlvpn.toml --tunnel --peer-addr 10.200.0.2                # upload only
+mlvpnd self-test --config /etc/mlvpn/mlvpn.toml --tunnel --peer-addr 10.200.0.2                # upload only, real TCP (default)
 mlvpnd self-test --config /etc/mlvpn/mlvpn.toml --tunnel --peer-addr 10.200.0.2 --duration 15   # longer stream
 mlvpnd self-test --config /etc/mlvpn/mlvpn.toml --tunnel --peer-addr 10.200.0.2 --bidirectional # also measure the reverse direction
+mlvpnd self-test --config /etc/mlvpn/mlvpn.toml --tunnel --peer-addr 10.200.0.2 --protocol udp  # raw UDP stream instead
 ```
 
 `--peer-addr` is the peer's *tunnel-internal* IP (the `tunnel.address`
@@ -143,10 +144,45 @@ target's listener runs unconditionally, same as the link-level
 self-test's own "any daemon can be the target" precedent, so nothing
 needs to be enabled ahead of time on the far end.
 
-Sample output:
+**`--protocol tcp|udp` (default `tcp`).** TCP mode opens a real TCP
+connection through the tunnel and reports genuine, kernel-measured
+retransmit counts (`TCP_INFO`) alongside throughput -- real loss on
+the path shows up directly as retransmits, the same signal `ss -ti`/
+`iperf3` surface, instead of the old UDP self-test's blind spot (its
+own active-loss probing is separate and doesn't reflect what a real
+bulk TCP flow experiences). UDP mode is the original behavior:
+raw UDP packets through the tunnel, with each direction's *sender*
+reporting its own outbound-queue-drop delta instead of a retransmit
+count (TCP has no outbound-queue concept in this design; UDP has no
+retransmit concept).
+
+**A real limitation of TCP mode, disclosed rather than silently wrong:**
+only the **upload** leg's retransmit count is genuine. It's measured
+locally, on the sender's own socket, right after it finishes sending --
+the only way to get a reading that means anything (a receiver only
+ever sends ACKs, never retransmits, so reading `TCP_INFO` on the
+*receiving* side is structurally always 0 regardless of real loss).
+For the **download** leg, the real sender is the peer, and there is no
+wire path for the peer's own sender-side measurement to reach back to
+the host that initiated the test -- so the download leg's retransmit
+count is reported as explicitly unavailable rather than printing the
+always-0 receiver-side reading a naive implementation would.
+
+Sample output (TCP, the default):
 
 ```
-running tunnel-level self-test against 10.200.0.2 (10s per direction, bidirectional) -- this will take a while...
+running tunnel-level self-test against 10.200.0.2 (10s per direction, bidirectional, tcp) -- this will take a while...
+upload: 148.3 Mbps
+  real TCP goodput, retransmits: 12
+download: 151.9 Mbps
+  retransmits: unavailable for the download leg -- the peer is the real sender for this leg and has no way to report its own TCP_INFO reading back to us (see docs/monitoring.md)
+peer version: 0.4.6 (matches this host)
+```
+
+Sample output (`--protocol udp`):
+
+```
+running tunnel-level self-test against 10.200.0.2 (10s per direction, bidirectional, udp) -- this will take a while...
 upload: 148.3 Mbps
   our own outbound queue dropped 0 packets during this leg
 download: 151.9 Mbps
@@ -154,16 +190,18 @@ download: 151.9 Mbps
 peer version: 0.4.6 (matches this host)
 ```
 
-Each direction reports its own outbound-queue drop count alongside the
-achieved rate. A non-zero count on the *sender's own* leg means the
-traffic never even made it out of that host's outbound queue -- a
-locally-observable cause, not something that requires guessing about
-what happened on the wire or at the peer. A clean queue on both legs
-combined with real measured loss (compare against `iperf3`, or the
-link-level self-test above) narrows the search to somewhere between
-the outbound queue and the peer's own application -- the kernel UDP
-socket buffers, most likely (see `mlvpnd diag-dump`'s kernel-level UDP
-diagnostics, below).
+In UDP mode, each direction reports its own outbound-queue drop count
+alongside the achieved rate. A non-zero count on the *sender's own*
+leg means the traffic never even made it out of that host's outbound
+queue -- a locally-observable cause, not something that requires
+guessing about what happened on the wire or at the peer. A clean queue
+on both legs combined with real measured loss (compare against
+`iperf3`, or the link-level self-test above) narrows the search to
+somewhere between the outbound queue and the peer's own application --
+the kernel UDP socket buffers, most likely (see `mlvpnd diag-dump`'s
+kernel-level UDP diagnostics, below). In TCP mode, the upload leg's
+real retransmit count is often a faster way to spot this same class of
+loss directly, without needing a separate `iperf3` comparison.
 
 ## Diagnostic dump
 

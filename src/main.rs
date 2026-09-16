@@ -406,9 +406,13 @@ fn run_tunnel_throughput_selftest(
     bidirectional: bool,
     protocol: mlvpn::ipc::Protocol,
 ) -> anyhow::Result<()> {
+    let protocol_str = match protocol {
+        mlvpn::ipc::Protocol::Tcp => "tcp",
+        mlvpn::ipc::Protocol::Udp => "udp",
+    };
     println!(
-        "running tunnel-level self-test against {peer_addr} ({duration_secs}s per direction{}) \
-         -- this will take a while...",
+        "running tunnel-level self-test against {peer_addr} ({duration_secs}s per direction{}, \
+         {protocol_str}) -- this will take a while...",
         if bidirectional { ", bidirectional" } else { "" }
     );
     let cmd = SocketCommand::RunTunnelThroughputTest {
@@ -463,6 +467,21 @@ fn run_tunnel_throughput_selftest(
         println!("download: {download}");
         match protocol {
             mlvpn::ipc::Protocol::Tcp => {
+                // `download_retransmits` is always `None` by design --
+                // see `TunnelTestOutcome::download_retransmits`'s doc
+                // comment (Finding 1, 2026-09-16 final review): a
+                // receiver-side retransmit reading is structurally
+                // always 0 and would be actively misleading, and the
+                // real sender-side (peer's own) measurement has no
+                // wire path back to us. Say so explicitly instead of
+                // silently printing nothing or a wrong number.
+                if tt.download_mbps.is_some() {
+                    println!(
+                        "  retransmits: unavailable for the download leg -- the peer is the \
+                         real sender for this leg and has no way to report its own TCP_INFO \
+                         reading back to us (see docs/monitoring.md)"
+                    );
+                }
                 if let Some(retrans) = tt.download_retransmits {
                     println!("  real TCP goodput, retransmits: {retrans}");
                 }

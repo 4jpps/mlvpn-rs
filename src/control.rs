@@ -696,15 +696,37 @@ async fn run_tunnel_throughput_test_command(
         }
     };
 
-    tracing::info!(
-        %peer_addr,
-        ?protocol,
-        upload_mbps = ?outcome.upload_mbps,
-        download_mbps = ?outcome.download_mbps,
-        local_queue_drops = outcome.local_queue_drops,
-        peer_queue_drops = ?outcome.peer_queue_drops,
-        "tunnel-level throughput self-test complete"
-    );
+    // `local_queue_drops`/`peer_queue_drops` are a meaningless
+    // hardcoded 0/None for a TCP-protocol test (TCP has no
+    // outbound-queue-drop-delta concept here, per the design) --
+    // logging them unconditionally would print a misleading "clean"
+    // 0 for a field this protocol never actually measures. Shape the
+    // log line by protocol instead, matching how the CLI's own
+    // printing already branches on it.
+    match protocol {
+        crate::ipc::Protocol::Udp => {
+            tracing::info!(
+                %peer_addr,
+                ?protocol,
+                upload_mbps = ?outcome.upload_mbps,
+                download_mbps = ?outcome.download_mbps,
+                local_queue_drops = outcome.local_queue_drops,
+                peer_queue_drops = ?outcome.peer_queue_drops,
+                "tunnel-level throughput self-test complete"
+            );
+        }
+        crate::ipc::Protocol::Tcp => {
+            tracing::info!(
+                %peer_addr,
+                ?protocol,
+                upload_mbps = ?outcome.upload_mbps,
+                download_mbps = ?outcome.download_mbps,
+                upload_retransmits = ?outcome.upload_retransmits,
+                download_retransmits = ?outcome.download_retransmits,
+                "tunnel-level throughput self-test complete"
+            );
+        }
+    }
 
     CommandResult {
         ok: true,
