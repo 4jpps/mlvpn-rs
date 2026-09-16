@@ -800,10 +800,34 @@ const MTU_FLOOR_DUAL_STACK: u16 = 1280;
 /// filter, pairing with an old peer would permanently floor the tunnel
 /// MTU the moment this function's caller started trusting `peer_advertised`.
 ///
-pub(crate) fn negotiate_tunnel_mtu(local: u16, peer_advertised: Option<u16>) -> u16 {
+/// `floor` is re-applied to whichever branch produced the result: a peer
+/// with a different (lower) mandatory minimum for its own address family
+/// -- e.g. an IPv4-only peer (`MTU_FLOOR_IPV4_ONLY = 576`) paired with a
+/// dual-stack tunnel on this side (`MTU_FLOOR_DUAL_STACK = 1280`) -- could
+/// otherwise honestly advertise a value below this side's own floor, and a
+/// raw `min()` would hand that straight to `mtu_resizer.set_mtu`, which the
+/// kernel rejects (`EINVAL`) for a TUN device carrying an IPv6 address. See
+/// the final-review finding that motivated this.
+pub(crate) fn negotiate_tunnel_mtu(local: u16, peer_advertised: Option<u16>, floor: u16) -> u16 {
     match peer_advertised {
         Some(peer) if peer != 0 => local.min(peer),
         _ => local,
+    }
+    .max(floor)
+}
+
+/// The mandatory minimum tunnel MTU for `cfg`'s own address family --
+/// shared by `effective_tunnel_mtu` (applied to the locally-computed
+/// value) and `mtu_monitor_loop`'s call to `negotiate_tunnel_mtu`
+/// (re-applied after peer negotiation, since a peer with a different,
+/// lower floor could otherwise negotiate this side below its own
+/// mandatory minimum -- see the final-review finding that motivated
+/// this).
+fn mtu_floor_for(cfg: &crate::config::TunnelConfig) -> u16 {
+    if cfg.address6.is_some() {
+        MTU_FLOOR_DUAL_STACK
+    } else {
+        MTU_FLOOR_IPV4_ONLY
     }
 }
 
@@ -880,11 +904,7 @@ pub fn effective_tunnel_mtu(
     // §1.
     primary_idx: Option<usize>,
 ) -> u16 {
-    let floor = if cfg.address6.is_some() {
-        MTU_FLOOR_DUAL_STACK
-    } else {
-        MTU_FLOOR_IPV4_ONLY
-    };
+    let floor = mtu_floor_for(cfg);
 
     let outer_overhead = crate::protocol::HEADER_LEN as u32
         + crate::wireguard::WG_OVERHEAD_BYTES
@@ -1046,6 +1066,13 @@ pub(crate) async fn mtu_monitor_loop(
     tun_ifname: String,
     bind_interfaces: Vec<String>,
     live_mtu: std::sync::Arc<std::sync::atomic::AtomicU16>,
+    // This side's own live LOCAL LINK CAPABILITY, pre-negotiation -- see
+    // `tunnel::run`'s doc comment on `local_capability_mtu` and the
+    // final-review finding that motivated splitting this from `live_mtu`.
+    // Stored here every tick so `link_prober`'s `send_version_info` calls
+    // advertise this side's own true capability, never the already-
+    // negotiated `live_mtu` value (which would create a monotonic ratchet).
+    local_capability_mtu: std::sync::Arc<std::sync::atomic::AtomicU16>,
     mtu_resizer: crate::link::MtuResizer,
     // Bytes to hold back for FEC parity frames -- see
     // `effective_tunnel_mtu`. Fixed for the daemon's lifetime (it is
@@ -1074,8 +1101,13 @@ pub(crate) async fn mtu_monitor_loop(
             .collect();
         let primary_idx = scheduler.lock().unwrap().primary();
         let local = effective_tunnel_mtu(&tunnel_cfg, &detected, fec_reservation, primary_idx);
+        // Always stored, every tick -- this is this side's own local
+        // capability regardless of whether the negotiated/live value needs
+        // a resize this tick. See the doc comment on this parameter.
+        local_capability_mtu.store(local, std::sync::atomic::Ordering::Relaxed);
         let peer_advertised = *peer_mtu.lock().unwrap();
-        let recomputed = negotiate_tunnel_mtu(local, peer_advertised);
+        let floor = mtu_floor_for(&tunnel_cfg);
+        let recomputed = negotiate_tunnel_mtu(local, peer_advertised, floor);
         let current = live_mtu.load(std::sync::atomic::Ordering::Relaxed);
 
         if !mtu_resize_needed(current, recomputed) {
@@ -1643,7 +1675,7 @@ mod tests {
     /// peer has never sent one) -- use the local value unchanged.
     #[test]
     fn negotiate_tunnel_mtu_with_no_peer_data_uses_local() {
-        assert_eq!(negotiate_tunnel_mtu(1400, None), 1400);
+        assert_eq!(negotiate_tunnel_mtu(1400, None, 0), 1400);
     }
 
     /// A peer-advertised `0` -- what `VersionInfoPayload::decode` produces
@@ -1653,7 +1685,7 @@ mod tests {
     /// docs/superpowers/specs/2026-09-16-primary-aware-peer-mtu-design.md §3.
     #[test]
     fn negotiate_tunnel_mtu_ignores_a_zero_peer_value() {
-        assert_eq!(negotiate_tunnel_mtu(1400, Some(0)), 1400);
+        assert_eq!(negotiate_tunnel_mtu(1400, Some(0), 0), 1400);
     }
 
     /// A genuinely smaller peer value wins -- the local side pulls its own
@@ -1661,7 +1693,7 @@ mod tests {
     /// capacity changed.
     #[test]
     fn negotiate_tunnel_mtu_picks_the_smaller_peer_value() {
-        assert_eq!(negotiate_tunnel_mtu(1400, Some(1200)), 1200);
+        assert_eq!(negotiate_tunnel_mtu(1400, Some(1200), 0), 1200);
     }
 
     /// A genuinely larger peer value does NOT win -- the local side never
@@ -1669,12 +1701,26 @@ mod tests {
     /// the two.
     #[test]
     fn negotiate_tunnel_mtu_does_not_rise_above_the_local_value() {
-        assert_eq!(negotiate_tunnel_mtu(1200, Some(1400)), 1200);
+        assert_eq!(negotiate_tunnel_mtu(1200, Some(1400), 0), 1200);
     }
 
     /// Equal values are a no-op either way.
     #[test]
     fn negotiate_tunnel_mtu_equal_values_is_a_no_op() {
-        assert_eq!(negotiate_tunnel_mtu(1368, Some(1368)), 1368);
+        assert_eq!(negotiate_tunnel_mtu(1368, Some(1368), 0), 1368);
+    }
+
+    /// A peer with a lower mandatory MTU floor for its own address family
+    /// (e.g. an IPv4-only peer, `MTU_FLOOR_IPV4_ONLY = 576`) can honestly
+    /// advertise a value below THIS side's own floor if this side is
+    /// dual-stack (`MTU_FLOOR_DUAL_STACK = 1280`). A raw `min()` would
+    /// negotiate this side down below what its own IPv6 configuration
+    /// requires, and the kernel would reject the resulting `set_mtu` call
+    /// outright (`EINVAL`) for a TUN device carrying an IPv6 address.
+    /// `negotiate_tunnel_mtu` must always re-apply this side's own floor to
+    /// the final result, regardless of how low the peer's value is.
+    #[test]
+    fn negotiate_tunnel_mtu_never_drops_below_the_local_floor_even_when_the_peer_reports_lower() {
+        assert_eq!(negotiate_tunnel_mtu(1440, Some(1000), 1280), 1280);
     }
 }

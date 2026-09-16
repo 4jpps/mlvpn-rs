@@ -224,6 +224,43 @@ async fn primary_mtu_tracks_the_active_link_and_converges_across_the_peer() {
         after_failover.daemon.local_tunnel_mtu
     );
 
+    // Fail BACK: bring link0's client-side veth back up and confirm both
+    // sides' live tunnel MTU eventually returns to the original
+    // pre-failover converged value -- the real regression guard for the
+    // monotonic-ratchet bug found in this feature's final review (see
+    // docs/superpowers/specs/2026-09-16-primary-aware-peer-mtu-design.md
+    // §2): before that fix, negotiate_tunnel_mtu stored the ALREADY-
+    // negotiated (post-min()) value back into the value advertised to the
+    // peer, so once either side ever negotiated down, neither side could
+    // ever advertise a higher capability again -- this assertion would
+    // hang and time out under that bug, since the MTU would stay pinned
+    // at the post-failover value forever.
+    ns_client
+        .exec("ip", &["link", "set", &vc0, "up"])
+        .expect("failed to bring link0's client-side veth back up");
+
+    let recovered = poll_snapshot_until(&client_ctl, Duration::from_secs(60), |s| {
+        s.daemon.local_tunnel_mtu == converged.daemon.local_tunnel_mtu
+    })
+    .await
+    .expect(
+        "client's live tunnel MTU never recovered to its original pre-failover value after \
+         link0 came back up -- this is the monotonic-ratchet regression: once a peer ever \
+         negotiates down, it must still be able to rise again once local capacity does",
+    );
+
+    let server_recovered = poll_snapshot_until(&server_ctl, Duration::from_secs(30), |s| {
+        s.daemon.local_tunnel_mtu == recovered.daemon.local_tunnel_mtu
+    })
+    .await
+    .expect(
+        "server's live tunnel MTU never converged back up to match the client's recovered value",
+    );
+    assert_eq!(
+        server_recovered.daemon.local_tunnel_mtu,
+        recovered.daemon.local_tunnel_mtu
+    );
+
     drop(veth0);
     drop(veth1);
 }

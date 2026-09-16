@@ -635,6 +635,18 @@ pub async fn run(
     // `tun_reader`'s MSS-clamping.
     let live_mtu: LiveMtu = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(params.mtu));
 
+    // This side's own live LOCAL LINK CAPABILITY -- what effective_tunnel_mtu
+    // computes from this side's currently-selected primary link (or bonded
+    // min), BEFORE the peer's advertised value is folded in via
+    // negotiate_tunnel_mtu. Advertised to the peer via VersionInfo in place
+    // of live_mtu itself, so peer negotiation cannot create a monotonic
+    // ratchet -- see docs/superpowers/specs/2026-09-16-primary-aware-peer-mtu-design.md
+    // §2 and the final-review finding that motivated this. live_mtu (above)
+    // remains "what the TUN device is actually set to right now"; this is
+    // "what this side could support if the peer had no lower value at all."
+    let local_capability_mtu: LiveMtu =
+        std::sync::Arc::new(std::sync::atomic::AtomicU16::new(params.mtu));
+
     // Bounded outbound queue between tun_reader (producer) and
     // outbound_sender (consumer) -- see OUTBOUND_QUEUE_CAPACITY's doc
     // comment. Built here, ahead of the control-socket spawn below, so
@@ -698,10 +710,19 @@ pub async fn run(
             let links = links.clone();
             let scheduler = scheduler.clone();
             let cfg = params.scheduler_cfg.clone();
-            let mtu = live_mtu.clone();
+            let local_capability_mtu = local_capability_mtu.clone();
             let peer_primary_link = peer_primary_link.clone();
             handles.push(tokio::spawn(async move {
-                link_prober(idx, links, scheduler, cfg, mtu, tracker, peer_primary_link).await;
+                link_prober(
+                    idx,
+                    links,
+                    scheduler,
+                    cfg,
+                    local_capability_mtu,
+                    tracker,
+                    peer_primary_link,
+                )
+                .await;
             }));
         }
         {
@@ -843,6 +864,7 @@ pub async fn run(
         let tun_ifname = params.tunnel_name.clone();
         let bind_interfaces = params.bind_interfaces.clone();
         let live_mtu = live_mtu.clone();
+        let local_capability_mtu = local_capability_mtu.clone();
         let mtu_resizer = params.mtu_resizer.clone();
         let fec_reservation = fec::mtu_reservation_bytes(&params.scheduler_cfg);
         let scheduler = scheduler.clone();
@@ -853,6 +875,7 @@ pub async fn run(
                 tun_ifname,
                 bind_interfaces,
                 live_mtu,
+                local_capability_mtu,
                 mtu_resizer,
                 fec_reservation,
                 scheduler,
@@ -1572,7 +1595,7 @@ async fn link_prober(
     links: Links,
     scheduler: Arc<std::sync::Mutex<Scheduler>>,
     cfg: SchedulerConfig,
-    mtu: LiveMtu,
+    local_capability_mtu: LiveMtu,
     tracker: Arc<AsyncMutex<ProbeTracker>>,
     peer_primary_link: PeerPrimaryLink,
 ) {
@@ -1656,7 +1679,7 @@ async fn link_prober(
             // drives scheduling decisions.
             _ = stats_tick.tick() => {
                 send_stats_share(link_id, &links, idx).await;
-                send_version_info(link_id, &links, idx, &mtu, &scheduler).await;
+                send_version_info(link_id, &links, idx, &local_capability_mtu, &scheduler).await;
             }
 
             _ = sweep_tick.tick() => {
@@ -3108,7 +3131,7 @@ async fn send_version_info(
     link_id: u8,
     links: &Links,
     idx: usize,
-    mtu: &LiveMtu,
+    local_capability_mtu: &LiveMtu,
     scheduler: &Arc<std::sync::Mutex<Scheduler>>,
 ) {
     let handle = {
@@ -3136,7 +3159,7 @@ async fn send_version_info(
 
     let payload = VersionInfoPayload {
         version: VersionInfoPayload::encode_version(crate::VERSION),
-        tunnel_mtu: mtu.load(std::sync::atomic::Ordering::Relaxed),
+        tunnel_mtu: local_capability_mtu.load(std::sync::atomic::Ordering::Relaxed),
         primary_link_name: VersionInfoPayload::encode_link_name(&primary_link_name),
     };
     let plaintext = payload.encode();
