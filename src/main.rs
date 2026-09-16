@@ -116,6 +116,15 @@ enum Command {
         /// `--tunnel` is set.
         #[arg(short, long)]
         peer_addr: Option<String>,
+        /// Which wire protocol to use for `--tunnel` mode. `tcp` (the
+        /// default) gives numbers directly comparable to `iperf3`, since
+        /// real TCP reacts to loss the way real application traffic
+        /// does. `udp` preserves the original raw, unpaced measurement
+        /// -- useful as a diagnostic comparison point, not
+        /// representative of real traffic. Ignored when `--tunnel` is
+        /// not set.
+        #[arg(long, default_value = "tcp")]
+        protocol: mlvpn::ipc::Protocol,
     },
     /// Capture a diagnostic dump for a running mlvpnd: every link's
     /// health, daemon/session state, and recent log lines (via the
@@ -195,12 +204,19 @@ fn main() -> anyhow::Result<()> {
             bidirectional,
             tunnel,
             peer_addr,
+            protocol,
         } => {
             if tunnel {
                 let Some(peer_addr) = peer_addr else {
                     anyhow::bail!("--tunnel requires --peer-addr <the peer's tunnel-internal IP>");
                 };
-                run_tunnel_throughput_selftest(&config, &peer_addr, duration, bidirectional)
+                run_tunnel_throughput_selftest(
+                    &config,
+                    &peer_addr,
+                    duration,
+                    bidirectional,
+                    protocol,
+                )
             } else {
                 run_throughput_selftest(&config, link, duration, bidirectional)
             }
@@ -388,6 +404,7 @@ fn run_tunnel_throughput_selftest(
     peer_addr: &str,
     duration_secs: u32,
     bidirectional: bool,
+    protocol: mlvpn::ipc::Protocol,
 ) -> anyhow::Result<()> {
     println!(
         "running tunnel-level self-test against {peer_addr} ({duration_secs}s per direction{}) \
@@ -398,6 +415,7 @@ fn run_tunnel_throughput_selftest(
         peer_addr: peer_addr.to_string(),
         duration_secs,
         bidirectional,
+        protocol,
     };
     let result = send_command(config_path, &cmd)?;
 
@@ -419,13 +437,22 @@ fn run_tunnel_throughput_selftest(
         .map(|v| format!("{v:.1} Mbps"))
         .unwrap_or_else(no_result);
     println!("upload: {upload}");
-    if tt.local_outbound_queue_dropped_delta > 0 {
-        println!(
-            "  our own outbound queue dropped {} packet(s) during this leg",
-            tt.local_outbound_queue_dropped_delta
-        );
-    } else {
-        println!("  our own outbound queue dropped 0 packets during this leg");
+    match protocol {
+        mlvpn::ipc::Protocol::Tcp => {
+            if let Some(retrans) = tt.upload_retransmits {
+                println!("  real TCP goodput, retransmits: {retrans}");
+            }
+        }
+        mlvpn::ipc::Protocol::Udp => {
+            if tt.local_outbound_queue_dropped_delta > 0 {
+                println!(
+                    "  our own outbound queue dropped {} packet(s) during this leg",
+                    tt.local_outbound_queue_dropped_delta
+                );
+            } else {
+                println!("  our own outbound queue dropped 0 packets during this leg");
+            }
+        }
     }
 
     if bidirectional {
@@ -434,10 +461,19 @@ fn run_tunnel_throughput_selftest(
             .map(|v| format!("{v:.1} Mbps"))
             .unwrap_or_else(no_result);
         println!("download: {download}");
-        match tt.peer_outbound_queue_dropped_delta {
-            Some(0) => println!("  peer's outbound queue dropped 0 packets during this leg"),
-            Some(n) => println!("  peer's outbound queue dropped {n} packet(s) during this leg"),
-            None => println!("  peer's outbound queue drop count unavailable (no result)"),
+        match protocol {
+            mlvpn::ipc::Protocol::Tcp => {
+                if let Some(retrans) = tt.download_retransmits {
+                    println!("  real TCP goodput, retransmits: {retrans}");
+                }
+            }
+            mlvpn::ipc::Protocol::Udp => match tt.peer_outbound_queue_dropped_delta {
+                Some(0) => println!("  peer's outbound queue dropped 0 packets during this leg"),
+                Some(n) => {
+                    println!("  peer's outbound queue dropped {n} packet(s) during this leg")
+                }
+                None => println!("  peer's outbound queue drop count unavailable (no result)"),
+            },
         }
     }
     print_peer_version_report(&result.peer_version);

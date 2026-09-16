@@ -631,11 +631,13 @@ async fn apply_command(
             peer_addr,
             duration_secs,
             bidirectional,
+            protocol,
         } => {
             run_tunnel_throughput_test_command(
                 &peer_addr,
                 duration_secs,
                 bidirectional,
+                protocol,
                 mtu,
                 &diag_ctx.outbound_dropped_total,
                 tunnel_test_ctx,
@@ -652,10 +654,12 @@ async fn apply_command(
 /// why this is a genuinely different mechanism from
 /// `run_throughput_test_command` above (real UDP through the TUN
 /// device/outbound queue/scheduler, not a link's own raw socket).
+#[allow(clippy::too_many_arguments)]
 async fn run_tunnel_throughput_test_command(
     peer_addr: &str,
     duration_secs: u32,
     bidirectional: bool,
+    protocol: crate::ipc::Protocol,
     mtu: crate::tunnel::LiveMtu,
     outbound_dropped_total: &Arc<AtomicU64>,
     tunnel_test_ctx: &Arc<tunneltest::TunnelTestContext>,
@@ -675,18 +679,26 @@ async fn run_tunnel_throughput_test_command(
         }
     };
 
-    let outcome = tunneltest::run_test(
-        peer_addr,
-        duration_secs,
-        bidirectional,
-        mtu,
-        outbound_dropped_total,
-        tunnel_test_ctx,
-    )
-    .await;
+    let outcome = match protocol {
+        crate::ipc::Protocol::Udp => {
+            tunneltest::run_test(
+                peer_addr,
+                duration_secs,
+                bidirectional,
+                mtu,
+                outbound_dropped_total,
+                tunnel_test_ctx,
+            )
+            .await
+        }
+        crate::ipc::Protocol::Tcp => {
+            tunneltest::run_tcp_test(peer_addr, duration_secs, bidirectional, tunnel_test_ctx).await
+        }
+    };
 
     tracing::info!(
         %peer_addr,
+        ?protocol,
         upload_mbps = ?outcome.upload_mbps,
         download_mbps = ?outcome.download_mbps,
         local_queue_drops = outcome.local_queue_drops,
@@ -704,6 +716,8 @@ async fn run_tunnel_throughput_test_command(
             download_mbps: outcome.download_mbps,
             local_outbound_queue_dropped_delta: outcome.local_queue_drops,
             peer_outbound_queue_dropped_delta: outcome.peer_queue_drops,
+            upload_retransmits: outcome.upload_retransmits,
+            download_retransmits: outcome.download_retransmits,
         }),
         // Read *after* the test, not before: if the peer's own
         // `VersionInfo` broadcast happens to land during the test

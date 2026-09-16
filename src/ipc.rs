@@ -292,6 +292,21 @@ pub struct LinkSnapshot {
     pub peer_stats_age_ms: Option<u64>,
 }
 
+/// Which wire protocol `Command::RunTunnelThroughputTest` uses --
+/// `Tcp` (the default) gives numbers directly comparable to `iperf3`
+/// since it reacts to real loss the way TCP does; `Udp` preserves the
+/// original raw, unpaced-by-loss measurement, useful as a diagnostic
+/// comparison point (the gap between the two shows how much real loss
+/// is hurting real traffic). See
+/// docs/superpowers/specs/2026-09-16-tcp-tunnel-self-test-design.md.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum Protocol {
+    #[default]
+    Tcp,
+    Udp,
+}
+
 /// A request sent over the command socket. `#[serde(tag = "command")]`
 /// gives each variant a plain `{"command": "set_link_enabled", ...}`
 /// shape on the wire rather than the more awkward externally-tagged
@@ -340,6 +355,8 @@ pub enum Command {
         peer_addr: String,
         duration_secs: u32,
         bidirectional: bool,
+        #[serde(default)]
+        protocol: Protocol,
     },
 }
 
@@ -427,6 +444,12 @@ pub struct TunnelTestCommandResult {
     /// on the reverse stream itself, so it's unavailable if that leg
     /// never arrived).
     pub peer_outbound_queue_dropped_delta: Option<u64>,
+    /// TCP-only (`None` for a UDP-protocol test). See `TunnelTestOutcome`.
+    #[serde(default)]
+    pub upload_retransmits: Option<u32>,
+    /// TCP-only (`None` for a UDP-protocol test). See `TunnelTestOutcome`.
+    #[serde(default)]
+    pub download_retransmits: Option<u32>,
 }
 
 #[cfg(test)]
@@ -729,6 +752,7 @@ mod tests {
             peer_addr: "10.200.0.2".to_string(),
             duration_secs: 10,
             bidirectional: true,
+            protocol: Protocol::Tcp,
         };
         let json = serde_json::to_string(&cmd).expect("serialize");
         let back: Command = serde_json::from_str(&json).expect("deserialize");
@@ -736,6 +760,7 @@ mod tests {
             peer_addr,
             duration_secs,
             bidirectional,
+            protocol,
         } = back
         else {
             panic!("expected RunTunnelThroughputTest, got {back:?}");
@@ -743,6 +768,28 @@ mod tests {
         assert_eq!(peer_addr, "10.200.0.2");
         assert_eq!(duration_secs, 10);
         assert!(bidirectional);
+        assert_eq!(protocol, Protocol::Tcp);
+    }
+
+    /// Forward-compatibility guard: an older CLI's request (predating
+    /// the `protocol` field) must still deserialize against a newer
+    /// daemon, defaulting to `Protocol::Tcp` via `#[serde(default)]` --
+    /// same established pattern as `peer_tunnel_mtu` elsewhere in this
+    /// file.
+    #[test]
+    fn run_tunnel_throughput_test_command_protocol_defaults_to_tcp_when_absent_from_the_wire() {
+        let json = serde_json::json!({
+            "command": "run_tunnel_throughput_test",
+            "peer_addr": "10.200.0.2",
+            "duration_secs": 10,
+            "bidirectional": false,
+        })
+        .to_string();
+        let back: Command = serde_json::from_str(&json).expect("deserialize");
+        let Command::RunTunnelThroughputTest { protocol, .. } = back else {
+            panic!("expected RunTunnelThroughputTest, got {back:?}");
+        };
+        assert_eq!(protocol, Protocol::Tcp);
     }
 
     #[test]
@@ -757,6 +804,8 @@ mod tests {
                 download_mbps: Some(388.9),
                 local_outbound_queue_dropped_delta: 0,
                 peer_outbound_queue_dropped_delta: Some(3),
+                upload_retransmits: Some(12),
+                download_retransmits: Some(7),
             }),
             peer_version: None,
         };
