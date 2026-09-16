@@ -220,6 +220,119 @@ impl ResultPayload {
     }
 }
 
+/// Header at the start of every TCP self-test stream -- TCP has no
+/// per-packet out-of-band flags the way the UDP `DataPayload` did, so
+/// this rides as the first `TCP_HEADER_LEN` bytes of the connection
+/// instead. Carries `test_id` for the exact same reason the UDP
+/// protocol does: so the persistent listener can tell "this incoming
+/// connection is a stranger testing us fresh" apart from "this is the
+/// autonomous reverse leg of a test *we* initiated" via
+/// `TunnelTestContext::forward_result` -- see that type's doc comment.
+///
+/// Not yet wired into any send/receive logic or the CLI -- pure
+/// wire-protocol primitives only, consumed by a later task.
+#[allow(dead_code)]
+const TCP_HEADER_LEN: usize = 5;
+#[allow(dead_code)]
+const TCP_FLAG_BIDIRECTIONAL_REQUESTED: u8 = 0b1;
+
+#[allow(dead_code)]
+fn encode_tcp_header(test_id: u32, bidirectional_requested: bool) -> [u8; TCP_HEADER_LEN] {
+    let mut out = [0u8; TCP_HEADER_LEN];
+    out[0..4].copy_from_slice(&test_id.to_be_bytes());
+    out[4] = if bidirectional_requested {
+        TCP_FLAG_BIDIRECTIONAL_REQUESTED
+    } else {
+        0
+    };
+    out
+}
+
+#[allow(dead_code)]
+fn decode_tcp_header(buf: &[u8]) -> Option<(u32, bool)> {
+    if buf.len() < TCP_HEADER_LEN {
+        return None;
+    }
+    let test_id = u32::from_be_bytes(buf[0..4].try_into().unwrap());
+    let bidirectional_requested = buf[4] & TCP_FLAG_BIDIRECTIONAL_REQUESTED != 0;
+    Some((test_id, bidirectional_requested))
+}
+
+/// Reply the receiver writes back over its still-open write half once
+/// it has read the connector's stream to EOF -- the TCP path's
+/// equivalent of `ResultPayload`, with an added real retransmit count
+/// (`read_tcp_retransmits`) the UDP path has no equivalent of.
+///
+/// Not yet wired into any send/receive logic or the CLI -- pure
+/// wire-protocol primitives only, consumed by a later task.
+#[allow(dead_code)]
+const TCP_RESULT_LEN: usize = 8 + 4;
+
+#[allow(dead_code)]
+struct TcpResultPayload {
+    achieved_mbps: f64,
+    retransmits: u32,
+}
+
+#[allow(dead_code)]
+impl TcpResultPayload {
+    fn encode(&self) -> [u8; TCP_RESULT_LEN] {
+        let mut out = [0u8; TCP_RESULT_LEN];
+        out[0..8].copy_from_slice(&self.achieved_mbps.to_be_bytes());
+        out[8..12].copy_from_slice(&self.retransmits.to_be_bytes());
+        out
+    }
+
+    fn decode(buf: &[u8]) -> Option<Self> {
+        if buf.len() < TCP_RESULT_LEN {
+            return None;
+        }
+        Some(Self {
+            achieved_mbps: f64::from_be_bytes(buf[0..8].try_into().unwrap()),
+            retransmits: u32::from_be_bytes(buf[8..12].try_into().unwrap()),
+        })
+    }
+}
+
+/// Reads the real, kernel-tracked total retransmit count for `stream`
+/// via `TCP_INFO` (Linux `getsockopt`) -- the same class of evidence
+/// `ss -ti`/`iperf3` surface, giving this tool's TCP mode genuine
+/// loss/retransmission signal instead of just an isolated throughput
+/// number. Returns 0 on any failure (e.g. a platform without
+/// `TCP_INFO`) rather than propagating an error -- this is diagnostic
+/// enrichment, not load-bearing for the test's own success/failure.
+///
+/// Not yet wired into any send/receive logic or the CLI -- pure
+/// wire-protocol primitive only, consumed by a later task.
+#[allow(dead_code)]
+fn read_tcp_retransmits(stream: &tokio::net::TcpStream) -> u32 {
+    use std::os::unix::io::AsRawFd;
+    let mut info: libc::tcp_info = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::tcp_info>() as libc::socklen_t;
+    // SAFETY: `stream.as_raw_fd()` returns a valid, open TCP socket file
+    // descriptor for the duration of this call (the stream is only
+    // borrowed, not consumed, so the fd stays valid and owned by
+    // `stream` throughout). `info` is a correctly-sized, zero-initialized
+    // `libc::tcp_info` and `len` is initialized to its exact size, both
+    // matching what `getsockopt(2)` expects for `IPPROTO_TCP`/`TCP_INFO`.
+    // The raw pointer cast is to the same `libc::tcp_info` type the
+    // syscall itself will write into, so no type confusion is possible.
+    // We intentionally ignore `getsockopt`'s return value: on failure
+    // (e.g. `TCP_INFO` unsupported on this platform) `info` is left in
+    // its zeroed state from above, so `tcpi_total_retrans` reads 0
+    // rather than an uninitialized value -- safe either way.
+    unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::IPPROTO_TCP,
+            libc::TCP_INFO,
+            &mut info as *mut _ as *mut libc::c_void,
+            &mut len,
+        );
+    }
+    info.tcpi_total_retrans
+}
+
 /// One leg's result, as delivered to a waiting `run_test` invocation by
 /// the persistent listener (`run_listener`) when it finishes measuring
 /// an incoming stream that turns out to be *this* daemon's own reverse
@@ -730,5 +843,72 @@ mod tests {
         // 1,000,000 bytes (8,000,000 bits) in exactly 1 second = 8 Mbps.
         let mbps = compute_achieved_mbps(1_000_000, 1.0);
         assert!((mbps - 8.0).abs() < 1e-9, "mbps was {mbps}");
+    }
+
+    #[test]
+    fn tcp_header_round_trips_test_id_and_bidirectional_flag() {
+        let encoded = encode_tcp_header(0xdead_beef, true);
+        let (test_id, bidirectional) = decode_tcp_header(&encoded).unwrap();
+        assert_eq!(test_id, 0xdead_beef);
+        assert!(bidirectional);
+
+        let encoded_false = encode_tcp_header(42, false);
+        let (test_id2, bidirectional2) = decode_tcp_header(&encoded_false).unwrap();
+        assert_eq!(test_id2, 42);
+        assert!(!bidirectional2);
+    }
+
+    #[test]
+    fn tcp_header_decode_rejects_truncated_buffer() {
+        assert!(decode_tcp_header(&[1, 2, 3]).is_none());
+    }
+
+    #[test]
+    fn tcp_result_payload_round_trips() {
+        let payload = TcpResultPayload {
+            achieved_mbps: 22.5,
+            retransmits: 1732,
+        };
+        let encoded = payload.encode();
+        let decoded = TcpResultPayload::decode(&encoded).unwrap();
+        assert!((decoded.achieved_mbps - 22.5).abs() < f64::EPSILON);
+        assert_eq!(decoded.retransmits, 1732);
+    }
+
+    #[test]
+    fn tcp_result_payload_decode_rejects_truncated_buffer() {
+        assert!(TcpResultPayload::decode(&[0u8; 4]).is_none());
+    }
+
+    /// Real loopback TCP connection -- no mocking needed, `TCP_INFO`
+    /// works on loopback the same as any TCP socket. Sends a known
+    /// amount of data so the connection has *something* to report; the
+    /// exact retransmit count on a healthy loopback connection is
+    /// expected to be 0, but this test's real point is proving
+    /// `read_tcp_retransmits` doesn't panic and returns a plausible
+    /// (small) value on a real, live socket -- exact-zero isn't
+    /// asserted since loopback behavior isn't perfectly guaranteed
+    /// across every CI/dev environment.
+    #[tokio::test]
+    async fn read_tcp_retransmits_works_on_a_real_loopback_connection() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf).await.unwrap();
+            read_tcp_retransmits(&stream)
+        });
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        client.write_all(b"hello").await.unwrap();
+
+        let retransmits = server.await.unwrap();
+        assert!(
+            retransmits < 1000,
+            "loopback retransmit count implausibly high: {retransmits}"
+        );
     }
 }
