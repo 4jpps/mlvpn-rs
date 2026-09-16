@@ -31,6 +31,13 @@ use std::time::{Duration, Instant};
 /// an idle tunnel is exactly when a lost packet costs the least. FEC
 /// here is aimed at sustained bulk traffic, where groups complete
 /// continuously and this gap never appears.
+///
+/// This deferral is safe on the receive side regardless of how long a
+/// partial group sits open: `FecRecoveryBuffer`'s `seen_floor` makes an
+/// arbitrarily old group's already-delivered members classify as
+/// `Handled`, never as a recoverable erasure, so an unbounded group
+/// lifetime costs at most a missed recovery -- never a duplicate
+/// delivery.
 pub struct FecSender {
     group_size: usize,
     member_seqs: Vec<u64>,
@@ -159,12 +166,19 @@ const MAX_SEEN_PER_GENERATION: usize = 131_072;
 
 /// A member seq more than this far behind the highest seq seen so far
 /// is treated as already-handled rather than missing, even if it is no
-/// longer in either `seen` generation. This is the backstop that makes
-/// duplicate delivery impossible: "not in the seen set" alone can mean
-/// *forgotten*, and reconstructing a forgotten-but-already-delivered
-/// frame would inject a byte-identical duplicate into the TUN device
-/// (dup-ACKs -> spurious fast retransmit -- the exact behavior this
-/// feature exists to reduce).
+/// longer in either `seen` generation.
+///
+/// This is a *rate-dependent* backstop and is deliberately no longer
+/// the load-bearing one: on a busy tunnel it retires ancient seqs
+/// promptly, but on a quiet tunnel 65536 seqs can take hours to elapse.
+/// `FecRecoveryBuffer::seen_floor` is the rate-independent guarantee
+/// that actually makes duplicate delivery impossible; this window is
+/// kept because it is free and still fires first under bulk traffic.
+/// Either way the hazard is the same: "not in the seen set" alone can
+/// mean *forgotten*, and reconstructing a forgotten-but-already-
+/// delivered frame would inject a byte-identical duplicate into the TUN
+/// device (dup-ACKs -> spurious fast retransmit -- the exact behavior
+/// this feature exists to reduce).
 const STALE_SEQ_WINDOW: u64 = 65_536;
 
 /// A seq this far *below* the highest seen is read as the peer having
@@ -205,6 +219,17 @@ const SEQ_RESET_GAP: u64 = 1 << 24;
 /// but no payload -- group is not reconstructible), or `Missing` (never
 /// seen and recent enough to genuinely still be outstanding). Only
 /// exactly one `Missing` with zero `Handled` is recoverable.
+///
+/// `seen`'s retention is finite, though, so "not in `seen`" on its own
+/// is ambiguous between *never arrived* and *arrived, then forgotten*.
+/// `seen_floor` removes that ambiguity in sequence space rather than in
+/// time: every seq a generation rotation forgets is provably at or
+/// below the floor, so `member_state` can treat at-or-below-the-floor
+/// as `Handled` unconditionally. That makes "forgotten" and "handled"
+/// exactly equivalent at every packet rate and for any group lifetime,
+/// which is what makes duplicate delivery impossible rather than merely
+/// unlikely -- independently of `PAYLOAD_TTL`, `STALE_SEQ_WINDOW`, and
+/// how long a sender-side group happens to stay open on a quiet link.
 pub struct FecRecoveryBuffer {
     payload_ttl: Duration,
     seen_generation: Duration,
@@ -222,6 +247,18 @@ pub struct FecRecoveryBuffer {
     seen_current: HashSet<u64>,
     seen_previous: HashSet<u64>,
     seen_rotated_at: Instant,
+    /// Sequence-space floor beneath which "not in `seen`" provably means
+    /// *forgotten by a rotation*, never *never-arrived*. Every seq a
+    /// generation rotation discards was marked before the rotation
+    /// before it, so it is by construction `<= highest_seq` as of that
+    /// earlier rotation -- which is exactly the value kept here. See
+    /// `rotate_seen`. `None` until two rotations have happened (nothing
+    /// has been forgotten yet, so there is no floor to enforce).
+    seen_floor: Option<u64>,
+    /// `highest_seq` as of the most recent rotation. Becomes `seen_floor`
+    /// at the next one, at which point the set it bounds is the one being
+    /// dropped.
+    seen_rotation_high: Option<u64>,
     /// Highest seq observed on any Data or parity frame -- the anchor
     /// for `STALE_SEQ_WINDOW`/`SEQ_RESET_GAP`.
     highest_seq: u64,
@@ -260,6 +297,8 @@ impl FecRecoveryBuffer {
             seen_current: HashSet::with_capacity(hint),
             seen_previous: HashSet::new(),
             seen_rotated_at: Instant::now(),
+            seen_floor: None,
+            seen_rotation_high: None,
             highest_seq: 0,
         }
     }
@@ -420,6 +459,20 @@ impl FecRecoveryBuffer {
         if self.seen_current.contains(&seq) || self.seen_previous.contains(&seq) {
             return MemberState::Handled;
         }
+        if self.seen_floor.is_some_and(|floor| seq <= floor) {
+            // Below the sequence-space floor the `seen` rotations have
+            // already swept past: if this seq had arrived, it would have
+            // been marked before that rotation and therefore dropped by
+            // it. "Forgotten" and "handled" are exactly equivalent here,
+            // at any packet rate -- which is what makes duplicate
+            // delivery impossible rather than merely unlikely. Without
+            // this, a quiet tunnel (where `STALE_SEQ_WINDOW`'s 65536
+            // seqs can take hours to elapse) leaves a window in which a
+            // delivered seq is forgotten by `seen` yet still "recent"
+            // by seq count, and gets reconstructed into a byte-identical
+            // duplicate.
+            return MemberState::Handled;
+        }
         if seq + STALE_SEQ_WINDOW <= self.highest_seq {
             // Too far behind the live stream to plausibly still be in
             // flight -- treat as handled (and therefore never
@@ -445,6 +498,11 @@ impl FecRecoveryBuffer {
             self.payload_order.clear();
             self.seen_current.clear();
             self.seen_previous.clear();
+            // The floors describe the *previous* incarnation's sequence
+            // space and would classify every seq of the new one as
+            // already-handled forever. Drop them with everything else.
+            self.seen_floor = None;
+            self.seen_rotation_high = None;
             self.highest_seq = seq;
         }
     }
@@ -456,8 +514,23 @@ impl FecRecoveryBuffer {
         }
     }
 
+    /// Rotate the two `seen` generations, and with them the
+    /// sequence-space floor that makes forgetting unambiguous.
+    ///
+    /// The set discarded by this rotation is the old `seen_previous`,
+    /// whose members were all marked before the *previous* rotation.
+    /// Every `mark_seen` call site runs `note_seq` first with a seq at
+    /// least as high, so each of those seqs is `<= highest_seq` as it
+    /// stood at that earlier rotation -- the value carried in
+    /// `seen_rotation_high`. Promoting it to `seen_floor` here therefore
+    /// gives `member_state` an exact bound: nothing above the floor has
+    /// been forgotten, and everything at or below it either arrived (and
+    /// was forgotten) or is far too old to still be in flight. Either
+    /// way it must never be reconstructed again.
     fn rotate_seen(&mut self, now: Instant) {
         self.seen_previous = std::mem::take(&mut self.seen_current);
+        self.seen_floor = self.seen_rotation_high;
+        self.seen_rotation_high = Some(self.highest_seq);
         self.seen_rotated_at = now;
     }
 
@@ -714,5 +787,104 @@ mod tests {
         // One rotation: 80 moved to the previous generation but is still
         // remembered, so a re-arrival is still recognized as a duplicate.
         assert!(!buf.observe_data(80, b"aa"));
+    }
+
+    /// Regression test for the residual duplicate-delivery path: a seq
+    /// that survives *two* generation rotations is forgotten by `seen`
+    /// entirely, while remaining far too recent for `STALE_SEQ_WINDOW`
+    /// (65536 seqs) to retire -- the everyday shape of a quiet tunnel,
+    /// where a group can stay open for minutes. Before `seen_floor`
+    /// existed this classified the delivered seq as genuinely `Missing`
+    /// and reconstructed a byte-identical duplicate into the TUN device.
+    #[test]
+    fn a_seq_forgotten_by_two_rotations_is_handled_not_recovered_again() {
+        let mut buf =
+            FecRecoveryBuffer::with_params(2, Duration::from_millis(5), Duration::from_millis(10));
+        // Delivered for real, payload + seen recorded.
+        assert!(buf.observe_data(100, b"aaaa"));
+
+        // Rotation 1: payload expires, 100 demoted to `seen_previous`.
+        std::thread::sleep(Duration::from_millis(15));
+        buf.tick(Instant::now());
+        // Rotation 2: 100 is dropped from `seen` altogether.
+        std::thread::sleep(Duration::from_millis(15));
+        buf.tick(Instant::now());
+        assert!(
+            !buf.seen_current.contains(&100) && !buf.seen_previous.contains(&100),
+            "the scenario requires seq 100 to be genuinely forgotten by `seen`"
+        );
+
+        // The group's other member arrives, then the parity frame. Note
+        // 100 is only one seq behind the live stream -- nowhere near
+        // `STALE_SEQ_WINDOW`, so that backstop cannot save us here.
+        assert!(buf.observe_data(101, b"bbbb"));
+        assert!(
+            100 + STALE_SEQ_WINDOW > buf.highest_seq,
+            "the stale-seq window must NOT be what rejects this seq, or the test is vacuous"
+        );
+
+        let parity = parity_of(&[(100, b"aaaa"), (101, b"bbbb")]);
+        let outcome = buf.try_recover(&parity);
+        assert!(
+            !matches!(outcome, RecoveryOutcome::Recovered { .. }),
+            "a forgotten-but-already-delivered seq must never be reconstructed again, got {outcome:?}"
+        );
+        assert_eq!(
+            outcome,
+            RecoveryOutcome::AlreadyComplete,
+            "both members are accounted for, so there is simply nothing to do"
+        );
+    }
+
+    /// The floor must not swallow a genuine loss: a member that never
+    /// arrived, whose seq is *above* the last rotation's high-water
+    /// mark, is still a real erasure and must still be recoverable.
+    #[test]
+    fn the_seen_floor_does_not_block_recovering_a_genuinely_recent_loss() {
+        let mut buf =
+            FecRecoveryBuffer::with_params(2, Duration::from_secs(60), Duration::from_millis(10));
+        assert!(buf.observe_data(200, b"zzzz"));
+        std::thread::sleep(Duration::from_millis(15));
+        buf.tick(Instant::now());
+        std::thread::sleep(Duration::from_millis(15));
+        buf.tick(Instant::now());
+        // Floor is now 200; 201/202 are a fresh group above it.
+        assert!(buf.observe_data(201, b"aaaa"));
+        let parity = parity_of(&[(201, b"aaaa"), (202, b"bbbb")]);
+        match buf.try_recover(&parity) {
+            RecoveryOutcome::Recovered { seq, plaintext } => {
+                assert_eq!(seq, 202);
+                assert_eq!(plaintext, b"bbbb");
+            }
+            other => panic!("expected Recovered for a real, recent erasure, got {other:?}"),
+        }
+    }
+
+    /// A peer restart resets the sequence space, so the floor (which
+    /// describes the previous incarnation's much higher seqs) must be
+    /// dropped too -- otherwise FEC would classify every seq of the new
+    /// run as already-handled and silently never recover anything again.
+    #[test]
+    fn a_peer_sequence_restart_also_clears_the_seen_floor() {
+        let mut buf =
+            FecRecoveryBuffer::with_params(2, Duration::from_millis(5), Duration::from_millis(10));
+        assert!(buf.observe_data(1 << 40, b"zz"));
+        std::thread::sleep(Duration::from_millis(15));
+        buf.tick(Instant::now());
+        std::thread::sleep(Duration::from_millis(15));
+        buf.tick(Instant::now());
+        assert!(
+            buf.seen_floor.is_some(),
+            "floor should be armed pre-restart"
+        );
+
+        // Peer restarts: seqs begin near zero again, far below the floor.
+        assert!(buf.observe_data(3, b"aaaa"));
+        assert!(buf.seen_floor.is_none(), "the restart must clear the floor");
+        let parity = parity_of(&[(3, b"aaaa"), (4, b"bbbb")]);
+        match buf.try_recover(&parity) {
+            RecoveryOutcome::Recovered { seq, .. } => assert_eq!(seq, 4),
+            other => panic!("expected Recovered after a peer restart, got {other:?}"),
+        }
     }
 }
