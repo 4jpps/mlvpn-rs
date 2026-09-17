@@ -54,7 +54,10 @@ the group, no per-project setup needed. Authenticates as a restricted
 `apt-publish` user on the repo host, scoped to only `/srv/apt-repo`.
 
 This project's own `.gitlab-ci.yml` (`.publish_to_apt_repo` and
-`.testing_build_suffix` blocks) is the reference implementation. Two
+`.beta_build_suffix` blocks) is the reference implementation --
+retrofitted 2026-09-16 to the Stable/Beta terminology (was
+`.testing_build_suffix`), matching `jpps/omnibridge`'s already-converted
+pattern (see the `jpps_stable_beta_release_pattern` memory). Two
 gotchas worth not re-discovering:
 1. GitLab writes file-type CI/CD variables to disk at `0664` -- SSH
    refuses a key that permissive. Copy it to a job-local file and
@@ -65,13 +68,18 @@ gotchas worth not re-discovering:
    `rm -f` the previous output immediately before each build, or a
    `dist/` glob can silently pick up more than one file.
 
-Version-suffix convention for throwaway (non-tagged) builds: `~testingN`
+Version-suffix convention for a Beta (non-clean-tag) build: `~betaN`
 for `.deb` (dpkg's tilde sorts *before* nothing, Debian Policy 5.6.12),
-`0.testingN` for `.rpm` (no tilde equivalent in rpmvercmp; a leading
-`0.` on the Release field is the standard convention). This guarantees
-a real numbered release always supersedes a leftover test build on a
-target system, never the reverse -- get it backwards and a real
-release can look like a downgrade to apt/dnf.
+`0.betaN` for `.rpm` (no tilde equivalent in rpmvercmp; a leading
+`0.` on the Release field is the standard convention). `N` is derived
+from the tag itself (`v0.7.3-beta6` -> `beta6`), not a pipeline
+counter, so the package version always matches the tag that produced
+it. This guarantees a real Stable release always supersedes a leftover
+Beta build on a target system, never the reverse -- get it backwards
+and a real release can look like a downgrade to apt/dnf. Only the
+package-version suffix and user-facing label changed -- the
+apt-repo-server's `testing` sub-repo itself is NOT renamed (shared
+infrastructure other projects' `sources.list` files already point at).
 
 The repo server itself (`jpps/apt-repo-server`) is packaged as an
 installable `.deb` too, so the whole setup is reproducible on a fresh

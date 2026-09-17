@@ -89,20 +89,35 @@ test:
     - when: manual
       allow_failure: true
 
-# Only a clean vX.Y.Z tag is a real release -- everything else (a
-# throwaway test tag, or a manual run with no tag at all) gets a
+# Only a clean vX.Y.Z tag is a real Stable release -- everything else
+# (a vX.Y.Z-betaN tag, or a manual run with no tag at all) gets a
 # package version apt/dnf will recognize as a new build without
-# actually bumping Cargo.toml, so it installs over a previous test
-# build on request. `~testingN` (.deb) / `0.testingN` (.rpm) are each
+# actually bumping Cargo.toml, so it installs over a previous Beta
+# build on request. `~betaN` (.deb) / `0.betaN` (.rpm) are each
 # format's own convention for "sorts *before* the eventual real
 # release with the same base version" -- dpkg's tilde is defined to
 # sort earlier than nothing at all, and rpm has no tilde equivalent,
 # so a leading "0." on the Release field is the standard substitute
 # (rpmvercmp compares Release segment-by-segment, and "0" always loses
 # to "1"). Get this backwards and a real release could look *older*
-# than a leftover test build already installed on a target system,
+# than a leftover Beta build already installed on a target system,
 # which is exactly the failure mode this exists to avoid.
-.testing_build_suffix:
+#
+# Matches jpps/omnibridge's .beta_build_suffix (the reference
+# implementation this project's own old .testing_build_suffix was
+# originally adapted *from*) -- SUFFIX is derived from the tag itself
+# (e.g. v0.7.3-beta6 -> beta6), not an unrelated pipeline counter, so
+# the package version always matches the tag that produced it and one
+# Beta build can be told apart from another sharing the same base
+# version. Falls back to the pipeline IID only if the tag has no
+# "-suffix" part at all to extract (a bare non-semver tag with no dash).
+#
+# Note this only renames the package-version suffix and the
+# user-facing "Beta" label -- it does NOT rename the apt-repo-server's
+# `testing` sub-repo itself (still `repo.jpps.us/testing`, shared
+# infrastructure already in other projects' sources.list files; see
+# jpps_stable_beta_release_pattern memory).
+.beta_build_suffix:
   script:
     - |
       if echo "${CI_COMMIT_TAG:-}" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
@@ -110,9 +125,14 @@ test:
         RPM_RELEASE_OVERRIDE=""
         PKG_DISTRIBUTION="stable"
       else
-        echo "not a clean vX.Y.Z release tag -- building as a throwaway testing build (suffix: testing${CI_PIPELINE_IID})"
-        DEB_REVISION_ARG="--deb-revision=~testing${CI_PIPELINE_IID}"
-        RPM_RELEASE_OVERRIDE="0.testing${CI_PIPELINE_IID}"
+        RAW_SUFFIX="${CI_COMMIT_TAG#*-}"
+        SUFFIX=$(echo "$RAW_SUFFIX" | tr -cd 'a-zA-Z0-9')
+        if [ -z "$SUFFIX" ] || [ "$RAW_SUFFIX" = "$CI_COMMIT_TAG" ]; then
+          SUFFIX="beta${CI_PIPELINE_IID}"
+        fi
+        echo "not a clean vX.Y.Z release tag -- building as a Beta release (suffix: ${SUFFIX})"
+        DEB_REVISION_ARG="--deb-revision=~${SUFFIX}"
+        RPM_RELEASE_OVERRIDE="0.${SUFFIX}"
         PKG_DISTRIBUTION="testing"
       fi
 
@@ -223,7 +243,7 @@ package:deb:amd64:
   extends: .cargo_cache
   <<: *package_rules
   script:
-    - !reference [.testing_build_suffix, script]
+    - !reference [.beta_build_suffix, script]
     - cargo build --release --locked
     # Same stale-output issue as cargo-generate-rpm: a leftover .deb
     # from an earlier cached run on this ref (different version
@@ -248,7 +268,7 @@ package:deb:arm64:
   extends: .cargo_cache
   <<: *package_rules
   script:
-    - !reference [.testing_build_suffix, script]
+    - !reference [.beta_build_suffix, script]
     - cargo build --release --locked --target aarch64-unknown-linux-gnu
     # See package:deb:amd64's own comment on this same line.
     - rm -f target/aarch64-unknown-linux-gnu/debian/*.deb
@@ -269,7 +289,7 @@ package:rpm:amd64:
   extends: .cargo_cache
   <<: *package_rules
   script:
-    - !reference [.testing_build_suffix, script]
+    - !reference [.beta_build_suffix, script]
     - cargo build --release --locked
     # Unlike cargo-deb, cargo-generate-rpm doesn't clean its own output
     # dir -- a stale .rpm from an earlier cached run on this same ref
@@ -300,7 +320,7 @@ package:rpm:arm64:
   extends: .cargo_cache
   <<: *package_rules
   script:
-    - !reference [.testing_build_suffix, script]
+    - !reference [.beta_build_suffix, script]
     - cargo build --release --locked --target aarch64-unknown-linux-gnu
     # See package:rpm:amd64's own comment on this same line -- same
     # stale-output reasoning, cross-compiled output directory.
