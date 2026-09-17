@@ -367,7 +367,7 @@ fn run_throughput_selftest(
 }
 
 /// Prints the peer's last-known `mlvpnd` version and flags a mismatch
-/// against this build's own `mlvpn::VERSION`. Shared by both self-test
+/// against this build's own `mlvpn::version()`. Shared by both self-test
 /// CLI paths (link-level and tunnel-level): the version comes from the
 /// periodic wire `VersionInfo` exchange (`CommandResult::peer_version`),
 /// not from the self-test's own round trip, so it's still available to
@@ -375,14 +375,14 @@ fn run_throughput_selftest(
 /// exactly the case where knowing whether a version skew might explain
 /// the failure is most useful.
 fn print_peer_version_report(peer_version: &Option<String>) {
+    let local_version = mlvpn::version();
     match peer_version {
-        Some(v) if v == mlvpn::VERSION => {
+        Some(v) if *v == local_version => {
             println!("peer version: {v} (matches this host)");
         }
         Some(v) => {
             println!(
-                "peer version: {v} -- WARNING: this host is running {}, versions differ",
-                mlvpn::VERSION
+                "peer version: {v} -- WARNING: this host is running {local_version}, versions differ"
             );
         }
         None => {

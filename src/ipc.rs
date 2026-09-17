@@ -110,11 +110,38 @@ pub struct DaemonSnapshot {
     /// mlvpn-tui at all (neither side's MTU was, despite this
     /// project's own design docs assuming local MTU already was).
     pub local_tunnel_mtu: u16,
-    /// The peer's own live tunnel MTU, from the periodic authenticated
-    /// `VersionInfo` wire exchange (same source/reasoning as
-    /// `peer_version`). `None` until the first `VersionInfo` arrives.
+    /// The peer's own raw, pre-negotiation local link capability
+    /// (`protocol::VersionInfoPayload::tunnel_mtu`), from the periodic
+    /// authenticated `VersionInfo` wire exchange (same source/reasoning
+    /// as `peer_version`). `None` until the first `VersionInfo`
+    /// arrives. Will legitimately differ from `local_tunnel_mtu`
+    /// whenever the peer's link happens to support more headroom than
+    /// this side's own -- that is NOT itself a problem; see
+    /// `peer_applied_tunnel_mtu` below for the field that actually
+    /// indicates whether negotiation has converged.
     #[serde(default)]
     pub peer_tunnel_mtu: Option<u16>,
+    /// The peer's own actual, already-negotiated live tunnel MTU
+    /// (`protocol::VersionInfoPayload::live_tunnel_mtu` --
+    /// what's really applied to the peer's TUN device right now).
+    /// `None` until the first `VersionInfo` carrying this field
+    /// arrives (added alongside this field, 2026-09-17 -- an older
+    /// peer's `VersionInfo` predates it, same convention as
+    /// `peer_tunnel_mtu` predating a pre-0.6.0 peer). Once both sides
+    /// have exchanged at least one `VersionInfo` post-negotiation,
+    /// this should equal `local_tunnel_mtu` -- a real, persistent
+    /// difference (not just momentarily stale right after a restart)
+    /// indicates negotiation hasn't converged, unlike a difference
+    /// against `peer_tunnel_mtu` (raw capability), which is often
+    /// completely normal. See `mlvpn-tui`'s Session panel, which is
+    /// what surfaced the need for this distinction in the first place:
+    /// a real asymmetric-but-fully-converged pairing (home-bgp:
+    /// capability 1285, cloud-bgp: capability 1305, both correctly
+    /// negotiated down to a shared applied MTU of 1285) showed as a
+    /// false "MISMATCH" before this field existed to tell the two
+    /// cases apart.
+    #[serde(default)]
+    pub peer_applied_tunnel_mtu: Option<u16>,
     /// Sum of every link's `LinkSnapshot::wg_rejected_total` -- see that
     /// field's doc comment. Added alongside the per-link counters
     /// 2026-09-14 while investigating real TCP-level loss (~15%
@@ -546,6 +573,7 @@ mod tests {
             peer_version: Some("0.4.5".to_string()),
             local_tunnel_mtu: 1420,
             peer_tunnel_mtu: Some(1420),
+            peer_applied_tunnel_mtu: Some(1420),
         };
         let json = serde_json::to_string(&snap).expect("serialize");
         let back: DaemonSnapshot = serde_json::from_str(&json).expect("deserialize");

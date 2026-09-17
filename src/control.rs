@@ -44,7 +44,8 @@ use crate::scheduler::Scheduler;
 use crate::sysfs_net;
 use crate::tunnel::{
     adaptive_bandwidth_ramp, send_throughput_test_reverse_request, send_throughput_test_stream,
-    DiagnosticsWatchParams, LiveMtu, OutboundFrame, PeerMtu, PeerVersion, ThroughputTestContext,
+    DiagnosticsWatchParams, LiveMtu, OutboundFrame, PeerLiveMtu, PeerMtu, PeerVersion,
+    ThroughputTestContext,
 };
 use crate::tunneltest;
 use std::os::unix::fs::PermissionsExt;
@@ -78,6 +79,7 @@ pub(crate) async fn serve(
     peer_version: PeerVersion,
     mtu: LiveMtu,
     peer_mtu: PeerMtu,
+    peer_live_mtu: PeerLiveMtu,
     scheduler: Arc<std::sync::Mutex<Scheduler>>,
     fec_recovered_total: Arc<AtomicU64>,
     fec_unrecoverable_total: Arc<AtomicU64>,
@@ -170,6 +172,7 @@ pub(crate) async fn serve(
         let peer_version = peer_version.clone();
         let mtu = mtu.clone();
         let peer_mtu = peer_mtu.clone();
+        let peer_live_mtu = peer_live_mtu.clone();
         let scheduler = scheduler.clone();
         let fec_recovered_total = fec_recovered_total.clone();
         let fec_unrecoverable_total = fec_unrecoverable_total.clone();
@@ -186,6 +189,7 @@ pub(crate) async fn serve(
                 peer_version,
                 mtu,
                 peer_mtu,
+                peer_live_mtu,
                 scheduler,
                 fec_recovered_total,
                 fec_unrecoverable_total,
@@ -208,6 +212,7 @@ async fn serve_client(
     peer_version: PeerVersion,
     mtu: LiveMtu,
     peer_mtu: PeerMtu,
+    peer_live_mtu: PeerLiveMtu,
     scheduler: Arc<std::sync::Mutex<Scheduler>>,
     fec_recovered_total: Arc<AtomicU64>,
     fec_unrecoverable_total: Arc<AtomicU64>,
@@ -233,6 +238,7 @@ async fn serve_client(
             &peer_version,
             &mtu,
             &peer_mtu,
+            &peer_live_mtu,
             &scheduler,
             &fec_recovered_total,
             &fec_unrecoverable_total,
@@ -262,6 +268,7 @@ async fn build_snapshot(
     peer_version: &PeerVersion,
     mtu: &LiveMtu,
     peer_mtu: &PeerMtu,
+    peer_live_mtu: &PeerLiveMtu,
     scheduler: &Arc<std::sync::Mutex<Scheduler>>,
     fec_recovered_total: &AtomicU64,
     fec_unrecoverable_total: &AtomicU64,
@@ -370,10 +377,11 @@ async fn build_snapshot(
                 mem_available_kb: system_stats.mem_available_kb,
                 uptime_secs: system_stats.uptime_secs,
             },
-            local_version: crate::VERSION.to_string(),
+            local_version: crate::version(),
             peer_version: peer_version.lock().unwrap().clone(),
             local_tunnel_mtu: mtu.load(Ordering::Relaxed),
             peer_tunnel_mtu: *peer_mtu.lock().unwrap(),
+            peer_applied_tunnel_mtu: *peer_live_mtu.lock().unwrap(),
         },
         new_log_lines,
     };
@@ -401,6 +409,7 @@ pub(crate) struct DiagContext {
     pub(crate) peer_version: PeerVersion,
     pub(crate) mtu: LiveMtu,
     pub(crate) peer_mtu: PeerMtu,
+    pub(crate) peer_live_mtu: PeerLiveMtu,
     pub(crate) scheduler: Arc<std::sync::Mutex<Scheduler>>,
     pub(crate) fec_recovered_total: Arc<AtomicU64>,
     pub(crate) fec_unrecoverable_total: Arc<AtomicU64>,
@@ -771,6 +780,7 @@ async fn run_diag_dump_command(links: &Links, diag_ctx: &DiagContext) -> Command
         &diag_ctx.peer_version,
         &diag_ctx.mtu,
         &diag_ctx.peer_mtu,
+        &diag_ctx.peer_live_mtu,
         &diag_ctx.scheduler,
         &diag_ctx.fec_recovered_total,
         &diag_ctx.fec_unrecoverable_total,
@@ -1229,6 +1239,7 @@ pub(crate) async fn diagnostics_watch_loop(
             &diag_ctx.peer_version,
             &diag_ctx.mtu,
             &diag_ctx.peer_mtu,
+            &diag_ctx.peer_live_mtu,
             &diag_ctx.scheduler,
             &diag_ctx.fec_recovered_total,
             &diag_ctx.fec_unrecoverable_total,

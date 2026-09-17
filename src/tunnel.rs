@@ -476,6 +476,22 @@ pub(crate) type PeerVersion = Arc<std::sync::Mutex<Option<String>>>;
 /// only on receipt at that same slow cadence.
 pub(crate) type PeerMtu = Arc<std::sync::Mutex<Option<u16>>>;
 
+/// Tunnel-wide storage for the peer's most recently reported *applied*
+/// live tunnel MTU (`VersionInfoPayload::live_tunnel_mtu`) -- same
+/// shape/reasoning as `PeerMtu` above, but this is the peer's own
+/// already-negotiated value (what's really on their TUN device right
+/// now), not their pre-negotiation capability. Lets a receiver confirm
+/// real convergence (this side's own `live_mtu` should equal this,
+/// once both sides have exchanged at least one `VersionInfo` post-
+/// negotiation) separately from `PeerMtu`, which will legitimately
+/// differ from `live_mtu` whenever the peer's link happens to support
+/// more headroom than this side's own -- see `mlvpn-tui`'s Session
+/// panel, which is what first surfaced the need for this distinction
+/// (a real asymmetric-but-healthy pairing on home-bgp/cloud-bgp showed
+/// as a false "MISMATCH" before this field existed to tell the two
+/// cases apart).
+pub(crate) type PeerLiveMtu = Arc<std::sync::Mutex<Option<u16>>>;
+
 /// Tunnel-wide storage for the peer's most recently advertised primary
 /// link, piggybacked on the same `PacketType::VersionInfo` exchange as
 /// `PeerVersion`/`PeerMtu` above. Holds the peer's advertised primary
@@ -602,6 +618,10 @@ pub async fn run(
     // doc comment.
     let peer_mtu: PeerMtu = Arc::new(std::sync::Mutex::new(None));
 
+    // The peer's own last-reported *applied* live tunnel MTU -- see
+    // `PeerLiveMtu`'s doc comment.
+    let peer_live_mtu: PeerLiveMtu = Arc::new(std::sync::Mutex::new(None));
+
     // The peer's own last-advertised primary link -- see
     // `PeerPrimaryLink`'s doc comment.
     let peer_primary_link: PeerPrimaryLink = Arc::new(std::sync::Mutex::new(None));
@@ -677,6 +697,7 @@ pub async fn run(
             let throughput_test_ctx = throughput_test_ctx.clone();
             let peer_version = peer_version.clone();
             let peer_mtu = peer_mtu.clone();
+            let peer_live_mtu = peer_live_mtu.clone();
             let peer_primary_link = peer_primary_link.clone();
             handles.push(tokio::spawn(async move {
                 // link_receiver never returns under normal operation --
@@ -701,6 +722,7 @@ pub async fn run(
                     throughput_test_ctx,
                     peer_version,
                     peer_mtu,
+                    peer_live_mtu,
                     peer_primary_link,
                 )
                 .await;
@@ -711,6 +733,7 @@ pub async fn run(
             let scheduler = scheduler.clone();
             let cfg = params.scheduler_cfg.clone();
             let local_capability_mtu = local_capability_mtu.clone();
+            let live_mtu = live_mtu.clone();
             let peer_primary_link = peer_primary_link.clone();
             handles.push(tokio::spawn(async move {
                 link_prober(
@@ -719,6 +742,7 @@ pub async fn run(
                     scheduler,
                     cfg,
                     local_capability_mtu,
+                    live_mtu,
                     tracker,
                     peer_primary_link,
                 )
@@ -750,6 +774,7 @@ pub async fn run(
         let log_ring = log_ring.clone();
         let peer_version = peer_version.clone();
         let peer_mtu = peer_mtu.clone();
+        let peer_live_mtu = peer_live_mtu.clone();
         let mtu = live_mtu.clone();
         let scheduler = scheduler.clone();
         let fec_recovered_total = fec_recovered_total.clone();
@@ -767,6 +792,7 @@ pub async fn run(
                 peer_version,
                 mtu,
                 peer_mtu,
+                peer_live_mtu,
                 scheduler,
                 fec_recovered_total,
                 fec_unrecoverable_total,
@@ -790,6 +816,7 @@ pub async fn run(
             peer_version: peer_version.clone(),
             mtu: live_mtu.clone(),
             peer_mtu: peer_mtu.clone(),
+            peer_live_mtu: peer_live_mtu.clone(),
             scheduler: scheduler.clone(),
             fec_recovered_total: fec_recovered_total.clone(),
             fec_unrecoverable_total: fec_unrecoverable_total.clone(),
@@ -861,6 +888,7 @@ pub async fn run(
             peer_version: peer_version.clone(),
             mtu: live_mtu.clone(),
             peer_mtu: peer_mtu.clone(),
+            peer_live_mtu: peer_live_mtu.clone(),
             scheduler: scheduler.clone(),
             fec_recovered_total: fec_recovered_total.clone(),
             fec_unrecoverable_total: fec_unrecoverable_total.clone(),
@@ -1496,6 +1524,7 @@ async fn link_receiver(
     throughput_test_ctx: Arc<ThroughputTestContext>,
     peer_version: PeerVersion,
     peer_mtu: PeerMtu,
+    peer_live_mtu: PeerLiveMtu,
     peer_primary_link: PeerPrimaryLink,
 ) {
     let (handle, link_id, link_name) = {
@@ -1535,6 +1564,7 @@ async fn link_receiver(
                     &throughput_test_ctx,
                     &peer_version,
                     &peer_mtu,
+                    &peer_live_mtu,
                     &peer_primary_link,
                 )
                 .await;
@@ -1607,6 +1637,7 @@ async fn link_prober(
     scheduler: Arc<std::sync::Mutex<Scheduler>>,
     cfg: SchedulerConfig,
     local_capability_mtu: LiveMtu,
+    live_mtu: LiveMtu,
     tracker: Arc<AsyncMutex<ProbeTracker>>,
     peer_primary_link: PeerPrimaryLink,
 ) {
@@ -1690,7 +1721,15 @@ async fn link_prober(
             // drives scheduling decisions.
             _ = stats_tick.tick() => {
                 send_stats_share(link_id, &links, idx).await;
-                send_version_info(link_id, &links, idx, &local_capability_mtu, &scheduler).await;
+                send_version_info(
+                    link_id,
+                    &links,
+                    idx,
+                    &local_capability_mtu,
+                    &live_mtu,
+                    &scheduler,
+                )
+                .await;
             }
 
             _ = sweep_tick.tick() => {
@@ -2574,6 +2613,7 @@ async fn handle_incoming(
     throughput_test_ctx: &Arc<ThroughputTestContext>,
     peer_version: &PeerVersion,
     peer_mtu: &PeerMtu,
+    peer_live_mtu: &PeerLiveMtu,
     peer_primary_link: &PeerPrimaryLink,
 ) {
     // `frame` is already the plaintext output of `LinkHandle::wg_recv`
@@ -2796,6 +2836,12 @@ async fn handle_incoming(
             Ok(payload) => {
                 *peer_version.lock().unwrap() = Some(payload.version_str());
                 *peer_mtu.lock().unwrap() = Some(payload.tunnel_mtu);
+                // `0` means the peer predates this field -- same
+                // "not a real MTU, treat as unknown" convention as
+                // `tunnel_mtu`'s own zero-sentinel (see
+                // `negotiate_tunnel_mtu`'s doc comment).
+                *peer_live_mtu.lock().unwrap() =
+                    (payload.live_tunnel_mtu != 0).then_some(payload.live_tunnel_mtu);
                 *peer_primary_link.lock().unwrap() = payload.primary_link_name_str();
             }
             Err(e) => {
@@ -3143,6 +3189,7 @@ async fn send_version_info(
     links: &Links,
     idx: usize,
     local_capability_mtu: &LiveMtu,
+    live_mtu: &LiveMtu,
     scheduler: &Arc<std::sync::Mutex<Scheduler>>,
 ) {
     let handle = {
@@ -3169,8 +3216,9 @@ async fn send_version_info(
     };
 
     let payload = VersionInfoPayload {
-        version: VersionInfoPayload::encode_version(crate::VERSION),
+        version: VersionInfoPayload::encode_version(&crate::version()),
         tunnel_mtu: local_capability_mtu.load(std::sync::atomic::Ordering::Relaxed),
+        live_tunnel_mtu: live_mtu.load(std::sync::atomic::Ordering::Relaxed),
         primary_link_name: VersionInfoPayload::encode_link_name(&primary_link_name),
     };
     let plaintext = payload.encode();

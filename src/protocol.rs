@@ -339,10 +339,28 @@ impl StatsPayload {
 #[derive(Debug, Clone)]
 pub struct VersionInfoPayload {
     pub version: [u8; Self::VERSION_LEN],
-    /// The sender's own live tunnel MTU (`tunnel::LiveMtu`), piggybacked
-    /// on this same periodic authenticated exchange rather than adding a
-    /// new packet type.
+    /// The sender's own raw, pre-negotiation local link capability
+    /// (`tunnel::local_capability_mtu`) -- what `control::negotiate_tunnel_mtu`
+    /// on *both* sides feeds in as input. Deliberately NOT the sender's
+    /// already-negotiated `live_tunnel_mtu` (below): advertising the
+    /// post-negotiation value here would create a monotonic ratchet
+    /// (each side would advertise its own past concession instead of
+    /// its true capability, permanently pinning the tunnel MTU low
+    /// after any single downward negotiation, e.g. a failover, even
+    /// once local capacity recovered) -- see the "CRITICAL" finding in
+    /// commit 420407b and docs/superpowers/specs/2026-09-16-primary-aware-peer-mtu-design.md.
     pub tunnel_mtu: u16,
+    /// The sender's own actual, already-negotiated live tunnel MTU
+    /// (`tunnel::LiveMtu` -- what's really applied to the TUN device
+    /// right now), added alongside `tunnel_mtu` specifically so a
+    /// receiver can tell "peer's capability differs from mine" (normal,
+    /// expected whenever link characteristics are asymmetric -- see
+    /// `tunnel_mtu`'s own doc comment) apart from "peer hasn't actually
+    /// converged to the same applied value yet" (a real problem worth
+    /// surfacing). `0` means the sender predates this field (decoded
+    /// from a shorter buffer) -- treated as "unknown", not a real MTU,
+    /// same convention as `tunnel_mtu`'s own zero-sentinel.
+    pub live_tunnel_mtu: u16,
     /// The sender's own currently-selected primary link's *name*
     /// (`LinkConfig::name`), when it's running `scheduler.primary_link_mode`.
     /// An all-zero array (empty string once decoded -- see
@@ -365,7 +383,12 @@ impl VersionInfoPayload {
     /// Same size class as `VERSION_LEN` -- plenty for typical link names
     /// like "comcast"/"tmobile"/"starlink".
     pub const LINK_NAME_LEN: usize = 16;
-    pub const LEN: usize = Self::VERSION_LEN + 2 + Self::LINK_NAME_LEN;
+    /// `+ 2` for `tunnel_mtu`, `+ 2` for `live_tunnel_mtu` -- the latter
+    /// appended after `primary_link_name` (not next to `tunnel_mtu`) so
+    /// the existing `tunnel_mtu`/`primary_link_name` byte offsets never
+    /// move, matching this struct's established append-only extension
+    /// pattern (see `decode`'s own doc comment).
+    pub const LEN: usize = Self::VERSION_LEN + 2 + Self::LINK_NAME_LEN + 2;
 
     pub fn encode_version(version: &str) -> [u8; Self::VERSION_LEN] {
         let mut out = [0u8; Self::VERSION_LEN];
@@ -423,18 +446,22 @@ impl VersionInfoPayload {
             .copy_from_slice(&self.tunnel_mtu.to_be_bytes());
         out[Self::VERSION_LEN + 2..Self::VERSION_LEN + 2 + Self::LINK_NAME_LEN]
             .copy_from_slice(&self.primary_link_name);
+        let live_mtu_start = Self::VERSION_LEN + 2 + Self::LINK_NAME_LEN;
+        out[live_mtu_start..live_mtu_start + 2]
+            .copy_from_slice(&self.live_tunnel_mtu.to_be_bytes());
         out
     }
 
     /// Tolerant of a shorter-than-current buffer from an older
     /// (pre-0.6.0) peer: only the `version` field is strictly required.
-    /// `tunnel_mtu` defaults to `0` and `primary_link_name` defaults to
-    /// the "no primary" sentinel when the buffer doesn't carry them.
-    /// Without this, a newly-upgraded host talking to an old peer would
-    /// go completely blind on version/MTU/primary-link display right
-    /// when that visibility matters most for catching a version-skewed
-    /// deployment (this project's own real-world upgrade pattern is one
-    /// host at a time, sometimes up to an hour apart).
+    /// `tunnel_mtu`/`live_tunnel_mtu` default to `0` and `primary_link_name`
+    /// defaults to the "no primary" sentinel when the buffer doesn't
+    /// carry them. Without this, a newly-upgraded host talking to an
+    /// old peer would go completely blind on version/MTU/primary-link
+    /// display right when that visibility matters most for catching a
+    /// version-skewed deployment (this project's own real-world
+    /// upgrade pattern is one host at a time, sometimes up to an hour
+    /// apart).
     pub fn decode(buf: &[u8]) -> Result<Self> {
         if buf.len() < Self::VERSION_LEN {
             return Err(MlvpnError::Protocol(
@@ -460,9 +487,17 @@ impl VersionInfoPayload {
             primary_link_name[..have].copy_from_slice(&buf[name_start..buf.len()]);
         }
 
+        let live_mtu_start = name_end;
+        let live_tunnel_mtu = if buf.len() >= live_mtu_start + 2 {
+            u16::from_be_bytes([buf[live_mtu_start], buf[live_mtu_start + 1]])
+        } else {
+            0
+        };
+
         Ok(Self {
             version,
             tunnel_mtu,
+            live_tunnel_mtu,
             primary_link_name,
         })
     }
@@ -824,6 +859,7 @@ mod version_info_payload_tests {
         let payload = VersionInfoPayload {
             version: VersionInfoPayload::encode_version("0.4.5"),
             tunnel_mtu: 1420,
+            live_tunnel_mtu: 1300,
             primary_link_name: VersionInfoPayload::encode_link_name(""),
         };
         let encoded = payload.encode();
@@ -837,6 +873,7 @@ mod version_info_payload_tests {
         let payload = VersionInfoPayload {
             version: encoded,
             tunnel_mtu: 1420,
+            live_tunnel_mtu: 1300,
             primary_link_name: VersionInfoPayload::encode_link_name(""),
         };
         assert_eq!(payload.version_str().len(), VersionInfoPayload::VERSION_LEN);
@@ -857,7 +894,44 @@ mod version_info_payload_tests {
         let decoded = VersionInfoPayload::decode(&buf).unwrap();
         assert_eq!(decoded.version_str(), "0.4.5");
         assert_eq!(decoded.tunnel_mtu, 0);
+        assert_eq!(decoded.live_tunnel_mtu, 0);
         assert_eq!(decoded.primary_link_name_str(), None);
+    }
+
+    #[test]
+    fn decode_tolerates_a_pre_2026_09_17_peer_with_no_live_tunnel_mtu_field() {
+        // Simulates a peer running the version-exchange wire format
+        // from just before `live_tunnel_mtu` was added: version + mtu +
+        // primary_link_name, nothing after. Must still decode with
+        // `live_tunnel_mtu` defaulting to the same "unknown" zero
+        // sentinel `tunnel_mtu` itself uses for an even older peer.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&VersionInfoPayload::encode_version("0.7.3"));
+        buf.extend_from_slice(&1420u16.to_be_bytes());
+        buf.extend_from_slice(&VersionInfoPayload::encode_link_name("comcast"));
+        let decoded = VersionInfoPayload::decode(&buf).unwrap();
+        assert_eq!(decoded.version_str(), "0.7.3");
+        assert_eq!(decoded.tunnel_mtu, 1420);
+        assert_eq!(decoded.live_tunnel_mtu, 0);
+        assert_eq!(decoded.primary_link_name_str(), Some("comcast".to_string()));
+    }
+
+    #[test]
+    fn version_info_payload_round_trips_live_tunnel_mtu() {
+        let payload = VersionInfoPayload {
+            version: VersionInfoPayload::encode_version("0.7.3"),
+            tunnel_mtu: 1305,
+            live_tunnel_mtu: 1285,
+            primary_link_name: VersionInfoPayload::encode_link_name(""),
+        };
+        let encoded = payload.encode();
+        let decoded = VersionInfoPayload::decode(&encoded).unwrap();
+        // The two fields are genuinely independent: capability (1305)
+        // can differ from the actually-applied, already-negotiated
+        // value (1285) -- see this struct's own doc comment for why
+        // that's expected, not a bug.
+        assert_eq!(decoded.tunnel_mtu, 1305);
+        assert_eq!(decoded.live_tunnel_mtu, 1285);
     }
 
     #[test]
@@ -876,6 +950,7 @@ mod version_info_payload_tests {
         let payload = VersionInfoPayload {
             version: VersionInfoPayload::encode_version("0.6.0"),
             tunnel_mtu: 1420,
+            live_tunnel_mtu: 1300,
             primary_link_name: VersionInfoPayload::encode_link_name(""),
         };
         let encoded = payload.encode();
@@ -889,6 +964,7 @@ mod version_info_payload_tests {
         let payload = VersionInfoPayload {
             version: VersionInfoPayload::encode_version("0.7.0"),
             tunnel_mtu: 1420,
+            live_tunnel_mtu: 1300,
             primary_link_name: VersionInfoPayload::encode_link_name("starlink"),
         };
         let encoded = payload.encode();
@@ -904,6 +980,7 @@ mod version_info_payload_tests {
         let payload = VersionInfoPayload {
             version: VersionInfoPayload::encode_version("0.7.0"),
             tunnel_mtu: 1420,
+            live_tunnel_mtu: 1300,
             primary_link_name: VersionInfoPayload::encode_link_name(""),
         };
         let encoded = payload.encode();
@@ -917,6 +994,7 @@ mod version_info_payload_tests {
         let payload = VersionInfoPayload {
             version: VersionInfoPayload::encode_version("0.7.0"),
             tunnel_mtu: 1420,
+            live_tunnel_mtu: 1300,
             primary_link_name: encoded,
         };
         assert_eq!(

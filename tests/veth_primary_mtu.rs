@@ -168,8 +168,16 @@ async fn primary_mtu_tracks_the_active_link_and_converges_across_the_peer() {
 
     // Give mtu_monitor_loop's now-3s tick, plus the VersionInfo
     // exchange, a few cycles to converge before asserting anything.
+    // `peer_applied_tunnel_mtu` (the peer's own already-negotiated
+    // value), not `peer_tunnel_mtu` (the peer's raw pre-negotiation
+    // capability) -- the two happen to be equal in this test's
+    // perfectly symmetric veth topology, but only `peer_applied_tunnel_mtu`
+    // is actually the correct "did negotiation converge" signal in
+    // general (see `ipc::DaemonSnapshot::peer_applied_tunnel_mtu`'s doc
+    // comment -- this exact mixup produced a false MISMATCH in
+    // mlvpn-tui on the real, asymmetric home-bgp/cloud-bgp pairing).
     let converged = poll_snapshot_until(&client_ctl, Duration::from_secs(20), |s| {
-        s.daemon.peer_tunnel_mtu == Some(s.daemon.local_tunnel_mtu)
+        s.daemon.peer_applied_tunnel_mtu == Some(s.daemon.local_tunnel_mtu)
     })
     .await
     .expect("client and server tunnel MTU never converged to the same value");

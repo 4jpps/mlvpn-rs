@@ -984,7 +984,32 @@ fn draw_session_panel(f: &mut Frame, area: Rect, daemon: &DaemonSnapshot) {
         ]),
     };
 
+    // `peer_tunnel_mtu` is the PEER's own raw, pre-negotiation local
+    // capability (`local_capability_mtu`, advertised via `VersionInfo` --
+    // see `tunnel::send_version_info`), not the peer's own already-
+    // negotiated live MTU. `negotiate_tunnel_mtu` (`control.rs`) means
+    // `local_tunnel_mtu` already reflects `min(this side's capability,
+    // peer's capability)`, so `peer_tunnel_mtu > local_tunnel_mtu` is
+    // the ordinary, expected result whenever the peer's own link
+    // happens to support more headroom than this side's -- not an
+    // error. Only `peer_tunnel_mtu < local_tunnel_mtu` indicates a real
+    // problem: the peer is advertising something below what this side
+    // is currently using, meaning negotiation hasn't (or can't) fully
+    // converge. Previously this compared for exact equality and
+    // flagged every asymmetric-but-healthy pairing as "MISMATCH" in
+    // red -- confirmed live on home-bgp/cloud-bgp (1285 local vs. 1305
+    // peer capability, fully negotiated and converged, still showed as
+    // a false MISMATCH under the old logic).
     let mtu_line = match daemon.peer_tunnel_mtu {
+        Some(peer_mtu) if peer_mtu < daemon.local_tunnel_mtu => Line::from(vec![
+            Span::raw("Tunnel MTU: "),
+            Span::raw(daemon.local_tunnel_mtu.to_string()),
+            Span::raw("   Peer capability: "),
+            Span::styled(
+                format!("{peer_mtu} (not yet converged)"),
+                Style::default().fg(COLOR_BAD),
+            ),
+        ]),
         Some(peer_mtu) if peer_mtu == daemon.local_tunnel_mtu => Line::from(vec![
             Span::raw("Tunnel MTU: "),
             Span::raw(daemon.local_tunnel_mtu.to_string()),
@@ -993,11 +1018,8 @@ fn draw_session_panel(f: &mut Frame, area: Rect, daemon: &DaemonSnapshot) {
         Some(peer_mtu) => Line::from(vec![
             Span::raw("Tunnel MTU: "),
             Span::raw(daemon.local_tunnel_mtu.to_string()),
-            Span::raw("   Peer: "),
-            Span::styled(
-                format!("{peer_mtu} (MISMATCH)"),
-                Style::default().fg(COLOR_BAD),
-            ),
+            Span::raw("   Peer capability: "),
+            Span::styled(peer_mtu.to_string(), Style::default().fg(COLOR_MUTED)),
         ]),
         None => Line::from(vec![
             Span::raw("Tunnel MTU: "),
