@@ -10,6 +10,18 @@ For implementation detail beyond what's here, read the code -- most
 modules and non-trivial functions have doc comments explaining the
 design, and `ARCHITECTURE.md` covers the system as a whole.
 
+## [0.7.5] - 2026-09-24
+
+### Fixed
+
+- **Automatic diagnostic reports to software-support have been silently failing since this feature existed.** `diagnostics::build_report_body` serialized an absent message (`control.rs`'s loss-threshold watcher always passes `None` for the automatic path) as JSON `null` -- but software-support's `SubmitReport.message` is a required `String`, not `Option<String>`, so axum's `Json` extractor rejected the whole request with `422 Unprocessable Entity` before the handler ever ran. Confirmed against the real live service both ways: an empty-string message gets a real `201` + ticket id, a `null` message gets the exact `"invalid type: null, expected a string"` error seen in production logs. omnibridge's own client (the only other real consumer of this shared endpoint) never hit this, because its equivalent field has always been a plain `String`. Fixed by sending an empty string instead of `null` for an absent message, matching the real contract. New test submits through the real `reqwest` JSON path (not just checking the in-process `serde_json::Value`) and asserts the literal wire bytes never contain `"message":null` -- the previous test suite's mock server ignored the request body entirely, which is exactly why this shipped unnoticed.
+
+## [0.7.4] - 2026-09-22
+
+### Changed
+
+- Full dependency update pass (including RUSTSEC-2026-0285, a rustls TLS 1.3 handshake-validation issue) found via a project-wide `cargo-audit` sweep. No source changes.
+
 ## [0.7.3] - 2026-09-15
 
 ### Added

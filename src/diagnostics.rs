@@ -48,7 +48,21 @@ fn build_report_body(bundle: &str, trigger: &str, message: Option<&str>) -> serd
         "hostname": hostname(),
         "trigger": trigger,
         "logs": bundle,
-        "message": message,
+        // software-support's SubmitReport.message is a required
+        // String, not Option<String> -- sending JSON `null` here (the
+        // old behavior for `None`) makes axum's Json extractor fail to
+        // deserialize the whole request before the handler even runs,
+        // rejecting with 422 regardless of anything else in the body.
+        // Confirmed live: every automatic (loss-threshold-triggered)
+        // report from this daemon has been silently failing with
+        // exactly this error since the intake service existed, since
+        // `control.rs`'s watcher always calls this with `message:
+        // None`. omnibridge's own client (the other real consumer of
+        // this same endpoint) never hits this because its equivalent
+        // field is typed as a plain String there too -- always a real
+        // value, never optional. Match that contract: an absent
+        // message is an empty string, never JSON null.
+        "message": message.unwrap_or(""),
     })
 }
 
@@ -122,10 +136,17 @@ mod tests {
         assert!(body.get("install_id").is_none());
     }
 
+    // Real bug this guards against: software-support's SubmitReport.message
+    // is a required String, not Option<String> -- sending JSON `null`
+    // makes axum's Json extractor reject the whole request with 422
+    // before the handler runs at all. Confirmed this was happening on
+    // every real automatic (loss-threshold) report in production; see
+    // `build_report_body`'s own doc comment for the full story.
     #[test]
-    fn build_report_body_message_is_null_when_absent() {
+    fn build_report_body_message_is_an_empty_string_not_null_when_absent() {
         let body = build_report_body("logs", "auto", None);
-        assert!(body["message"].is_null());
+        assert_eq!(body["message"], "");
+        assert!(!body["message"].is_null());
     }
 
     use std::io::{Read, Write};
@@ -178,5 +199,89 @@ mod tests {
         let result = submit_report_blocking("some logs", "manual", None);
         std::env::remove_var("MLVPN_DIAGNOSTICS_URL");
         assert!(result.is_err());
+    }
+
+    /// Like `spawn_mock_server`, but hands the captured request body
+    /// back to the caller via the returned channel instead of ignoring
+    /// it -- lets a test assert on the actual bytes sent over the
+    /// wire, not just what `build_report_body` produces as a
+    /// `serde_json::Value` in-process (which is exactly what the
+    /// removed `build_report_body_message_is_null_when_absent` test
+    /// did, and why it never caught this bug -- it checked the value
+    /// this module builds, never what a real HTTP client actually
+    /// serializes and sends).
+    fn spawn_mock_server_capturing_body(
+        status_line: &'static str,
+        json_body: &'static str,
+    ) -> (String, std::sync::mpsc::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            // Read until we've seen the blank line ending the headers,
+            // then keep reading exactly Content-Length more bytes --
+            // good enough for this test's own small, single-request
+            // client, not a general HTTP parser.
+            loop {
+                let n = stream.read(&mut chunk).unwrap();
+                buf.extend_from_slice(&chunk[..n]);
+                if let Some(header_end) = find_subslice(&buf, b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&buf[..header_end]);
+                    let content_length: usize = headers
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length: ").or_else(|| l.strip_prefix("Content-Length: ")))
+                        .and_then(|v| v.trim().parse().ok())
+                        .unwrap_or(0);
+                    let body_so_far = buf.len() - (header_end + 4);
+                    if body_so_far >= content_length {
+                        break;
+                    }
+                }
+            }
+            let header_end = find_subslice(&buf, b"\r\n\r\n").unwrap();
+            let body = String::from_utf8_lossy(&buf[header_end + 4..]).into_owned();
+            let _ = tx.send(body);
+            let response = format!(
+                "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{json_body}",
+                json_body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        (format!("http://{addr}"), rx)
+    }
+
+    fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack.windows(needle.len()).position(|w| w == needle)
+    }
+
+    /// The real regression test: submits with no message (the exact
+    /// call shape `control.rs`'s automatic loss-threshold watcher
+    /// uses) through the real `reqwest` JSON-serialization path, and
+    /// asserts the literal bytes on the wire never contain `null` for
+    /// message -- catches the bug even if some future change
+    /// reintroduces `Option<&str>` being serialized directly again.
+    #[test]
+    fn submit_report_async_never_sends_a_null_message_over_the_wire() {
+        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+
+        let (url, rx) = spawn_mock_server_capturing_body("HTTP/1.1 201 Created", r#"{"ticket_id":"abc-123"}"#);
+        std::env::set_var("MLVPN_DIAGNOSTICS_URL", &url);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(submit_report_async("some logs", "auto", None));
+        std::env::remove_var("MLVPN_DIAGNOSTICS_URL");
+        assert!(result.is_ok());
+
+        let sent_body = rx.recv_timeout(std::time::Duration::from_secs(2)).expect("mock server should have captured a request body");
+        assert!(
+            !sent_body.contains("\"message\":null"),
+            "message must never be serialized as JSON null -- software-support's \
+             SubmitReport.message is a required String, and a null here makes \
+             axum's Json extractor reject the whole request with 422. Got: {sent_body}"
+        );
+        assert!(sent_body.contains("\"message\":\"\""), "expected an empty string for an absent message, got: {sent_body}");
     }
 }
