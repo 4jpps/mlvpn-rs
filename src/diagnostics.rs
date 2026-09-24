@@ -232,7 +232,10 @@ mod tests {
                     let headers = String::from_utf8_lossy(&buf[..header_end]);
                     let content_length: usize = headers
                         .lines()
-                        .find_map(|l| l.strip_prefix("content-length: ").or_else(|| l.strip_prefix("Content-Length: ")))
+                        .find_map(|l| {
+                            l.strip_prefix("content-length: ")
+                                .or_else(|| l.strip_prefix("Content-Length: "))
+                        })
                         .and_then(|v| v.trim().parse().ok())
                         .unwrap_or(0);
                     let body_so_far = buf.len() - (header_end + 4);
@@ -268,20 +271,26 @@ mod tests {
     fn submit_report_async_never_sends_a_null_message_over_the_wire() {
         let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
 
-        let (url, rx) = spawn_mock_server_capturing_body("HTTP/1.1 201 Created", r#"{"ticket_id":"abc-123"}"#);
+        let (url, rx) =
+            spawn_mock_server_capturing_body("HTTP/1.1 201 Created", r#"{"ticket_id":"abc-123"}"#);
         std::env::set_var("MLVPN_DIAGNOSTICS_URL", &url);
         let rt = tokio::runtime::Runtime::new().unwrap();
         let result = rt.block_on(submit_report_async("some logs", "auto", None));
         std::env::remove_var("MLVPN_DIAGNOSTICS_URL");
         assert!(result.is_ok());
 
-        let sent_body = rx.recv_timeout(std::time::Duration::from_secs(2)).expect("mock server should have captured a request body");
+        let sent_body = rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("mock server should have captured a request body");
         assert!(
             !sent_body.contains("\"message\":null"),
             "message must never be serialized as JSON null -- software-support's \
              SubmitReport.message is a required String, and a null here makes \
              axum's Json extractor reject the whole request with 422. Got: {sent_body}"
         );
-        assert!(sent_body.contains("\"message\":\"\""), "expected an empty string for an absent message, got: {sent_body}");
+        assert!(
+            sent_body.contains("\"message\":\"\""),
+            "expected an empty string for an absent message, got: {sent_body}"
+        );
     }
 }
