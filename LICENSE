@@ -633,7 +633,7 @@ state the exclusion of warranty; and each file should have at least
 the "copyright" line and a pointer to where the full notice is found.
 
     mlvpn-rs -- multi-link VPN bonding daemon
-    Copyright (C) 2026  Jeff Parrish PC Services <https://www.jpps.us>
+    Copyright (C) 2026  Jeff Parrish PC Services LLC <https://www.jpps.us>
 
     This program is free software: you can redistribute it and/or modify
     it under the terms of version 3 of the GNU Affero General Public

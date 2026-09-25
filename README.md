@@ -29,7 +29,7 @@ instead of an IP address so it survives DHCP/roaming changes, a
 memory-safe implementation, a modern authenticated-key-exchange
 handshake instead of a shared password, and more).
 
-By [Jeff Parrish PC Services](https://www.jpps.us), vibe-coded with
+By [Jeff Parrish PC Services LLC](https://www.jpps.us), vibe-coded with
 [Claude](https://claude.com/claude-code). License:
 [AGPL-3.0-only](LICENSE) -- if you run a modified version as a network
 service, you must make your changes' source available to its users; see

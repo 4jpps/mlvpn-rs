@@ -25,7 +25,7 @@ for this repository (Security tab -> "Report a vulnerability"). This
 creates a private discussion visible only to maintainers until a fix is
 ready.
 
-Alternative: email **security reports to Jeff Parrish PC Services**
+Alternative: email **security reports to Jeff Parrish PC Services LLC**
 via [www.jpps.us](https://www.jpps.us) with "mlvpn-rs security" in the
 subject. Please include:
 
