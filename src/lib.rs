@@ -10,6 +10,7 @@
 //! consumers outside `src/main.rs` and `src/bin/mlvpn-tui.rs`.
 
 pub mod config;
+pub mod congestion;
 pub mod control;
 pub mod crypto;
 pub mod diag;

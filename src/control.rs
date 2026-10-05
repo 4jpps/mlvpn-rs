@@ -284,6 +284,12 @@ async fn build_snapshot(
         .enumerate()
         .map(|(idx, link)| {
             let peer = peer_stats.get(idx as u8);
+            let congestion = link
+                .stats
+                .tx_counters
+                .congestion_milli
+                .load(Ordering::Relaxed) as f64
+                / 1000.0;
             LinkSnapshot {
                 name: link.config.name.clone(),
                 bind_interface: link.config.bind_interface.clone(),
@@ -311,6 +317,25 @@ async fn build_snapshot(
                 tx_queue_full_total: link.stats.tx_counters.queue_full.load(Ordering::Relaxed),
                 tx_send_failed_total: link.stats.tx_counters.send_failed.load(Ordering::Relaxed),
                 tx_rerouted_total: link.stats.tx_counters.rerouted_away.load(Ordering::Relaxed),
+                tx_queue_depth: link.stats.tx_counters.depth.load(Ordering::Relaxed),
+                tx_queue_delay_us: link
+                    .stats
+                    .tx_counters
+                    .queue_delay_recent_us
+                    .load(Ordering::Relaxed),
+                tx_queue_delay_max_us: link
+                    .stats
+                    .tx_counters
+                    .queue_delay_max_us
+                    .load(Ordering::Relaxed),
+                tx_send_wait_us: link
+                    .stats
+                    .tx_counters
+                    .send_wait_recent_us
+                    .load(Ordering::Relaxed),
+                congestion_factor: congestion,
+                degraded: link.state == LinkState::Up
+                    && congestion < crate::congestion::DEGRADED_BELOW,
                 peer_name: peer.as_ref().map(|p| p.name.clone()),
                 peer_state: peer
                     .as_ref()

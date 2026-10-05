@@ -980,6 +980,15 @@ pub async fn run(
                     link_tx_worker(idx, rx, d).await;
                 }));
             }
+            let counters: Vec<Arc<link::TxCounters>> = dispatcher
+                .queues
+                .iter()
+                .map(|q| q.counters.clone())
+                .collect();
+            let sched = scheduler.clone();
+            handles.push(tokio::spawn(async move {
+                congestion_loop(sched, counters).await;
+            }));
             Some(dispatcher)
         } else {
             None
@@ -1259,6 +1268,37 @@ struct TxJob {
     /// Already redirected once after a send failure -- a second failure
     /// drops the packet rather than bouncing it between links forever.
     rerouted: bool,
+    /// When this job was last handed to a link's queue (stamped by
+    /// `try_enqueue`); the worker turns it into the link's queue delay.
+    enqueued: Instant,
+}
+
+/// Enqueue `job` on `q` with the depth / enqueue-time accounting the
+/// congestion tracker relies on. `depth` is raised *before* the attempt so
+/// the worker's decrement can never underflow it, and undone on failure.
+fn try_enqueue(q: &LinkTx, mut job: TxJob) -> std::result::Result<(), TrySendError<TxJob>> {
+    job.enqueued = Instant::now();
+    q.counters.depth.fetch_add(1, Ordering::Relaxed);
+    q.tx.try_send(job).inspect_err(|_| {
+        q.counters.depth.fetch_sub(1, Ordering::Relaxed);
+    })
+}
+
+/// How often the scheduler re-reads every link's TX counters to update
+/// congestion factors. Short enough to catch a stalling link within a few
+/// RTTs, long enough that each window holds many worker-batch samples.
+const CONGESTION_TICK: Duration = Duration::from_millis(100);
+
+async fn congestion_loop(
+    scheduler: Arc<std::sync::Mutex<Scheduler>>,
+    counters: Vec<Arc<link::TxCounters>>,
+) {
+    let mut tick = tokio::time::interval(CONGESTION_TICK);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tick.tick().await;
+        scheduler.lock().unwrap().update_congestion(&counters);
+    }
 }
 
 /// A link's TX queue sender plus its lock-free health counters.
@@ -1340,7 +1380,7 @@ impl TxDispatcher {
             tracing::warn!("no link available to send on; dropping packet");
             return;
         };
-        match q.tx.try_send(job) {
+        match try_enqueue(q, job) {
             Ok(()) => {}
             Err(TrySendError::Full(job)) => {
                 q.counters.queue_full.fetch_add(1, Ordering::Relaxed);
@@ -1378,7 +1418,7 @@ impl TxDispatcher {
                     continue;
                 }
             }
-            match self.queues[cand].tx.try_send(job) {
+            match try_enqueue(&self.queues[cand], job) {
                 Ok(()) => {
                     self.queues[from]
                         .counters
@@ -1433,8 +1473,9 @@ impl TxDispatcher {
                 seq,
                 plaintext: plaintext.clone(),
                 rerouted: true,
+                enqueued: Instant::now(),
             };
-            if let Err(TrySendError::Full(_)) = q.tx.try_send(job) {
+            if let Err(TrySendError::Full(_)) = try_enqueue(q, job) {
                 q.counters.queue_full.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -1461,11 +1502,27 @@ async fn link_tx_worker(idx: usize, mut rx: mpsc::Receiver<TxJob>, d: TxDispatch
             let g = d.links[idx].lock().await;
             g.remote.map(|_| (g.id, g.handle(), g.config.name.clone()))
         };
+        // FIFO queue: the first job of the batch is the oldest, so its
+        // age is the delay the worst-served packet just experienced.
+        let batch_len = batch.len() as u32;
+        let queue_delay_us = batch[0].enqueued.elapsed().as_micros() as u64;
+        counters
+            .queue_delay_sum_us
+            .fetch_add(queue_delay_us, Ordering::Relaxed);
+        counters.queue_delay_samples.fetch_add(1, Ordering::Relaxed);
+        counters
+            .queue_delay_max_us
+            .fetch_max(queue_delay_us, Ordering::Relaxed);
+        counters
+            .last_progress_us
+            .store(link::mono_us(), Ordering::Relaxed);
+        let send_started = Instant::now();
         let mut bytes = 0u64;
         let mut pkts = 0u64;
         for job in batch.drain(..) {
             let Some((link_id, handle, name)) = &target else {
                 counters.send_failed.fetch_add(1, Ordering::Relaxed);
+                d.scheduler.lock().unwrap().note_send_failed(idx);
                 d.reroute(idx, job).await;
                 continue;
             };
@@ -1491,13 +1548,22 @@ async fn link_tx_worker(idx: usize, mut rx: mpsc::Receiver<TxJob>, d: TxDispatch
                 Err(e) => {
                     tracing::debug!(link = %name, error = %e, "send failed");
                     counters.send_failed.fetch_add(1, Ordering::Relaxed);
+                    d.scheduler.lock().unwrap().note_send_failed(idx);
                     d.reroute(idx, job).await;
                 }
             }
         }
-        if pkts > 0 {
+        if let Some(per_packet_us) = (send_started.elapsed().as_micros() as u64).checked_div(pkts) {
+            counters
+                .send_wait_sum_us
+                .fetch_add(per_packet_us, Ordering::Relaxed);
+            counters.send_wait_samples.fetch_add(1, Ordering::Relaxed);
             d.links[idx].lock().await.stats.record_tx_many(bytes, pkts);
         }
+        counters.depth.fetch_sub(batch_len, Ordering::Relaxed);
+        counters
+            .last_progress_us
+            .store(link::mono_us(), Ordering::Relaxed);
     }
 }
 
@@ -1541,6 +1607,7 @@ async fn outbound_sender(
                     seq: next_send_seq(),
                     plaintext: frame.plaintext,
                     rerouted: false,
+                    enqueued: Instant::now(),
                 })
                 .await;
             }
@@ -3900,6 +3967,33 @@ mod spill_candidate_tests {
     fn spill_has_no_candidate_when_everything_else_is_full() {
         assert!(spill_candidates(&[128, 0, 0], 0).is_empty());
         assert!(spill_candidates(&[128], 0).is_empty());
+    }
+
+    fn job() -> TxJob {
+        TxJob {
+            seq: 1,
+            plaintext: vec![0; 10],
+            rerouted: false,
+            enqueued: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn try_enqueue_tracks_depth_and_undoes_it_when_the_queue_is_full() {
+        let (tx, _rx) = mpsc::channel::<TxJob>(2);
+        let q = LinkTx {
+            tx,
+            counters: Arc::new(link::TxCounters::new()),
+        };
+        assert!(try_enqueue(&q, job()).is_ok());
+        assert!(try_enqueue(&q, job()).is_ok());
+        assert_eq!(q.counters.depth.load(Ordering::Relaxed), 2);
+        assert!(matches!(try_enqueue(&q, job()), Err(TrySendError::Full(_))));
+        assert_eq!(
+            q.counters.depth.load(Ordering::Relaxed),
+            2,
+            "a rejected enqueue must not count as queued"
+        );
     }
 }
 

@@ -35,7 +35,7 @@ use socket2::{Domain, Protocol, Socket, Type};
 use std::net::{IpAddr, SocketAddr, UdpSocket as StdUdpSocket};
 #[cfg(target_os = "linux")]
 use std::os::unix::io::AsRawFd;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
@@ -207,6 +207,51 @@ pub struct TxCounters {
     /// Packets that were redirected to a different link because this one
     /// could not take them (queue full or send failure).
     pub rerouted_away: AtomicU64,
+    /// Packets currently waiting in (or being sent from) this link's TX
+    /// queue. Incremented by the dispatcher before each enqueue attempt
+    /// and decremented by the worker once a batch is finished.
+    pub depth: AtomicU32,
+    /// Sum / count / max of the queue delay -- how long the oldest packet
+    /// of each worker batch sat in the queue before the worker picked it
+    /// up. The scheduler turns interval deltas of the first two into an
+    /// average delay (`congestion.rs`); the third is a lifetime peak.
+    pub queue_delay_sum_us: AtomicU64,
+    pub queue_delay_samples: AtomicU64,
+    pub queue_delay_max_us: AtomicU64,
+    /// Sum / count of the per-packet time spent inside the link's socket
+    /// send (`wg_send_parts`), one sample per worker batch.
+    pub send_wait_sum_us: AtomicU64,
+    pub send_wait_samples: AtomicU64,
+    /// `mono_us()` of the worker's last batch start/finish; 0 until the
+    /// first batch. A worker wedged inside a blocking send stops updating
+    /// it, which is how the scheduler notices a stall that produces no
+    /// new delay samples.
+    pub last_progress_us: AtomicU64,
+    /// Scheduler-published view, refreshed every congestion tick: the
+    /// recent average queue delay and send wait (0 when idle), and the
+    /// congestion factor in thousandths (1000 = healthy).
+    pub queue_delay_recent_us: AtomicU64,
+    pub send_wait_recent_us: AtomicU64,
+    pub congestion_milli: AtomicU32,
+}
+
+impl TxCounters {
+    pub fn new() -> Self {
+        let c = Self::default();
+        c.congestion_milli.store(1000, Ordering::Relaxed);
+        c
+    }
+}
+
+/// Microseconds on a process-wide monotonic clock, never 0 (0 means
+/// "unset" in `TxCounters::last_progress_us`).
+pub fn mono_us() -> u64 {
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    EPOCH
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_micros() as u64
+        + 1
 }
 
 impl LinkStats {
@@ -232,7 +277,7 @@ impl LinkStats {
             rx_bytes: 0,
             tx_packets: 0,
             rx_packets: 0,
-            tx_counters: Arc::new(TxCounters::default()),
+            tx_counters: Arc::new(TxCounters::new()),
         }
     }
 

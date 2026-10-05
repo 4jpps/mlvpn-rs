@@ -215,6 +215,10 @@ pub struct TunSnapshot {
     pub tx_dropped: Option<u64>,
 }
 
+fn default_congestion_factor() -> f64 {
+    1.0
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LinkSnapshot {
     pub name: String,
@@ -315,6 +319,31 @@ pub struct LinkSnapshot {
     /// one could not take them (queue full, or send failure).
     #[serde(default)]
     pub tx_rerouted_total: u64,
+    /// Packets currently queued for (or being sent by) this link's TX
+    /// worker.
+    #[serde(default)]
+    pub tx_queue_depth: u32,
+    /// Recent average time the oldest packet of each TX batch waited in
+    /// this link's queue, microseconds (0 when idle). The primary
+    /// congestion signal the scheduler acts on.
+    #[serde(default)]
+    pub tx_queue_delay_us: u64,
+    /// Lifetime peak of the same measurement.
+    #[serde(default)]
+    pub tx_queue_delay_max_us: u64,
+    /// Recent average per-packet time spent inside this link's socket
+    /// send, microseconds.
+    #[serde(default)]
+    pub tx_send_wait_us: u64,
+    /// Scheduler weight multiplier in `[0.1, 1.0]`: 1.0 healthy, lower
+    /// while the link's queue delay / send failures say it is congested.
+    #[serde(default = "default_congestion_factor")]
+    pub congestion_factor: f64,
+    /// The link is Up but congested enough (`congestion_factor` below
+    /// 0.7) that the scheduler is steering traffic away from it. A
+    /// derived overlay on `state`, not a separate state.
+    #[serde(default)]
+    pub degraded: bool,
 
     // Peer-reported -- their view of the same physical link, received
     // over the wire via a `StatsShare` frame (see `protocol.rs`). `None`
@@ -529,6 +558,12 @@ mod tests {
             tx_queue_full_total: 0,
             tx_send_failed_total: 0,
             tx_rerouted_total: 0,
+            tx_queue_depth: 0,
+            tx_queue_delay_us: 0,
+            tx_queue_delay_max_us: 0,
+            tx_send_wait_us: 0,
+            congestion_factor: 1.0,
+            degraded: false,
             peer_name: None,
             peer_state: None,
             peer_rtt_ms: None,

@@ -803,6 +803,16 @@ fn link_row(l: &LinkSnapshot, any_primary: bool) -> Row<'static> {
             Style::default().fg(Color::Yellow),
         )));
     }
+    if l.degraded {
+        tx_rx_lines.push(Line::from(Span::styled(
+            format!(
+                "DEGRADED: queue {:.1} ms, share x{:.2}",
+                l.tx_queue_delay_us as f64 / 1000.0,
+                l.congestion_factor
+            ),
+            Style::default().fg(Color::Yellow),
+        )));
+    }
     if l.tx_send_failed_total > 0 {
         tx_rx_lines.push(Line::from(Span::styled(
             format!("tx send failed: {}", l.tx_send_failed_total),

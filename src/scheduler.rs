@@ -20,9 +20,12 @@
 //! inside the process.
 
 use crate::config::SchedulerConfig;
-use crate::link::{Link, LinkScore, LinkState};
+use crate::congestion::{CongestionTracker, CounterSnapshot};
+use crate::link::{Link, LinkScore, LinkState, TxCounters};
 use crate::monitor;
 use std::collections::HashMap;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// How far ahead (as a fraction, 0.2 = 20%) a candidate link's score
@@ -33,6 +36,10 @@ const PRIMARY_SWITCH_MARGIN: f64 = 0.2;
 
 struct SwrrEntry {
     link_index: usize,
+    /// `monitor::score` as of the last `refresh()`.
+    base_weight: f64,
+    /// `base_weight` scaled by the link's congestion factor -- what SWRR
+    /// actually uses. Re-derived on every `update_congestion` tick.
     effective_weight: f64,
     current_weight: f64,
     /// Copied out of `LinkConfig` once, here in `refresh()` (which only
@@ -94,6 +101,10 @@ impl RateLimitState {
 /// within a fraction of a second, and a link that is still full is simply
 /// re-penalized by the next overflow.
 const QUEUE_FULL_PENALTY: Duration = Duration::from_millis(200);
+/// Same idea for a send failure (socket error / no remote); a little
+/// longer because a failing link is less likely to be healthy again in
+/// 200 ms than one that merely had a burst.
+const SEND_FAILED_PENALTY: Duration = Duration::from_millis(500);
 
 pub struct Scheduler {
     entries: Vec<SwrrEntry>,
@@ -101,6 +112,10 @@ pub struct Scheduler {
     /// Links recently reported queue-full, with when the penalty lapses.
     /// Almost always empty, so the hot path only pays an `is_empty()`.
     penalized: Vec<(usize, Instant)>,
+    /// Per-link congestion state, indexed by link index. Lives outside
+    /// `entries` because `refresh()` rebuilds those from scratch while the
+    /// factor has to persist (and recover gradually) across rebuilds.
+    congestion: Vec<CongestionTracker>,
     /// Current primary link's index, when `scheduler.primary_link_mode`
     /// is on. `None` before the first `refresh()`, or if every link is
     /// currently Down. See `refresh_from_scores`'s doc comment for
@@ -122,6 +137,7 @@ impl Scheduler {
             entries: Vec::new(),
             rate_limits: HashMap::new(),
             penalized: Vec::new(),
+            congestion: Vec::new(),
             primary: None,
             candidate: None,
         }
@@ -144,10 +160,59 @@ impl Scheduler {
     /// `primary` selection is untouched (a primary stays primary; the
     /// dispatcher decides separately whether it may spill).
     pub fn note_queue_full(&mut self, idx: usize) {
-        let until = Instant::now() + QUEUE_FULL_PENALTY;
+        self.penalize(idx, QUEUE_FULL_PENALTY);
+    }
+
+    /// A link's TX worker failed to put a packet on the wire. Same
+    /// short-lived deprioritization as `note_queue_full`; because it only
+    /// lasts `SEND_FAILED_PENALTY` past the *last* failure, one transient
+    /// socket error costs a fraction of a second of reduced share and
+    /// never takes the link out (link state stays with the probes).
+    pub fn note_send_failed(&mut self, idx: usize) {
+        self.penalize(idx, SEND_FAILED_PENALTY);
+    }
+
+    fn penalize(&mut self, idx: usize, dur: Duration) {
+        let until = Instant::now() + dur;
         match self.penalized.iter_mut().find(|(i, _)| *i == idx) {
-            Some(entry) => entry.1 = until,
+            Some(entry) => entry.1 = entry.1.max(until),
             None => self.penalized.push((idx, until)),
+        }
+    }
+
+    /// Current congestion factor for link `idx` (1.0 when unknown).
+    pub fn congestion_factor(&self, idx: usize) -> f64 {
+        self.congestion.get(idx).map_or(1.0, |t| t.factor())
+    }
+
+    /// Fold each link's TX counters into its congestion factor and
+    /// re-scale the SWRR weights; also publishes the recent delay / send
+    /// wait / factor back onto the counters for diagnostics. Cheap (atomic
+    /// loads), run on its own short tick rather than per probe so a
+    /// congested link is noticed within ~100 ms. `counters` is in `Links`
+    /// order. Primary-link selection deliberately ignores the factor.
+    pub fn update_congestion(&mut self, counters: &[Arc<TxCounters>]) {
+        let now = Instant::now();
+        if self.congestion.len() < counters.len() {
+            self.congestion
+                .resize_with(counters.len(), CongestionTracker::default);
+        }
+        for (i, c) in counters.iter().enumerate() {
+            let t = &mut self.congestion[i];
+            t.update(now, CounterSnapshot::read(c));
+            c.queue_delay_recent_us
+                .store(t.delay_recent_us(), Ordering::Relaxed);
+            c.send_wait_recent_us
+                .store(t.send_wait_recent_us(), Ordering::Relaxed);
+            c.congestion_milli
+                .store((t.factor() * 1000.0).round() as u32, Ordering::Relaxed);
+        }
+        for e in &mut self.entries {
+            e.effective_weight = e.base_weight
+                * self
+                    .congestion
+                    .get(e.link_index)
+                    .map_or(1.0, |t| t.factor());
         }
     }
 
@@ -177,7 +242,8 @@ impl Scheduler {
             .into_iter()
             .map(|(i, w)| SwrrEntry {
                 link_index: i,
-                effective_weight: w,
+                base_weight: w,
+                effective_weight: w * self.congestion_factor(i),
                 current_weight: 0.0,
                 bandwidth_cap_mbps: links[i].config.bandwidth_cap_mbps,
             })
@@ -489,12 +555,14 @@ mod tests {
             SwrrEntry {
                 link_index: 0,
                 effective_weight: 3.0,
+                base_weight: 3.0,
                 current_weight: 0.0,
                 bandwidth_cap_mbps: None,
             },
             SwrrEntry {
                 link_index: 1,
                 effective_weight: 1.0,
+                base_weight: 1.0,
                 current_weight: 0.0,
                 bandwidth_cap_mbps: None,
             },
@@ -528,6 +596,7 @@ mod tests {
             .map(|i| SwrrEntry {
                 link_index: i,
                 effective_weight: 1.0,
+                base_weight: 1.0,
                 current_weight: 0.0,
                 bandwidth_cap_mbps: None,
             })
@@ -554,6 +623,84 @@ mod tests {
             seen[s.select_fast(2, 100).unwrap()] = true;
         }
         assert!(seen[0] && seen[1], "all-penalized must fall back to SWRR");
+    }
+
+    fn counters_pair() -> Vec<Arc<TxCounters>> {
+        vec![Arc::new(TxCounters::new()), Arc::new(TxCounters::new())]
+    }
+
+    /// Pretend link `i`'s worker saw `n` batches each `delay_us` old.
+    fn add_delay(c: &TxCounters, delay_us: u64, n: u64) {
+        c.queue_delay_sum_us
+            .fetch_add(delay_us * n, Ordering::Relaxed);
+        c.queue_delay_samples.fetch_add(n, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn congested_link_loses_share_but_keeps_a_trickle() {
+        let mut s = two_entry_scheduler();
+        let counters = counters_pair();
+        s.update_congestion(&counters);
+        std::thread::sleep(Duration::from_millis(60));
+        add_delay(&counters[1], 40_000, 20);
+        s.update_congestion(&counters);
+
+        assert!(
+            s.congestion_factor(1) <= 0.2 + 1e-9,
+            "{}",
+            s.congestion_factor(1)
+        );
+        assert_eq!(s.congestion_factor(0), 1.0);
+        assert!(s.entries[1].effective_weight <= s.entries[0].effective_weight * 0.2 + 1e-9);
+        assert_eq!(s.entries[1].base_weight, 1.0, "base weight is preserved");
+        let mut picks = [0usize; 2];
+        for _ in 0..1000 {
+            picks[s.select_fast(2, 100).unwrap()] += 1;
+        }
+        assert!(picks[0] >= picks[1] * 4, "picks {picks:?}");
+        assert!(picks[1] > 0, "congested link keeps a trickle: {picks:?}");
+        assert!(counters[1].congestion_milli.load(Ordering::Relaxed) <= 200);
+        assert_eq!(
+            counters[1].queue_delay_recent_us.load(Ordering::Relaxed),
+            40_000
+        );
+    }
+
+    #[test]
+    fn congestion_factor_survives_refresh_style_entry_rebuild() {
+        let mut s = two_entry_scheduler();
+        let counters = counters_pair();
+        s.update_congestion(&counters);
+        std::thread::sleep(Duration::from_millis(60));
+        add_delay(&counters[0], 30_000, 10);
+        s.update_congestion(&counters);
+        let f = s.congestion_factor(0);
+        assert!(f < 0.3);
+        // `refresh()` rebuilds `entries` from monitor scores; the factor
+        // lives in `congestion` and is re-applied from there.
+        s.entries.clear();
+        assert_eq!(s.congestion_factor(0), f);
+    }
+
+    #[test]
+    fn send_failure_penalty_lapses_and_never_extends_backwards() {
+        let mut s = two_entry_scheduler();
+        s.note_send_failed(1);
+        for _ in 0..50 {
+            assert_eq!(s.select_fast(2, 100), Some(0));
+        }
+        let until = s.penalized[0].1;
+        s.note_queue_full(1);
+        assert!(
+            s.penalized[0].1 >= until,
+            "a shorter penalty must not shorten a longer one"
+        );
+        s.penalized[0].1 = Instant::now() - Duration::from_millis(1);
+        let mut seen = [false; 2];
+        for _ in 0..20 {
+            seen[s.select_fast(2, 100).unwrap()] = true;
+        }
+        assert!(seen[1]);
     }
 
     #[test]
@@ -749,12 +896,14 @@ mod tests {
         sched.entries.push(SwrrEntry {
             link_index: 0,
             effective_weight: 5.0,
+            base_weight: 5.0,
             current_weight: 0.0,
             bandwidth_cap_mbps: None,
         });
         sched.entries.push(SwrrEntry {
             link_index: 1,
             effective_weight: 3.0,
+            base_weight: 3.0,
             current_weight: 0.0,
             bandwidth_cap_mbps: None,
         });
@@ -844,12 +993,14 @@ mod tests {
             s.entries.push(SwrrEntry {
                 link_index: 0,
                 effective_weight: 5.0,
+                base_weight: 5.0,
                 current_weight: 0.0,
                 bandwidth_cap_mbps: None,
             });
             s.entries.push(SwrrEntry {
                 link_index: 1,
                 effective_weight: 3.0,
+                base_weight: 3.0,
                 current_weight: 0.0,
                 bandwidth_cap_mbps: None,
             });

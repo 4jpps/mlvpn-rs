@@ -72,7 +72,9 @@ pub fn format_dump(snapshot: &Snapshot, trigger: &str) -> String {
         ));
         out.push_str(&format!(
             "  totals: tx_bytes={} rx_bytes={} tx_packets={} rx_packets={} wg_rejected={} \
-             wg_substituted={} tx_queue_full={} tx_send_failed={} tx_rerouted={}\n\n",
+             wg_substituted={} tx_queue_full={} tx_send_failed={} tx_rerouted={}\n  \
+             tx_queue: depth={} delay={}us (max {}us) send_wait={}us congestion_factor={:.2} \
+             degraded={}\n\n",
             l.tx_bytes,
             l.rx_bytes,
             l.tx_packets,
@@ -82,6 +84,12 @@ pub fn format_dump(snapshot: &Snapshot, trigger: &str) -> String {
             l.tx_queue_full_total,
             l.tx_send_failed_total,
             l.tx_rerouted_total,
+            l.tx_queue_depth,
+            l.tx_queue_delay_us,
+            l.tx_queue_delay_max_us,
+            l.tx_send_wait_us,
+            l.congestion_factor,
+            l.degraded,
         ));
     }
 
@@ -221,6 +229,12 @@ mod tests {
             tx_queue_full_total: 0,
             tx_send_failed_total: 0,
             tx_rerouted_total: 0,
+            tx_queue_depth: 0,
+            tx_queue_delay_us: 0,
+            tx_queue_delay_max_us: 0,
+            tx_send_wait_us: 0,
+            congestion_factor: 1.0,
+            degraded: false,
             peer_name: Some("lte0".to_string()),
             peer_state: Some("up".to_string()),
             peer_rtt_ms: Some(25.0),
