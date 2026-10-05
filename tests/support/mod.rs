@@ -844,10 +844,20 @@ pub fn spawn_capturing_mock_server(
     status_line: &'static str,
     json_body: &'static str,
 ) -> (String, std::sync::mpsc::Receiver<String>) {
+    spawn_capturing_mock_server_on("127.0.0.1", status_line, json_body)
+}
+
+/// Like `spawn_capturing_mock_server`, but bound to `bind_ip` so a client
+/// inside a separate network namespace can reach it over a veth.
+pub fn spawn_capturing_mock_server_on(
+    bind_ip: &str,
+    status_line: &'static str,
+    json_body: &'static str,
+) -> (String, std::sync::mpsc::Receiver<String>) {
     use std::io::{Read, Write};
     use std::net::TcpListener;
 
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let listener = TcpListener::bind((bind_ip, 0)).unwrap();
     let addr = listener.local_addr().unwrap();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {

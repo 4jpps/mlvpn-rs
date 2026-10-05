@@ -39,8 +39,8 @@ use std::time::Duration;
 use support::{
     create_scratch_dir, ensure_mlvpn_system_user, generate_test_keypair, link_is_up,
     poll_snapshot_until, require_ip_command, require_root, require_tc_command,
-    spawn_capturing_mock_server, unique_id, veth_link_addrs, write_config, LinkSpec, MlvpnProcess,
-    NetNs, SchedulerOverrides, VethPair, CLIENT_TUNNEL_ADDR, SERVER_TUNNEL_ADDR,
+    spawn_capturing_mock_server_on, unique_id, veth_link_addrs, write_config, LinkSpec,
+    MlvpnProcess, NetNs, SchedulerOverrides, VethPair, CLIENT_TUNNEL_ADDR, SERVER_TUNNEL_ADDR,
     SERVER_TUNNEL_HOST,
 };
 
@@ -352,6 +352,61 @@ async fn diag_dump_auto_watch_fires_on_real_loss() {
     );
 }
 
+const HOST_VETH_HOST_IP: &str = "203.0.113.1";
+const HOST_VETH_CLIENT_IP: &str = "203.0.113.2";
+
+struct HostVeth {
+    host_if: String,
+}
+
+impl HostVeth {
+    fn create(host_if: &str, peer_if: &str, client_ns: &NetNs) -> std::io::Result<Self> {
+        let run = |args: &[&str]| -> std::io::Result<()> {
+            let st = std::process::Command::new("ip").args(args).status()?;
+            if st.success() {
+                Ok(())
+            } else {
+                Err(std::io::Error::other(format!("ip {args:?} failed")))
+            }
+        };
+        run(&[
+            "link", "add", host_if, "type", "veth", "peer", "name", peer_if,
+        ])?;
+        let this = Self {
+            host_if: host_if.to_string(),
+        };
+        run(&["link", "set", peer_if, "netns", client_ns.name.as_str()])?;
+        run(&[
+            "addr",
+            "add",
+            &format!("{HOST_VETH_HOST_IP}/30"),
+            "dev",
+            host_if,
+        ])?;
+        run(&["link", "set", host_if, "up"])?;
+        client_ns.exec(
+            "ip",
+            &[
+                "addr",
+                "add",
+                &format!("{HOST_VETH_CLIENT_IP}/30"),
+                "dev",
+                peer_if,
+            ],
+        )?;
+        client_ns.exec("ip", &["link", "set", peer_if, "up"])?;
+        Ok(this)
+    }
+}
+
+impl Drop for HostVeth {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("ip")
+            .args(["link", "del", self.host_if.as_str()])
+            .status();
+    }
+}
+
 /// Same real-loss setup as `diag_dump_auto_watch_fires_on_real_loss`, but
 /// with `auto_submit_enabled = true` and `MLVPN_DIAGNOSTICS_URL` pointed
 /// at a local mock server (see `support::spawn_capturing_mock_server`)
@@ -369,19 +424,28 @@ async fn diag_dump_auto_watch_submits_report_when_auto_submit_enabled() {
     require_tc_command();
     ensure_mlvpn_system_user().expect("ensure mlvpn system user/group exists");
 
-    let (mock_url, mock_rx) =
-        spawn_capturing_mock_server("HTTP/1.1 201 Created", r#"{"ticket_id":"test-ticket-1"}"#);
-    // `MlvpnProcess::spawn_with_log_capture` inherits the current
-    // process's environment (it never clears/replaces it), so setting
-    // this here before spawning the client is enough for the child
-    // `mlvpnd` process to pick it up via `diagnostics::diagnostics_url`.
-    // Held for the rest of the test's scope; `Drop` unsets it and
-    // releases `ENV_LOCK` even if something below panics.
-    let _diagnostics_url_guard = DiagnosticsUrlGuard::set(&mock_url);
-
     let id = unique_id();
     let ns_client = NetNs::create(&format!("mdsc{id}")).expect("create client netns");
     let ns_server = NetNs::create(&format!("mdss{id}")).expect("create server netns");
+
+    // The mock intake server lives in the host netns, but `mlvpnd` runs in
+    // `ns_client` with its own loopback, so give the client a dedicated
+    // veth to the host (no netem on it) and bind the mock to the host end.
+    let host_if = format!("mdsh{id}");
+    let host_peer = format!("mdsp{id}");
+    let _host_veth = HostVeth::create(&host_if, &host_peer, &ns_client)
+        .expect("create host<->client veth for the mock intake server");
+    let (mock_url, mock_rx) = spawn_capturing_mock_server_on(
+        HOST_VETH_HOST_IP,
+        "HTTP/1.1 201 Created",
+        r#"{"ticket_id":"test-ticket-1"}"#,
+    );
+    // `MlvpnProcess::spawn_with_log_capture` inherits the current
+    // process's environment, so setting this before spawning the client
+    // is enough for the child `mlvpnd` to pick it up via
+    // `diagnostics::diagnostics_url`. `Drop` unsets it and releases
+    // `ENV_LOCK` even if something below panics.
+    let _diagnostics_url_guard = DiagnosticsUrlGuard::set(&mock_url);
 
     let vc0 = format!("mds0c{id}");
     let vs0 = format!("mds0s{id}");

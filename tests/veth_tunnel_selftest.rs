@@ -135,7 +135,13 @@ async fn tunnel_selftest_measures_the_real_bonded_path() {
     let output = Command::new(bin)
         .args(["self-test", "--config"])
         .arg(&client_cfg)
-        .args(["--tunnel", "--peer-addr", SERVER_TUNNEL_HOST])
+        .args([
+            "--tunnel",
+            "--protocol",
+            "udp",
+            "--peer-addr",
+            SERVER_TUNNEL_HOST,
+        ])
         .args(["--duration", "2"])
         .output()
         .expect("run mlvpnd self-test --tunnel (unidirectional)");
@@ -173,7 +179,13 @@ async fn tunnel_selftest_measures_the_real_bonded_path() {
     let output = Command::new(bin)
         .args(["self-test", "--config"])
         .arg(&client_cfg)
-        .args(["--tunnel", "--peer-addr", SERVER_TUNNEL_HOST])
+        .args([
+            "--tunnel",
+            "--protocol",
+            "udp",
+            "--peer-addr",
+            SERVER_TUNNEL_HOST,
+        ])
         .args(["--duration", "2", "--bidirectional"])
         .output()
         .expect("run mlvpnd self-test --tunnel (bidirectional)");

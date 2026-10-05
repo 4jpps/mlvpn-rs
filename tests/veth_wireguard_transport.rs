@@ -101,9 +101,11 @@ struct WgLinkSpec<'a> {
 /// not just calling `crypto::StaticKeypair::generate()` directly (that
 /// would only prove the key format itself works, which every other
 /// veth test's `generate_test_keypair` already covers).
-fn genkey_via_cli(link_name: &str, dir: &Path) -> (PathBuf, String) {
+fn genkey_via_cli(side: &str, link_name: &str, dir: &Path) -> (PathBuf, String) {
     let bin = env!("CARGO_BIN_EXE_mlvpnd");
-    let key_path = dir.join(format!("{link_name}.key"));
+    // `genkey --out` truncates, so each (side, link) needs its own file or a later
+    // call silently replaces an earlier key the config still pairs with the old public key.
+    let key_path = dir.join(format!("{side}-{link_name}.key"));
     let output = Command::new(bin)
         .args(["genkey", "--link", link_name, "--out"])
         .arg(&key_path)
@@ -215,10 +217,10 @@ async fn two_independent_wireguard_links_come_up_and_sustain_data_flow() {
     // with the server's link0 public key, and vice versa -- exactly
     // like an operator would copy/paste them between two hosts' config
     // files, per link.
-    let (client_link0_key, client_link0_pub) = genkey_via_cli("link0", &tmp);
-    let (server_link0_key, server_link0_pub) = genkey_via_cli("link0", &tmp);
-    let (client_link1_key, client_link1_pub) = genkey_via_cli("link1", &tmp);
-    let (server_link1_key, server_link1_pub) = genkey_via_cli("link1", &tmp);
+    let (client_link0_key, client_link0_pub) = genkey_via_cli("client", "link0", &tmp);
+    let (server_link0_key, server_link0_pub) = genkey_via_cli("server", "link0", &tmp);
+    let (client_link1_key, client_link1_pub) = genkey_via_cli("client", "link1", &tmp);
+    let (server_link1_key, server_link1_pub) = genkey_via_cli("server", "link1", &tmp);
 
     // Sanity check on the CLI-driven generation itself: link0's and
     // link1's keys must actually be distinct (not e.g. a copy-paste bug

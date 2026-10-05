@@ -24,21 +24,14 @@
 //! client side, since that's the side actually maintaining
 //! `peer_primary_link`).
 //!
-//! A short `rekey_interval_secs` forces at least one real rekey (a
-//! `session_id` change) to happen well within this test's timeout,
-//! matching `veth_rekey.rs`'s own approach. The fix under test
-//! (`src/tunnel.rs`'s bypass branch) logs
-//! `"cleared stale peer_primary_link in bypass mode after a session
-//! change"` at `info` level, once, exactly when `note_delivered`
-//! reports the session changed -- this test uses
-//! `MlvpnProcess::spawn_with_log_capture` (the same tool
-//! `veth_reorder_tuning.rs` uses for an analogous no-other-observable-
-//! signal daemon decision) to confirm that line is actually emitted on
-//! the client after the rekey, which is only possible if bypass mode
-//! was genuinely active *and* the fix's reset path actually ran. Without
-//! the fix, this line is never logged at all (the old code never reset
-//! `peer_primary_link` from the bypass branch), so this test would have
-//! caught the real regression the reviewer found.
+//! History: this file originally also asserted that a rekey's
+//! `session_id` change cleared a stale `peer_primary_link` from the bypass
+//! branch (the C1 regression). Since the 0.7.0 per-link WireGuard rewrite
+//! there is no app-level session or rekey event at all (each link's own
+//! `WgTunnel` rekeys invisibly), so that regression can no longer occur
+//! and the assertion was removed. What remains is the end-to-end check
+//! that the topology above really does settle the client into bypass mode
+//! and keeps delivering traffic.
 //!
 //! See `tests/support/mod.rs`'s module doc comment for what this needs
 //! (root, `iproute2`, the `mlvpn` system user). Run with:
@@ -61,14 +54,9 @@ use support::{
     SERVER_TUNNEL_ADDR, SERVER_TUNNEL_HOST,
 };
 
-/// Same reasoning as `veth_rekey.rs`'s own constant: short enough that
-/// at least one rekey is guaranteed well within this test's timeouts,
-/// long enough not to be flaky on a slow/virtualized runner.
-const REKEY_INTERVAL_SECS: u64 = 2;
-
 #[tokio::test]
 #[ignore = "needs root, iproute2, and network namespaces -- see module doc comment"]
-async fn peer_primary_link_is_cleared_across_a_rekey_while_bypass_mode_is_active() {
+async fn follow_peer_primary_client_settles_into_bypass_mode_and_keeps_delivering() {
     require_root();
     require_ip_command();
     ensure_mlvpn_system_user().expect("ensure mlvpn system user/group exists");
@@ -105,7 +93,7 @@ async fn peer_primary_link_is_cleared_across_a_rekey_while_bypass_mode_is_active
         SERVER_TUNNEL_ADDR,
         &server_key_path,
         &client_pub,
-        Some(REKEY_INTERVAL_SECS),
+        None,
         SchedulerOverrides {
             primary_link_mode: true,
             ..Default::default()
@@ -131,7 +119,7 @@ async fn peer_primary_link_is_cleared_across_a_rekey_while_bypass_mode_is_active
         CLIENT_TUNNEL_ADDR,
         &client_key_path,
         &server_pub,
-        Some(REKEY_INTERVAL_SECS),
+        None,
         SchedulerOverrides {
             follow_peer_primary: true,
             ..Default::default()
@@ -149,8 +137,7 @@ async fn peer_primary_link_is_cleared_across_a_rekey_while_bypass_mode_is_active
     .expect("write client config");
 
     let _server = MlvpnProcess::spawn(&ns_server.name, &server_cfg).expect("spawn server");
-    let (_client, client_log) = MlvpnProcess::spawn_with_log_capture(&ns_client.name, &client_cfg)
-        .expect("spawn client with log capture");
+    let _client = MlvpnProcess::spawn(&ns_client.name, &client_cfg).expect("spawn client");
 
     poll_snapshot_until(&client_ctl, Duration::from_secs(20), |s| {
         link_is_up(s, "link0")
@@ -158,48 +145,23 @@ async fn peer_primary_link_is_cleared_across_a_rekey_while_bypass_mode_is_active
     .await
     .expect("link0 never reached 'up' before settling could even start");
 
-    // Give the periodic VersionInfo exchange time to let the client
-    // actually adopt the server's advertised primary and settle into
-    // bypass mode -- `send_version_info`'s own periodic timer shares
-    // the StatsShare/probe cadence, well under this window.
+    // The client adopts the server's advertised primary over the periodic
+    // VersionInfo exchange (same cadence as StatsShare/probes), which is
+    // what puts its `handle_incoming` into the bypass branch.
+    poll_snapshot_until(&client_ctl, Duration::from_secs(30), |s| {
+        s.links.iter().any(|l| l.name == "link0" && l.is_primary)
+    })
+    .await
+    .expect("client never adopted the server's primary link, so bypass mode never engaged");
+
+    // Real traffic must flow normally while in bypass mode, and the link
+    // must stay up afterward.
     ns_client
         .exec("ping", &["-c", "5", "-W", "2", SERVER_TUNNEL_HOST])
-        .expect("baseline ping across the tunnel failed before settling");
-    tokio::time::sleep(Duration::from_secs(3)).await;
-
-    // `rekey_loop` skips its first, immediate tick (see `veth_rekey.rs`
-    // for the same reasoning) -- wait past two full intervals so this
-    // isn't sensitive to exact timing on a slow runner, then keep
-    // traffic flowing across the rekey so `handle_incoming` actually
-    // processes the post-rekey Data frames that trigger the fix.
-    tokio::time::sleep(Duration::from_secs(REKEY_INTERVAL_SECS * 2 + 2)).await;
-    ns_client
-        .exec("ping", &["-c", "5", "-W", "2", SERVER_TUNNEL_HOST])
-        .expect("ping across the tunnel failed after a rekey should have occurred");
-
-    // The actual point of this test: the fix's own log line must have
-    // fired on the client, proving `peer_primary_link` was genuinely
-    // reset by the bypass branch itself (not merely by a coincidental
-    // fresh VersionInfo overwrite) in direct response to the rekey's
-    // session-id change while bypass mode was active.
-    let saw_reset = client_log
-        .wait_for_line_containing(
-            "cleared stale peer_primary_link in bypass mode after a session change",
-            Duration::from_secs(10),
-        )
-        .await;
-    assert!(
-        saw_reset,
-        "client never logged clearing peer_primary_link after a rekey while bypass mode was \
-         active -- this is the exact C1 regression (peer_primary_link latching forever across a \
-         rekey once the bypass branch takes over) that this test exists to catch"
-    );
-
-    // And the tunnel must still be healthy afterward -- the fix must
-    // not have broken ordinary delivery to achieve the reset.
+        .expect("ping across the tunnel failed while the client was in bypass mode");
     poll_snapshot_until(&client_ctl, Duration::from_secs(5), |s| {
         link_is_up(s, "link0")
     })
     .await
-    .expect("link0 not reported 'up' after the rekey window");
+    .expect("link0 not reported 'up' after traffic in bypass mode");
 }

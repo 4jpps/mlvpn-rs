@@ -181,9 +181,9 @@ async fn tun_device_mtu_converges_after_a_live_link_mtu_change() {
          not the hardcoded fallback"
     );
     assert!(
-        initial_mtu > 1400 && initial_mtu < 1500,
-        "expected initial MTU derived from a ~1500-byte physical link minus protocol overhead, \
-         got {initial_mtu}"
+        initial_mtu > 1300 && initial_mtu < 1400,
+        "expected initial MTU derived from a ~1500-byte physical link minus protocol overhead \
+         (112 bytes with the WireGuard transport, i.e. 1388), got {initial_mtu}"
     );
 
     // Step 3: lower the client's own veth interface's MTU mid-test, with
@@ -376,7 +376,7 @@ async fn tun_device_mtu_converges_after_a_live_link_mtu_increase() {
          to 1500, got {converged_mtu}"
     );
     assert!(
-        converged_mtu > 1400 && converged_mtu < 1500,
+        converged_mtu > 1300 && converged_mtu < 1400,
         "expected the resized MTU to be derived from the new 1500-byte physical MTU minus \
          protocol overhead, got {converged_mtu}"
     );

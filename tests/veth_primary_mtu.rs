@@ -99,8 +99,12 @@ async fn primary_mtu_tracks_the_active_link_and_converges_across_the_peer() {
         &server_key_path,
         &client_pub,
         None,
+        // The server follows the client's primary: with two independent
+        // elections each side can settle on a different link (e.g. server
+        // on link1, client on link0), and the test's 1388-vs-1288 steps
+        // assume both sides sit on the same link.
         SchedulerOverrides {
-            primary_link_mode: true,
+            follow_peer_primary: true,
             ..Default::default()
         },
         &[
@@ -166,6 +170,19 @@ async fn primary_mtu_tracks_the_active_link_and_converges_across_the_peer() {
     .await
     .expect("both links never reached 'up' before the primary-mtu test could even start");
 
+    // With both links healthy and near-identical scores, which one the
+    // client elects is a coin flip, and the steps below assume link0 (the
+    // 1500-MTU link) is primary. Make link1 clearly worse so the election
+    // is deterministic.
+    ns_client
+        .exec(
+            "tc",
+            &[
+                "qdisc", "add", "dev", &vc1, "root", "netem", "delay", "40ms",
+            ],
+        )
+        .expect("failed to add netem delay to link1");
+
     // Give mtu_monitor_loop's now-3s tick, plus the VersionInfo
     // exchange, a few cycles to converge before asserting anything.
     // `peer_applied_tunnel_mtu` (the peer's own already-negotiated
@@ -176,8 +193,15 @@ async fn primary_mtu_tracks_the_active_link_and_converges_across_the_peer() {
     // general (see `ipc::DaemonSnapshot::peer_applied_tunnel_mtu`'s doc
     // comment -- this exact mixup produced a false MISMATCH in
     // mlvpn-tui on the real, asymmetric home-bgp/cloud-bgp pairing).
+    // Must also wait for link0 to actually become primary and the MTU to rise
+    // to reflect its 1500-byte physical MTU (1388 with WireGuard overhead):
+    // before that, both sides trivially agree on the bonded-mode minimum
+    // (1288, from link1's 1400), and a snapshot taken then would make the
+    // post-failover "MTU shrank" check below compare 1288 against 1288.
     let converged = poll_snapshot_until(&client_ctl, Duration::from_secs(20), |s| {
-        s.daemon.peer_applied_tunnel_mtu == Some(s.daemon.local_tunnel_mtu)
+        s.links.iter().any(|l| l.name == "link0" && l.is_primary)
+            && s.daemon.local_tunnel_mtu > 1300
+            && s.daemon.peer_applied_tunnel_mtu == Some(s.daemon.local_tunnel_mtu)
     })
     .await
     .expect("client and server tunnel MTU never converged to the same value");
