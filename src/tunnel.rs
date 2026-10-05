@@ -8,10 +8,20 @@
 //!   non-blocking `try_send`, see `OUTBOUND_QUEUE_CAPACITY`'s doc
 //!   comment) to...
 //! - one `outbound_sender` task: asks the `Scheduler` which link to use
-//!   for each queued frame and sends the resulting datagram out that
-//!   link's socket. Split from `tun_reader` specifically so a slow send
-//!   side can never stall draining the TUN device -- a full queue drops
-//!   the packet and counts it instead, logged by...
+//!   for each queued frame and `try_send`s it onto that link's own
+//!   bounded queue (`TxDispatcher`), never blocking. Split from
+//!   `tun_reader` specifically so a slow send side can never stall
+//!   draining the TUN device -- a full queue drops the packet and counts
+//!   it instead, logged by...
+//! - one `link_tx_worker` task per link: drains that link's queue,
+//!   encrypts and does the actual `send_to`. A stalled socket therefore
+//!   only backs up its own queue (counted in `TxCounters::queue_full`);
+//!   other links keep transmitting. A packet that finds its link's queue
+//!   full spills to the freest other link, or is dropped under
+//!   `primary_link_mode`/`follow_peer_primary`. With FEC enabled (and not
+//!   `redundant_mode`) `outbound_sender` still sends inline via
+//!   `send_scheduled`, because FEC group accumulation needs to know a
+//!   frame actually went out.
 //! - one `outbound_queue_drop_reporter` task: silent on a healthy
 //!   tunnel, periodically logs (and resets) the outbound queue's drop
 //!   counter otherwise. The original C `MLVPN`'s equivalent mechanism
@@ -141,7 +151,7 @@
 //! see a genuine decrypted mlvpn frame). Because encryption is now tied
 //! to *which link* a frame goes out on, a frame can no longer be
 //! encrypted once, tunnel-wide, before a link is chosen the way the old
-//! shared-session design did -- `send_scheduled`/`send_redundant` below
+//! shared-session design did -- `TxDispatcher`/`send_scheduled` below
 //! pick the link first, then build and encrypt that specific frame via
 //! the chosen link's own `wg_send`.
 //!
@@ -939,10 +949,46 @@ pub async fn run(
     }
 
     {
-        let links = links.clone();
-        let scheduler = scheduler.clone();
         let redundant_mode = params.scheduler_cfg.redundant_mode;
         let fec_enabled = params.scheduler_cfg.fec_enabled;
+
+        // Per-link TX workers (Phase 2). Everything except FEC sends via
+        // them; FEC keeps the inline `send_scheduled` path because it
+        // needs each frame's `carried` result to decide FEC group
+        // membership, which a queued hand-off cannot report back
+        // synchronously. Revisit with the single-owner FEC pipeline.
+        let dispatcher = if !fec_enabled || redundant_mode {
+            let mut senders = Vec::with_capacity(links.len());
+            let mut receivers = Vec::with_capacity(links.len());
+            for l in links.iter() {
+                let (tx, rx) = mpsc::channel::<TxJob>(LINK_TX_QUEUE_CAPACITY);
+                senders.push(LinkTx {
+                    tx,
+                    counters: l.lock().await.stats.tx_counters.clone(),
+                });
+                receivers.push(rx);
+            }
+            let dispatcher = TxDispatcher {
+                links: links.clone(),
+                queues: Arc::new(senders),
+                scheduler: scheduler.clone(),
+                allow_spill: !(params.scheduler_cfg.primary_link_mode
+                    || params.scheduler_cfg.follow_peer_primary),
+                dropped_total: outbound_dropped_total.clone(),
+            };
+            for (idx, rx) in receivers.into_iter().enumerate() {
+                let d = dispatcher.clone();
+                handles.push(tokio::spawn(async move {
+                    link_tx_worker(idx, rx, d).await;
+                }));
+            }
+            Some(dispatcher)
+        } else {
+            None
+        };
+
+        let links = links.clone();
+        let scheduler = scheduler.clone();
         let fec_group_size = params.scheduler_cfg.fec_group_size;
         let live_mtu = live_mtu.clone();
         let fec_unrecoverable_total = fec_unrecoverable_total.clone();
@@ -956,6 +1002,7 @@ pub async fn run(
                 fec_group_size,
                 live_mtu,
                 fec_unrecoverable_total,
+                dispatcher,
             )
             .await;
         }));
@@ -1062,7 +1109,8 @@ async fn broadcast_disconnect(links: &Links) {
 
 /// Capacity of the bounded channel between `tun_reader` (producer: reads
 /// the TUN device, clamps MSS, encrypts) and `outbound_sender` (consumer:
-/// asks the `Scheduler` for a link and does the actual socket I/O).
+/// asks the `Scheduler` for a link and hands the frame to that link's TX
+/// worker, or, in the FEC path, does the socket I/O inline).
 ///
 /// Loosely modeled on the original C `MLVPN`'s `freebuffer_t`
 /// (`src/buffer.c` upstream): a fixed-size pool of packet slots that
@@ -1117,7 +1165,7 @@ const OUTBOUND_QUEUE_DROP_REPORT_INTERVAL: Duration = Duration::from_secs(2);
 /// design, this is deliberately *not* pre-encrypted: encryption now
 /// happens per-link (`wireguard::WgTunnel`, via `LinkHandle::wg_send`),
 /// so which link's key material applies is only known once
-/// `send_scheduled`/`send_redundant` has actually picked a link -- see
+/// the dispatcher/`send_scheduled` has actually picked a link -- see
 /// this module's doc comment.
 pub(crate) struct OutboundFrame {
     plaintext: Vec<u8>,
@@ -1181,11 +1229,276 @@ async fn tun_reader(
     }
 }
 
+/// Capacity of each link's own bounded TX queue (`LinkTx`). Small on
+/// purpose: it only has to absorb the burstiness between the dispatcher
+/// and one link's socket, and every queued packet is latency a stalled
+/// link adds before its backlog is noticed. A link whose queue fills is
+/// by definition not keeping up, which is exactly the signal the
+/// dispatcher acts on (penalize + spill) instead of letting that link's
+/// slow `send_to` hold up every other link.
+const LINK_TX_QUEUE_CAPACITY: usize = 128;
+
+/// Most packets a link's TX worker pulls off its queue per wakeup (one
+/// link lock to resolve the handle and one to record stats per batch,
+/// instead of two per packet).
+const TX_WORKER_BATCH: usize = 32;
+
+/// One Data frame handed to a link's TX worker. `seq` is allocated by the
+/// dispatcher (not the worker) so a packet rerouted to another link keeps
+/// its sequence number, and redundant mode can send the *same* seq on
+/// every link.
+struct TxJob {
+    seq: u64,
+    plaintext: Vec<u8>,
+    /// Already redirected once after a send failure -- a second failure
+    /// drops the packet rather than bouncing it between links forever.
+    rerouted: bool,
+}
+
+/// A link's TX queue sender plus its lock-free health counters.
+struct LinkTx {
+    tx: mpsc::Sender<TxJob>,
+    counters: Arc<link::TxCounters>,
+}
+
+/// Links in `Links` order: `TxQueues[i]` feeds link `i`'s worker.
+type TxQueues = Arc<Vec<LinkTx>>;
+
+/// Links to try, best first, when a packet cannot go to `from`: every
+/// other link with free queue room, most free slots first (ties broken by
+/// index for determinism). Pure so the spill policy is unit-testable
+/// without sockets; link *usability* (Up, enabled, has a remote) is
+/// checked separately by the caller because it needs the link locks.
+fn spill_candidates(free: &[usize], from: usize) -> Vec<usize> {
+    let mut c: Vec<usize> = (0..free.len())
+        .filter(|&i| i != from && free[i] > 0)
+        .collect();
+    c.sort_by(|&a, &b| free[b].cmp(&free[a]).then(a.cmp(&b)));
+    c
+}
+
+/// Choose the link for one frame: `Scheduler::select_fast` first (zero
+/// link locking), falling back to a full `link::snapshot_scores` scan
+/// only when nothing is cached yet. See `select_fast`'s doc comment: the
+/// unconditional scan used to be the dominant cost in the send path.
+async fn pick_link(
+    links: &Links,
+    scheduler: &Arc<std::sync::Mutex<Scheduler>>,
+    frame_len: usize,
+) -> Option<usize> {
+    let fast = scheduler
+        .lock()
+        .unwrap()
+        .select_fast(links.len(), frame_len);
+    match fast {
+        Some(idx) => Some(idx),
+        None => {
+            let scores = link::snapshot_scores(links).await;
+            let mut sched = scheduler.lock().unwrap();
+            sched.select(&scores, frame_len)
+        }
+    }
+}
+
+/// Hands Data frames to per-link TX workers without ever blocking: the
+/// failure-isolation half of the send path. A link whose socket send is
+/// stalled only backs up *its own* bounded queue; the dispatcher
+/// (`outbound_sender`) keeps running because it only ever `try_send`s.
+#[derive(Clone)]
+struct TxDispatcher {
+    links: Links,
+    queues: TxQueues,
+    scheduler: Arc<std::sync::Mutex<Scheduler>>,
+    /// Whether a packet that finds its chosen link's queue full may be
+    /// redirected to another link. False under `primary_link_mode` /
+    /// `follow_peer_primary`: those modes mean "use this link and nothing
+    /// else", and a transient burst on the primary must not leak traffic
+    /// onto a (possibly metered) backup -- the packet is dropped and
+    /// counted instead, same as an overflowing outbound queue.
+    allow_spill: bool,
+    dropped_total: Arc<AtomicU64>,
+}
+
+impl TxDispatcher {
+    fn drop_job(&self) {
+        self.dropped_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    async fn dispatch(&self, job: TxJob) {
+        let frame_len = HEADER_LEN + job.plaintext.len();
+        let Some(idx) = pick_link(&self.links, &self.scheduler, frame_len).await else {
+            tracing::warn!("no link available to send on; dropping packet");
+            return;
+        };
+        let Some(q) = self.queues.get(idx) else {
+            tracing::warn!("no link available to send on; dropping packet");
+            return;
+        };
+        match q.tx.try_send(job) {
+            Ok(()) => {}
+            Err(TrySendError::Full(job)) => {
+                q.counters.queue_full.fetch_add(1, Ordering::Relaxed);
+                self.scheduler.lock().unwrap().note_queue_full(idx);
+                if self.allow_spill {
+                    self.spill(idx, job).await;
+                } else {
+                    self.drop_job();
+                }
+            }
+            // Only possible once the worker is gone (shutdown).
+            Err(TrySendError::Closed(job)) => self.spill(idx, job).await,
+        }
+    }
+
+    /// A worker could not put `job` on the wire (socket error, or the
+    /// link has no remote yet): give it one more chance on another link.
+    async fn reroute(&self, from: usize, mut job: TxJob) {
+        if job.rerouted {
+            self.drop_job();
+            return;
+        }
+        job.rerouted = true;
+        self.spill(from, job).await;
+    }
+
+    /// Redirect `job` away from link `from` to the usable link with the
+    /// most free queue room, or drop it if there is none.
+    async fn spill(&self, from: usize, mut job: TxJob) {
+        let free: Vec<usize> = self.queues.iter().map(|q| q.tx.capacity()).collect();
+        for cand in spill_candidates(&free, from) {
+            {
+                let g = self.links[cand].lock().await;
+                if g.state == LinkState::Down || g.admin_disabled || g.remote.is_none() {
+                    continue;
+                }
+            }
+            match self.queues[cand].tx.try_send(job) {
+                Ok(()) => {
+                    self.queues[from]
+                        .counters
+                        .rerouted_away
+                        .fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+                Err(TrySendError::Full(j) | TrySendError::Closed(j)) => job = j,
+            }
+        }
+        self.drop_job();
+    }
+
+    /// Redundancy mode (`scheduler.redundant_mode`): send the same frame
+    /// on every currently-Up link instead of picking one via `Scheduler`,
+    /// trading bandwidth for the lowest chance of losing this packet.
+    /// Falls back to every link with a known remote (regardless of state)
+    /// if none are Up. Deliberately bypasses `bandwidth_cap_mbps`: this
+    /// mode is opt-in specifically to prioritize reliability, and quietly
+    /// skipping a capped link would undermine its one guarantee. A blunt
+    /// whole-tunnel toggle (no per-flow classification) -- only worth
+    /// enabling for a small, latency-critical tunnel.
+    ///
+    /// A copy that finds its link's queue
+    /// full is simply not sent -- the other copies still carry the packet,
+    /// and spilling would only duplicate a copy onto a link that already
+    /// has one.
+    async fn send_redundant(&self, plaintext: Vec<u8>) {
+        let mut up = Vec::new();
+        let mut any = Vec::new();
+        for (i, l) in self.links.iter().enumerate() {
+            let g = l.lock().await;
+            if g.remote.is_some() {
+                any.push(i);
+                if g.state == LinkState::Up {
+                    up.push(i);
+                }
+            }
+        }
+        let targets = if up.is_empty() { any } else { up };
+        if targets.is_empty() {
+            tracing::warn!("redundant mode: no link available to send on; dropping packet");
+            return;
+        }
+        // Every copy carries the SAME seq -- `ReorderBuffer`'s
+        // high-watermark logic treats every copy after the first as "not
+        // forward progress" and discards it via the stale-duplicate path.
+        let seq = next_send_seq();
+        for idx in targets {
+            let q = &self.queues[idx];
+            let job = TxJob {
+                seq,
+                plaintext: plaintext.clone(),
+                rerouted: true,
+            };
+            if let Err(TrySendError::Full(_)) = q.tx.try_send(job) {
+                q.counters.queue_full.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+/// One link's TX worker: drains its bounded queue and does the
+/// encrypt + `send_to` for that link only. A slow or stalled socket
+/// blocks just this task; every other link's worker and the dispatcher
+/// keep running (Phase 2 of the improvement plan -- previously a single
+/// `outbound_sender` did every link's `send_to` inline, so one stalled
+/// link stalled them all).
+async fn link_tx_worker(idx: usize, mut rx: mpsc::Receiver<TxJob>, d: TxDispatcher) {
+    let counters = d.queues[idx].counters.clone();
+    let mut batch: Vec<TxJob> = Vec::with_capacity(TX_WORKER_BATCH);
+    loop {
+        if rx.recv_many(&mut batch, TX_WORKER_BATCH).await == 0 {
+            return;
+        }
+        // Resolved once per batch, still on every batch rather than once
+        // for the task's lifetime, so a reconnect that swaps this link's
+        // socket or remote is picked up within one batch.
+        let target = {
+            let g = d.links[idx].lock().await;
+            g.remote.map(|_| (g.id, g.handle(), g.config.name.clone()))
+        };
+        let mut bytes = 0u64;
+        let mut pkts = 0u64;
+        for job in batch.drain(..) {
+            let Some((link_id, handle, name)) = &target else {
+                counters.send_failed.fetch_add(1, Ordering::Relaxed);
+                d.reroute(idx, job).await;
+                continue;
+            };
+            let header = Header {
+                ptype: PacketType::Data,
+                link_id: *link_id,
+                seq: job.seq,
+            }
+            .to_bytes();
+            match handle
+                .wg_send_parts(&[&header, job.plaintext.as_slice()])
+                .await
+            {
+                // `carried` ignored: only the FEC path (which does not
+                // use workers) needs to know whether a frame was
+                // substituted by a handshake datagram. `record_tx` keeps
+                // its existing "bytes this link put on the wire"
+                // semantics.
+                Ok(_carried) => {
+                    bytes += (HEADER_LEN + job.plaintext.len()) as u64;
+                    pkts += 1;
+                }
+                Err(e) => {
+                    tracing::debug!(link = %name, error = %e, "send failed");
+                    counters.send_failed.fetch_add(1, Ordering::Relaxed);
+                    d.reroute(idx, job).await;
+                }
+            }
+        }
+        if pkts > 0 {
+            d.links[idx].lock().await.stats.record_tx_many(bytes, pkts);
+        }
+    }
+}
+
 /// Pulls encrypted frames off the outbound queue and actually sends
 /// them -- the other half of `tun_reader`'s split, see
 /// `OUTBOUND_QUEUE_CAPACITY`'s doc comment for why this is a separate
-/// task rather than `tun_reader` calling `send_scheduled`/`send_redundant`
-/// directly. Returns once `tx` (held by `tun_reader`) is dropped, i.e.
+/// task rather than `tun_reader` sending directly. Returns once `tx` (held by `tun_reader`) is dropped, i.e.
 /// only during shutdown.
 #[allow(clippy::too_many_arguments)]
 async fn outbound_sender(
@@ -1197,6 +1510,7 @@ async fn outbound_sender(
     fec_group_size: u8,
     mtu: LiveMtu,
     fec_unrecoverable_total: Arc<AtomicU64>,
+    dispatcher: Option<TxDispatcher>,
 ) {
     let mut fec_sender = fec_enabled.then(|| crate::fec::FecSender::new(fec_group_size));
     // What a parity frame is allowed to cost beyond the tunnel MTU: the
@@ -1210,8 +1524,20 @@ async fn outbound_sender(
         0
     };
     while let Some(frame) = rx.recv().await {
-        if redundant_mode {
-            send_redundant(&links, &frame.plaintext).await;
+        // Worker path (every mode except FEC, see `TxDispatcher`): hand
+        // the frame to a per-link queue and move on -- this loop never
+        // waits on a socket, so one stalled link cannot stall the rest.
+        if let Some(d) = &dispatcher {
+            if redundant_mode {
+                d.send_redundant(frame.plaintext).await;
+            } else {
+                d.dispatch(TxJob {
+                    seq: next_send_seq(),
+                    plaintext: frame.plaintext,
+                    rerouted: false,
+                })
+                .await;
+            }
             continue;
         }
         let seq = next_send_seq();
@@ -1339,28 +1665,7 @@ async fn send_scheduled(
     // exact byte count.
     let frame_len = HEADER_LEN + plaintext.len();
 
-    // Fast path first: `Scheduler::select_fast` resolves a primary or
-    // an SWRR pick entirely from state the last periodic `refresh()`
-    // already cached, with zero link locking. Only fall back to a full
-    // `link::snapshot_scores` scan (locks every configured link) when
-    // that returns `None` -- the rare case where nothing is cached yet
-    // (every link Down). See `select_fast`'s doc comment: this used to
-    // run unconditionally on every packet and was confirmed live via
-    // `strace -f -c` to be the dominant cost in the entire send path.
-    let chosen_idx: Option<usize> = {
-        let fast = scheduler
-            .lock()
-            .unwrap()
-            .select_fast(links.len(), frame_len);
-        match fast {
-            Some(idx) => Some(idx),
-            None => {
-                let scores = link::snapshot_scores(links).await;
-                let mut sched = scheduler.lock().unwrap();
-                sched.select(&scores, frame_len)
-            }
-        }
-    };
+    let chosen_idx = pick_link(links, scheduler, frame_len).await;
     let Some(idx) = chosen_idx else {
         tracing::warn!("no link available to send on; dropping packet");
         return false;
@@ -1416,90 +1721,6 @@ async fn send_scheduled(
         Err(e) => {
             tracing::debug!(link = %link_name, error = %e, "send failed");
             false
-        }
-    }
-}
-
-/// Redundancy-mode send path (`scheduler.redundant_mode`): send the same
-/// frame on every currently-Up link instead of picking just one via
-/// `Scheduler`, trading bandwidth for the lowest possible chance of
-/// losing this particular packet. Falls back to every link with a known
-/// remote address (regardless of state) if none are currently Up, same
-/// zero-downtime rationale as `Scheduler::select`'s own fallback.
-/// Deliberately bypasses `bandwidth_cap_mbps` entirely for these sends:
-/// this mode is opt-in specifically to prioritize reliability over
-/// bandwidth, and quietly skipping a capped link would undermine the
-/// one guarantee it exists to provide. The receiving side needs no
-/// special handling -- the existing replay window (`crypto::ReplayWindow`)
-/// already rejects the second and later copies of the same sequence
-/// number, the same protection it provides against a genuine replay
-/// attack, so a duplicate delivered via another link is simply dropped
-/// rather than double-delivered to the TUN device.
-///
-/// This is a blunt, whole-tunnel toggle rather than per-flow
-/// classification (no DSCP/traffic-class inspection of the inner IP
-/// packet) -- simpler to implement and reason about correctly, at the
-/// cost of duplicating *every* packet rather than only genuinely
-/// latency-sensitive ones. Only worth enabling for a small,
-/// latency-critical tunnel (e.g. VoIP/control traffic bonded across a
-/// couple of links); a bulk-transfer tunnel should leave this off.
-async fn send_redundant(links: &Links, plaintext: &[u8]) {
-    let targets: Vec<(u8, LinkHandle, String)> = {
-        let snap = link::snapshot_links(links).await;
-        let up: Vec<_> = snap
-            .iter()
-            .filter(|l| l.state == LinkState::Up && l.remote.is_some())
-            .map(|l| (l.id, l.handle(), l.config.name.clone()))
-            .collect();
-        if !up.is_empty() {
-            up
-        } else {
-            snap.iter()
-                .filter(|l| l.remote.is_some())
-                .map(|l| (l.id, l.handle(), l.config.name.clone()))
-                .collect()
-        }
-    };
-
-    if targets.is_empty() {
-        tracing::warn!("redundant mode: no link available to send on; dropping packet");
-        return;
-    }
-
-    // Every copy carries the SAME seq -- the receiving side's replay
-    // window (now per-link, inside each `WgTunnel`) doesn't dedupe
-    // across links on its own, but `ReorderBuffer`'s own high-watermark
-    // logic (`note_delivered`) treats every copy after the first as "not
-    // forward progress" and buffers/discards it via the ordinary
-    // stale-duplicate path, the same as before this task.
-    let seq = next_send_seq();
-    let frame_len = HEADER_LEN + plaintext.len();
-
-    for (link_id, handle, link_name) in targets {
-        let header = Header {
-            ptype: PacketType::Data,
-            link_id,
-            seq,
-        }
-        .to_bytes();
-        match handle.wg_send_parts(&[&header, plaintext]).await {
-            // Redundant mode has no FEC group to corrupt (FEC and
-            // redundant mode are mutually exclusive send paths in
-            // `outbound_sender`), so `wg_send`'s new bool is irrelevant
-            // here -- `record_tx` keeps its existing semantics.
-            Ok(_carried) => {
-                // `link_id` is always the live link's own Vec index (see
-                // main.rs's `Link::bind(id, ...)` call site: id is
-                // assigned from the config Vec's own position), so this
-                // reaches the real, live `Link`, not the `snapshot_links`
-                // copy `targets` was built from above.
-                if let Some(link_mutex) = links.get(link_id as usize) {
-                    link_mutex.lock().await.stats.record_tx(frame_len as u64);
-                }
-            }
-            Err(e) => {
-                tracing::debug!(link = %link_name, error = %e, "redundant send failed");
-            }
         }
     }
 }
@@ -3675,6 +3896,28 @@ mod send_scheduled_tests {
             !sent,
             "a dropped packet must never be reported as transmitted"
         );
+    }
+}
+
+#[cfg(test)]
+mod spill_candidate_tests {
+    use super::*;
+
+    #[test]
+    fn spill_prefers_most_free_slots_and_skips_origin_and_full_queues() {
+        // link 0 is the origin, link 1 is full, 2 has the most room.
+        assert_eq!(spill_candidates(&[10, 0, 100, 50], 0), vec![2, 3]);
+    }
+
+    #[test]
+    fn spill_breaks_ties_by_index() {
+        assert_eq!(spill_candidates(&[5, 9, 9, 9], 0), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn spill_has_no_candidate_when_everything_else_is_full() {
+        assert!(spill_candidates(&[128, 0, 0], 0).is_empty());
+        assert!(spill_candidates(&[128], 0).is_empty());
     }
 }
 

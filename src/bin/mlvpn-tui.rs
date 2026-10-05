@@ -797,6 +797,18 @@ fn link_row(l: &LinkSnapshot, any_primary: bool) -> Row<'static> {
             Style::default().fg(Color::Red),
         )));
     }
+    if l.tx_queue_full_total > 0 {
+        tx_rx_lines.push(Line::from(Span::styled(
+            format!("tx queue full: {}", l.tx_queue_full_total),
+            Style::default().fg(Color::Yellow),
+        )));
+    }
+    if l.tx_send_failed_total > 0 {
+        tx_rx_lines.push(Line::from(Span::styled(
+            format!("tx send failed: {}", l.tx_send_failed_total),
+            Style::default().fg(Color::Red),
+        )));
+    }
     let tx_rx_cell = Cell::from(Text::from(tx_rx_lines));
 
     Row::new(vec![

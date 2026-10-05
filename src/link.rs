@@ -35,6 +35,7 @@ use socket2::{Domain, Protocol, Socket, Type};
 use std::net::{IpAddr, SocketAddr, UdpSocket as StdUdpSocket};
 #[cfg(target_os = "linux")]
 use std::os::unix::io::AsRawFd;
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
@@ -184,6 +185,28 @@ pub struct LinkStats {
     pub rx_bytes: u64,
     pub tx_packets: u64,
     pub rx_packets: u64,
+    /// Lock-free send-side health counters, shared with this link's TX
+    /// worker and the dispatcher in `tunnel.rs` (they bump these without
+    /// taking the link mutex, which matters exactly when a link is
+    /// congested and every packet hits one of them).
+    pub tx_counters: Arc<TxCounters>,
+}
+
+/// Lifetime counters for the per-link TX queue/worker (`tunnel.rs`'s
+/// `LinkTxQueue`). Plain relaxed atomics: they are diagnostics, never used
+/// to make a correctness decision.
+#[derive(Debug, Default)]
+pub struct TxCounters {
+    /// Times the dispatcher found this link's bounded TX queue full when
+    /// it tried to hand it a packet -- i.e. the link's socket send path
+    /// was not keeping up.
+    pub queue_full: AtomicU64,
+    /// Packets this link's worker failed to put on the wire (socket
+    /// error, or no remote address known).
+    pub send_failed: AtomicU64,
+    /// Packets that were redirected to a different link because this one
+    /// could not take them (queue full or send failure).
+    pub rerouted_away: AtomicU64,
 }
 
 impl LinkStats {
@@ -209,6 +232,7 @@ impl LinkStats {
             rx_bytes: 0,
             tx_packets: 0,
             rx_packets: 0,
+            tx_counters: Arc::new(TxCounters::default()),
         }
     }
 
@@ -252,8 +276,15 @@ impl LinkStats {
     /// call once per packet actually handed to the socket, on the send
     /// side.
     pub fn record_tx(&mut self, n: u64) {
+        self.record_tx_many(n, 1);
+    }
+
+    /// Batch form of `record_tx`, for a per-link TX worker that sent
+    /// several frames under one link lock (`tunnel::link_tx_worker`).
+    pub fn record_tx_many(&mut self, bytes: u64, packets: u64) {
+        let n = bytes;
         self.tx_bytes += n;
-        self.tx_packets += 1;
+        self.tx_packets += packets;
         self.tx_bytes_since_last_sample += n;
         let elapsed = self.last_tx_throughput_sample.elapsed();
         if elapsed.as_secs_f64() >= 1.0 {

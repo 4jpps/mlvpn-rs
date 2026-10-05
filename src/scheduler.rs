@@ -86,9 +86,21 @@ impl RateLimitState {
     }
 }
 
+/// How long a link that just reported a full per-link TX queue
+/// (`note_queue_full`) is skipped by the SWRR pick, so the scheduler
+/// steers new traffic toward links that can take it instead of
+/// re-offering packets to a link whose socket send path is backed up.
+/// Short on purpose: a stalled link that recovers gets traffic back
+/// within a fraction of a second, and a link that is still full is simply
+/// re-penalized by the next overflow.
+const QUEUE_FULL_PENALTY: Duration = Duration::from_millis(200);
+
 pub struct Scheduler {
     entries: Vec<SwrrEntry>,
     rate_limits: HashMap<usize, RateLimitState>,
+    /// Links recently reported queue-full, with when the penalty lapses.
+    /// Almost always empty, so the hot path only pays an `is_empty()`.
+    penalized: Vec<(usize, Instant)>,
     /// Current primary link's index, when `scheduler.primary_link_mode`
     /// is on. `None` before the first `refresh()`, or if every link is
     /// currently Down. See `refresh_from_scores`'s doc comment for
@@ -109,6 +121,7 @@ impl Scheduler {
         Self {
             entries: Vec::new(),
             rate_limits: HashMap::new(),
+            penalized: Vec::new(),
             primary: None,
             candidate: None,
         }
@@ -122,6 +135,20 @@ impl Scheduler {
     /// `VersionInfoPayload::primary_link_name`).
     pub fn primary(&self) -> Option<usize> {
         self.primary
+    }
+
+    /// A link's bounded TX queue was full when the dispatcher tried to
+    /// hand it a packet (`tunnel::dispatch`): deprioritize it in the SWRR
+    /// pick for `QUEUE_FULL_PENALTY`. Never removes the link outright --
+    /// if every candidate is penalized the pick proceeds as normal, and
+    /// `primary` selection is untouched (a primary stays primary; the
+    /// dispatcher decides separately whether it may spill).
+    pub fn note_queue_full(&mut self, idx: usize) {
+        let until = Instant::now() + QUEUE_FULL_PENALTY;
+        match self.penalized.iter_mut().find(|(i, _)| *i == idx) {
+            Some(entry) => entry.1 = until,
+            None => self.penalized.push((idx, until)),
+        }
     }
 
     /// Recompute per-link scores and rebuild the SWRR weight table, then
@@ -385,6 +412,23 @@ impl Scheduler {
             }
         }
 
+        if !self.penalized.is_empty() {
+            let now = Instant::now();
+            self.penalized.retain(|(_, until)| *until > now);
+            if !self.penalized.is_empty() {
+                let penalized = &self.penalized;
+                let entries = &self.entries;
+                let unpenalized: Vec<usize> = eligible
+                    .iter()
+                    .copied()
+                    .filter(|&pos| !penalized.iter().any(|(i, _)| *i == entries[pos].link_index))
+                    .collect();
+                if !unpenalized.is_empty() {
+                    eligible = unpenalized;
+                }
+            }
+        }
+
         if eligible.is_empty() {
             let idx = self.swrr_pick();
             if let Some(state) = self.rate_limits.get_mut(&idx) {
@@ -476,6 +520,53 @@ mod tests {
             (2.5..3.5).contains(&ratio),
             "ratio was {ratio}, counts {counts:?}"
         );
+    }
+
+    fn two_entry_scheduler() -> Scheduler {
+        let mut s = Scheduler::new();
+        s.entries = (0..2)
+            .map(|i| SwrrEntry {
+                link_index: i,
+                effective_weight: 1.0,
+                current_weight: 0.0,
+                bandwidth_cap_mbps: None,
+            })
+            .collect();
+        s
+    }
+
+    #[test]
+    fn queue_full_penalty_steers_picks_to_other_links() {
+        let mut s = two_entry_scheduler();
+        s.note_queue_full(1);
+        for _ in 0..50 {
+            assert_eq!(s.select_fast(2, 100), Some(0));
+        }
+    }
+
+    #[test]
+    fn queue_full_penalty_never_empties_the_pick_set() {
+        let mut s = two_entry_scheduler();
+        s.note_queue_full(0);
+        s.note_queue_full(1);
+        let mut seen = [false; 2];
+        for _ in 0..20 {
+            seen[s.select_fast(2, 100).unwrap()] = true;
+        }
+        assert!(seen[0] && seen[1], "all-penalized must fall back to SWRR");
+    }
+
+    #[test]
+    fn queue_full_penalty_lapses() {
+        let mut s = two_entry_scheduler();
+        s.penalized
+            .push((1, Instant::now() - Duration::from_millis(1)));
+        let mut seen = [false; 2];
+        for _ in 0..20 {
+            seen[s.select_fast(2, 100).unwrap()] = true;
+        }
+        assert!(seen[1], "an expired penalty must not exclude the link");
+        assert!(s.penalized.is_empty());
     }
 
     #[test]

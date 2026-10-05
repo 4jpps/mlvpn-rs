@@ -72,13 +72,16 @@ pub fn format_dump(snapshot: &Snapshot, trigger: &str) -> String {
         ));
         out.push_str(&format!(
             "  totals: tx_bytes={} rx_bytes={} tx_packets={} rx_packets={} wg_rejected={} \
-             wg_substituted={}\n\n",
+             wg_substituted={} tx_queue_full={} tx_send_failed={} tx_rerouted={}\n\n",
             l.tx_bytes,
             l.rx_bytes,
             l.tx_packets,
             l.rx_packets,
             l.wg_rejected_total,
             l.wg_substituted_total,
+            l.tx_queue_full_total,
+            l.tx_send_failed_total,
+            l.tx_rerouted_total,
         ));
     }
 
@@ -215,6 +218,9 @@ mod tests {
             local_consecutive_misses: 5,
             wg_rejected_total: 0,
             wg_substituted_total: 0,
+            tx_queue_full_total: 0,
+            tx_send_failed_total: 0,
+            tx_rerouted_total: 0,
             peer_name: Some("lte0".to_string()),
             peer_state: Some("up".to_string()),
             peer_rtt_ms: Some(25.0),

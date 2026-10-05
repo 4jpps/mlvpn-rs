@@ -308,6 +308,9 @@ async fn build_snapshot(
                 local_consecutive_misses: link.stats.consecutive_misses,
                 wg_rejected_total: link.wg_rejected_count(),
                 wg_substituted_total: link.wg_substituted_count(),
+                tx_queue_full_total: link.stats.tx_counters.queue_full.load(Ordering::Relaxed),
+                tx_send_failed_total: link.stats.tx_counters.send_failed.load(Ordering::Relaxed),
+                tx_rerouted_total: link.stats.tx_counters.rerouted_away.load(Ordering::Relaxed),
                 peer_name: peer.as_ref().map(|p| p.name.clone()),
                 peer_state: peer
                     .as_ref()

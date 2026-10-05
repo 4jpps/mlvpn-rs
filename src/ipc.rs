@@ -302,6 +302,19 @@ pub struct LinkSnapshot {
     /// the full boringtun-source-level explanation. Added 2026-09-15.
     #[serde(default)]
     pub wg_substituted_total: u64,
+    /// Lifetime count of times this link's bounded TX queue was full when
+    /// the dispatcher tried to hand it a packet -- the link's socket send
+    /// path was not keeping up. See `link::TxCounters`.
+    #[serde(default)]
+    pub tx_queue_full_total: u64,
+    /// Lifetime count of packets this link's TX worker failed to put on
+    /// the wire (socket error or no remote address).
+    #[serde(default)]
+    pub tx_send_failed_total: u64,
+    /// Lifetime count of packets redirected to another link because this
+    /// one could not take them (queue full, or send failure).
+    #[serde(default)]
+    pub tx_rerouted_total: u64,
 
     // Peer-reported -- their view of the same physical link, received
     // over the wire via a `StatsShare` frame (see `protocol.rs`). `None`
@@ -513,6 +526,9 @@ mod tests {
             local_consecutive_misses: 0,
             wg_rejected_total: 3,
             wg_substituted_total: 2,
+            tx_queue_full_total: 0,
+            tx_send_failed_total: 0,
+            tx_rerouted_total: 0,
             peer_name: None,
             peer_state: None,
             peer_rtt_ms: None,
