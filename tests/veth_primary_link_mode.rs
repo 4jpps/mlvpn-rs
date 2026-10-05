@@ -41,6 +41,26 @@ fn tx_bytes_pair(snapshot: &mlvpn::ipc::Snapshot) -> (u64, u64) {
     (get("link0"), get("link1"))
 }
 
+fn describe_links(snapshot: &mlvpn::ipc::Snapshot) -> String {
+    snapshot
+        .links
+        .iter()
+        .map(|l| {
+            format!(
+                "{}: state={} primary={} rx_mbps={:?} rtt_ms={:?} loss_pct={:?} congestion={:.2}",
+                l.name,
+                l.state,
+                l.is_primary,
+                l.local_rx_throughput_mbps,
+                l.local_rtt_ms,
+                l.local_loss_pct,
+                l.congestion_factor,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 #[tokio::test]
 #[ignore = "needs root, iproute2, and network namespaces -- see module doc comment"]
 async fn primary_link_mode_sends_all_traffic_on_one_link_and_fails_over_immediately() {
@@ -278,9 +298,12 @@ async fn primary_link_mode_sends_all_traffic_on_one_link_and_fails_over_immediat
         after_recovery_l1.saturating_sub(before_recovery_l1)
     };
     assert_eq!(
-        recovered_delta, 0,
+        recovered_delta,
+        0,
         "the recovered link ('{primary_link}') carried Data traffic again immediately after \
          coming back Up, but hysteresis should have kept the failed-over link primary until \
-         a sustained-margin window passed"
+         a sustained-margin window passed.\nbefore: {}\nafter: {}",
+        describe_links(&before_recovery),
+        describe_links(&after_recovery),
     );
 }

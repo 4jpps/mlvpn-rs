@@ -117,13 +117,17 @@ pub fn score(link: &Link) -> f64 {
     // currently under-used by real traffic still gets scored on its true
     // capacity instead of looking artificially slow. See
     // `LinkStats::active_bandwidth_mbps`'s doc comment.
+    // The passive fallback measures load, not capacity, so it is floored
+    // at the same 1.0 Mbps a link with no sample at all gets. Without
+    // the floor, a link carrying a trickle of real traffic (clamped to
+    // 0.1) scored ~3x below an idle one (no sample, 1.0), and an idle
+    // backup could out-score the active primary and take it over.
     let throughput = link
         .stats
         .active_bandwidth_mbps
         .get()
-        .or_else(|| link.stats.rx_throughput_mbps.get())
-        .unwrap_or(1.0)
-        .max(0.1)
+        .map(|a| a.max(0.1))
+        .unwrap_or_else(|| link.stats.rx_throughput_mbps.get().unwrap_or(1.0).max(1.0))
         .min(link.config.bandwidth_cap_mbps.unwrap_or(f64::MAX));
 
     let latency_factor = 1.0 / (1.0 + rtt / 50.0);
@@ -219,5 +223,28 @@ mod tests {
         assert_eq!(link.stats.confirmed_ceiling_mbps, Some(55.5));
         assert_eq!(link.stats.last_ramp_at, Some(last_ramp_at));
         assert_eq!(link.stats.consecutive_verify_misses, 1);
+    }
+
+    /// A link carrying a trickle of real traffic must not score below an
+    /// otherwise identical idle link (no passive sample at all).
+    #[tokio::test]
+    async fn lightly_loaded_link_does_not_score_below_an_idle_one() {
+        use crate::link::{test_link_for_state_transitions, LinkState, LinkStats};
+
+        let idle = test_link_for_state_transitions(LinkState::Up, LinkStats::new(0.2)).await;
+        let mut stats = LinkStats::new(0.2);
+        stats.rx_throughput_mbps.update(0.0008);
+        let busy = test_link_for_state_transitions(LinkState::Up, stats).await;
+
+        let (idle_score, busy_score) = (score(&idle), score(&busy));
+        assert!(
+            (idle_score - busy_score).abs() < 1e-9,
+            "idle {idle_score} vs lightly loaded {busy_score}"
+        );
+
+        let mut stats = LinkStats::new(0.2);
+        stats.rx_throughput_mbps.update(100.0);
+        let fast = test_link_for_state_transitions(LinkState::Up, stats).await;
+        assert!(score(&fast) > idle_score * 5.0);
     }
 }
