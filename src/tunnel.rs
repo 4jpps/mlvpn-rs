@@ -594,7 +594,10 @@ pub async fn run(
     // see `fec::PAYLOAD_TTL`'s doc comment for why those are unrelated
     // timescales. Built unconditionally (it is empty and never touched
     // when FEC is disabled) so nothing downstream needs an Option.
-    let fec_recovery = fec::FecRecoveryBuffer::new(params.scheduler_cfg.fec_group_size);
+    let fec_recovery = fec::FecRecoveryBuffer::new(
+        params.scheduler_cfg.fec_group_size,
+        params.scheduler_cfg.fec_parity,
+    );
     let fec_recovered_total = Arc::new(AtomicU64::new(0));
     let fec_unrecoverable_total = Arc::new(AtomicU64::new(0));
 
@@ -997,6 +1000,8 @@ pub async fn run(
         let links = links.clone();
         let scheduler = scheduler.clone();
         let fec_group_size = params.scheduler_cfg.fec_group_size;
+        let fec_parity = params.scheduler_cfg.fec_parity;
+        let fec_placement = params.scheduler_cfg.fec_parity_placement;
         let live_mtu = live_mtu.clone();
         let fec_unrecoverable_total = fec_unrecoverable_total.clone();
         handles.push(tokio::spawn(async move {
@@ -1007,6 +1012,8 @@ pub async fn run(
                 redundant_mode,
                 fec_enabled,
                 fec_group_size,
+                fec_parity,
+                fec_placement,
                 live_mtu,
                 fec_unrecoverable_total,
                 dispatcher,
@@ -1580,11 +1587,14 @@ async fn outbound_sender(
     redundant_mode: bool,
     fec_enabled: bool,
     fec_group_size: u8,
+    fec_parity: u8,
+    fec_placement: crate::config::FecParityPlacement,
     mtu: LiveMtu,
     fec_unrecoverable_total: Arc<AtomicU64>,
     dispatcher: Option<TxDispatcher>,
 ) {
-    let mut fec_sender = fec_enabled.then(|| crate::fec::FecSender::new(fec_group_size));
+    let mut fec_sender =
+        fec_enabled.then(|| crate::fec::FecSender::new(fec_group_size, fec_parity));
     // What a parity frame is allowed to cost beyond the tunnel MTU: the
     // exact same number of bytes `control::effective_tunnel_mtu` already
     // reserved out of the tunnel MTU for this group size, so a parity
@@ -1614,8 +1624,15 @@ async fn outbound_sender(
             continue;
         }
         let seq = next_send_seq();
-        let sent =
-            send_scheduled(&links, &scheduler, PacketType::Data, seq, &frame.plaintext).await;
+        let sent_on = send_scheduled(
+            &links,
+            &scheduler,
+            PacketType::Data,
+            seq,
+            &frame.plaintext,
+            None,
+        )
+        .await;
         // Only a frame that genuinely reached the wire may join the
         // current FEC group. A frame that was dropped here (no link
         // available) or whose payload boringtun substituted with a
@@ -1627,12 +1644,12 @@ async fn outbound_sender(
         // seq would "reconstruct" and inject into the TUN device a
         // datagram the peer never sent (observed live as a fabricated
         // IPv6 Router Solicitation).
-        if !sent {
+        let Some(link_idx) = sent_on else {
             continue;
-        }
+        };
         if let Some(sender) = fec_sender.as_mut() {
-            if let Some(parity) = sender.accumulate(seq, &frame.plaintext) {
-                let parity_bytes = parity.encode();
+            if let Some(group) = sender.accumulate(seq, &frame.plaintext, link_idx) {
+                let parity_bytes = group.p.encode();
                 // Belt-and-braces against the MTU reservation being
                 // momentarily wrong: `mtu_monitor_loop` can *shrink* the
                 // live tunnel MTU (a link reconnecting on smaller
@@ -1643,7 +1660,8 @@ async fn outbound_sender(
                 // *both* fragments to survive, making it less likely to
                 // arrive than the data it protects) or fails outright --
                 // so drop it and count the group as one FEC could not
-                // help with.
+                // help with. The Q share is exactly as wide as P, so one
+                // check covers both.
                 let budget = mtu.load(Ordering::Relaxed) as usize + parity_headroom;
                 if parity_bytes.len() > budget {
                     fec_unrecoverable_total.fetch_add(1, Ordering::Relaxed);
@@ -1654,6 +1672,20 @@ async fn outbound_sender(
                     );
                     continue;
                 }
+                let forced = if fec_placement == crate::config::FecParityPlacement::Scheduler {
+                    None
+                } else {
+                    let mut usable = Vec::with_capacity(links.len());
+                    for l in links.iter() {
+                        let g = l.lock().await;
+                        usable.push(
+                            g.state == link::LinkState::Up
+                                && !g.admin_disabled
+                                && g.remote.is_some(),
+                        );
+                    }
+                    crate::fec::choose_parity_link(fec_placement, &group.member_links, &usable)
+                };
                 let parity_seq = next_send_seq();
                 // Return value deliberately ignored: a parity frame is
                 // not itself a group member, so a failed/substituted
@@ -1666,8 +1698,22 @@ async fn outbound_sender(
                     PacketType::FecParity,
                     parity_seq,
                     &parity_bytes,
+                    forced,
                 )
                 .await;
+                if let Some(q) = group.q {
+                    let q_bytes = q.encode();
+                    let q_seq = next_send_seq();
+                    let _ = send_scheduled(
+                        &links,
+                        &scheduler,
+                        PacketType::FecParityQ,
+                        q_seq,
+                        &q_bytes,
+                        forced,
+                    )
+                    .await;
+                }
             }
         }
     }
@@ -1715,7 +1761,12 @@ async fn outbound_queue_drop_reporter(dropped_total: Arc<AtomicU64>) {
 /// link and send there. Split out of `tun_reader` purely to keep that
 /// loop body readable now that it branches on `redundant_mode`.
 ///
-/// Returns whether `plaintext` genuinely reached the wire: `false` for
+/// `forced` pins the send to one link (FEC parity placement) when that
+/// link is `Up`, not admin-disabled and has a remote; otherwise the
+/// normal scheduler pick is used.
+///
+/// Returns the index of the link `plaintext` genuinely reached the wire
+/// on, or `None` for
 /// every "no link available to send on" early return, for a failed
 /// `wg_send`, and for a `wg_send` that succeeded at the socket level but
 /// whose payload boringtun substituted with a handshake datagram (see
@@ -1730,7 +1781,8 @@ async fn send_scheduled(
     ptype: PacketType,
     seq: u64,
     plaintext: &[u8],
-) -> bool {
+    forced: Option<usize>,
+) -> Option<usize> {
     // Not the real on-wire size (WireGuard adds its own AEAD overhead on
     // top, invisibly to this layer), but the same approximation the old
     // shared-session design used for the scheduler's own cap-check
@@ -1738,14 +1790,25 @@ async fn send_scheduled(
     // exact byte count.
     let frame_len = HEADER_LEN + plaintext.len();
 
-    let chosen_idx = pick_link(links, scheduler, frame_len).await;
+    let mut chosen_idx = None;
+    if let Some(f) = forced {
+        if let Some(l) = links.get(f) {
+            let g = l.lock().await;
+            if g.state == link::LinkState::Up && !g.admin_disabled && g.remote.is_some() {
+                chosen_idx = Some(f);
+            }
+        }
+    }
+    if chosen_idx.is_none() {
+        chosen_idx = pick_link(links, scheduler, frame_len).await;
+    }
     let Some(idx) = chosen_idx else {
         tracing::warn!("no link available to send on; dropping packet");
-        return false;
+        return None;
     };
     let Some(link_mutex) = links.get(idx) else {
         tracing::warn!("no link available to send on; dropping packet");
-        return false;
+        return None;
     };
 
     // Only *now*, having already picked a winner, do we lock a link at
@@ -1763,7 +1826,7 @@ async fn send_scheduled(
     };
     let Some((link_id, handle, link_name)) = chosen else {
         tracing::warn!("no link available to send on; dropping packet");
-        return false;
+        return None;
     };
 
     let header = Header {
@@ -1789,11 +1852,11 @@ async fn send_scheduled(
             // slightly optimistic during a handshake is a separate,
             // pre-existing concern -- only the returned bool is new.
             link_mutex.lock().await.stats.record_tx(frame_len as u64);
-            carried
+            carried.then_some(idx)
         }
         Err(e) => {
             tracing::debug!(link = %link_name, error = %e, "send failed");
-            false
+            None
         }
     }
 }
@@ -2977,7 +3040,7 @@ async fn handle_incoming(
                 plaintext: plaintext.to_vec(),
             });
         }
-        PacketType::FecParity => {
+        PacketType::FecParity | PacketType::FecParityQ => {
             if !cfg.fec_enabled {
                 // A peer with FEC on talking to a receiver with it off:
                 // nothing is being observed to reconstruct against, and
@@ -2989,7 +3052,12 @@ async fn handle_incoming(
                 tracing::debug!("malformed FecParity payload, ignoring");
                 return;
             };
-            rx_pipeline.deliver(RxEvent::Parity(parity));
+            let kind = if hdr.ptype == PacketType::FecParityQ {
+                fec::ParityKind::Q
+            } else {
+                fec::ParityKind::P
+            };
+            rx_pipeline.deliver(RxEvent::Parity(kind, parity));
         }
         PacketType::Probe => {
             // Echo the decrypted probe payload straight back, so the
@@ -3610,7 +3678,7 @@ const RX_PIPELINE_DROP_REPORT_INTERVAL: Duration = Duration::from_secs(2);
 /// receiving link's own task.
 enum RxEvent {
     Data { seq: u64, plaintext: Vec<u8> },
-    Parity(crate::protocol::FecParityPayload),
+    Parity(fec::ParityKind, crate::protocol::FecParityPayload),
     SetReorderWindow(u64),
 }
 
@@ -3693,16 +3761,27 @@ async fn rx_pipeline<S: RxSink>(
                                 continue;
                             }
                             rx_deliver(&*tun, &scheduler, &mut reorder, seq, plaintext).await;
+                            // A late member can complete a parked
+                            // two-erasure group (`fec_parity = 2`).
+                            if fec_enabled && fec_recovery.has_late_recoveries() {
+                                for (seq, plaintext) in fec_recovery.take_late_recoveries() {
+                                    fec_recovered_total.fetch_add(1, Ordering::Relaxed);
+                                    rx_deliver(&*tun, &scheduler, &mut reorder, seq, plaintext).await;
+                                }
+                            }
                         }
-                        RxEvent::Parity(parity) => match fec_recovery.try_recover(&parity) {
-                            fec::RecoveryOutcome::Recovered { seq, plaintext } => {
-                                fec_recovered_total.fetch_add(1, Ordering::Relaxed);
-                                rx_deliver(&*tun, &scheduler, &mut reorder, seq, plaintext).await;
+                        RxEvent::Parity(kind, parity) => match fec_recovery.try_recover(kind, &parity) {
+                            fec::RecoveryOutcome::Recovered(frames) => {
+                                for (seq, plaintext) in frames {
+                                    fec_recovered_total.fetch_add(1, Ordering::Relaxed);
+                                    rx_deliver(&*tun, &scheduler, &mut reorder, seq, plaintext).await;
+                                }
                             }
                             fec::RecoveryOutcome::Unrecoverable => {
                                 fec_unrecoverable_total.fetch_add(1, Ordering::Relaxed);
                             }
-                            fec::RecoveryOutcome::AlreadyComplete => {}
+                            fec::RecoveryOutcome::AlreadyComplete
+                            | fec::RecoveryOutcome::Pending => {}
                         },
                         RxEvent::SetReorderWindow(ms) => reorder.set_window(ms),
                     }
@@ -3717,7 +3796,10 @@ async fn rx_pipeline<S: RxSink>(
                 }
             }
             _ = fec_tick.tick(), if fec_enabled => {
-                fec_recovery.tick(Instant::now());
+                let given_up = fec_recovery.tick(Instant::now());
+                if given_up > 0 {
+                    fec_unrecoverable_total.fetch_add(given_up, Ordering::Relaxed);
+                }
             }
             _ = report_tick.tick() => {
                 let n = dropped.swap(0, Ordering::Relaxed);
@@ -3940,9 +4022,9 @@ mod send_scheduled_tests {
     async fn send_scheduled_reports_false_when_no_link_is_available() {
         let links: link::Links = Arc::new(Vec::new());
         let scheduler = Arc::new(std::sync::Mutex::new(Scheduler::new()));
-        let sent = send_scheduled(&links, &scheduler, PacketType::Data, 1, b"payload").await;
+        let sent = send_scheduled(&links, &scheduler, PacketType::Data, 1, b"payload", None).await;
         assert!(
-            !sent,
+            sent.is_none(),
             "a dropped packet must never be reported as transmitted"
         );
     }
@@ -4691,7 +4773,7 @@ mod rx_pipeline_tests {
             sink.clone(),
             Arc::new(std::sync::Mutex::new(Scheduler::new())),
             window_ms,
-            fec::FecRecoveryBuffer::new(fec_group.unwrap_or(4)),
+            fec::FecRecoveryBuffer::new(fec_group.unwrap_or(4), 1),
             fec_group.is_some(),
             recovered.clone(),
             unrecoverable.clone(),
@@ -4789,7 +4871,7 @@ mod rx_pipeline_tests {
     #[tokio::test]
     async fn fec_recovered_frame_is_not_delivered_twice() {
         let h = spawn_pipeline(20, Some(4));
-        let mut sender = fec::FecSender::new(4);
+        let mut sender = fec::FecSender::new(4, 1);
         let mut parity = None;
         let frames: Vec<(u64, Vec<u8>)> = (1u64..=4)
             .map(|seq| {
@@ -4799,7 +4881,7 @@ mod rx_pipeline_tests {
             })
             .collect();
         for (seq, p) in &frames {
-            parity = sender.accumulate(*seq, p);
+            parity = sender.accumulate(*seq, p, 0).map(|g| g.p);
         }
         let parity = parity.expect("group of 4 completes parity");
 
@@ -4809,7 +4891,7 @@ mod rx_pipeline_tests {
                 plaintext: p.clone(),
             });
         }
-        h.tx.deliver(RxEvent::Parity(parity));
+        h.tx.deliver(RxEvent::Parity(fec::ParityKind::P, parity));
         assert!(wait_for_len(&h.sink, 4).await);
         assert_eq!(h.recovered.load(Ordering::Relaxed), 1);
 

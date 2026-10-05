@@ -126,6 +126,14 @@ pub enum PacketType {
     /// same degrade-gracefully behavior every other unrecognized frame
     /// type already gets.
     FecParity = 15,
+    /// The second parity share of a `fec_parity = 2` group: `Q = sum
+    /// g^i * D_i` over GF(256) (see `fec::gf`). Same payload layout as
+    /// `FecParity` (`FecParityPayload`). Together with the plain-XOR `P`
+    /// share it lets the receiver rebuild any two lost members. Only
+    /// ever sent when `scheduler.fec_parity` is 2; an older peer drops
+    /// it through the unrecognized-`ptype` path and simply never gets
+    /// the second erasure's worth of protection (P still works).
+    FecParityQ = 16,
 }
 
 impl PacketType {
@@ -148,6 +156,7 @@ impl PacketType {
             13 => Self::ThroughputTestReverseRequest,
             14 => Self::VersionInfo,
             15 => Self::FecParity,
+            16 => Self::FecParityQ,
             other => {
                 return Err(MlvpnError::Protocol(format!(
                     "unknown packet type byte {other}"
@@ -1054,5 +1063,24 @@ mod fec_parity_payload_tests {
         .encode(&mut buf);
         let (hdr, _) = Header::decode(&buf).expect("decode");
         assert_eq!(hdr.ptype, PacketType::FecParity);
+    }
+
+    #[test]
+    fn packet_type_fec_parity_q_round_trips_through_header() {
+        let mut buf = Vec::new();
+        Header {
+            ptype: PacketType::FecParityQ,
+            link_id: 1,
+            seq: 43,
+        }
+        .encode(&mut buf);
+        let (hdr, _) = Header::decode(&buf).expect("decode");
+        assert_eq!(hdr.ptype, PacketType::FecParityQ);
+        assert_eq!(PacketType::FecParityQ as u8, 16);
+        assert_eq!(
+            PacketType::FecParity as u8,
+            15,
+            "P's wire value must not move"
+        );
     }
 }

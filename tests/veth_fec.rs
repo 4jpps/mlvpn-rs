@@ -169,6 +169,8 @@ async fn setup_fec_rig(label: &str, scheduler: SchedulerOverrides) -> FecTestRig
         SchedulerOverrides {
             fec_enabled: scheduler.fec_enabled,
             fec_group_size: scheduler.fec_group_size,
+            fec_parity: scheduler.fec_parity,
+            fec_parity_placement: scheduler.fec_parity_placement,
             ..Default::default()
         },
         &[LinkSpec {
@@ -502,6 +504,116 @@ async fn two_dropped_frames_in_group_are_unrecoverable() {
     assert_eq!(
         snapshot.daemon.fec_recovered_total, baseline_recovered,
         "a 2-loss group should never count as recovered"
+    );
+}
+
+/// Phase 5: with `fec_parity = 2` the very same two-member loss that
+/// `two_dropped_frames_in_group_are_unrecoverable` shows is fatal under
+/// single-erasure parity is fully repaired by the P+Q pair.
+#[tokio::test]
+#[ignore = "needs root, iproute2 (incl. tc), and network namespaces -- see module doc comment"]
+async fn two_dropped_frames_in_group_are_recovered_with_parity_two() {
+    let rig = setup_fec_rig(
+        "p2",
+        SchedulerOverrides {
+            fec_enabled: true,
+            fec_group_size: Some(FEC_GROUP_SIZE),
+            fec_parity: Some(2),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let baseline = poll_snapshot_until(&rig.server_ctl, Duration::from_secs(5), |_| true)
+        .await
+        .expect("read baseline server snapshot");
+    let baseline_recovered = baseline.daemon.fec_recovered_total;
+    let baseline_unrecoverable = baseline.daemon.fec_unrecoverable_total;
+
+    let group_started = std::time::Instant::now();
+    let status =
+        ping_once(&rig.ns_client_name, SERVER_TUNNEL_HOST, "2").expect("run ping for member 1");
+    assert!(status.success(), "member 1's ping should succeed cleanly");
+
+    Command::new("ip")
+        .args([
+            "netns",
+            "exec",
+            &rig.ns_client_name,
+            "tc",
+            "qdisc",
+            "add",
+            "dev",
+            &rig.vc0,
+            "root",
+            "netem",
+            "loss",
+            "100%",
+        ])
+        .status()
+        .expect("add netem loss to client's veth");
+
+    // Members 2 and 3 are both lost on the wire; each ping thread stays
+    // blocked until FEC reconstructs its request, which needs member 4
+    // and the P+Q pair behind it (sent on the main thread below).
+    let ns_for_member2 = rig.ns_client_name.clone();
+    let member2 = std::thread::spawn(move || ping_once(&ns_for_member2, SERVER_TUNNEL_HOST, "10"));
+    let ns_for_member3 = rig.ns_client_name.clone();
+    let member3 = std::thread::spawn(move || ping_once(&ns_for_member3, SERVER_TUNNEL_HOST, "10"));
+
+    tokio::time::sleep(LOSS_WINDOW).await;
+
+    Command::new("ip")
+        .args([
+            "netns",
+            "exec",
+            &rig.ns_client_name,
+            "tc",
+            "qdisc",
+            "del",
+            "dev",
+            &rig.vc0,
+            "root",
+        ])
+        .status()
+        .expect("remove netem loss from client's veth");
+
+    let status =
+        ping_once(&rig.ns_client_name, SERVER_TUNNEL_HOST, "2").expect("run ping for member 4");
+    assert!(status.success(), "member 4's ping should succeed cleanly");
+
+    let elapsed = group_started.elapsed();
+    assert!(
+        elapsed < GROUP_BUDGET,
+        "the whole group took {elapsed:?}, past this test's own {GROUP_BUDGET:?} budget -- \
+         the result below would not be meaningful"
+    );
+
+    for (name, handle) in [("member 2", member2), ("member 3", member3)] {
+        let status = handle
+            .join()
+            .unwrap_or_else(|_| panic!("{name}'s ping thread panicked"))
+            .unwrap_or_else(|e| panic!("run ping for {name}: {e}"));
+        assert!(
+            status.success(),
+            "{name}'s data should arrive via P+Q reconstruction even though its own \
+             raw UDP transmission was dropped"
+        );
+    }
+
+    let snapshot = poll_snapshot_until(&rig.server_ctl, Duration::from_secs(5), |s| {
+        s.daemon.fec_recovered_total >= baseline_recovered + 2
+    })
+    .await
+    .expect("fec_recovered_total never rose by 2 on the server");
+    assert_eq!(
+        snapshot.daemon.fec_recovered_total,
+        baseline_recovered + 2,
+        "expected both lost members to be recovered"
+    );
+    assert_eq!(
+        snapshot.daemon.fec_unrecoverable_total, baseline_unrecoverable,
+        "a 2-loss group is fully recoverable with fec_parity = 2"
     );
 }
 

@@ -113,6 +113,33 @@ fn default_tx_queue_len() -> u32 {
     4000
 }
 
+/// Where a FEC group's parity frame(s) are sent.
+///
+/// A parity frame protects a group only if it survives, and a link
+/// failure takes out *all* of that link's members of the group at once.
+/// The group is recoverable after a single-link burst only if the
+/// failing link carried no more members than there are surviving
+/// parity frames -- so the interesting question is which link the
+/// parity should sit on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FecParityPlacement {
+    /// Parity goes wherever the normal scheduler picks (default; the
+    /// pre-Phase-5 behaviour).
+    #[default]
+    Scheduler,
+    /// Parity goes on the usable link that carried the *most* members
+    /// of the group. That link's own failure is the one the group
+    /// cannot survive anyway (it took out most of the data), so the
+    /// parity is kept off the links whose failure it could repair.
+    Dominant,
+    /// Parity goes on the usable link that carried the *fewest* members
+    /// (the literal "put parity on a different path" reading). Kept for
+    /// comparison; with SWRR-balanced groups it tends to co-locate
+    /// parity with the survivors of a failure of the busy link.
+    Diverse,
+}
+
 /// `redundant_mode`, `primary_link_mode`, and `follow_peer_primary` are
 /// mutually exclusive -- at most one may be `true` at a time (enforced in
 /// `Config::validate`). Each represents a fundamentally different
@@ -208,6 +235,20 @@ pub struct SchedulerConfig {
     /// `fec_enabled` is true.
     #[serde(default = "default_fec_group_size")]
     pub fec_group_size: u8,
+    /// Parity frames per FEC group: 1 (default, a plain-XOR share, one
+    /// recoverable loss per group) or 2 (adds a GF(256) `Q` share, so
+    /// any two losses in a group are recoverable -- e.g. 8+2). Doubles
+    /// the FEC bandwidth overhead (`2/fec_group_size`) and adds one
+    /// extra parity frame per group, but parity is sent the moment the
+    /// group completes, so it adds no send latency. Both peers must use
+    /// the same value. Validated to 1..=2. Only meaningful when
+    /// `fec_enabled` is true.
+    #[serde(default = "default_fec_parity")]
+    pub fec_parity: u8,
+    /// Which link carries a group's parity frames (only meaningful with
+    /// `fec_enabled`). See `FecParityPlacement`.
+    #[serde(default)]
+    pub fec_parity_placement: FecParityPlacement,
     /// Opt-in: instead of splitting traffic across every currently-Up
     /// link via SWRR proportional to monitor::score(), send everything
     /// over whichever single link currently looks fastest, failing
@@ -398,6 +439,9 @@ fn default_ewma_alpha() -> f64 {
 fn default_fec_group_size() -> u8 {
     8
 }
+fn default_fec_parity() -> u8 {
+    1
+}
 fn default_reorder_window_min_ms() -> u64 {
     10
 }
@@ -433,6 +477,8 @@ impl Default for SchedulerConfig {
             redundant_mode: false,
             fec_enabled: false,
             fec_group_size: default_fec_group_size(),
+            fec_parity: default_fec_parity(),
+            fec_parity_placement: FecParityPlacement::default(),
             primary_link_mode: false,
             follow_peer_primary: false,
             auto_tune_reorder_window: false,
@@ -814,6 +860,13 @@ impl Config {
             )));
         }
 
+        if self.scheduler.fec_enabled && !(1..=2).contains(&self.scheduler.fec_parity) {
+            return Err(MlvpnError::Config(format!(
+                "scheduler.fec_parity ({}) must be 1 or 2",
+                self.scheduler.fec_parity
+            )));
+        }
+
         if self.scheduler.reorder_window_min_ms > self.scheduler.reorder_window_max_ms {
             return Err(MlvpnError::Config(format!(
                 "scheduler.reorder_window_min_ms ({}) must be <= reorder_window_max_ms ({})",
@@ -1089,6 +1142,64 @@ mod tests {
         cfg.scheduler.fec_enabled = true;
         cfg.scheduler.fec_group_size = 1;
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn fec_parity_defaults_to_one_with_scheduler_placement() {
+        let cfg = minimal_valid_config();
+        assert_eq!(cfg.scheduler.fec_parity, 1);
+        assert_eq!(
+            cfg.scheduler.fec_parity_placement,
+            FecParityPlacement::Scheduler
+        );
+    }
+
+    #[test]
+    fn fec_parity_and_placement_parse_from_toml() {
+        let toml_str = r#"
+        mode = "client"
+        [tunnel]
+        name = "mlvpn0"
+        address = "10.200.0.1/30"
+        [scheduler]
+        fec_enabled = true
+        fec_parity = 2
+        fec_parity_placement = "dominant"
+        [[links]]
+        name = "a"
+        bind_interface = "eth0"
+        local_port = 6900
+        private_key_file = "/tmp/a.key"
+        peer_public_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+    "#;
+        let cfg: Config = toml::from_str(toml_str).expect("parse");
+        assert_eq!(cfg.scheduler.fec_parity, 2);
+        assert_eq!(
+            cfg.scheduler.fec_parity_placement,
+            FecParityPlacement::Dominant
+        );
+    }
+
+    #[test]
+    fn fec_parity_outside_one_or_two_is_rejected_when_fec_is_on() {
+        for bad in [0u8, 3, 255] {
+            let mut cfg = minimal_valid_config();
+            cfg.scheduler.fec_enabled = true;
+            cfg.scheduler.fec_parity = bad;
+            assert!(
+                cfg.validate().is_err(),
+                "fec_parity {bad} should be rejected"
+            );
+        }
+        for good in [1u8, 2] {
+            let mut cfg = minimal_valid_config();
+            cfg.scheduler.fec_enabled = true;
+            cfg.scheduler.fec_parity = good;
+            assert!(
+                cfg.validate().is_ok(),
+                "fec_parity {good} should be accepted"
+            );
+        }
     }
 
     #[test]

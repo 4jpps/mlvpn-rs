@@ -419,6 +419,11 @@ pub struct SchedulerOverrides {
     /// 8) -- `None` omits the field, leaving the config default in
     /// place. Only meaningful alongside `fec_enabled: true`.
     pub fec_group_size: Option<u8>,
+    /// Overrides `scheduler.fec_parity` (1 or 2). `None` omits the field.
+    pub fec_parity: Option<u8>,
+    /// Overrides `scheduler.fec_parity_placement` (`"scheduler"`,
+    /// `"dominant"`, `"diverse"`). `None` omits the field.
+    pub fec_parity_placement: Option<&'static str>,
 }
 
 /// Writes a minimal-but-complete `mlvpnd` TOML config to `dir`. The
@@ -487,6 +492,8 @@ pub fn write_config(
         || scheduler.active_bandwidth_probe_interval_secs.is_some()
         || scheduler.fec_enabled
         || scheduler.fec_group_size.is_some()
+        || scheduler.fec_parity.is_some()
+        || scheduler.fec_parity_placement.is_some()
     {
         toml.push_str("[scheduler]\n");
         if scheduler.redundant_mode {
@@ -518,6 +525,12 @@ pub fn write_config(
         }
         if let Some(size) = scheduler.fec_group_size {
             toml.push_str(&format!("fec_group_size = {size}\n"));
+        }
+        if let Some(parity) = scheduler.fec_parity {
+            toml.push_str(&format!("fec_parity = {parity}\n"));
+        }
+        if let Some(placement) = scheduler.fec_parity_placement {
+            toml.push_str(&format!("fec_parity_placement = \"{placement}\"\n"));
         }
         toml.push('\n');
     }
