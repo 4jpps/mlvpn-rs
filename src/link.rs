@@ -699,16 +699,11 @@ pub struct Link {
     /// at `Link::bind` time only when resolution produced both an IPv4
     /// and IPv6 candidate and `local_addr` didn't pin one (see
     /// `pick_remote_addr`'s doc comment). Raced against `remote`/`socket`
-    /// during the very first handshake attempt only
-    /// (`tunnel::perform_client_handshake`, gated on `rekey_ctx.is_none()`)
-    /// -- deliberately never re-raced on a later rekey: by then,
-    /// `link_receiver`/`link_prober` already hold their own `LinkHandle`
-    /// snapshotted at spawn time (right after the initial handshake
-    /// commits), which wouldn't observe a `remote` flip happening that
-    /// late without a much larger change to how those tasks pick up a
-    /// changed remote. Always `None` again once the initial handshake
-    /// has resolved which family actually works, win or lose -- see
-    /// `commit_remote`.
+    /// once at tunnel startup (`Link::resolve_alternate`, called from
+    /// `tunnel::run`) -- deliberately never re-raced later: per-link
+    /// tasks snapshot `remote` in their `LinkHandle` at spawn time and
+    /// wouldn't observe a flip. Always `None` again once that race has
+    /// resolved, win or lose -- see `commit_remote`.
     pub alternate: Option<(SocketAddr, SharedSocket)>,
     /// This link's own independent WireGuard tunnel, constructed once at
     /// `Link::bind` time from `config.private_key_file`/
@@ -841,20 +836,125 @@ impl Link {
         })
     }
 
-    /// Resolves `alternate` once this link's own primary-vs-alternate
-    /// ambiguity has actually been tested -- called from two places:
-    /// `tunnel::perform_client_handshake`'s success arm, for whichever
-    /// link's reply happened to win the initial handshake broadcast (the
-    /// only link that gets a real signal from *that* exchange, since the
-    /// peer only ever answers the first-arriving copy of it -- see that
-    /// function's doc comment); and `tunnel::resolve_remaining_alternates`,
-    /// right after, for every *other* link, using a lightweight
-    /// authenticated probe race instead since the handshake itself never
-    /// gave them a chance to prove anything. Either way, this runs
-    /// exactly once per link before any `link_receiver`/`link_prober`
-    /// task exists to hold a stale copy of the pre-resolution socket, so
-    /// no link is ever left holding an untested alternate open for the
-    /// rest of the process's life.
+    /// Races this link's real WireGuard handshake initiation against its
+    /// primary and alternate address at once and commits whichever
+    /// answers first (`commit_remote`); a no-op for a link with no
+    /// alternate. The same init datagram goes to both addresses, so the
+    /// peer accepts exactly one copy (the other is a replay to it) and
+    /// the winning socket completes the handshake -- the link comes up
+    /// already established on the working family. WireGuard state is
+    /// address-independent, so the handshake carries over to the per-link
+    /// tasks spawned afterward. If nothing answers within `deadline` the
+    /// primary is kept and the normal lazy handshake retries take over.
+    ///
+    /// Must run before any per-link task takes a `handle()`: those
+    /// snapshot `remote` and would never see it change.
+    pub async fn resolve_alternate(&mut self, deadline: Duration) {
+        let Some((alt_remote, alt_shared)) = self.alternate.clone() else {
+            return;
+        };
+        let Some(primary_remote) = self.remote else {
+            self.commit_remote(None);
+            return;
+        };
+        let primary_socket = self.socket.read().await.clone();
+        let alt_socket = alt_shared.read().await.clone();
+
+        let mut frame = Vec::with_capacity(crate::protocol::HEADER_LEN);
+        crate::protocol::Header {
+            ptype: crate::protocol::PacketType::Keepalive,
+            link_id: self.id,
+            seq: 0,
+        }
+        .encode(&mut frame);
+        let init = match self.wg.encapsulate(&frame) {
+            Ok((datagram, _)) => datagram,
+            Err(e) => {
+                tracing::warn!(link = %self.config.name, error = %e, "could not start the address-family race; keeping the primary address");
+                self.commit_remote(None);
+                return;
+            }
+        };
+
+        let mut primary_buf = vec![0u8; u16::MAX as usize + 64];
+        let mut alt_buf = vec![0u8; u16::MAX as usize + 64];
+        let mut scratch = Vec::with_capacity(2048);
+        let mut retry = tokio::time::interval(Duration::from_millis(500));
+        let mut first = true;
+        let give_up = tokio::time::sleep(deadline);
+        tokio::pin!(give_up);
+
+        let winner = loop {
+            tokio::select! {
+                _ = retry.tick() => {
+                    let datagram = if first {
+                        first = false;
+                        Some(init.clone())
+                    } else {
+                        self.wg.tick()
+                    };
+                    if let Some(d) = datagram {
+                        let _ = primary_socket.send_to(&d, primary_remote).await;
+                        let _ = alt_socket.send_to(&d, alt_remote).await;
+                    }
+                }
+                r = primary_socket.recv_from(&mut primary_buf) => {
+                    if let Ok((n, from)) = r {
+                        if from == primary_remote
+                            && self.answered(&primary_socket, &primary_buf[..n], from, &mut scratch).await
+                        {
+                            break Some(primary_remote);
+                        }
+                    }
+                }
+                r = alt_socket.recv_from(&mut alt_buf) => {
+                    if let Ok((n, from)) = r {
+                        if from == alt_remote
+                            && self.answered(&alt_socket, &alt_buf[..n], from, &mut scratch).await
+                        {
+                            break Some(alt_remote);
+                        }
+                    }
+                }
+                _ = &mut give_up => break None,
+            }
+        };
+
+        if winner.is_none() {
+            tracing::warn!(
+                link = %self.config.name,
+                primary = %primary_remote,
+                alternate = %alt_remote,
+                "neither address family answered in time; keeping the primary and retrying normally"
+            );
+        }
+        self.commit_remote(winner);
+    }
+
+    /// Feeds one received datagram through this link's `WgTunnel` and
+    /// reports whether it was an authenticated answer (handshake
+    /// response or data), sending any reply boringtun produced.
+    async fn answered(
+        &self,
+        socket: &UdpSocket,
+        datagram: &[u8],
+        from: SocketAddr,
+        scratch: &mut Vec<u8>,
+    ) -> bool {
+        match self.wg.decapsulate_into(datagram, scratch) {
+            Ok(wireguard::DecapsulateKind::SendReply(reply)) => {
+                let _ = socket.send_to(&reply, from).await;
+                true
+            }
+            Ok(wireguard::DecapsulateKind::Frame) => true,
+            Ok(wireguard::DecapsulateKind::Consumed) | Err(_) => false,
+        }
+    }
+
+    /// Resolves `alternate` once the primary-vs-alternate question has
+    /// been answered by `resolve_alternate` (or abandoned). Runs exactly
+    /// once per link, before any `link_receiver`/`link_prober` task
+    /// exists to hold a stale copy of the pre-resolution socket.
     ///
     /// `winner`, if `Some`, is the address that actually answered.  If it
     /// matches `alternate`'s address, that candidate just proved itself

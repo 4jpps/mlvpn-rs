@@ -173,18 +173,14 @@
 //! for ordinary link-quality reasons, reused here rather than inventing
 //! a second "is the whole tunnel up yet" concept.
 //!
-//! One real, known gap this leaves relative to the old design: the old
-//! `perform_client_handshake` actively raced a link's not-yet-confirmed
-//! alternate address family (`link::Link::alternate`/`commit_remote`,
-//! see their own doc comments) once, right after the initial handshake,
-//! to recover a link whose `pick_remote_addr` guess picked the wrong
-//! family. That active-racing step has not been reimplemented here --
-//! `Link::alternate`/`alternate_handle`/`commit_remote` still exist in
-//! `link.rs` but nothing in this module calls them anymore, so a link
-//! configured with a dual-stack `remote_addr` now simply uses whichever
-//! family `pick_remote_addr` chose at bind time, with no runtime
-//! fallback if that guess is wrong. Worth reconsidering in a later task
-//! if this turns out to matter in practice.
+//! **Dual-stack address-family race.** A link whose `remote_addr` hostname
+//! resolves to both IPv4 and IPv6 races its real WireGuard handshake
+//! initiation against both addresses once, at the top of `run`
+//! (`Link::resolve_alternate`), before any per-link task snapshots the
+//! link's remote, and keeps whichever family answers. If neither answers
+//! within `ALTERNATE_RACE_DEADLINE` the primary is kept and ordinary lazy
+//! handshake retries continue against it (so a peer that is down at
+//! startup can leave a link on a wrong-family guess until restart).
 //!
 //! **Self-healing reconnection.** `link_receiver` and `link_prober` each
 //! track consecutive I/O failures on the socket they're currently using
@@ -530,6 +526,9 @@ fn resolve_peer_primary_index(snap: &[Link], peer_primary_link: &PeerPrimaryLink
     snap.iter().position(|l| l.config.name == name)
 }
 
+/// How long startup waits for a dual-stack link's address-family race.
+const ALTERNATE_RACE_DEADLINE: Duration = Duration::from_secs(10);
+
 pub async fn run(
     tun: AsyncDevice,
     links: Vec<Link>,
@@ -538,6 +537,23 @@ pub async fn run(
 ) -> Result<()> {
     let tun = Arc::new(tun);
     let links: Links = Arc::new(links.into_iter().map(AsyncMutex::new).collect());
+    {
+        let races: Vec<_> = (0..links.len())
+            .map(|idx| {
+                let links = links.clone();
+                tokio::spawn(async move {
+                    links[idx]
+                        .lock()
+                        .await
+                        .resolve_alternate(ALTERNATE_RACE_DEADLINE)
+                        .await;
+                })
+            })
+            .collect();
+        for race in races {
+            let _ = race.await;
+        }
+    }
     let scheduler = Arc::new(std::sync::Mutex::new(Scheduler::new()));
     // Wrapped once, here, so every task below can cheaply clone a handle
     // to the full params instead of each needing its own hand-picked

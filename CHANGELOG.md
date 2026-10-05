@@ -12,6 +12,14 @@ design, and `ARCHITECTURE.md` covers the system as a whole.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Dual-stack address-family race restored.** A client link whose `remote_addr` hostname resolves to both an A and an AAAA record could stay stuck on an unreachable address family. The race that settles this was lost in 0.7.0, when the tunnel-wide handshake it hung off was removed: `Link::alternate` was still populated by `pick_remote_addr`, but nothing ever resolved it. `Link::resolve_alternate` (called once per link, concurrently, from `tunnel::run` before any per-link task spawns, with a 10 s deadline) now sends a real WireGuard handshake initiation to both candidates, retransmitting via `wg.tick()` every 500 ms, and commits whichever family answers first. If neither answers in time the primary is kept and normal retry continues. Known limitation: a peer that is down at startup can leave the link on the wrong-family primary until restart. Caught by `veth_dualstack_link`, which had been failing since 0.7.0.
+
+### Tests
+
+- Brought six `#[ignore]` veth integration tests back in line with 0.7.x behaviour: `veth_mtu_monitor` (MTU bounds now account for the 112-byte outer overhead), `veth_tunnel_selftest` (explicit `--protocol udp`), `veth_wireguard_style_immediate_delivery` (no tunnel-wide rekey exists any more; now checks the follow-peer-primary client settling into bypass mode), `veth_wireguard_transport` (per-link key files), `veth_primary_mtu` (server uses `follow_peer_primary` alone since it is mutually exclusive with `primary_link_mode`, and netem on the second link makes the primary deterministic), and `veth_diag_dump`'s auto-submit test (the mock intake server is now reachable from the client netns over a dedicated host veth instead of the host's own loopback).
+
 ### Changed
 
 - **Per-packet hot-path allocation cleanup (no wire or config change).** Receive previously allocated and zero-filled a fresh ~64 KB scratch buffer for every datagram (`wg_recv`), plus a second buffer inside `WgTunnel::decapsulate`, plus an extra `plaintext.to_vec()` in `handle_incoming`; transmit built a frame `Vec`, a fake-IPv4-wrapped copy, and an encryption buffer per packet. Now `link_receiver` owns one reusable receive buffer and one frame buffer (`Link::wg_recv_into` / `WgTunnel::decapsulate_into`), `WgTunnel` keeps reusable wrap/encrypt/decrypt scratch buffers behind its existing lock, and transmit encapsulates a header + payload pair directly (`encapsulate_parts`, `Header::to_bytes`) without building an intermediate frame. `benches/wg_path.rs` (`cargo bench --bench wg_path`) measures it with a counting allocator: receive goes from ~131 KB and 4 allocations per packet to 0 (about 10x faster for small packets, 6.0 us -> 0.6 us at 100 B), transmit from 5 allocations to 2.
