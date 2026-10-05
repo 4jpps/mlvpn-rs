@@ -18,6 +18,10 @@ path = "src/lib.rs"
 name = "mlvpnd"
 path = "src/main.rs"
 
+[[bench]]
+name = "wg_path"
+harness = false
+
 # src/bin/mlvpn-tui.rs is picked up automatically by cargo's default
 # `autobins` discovery -- no explicit [[bin]] section needed for it.
 

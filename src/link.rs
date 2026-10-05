@@ -359,13 +359,20 @@ impl LinkHandle {
     /// depends on the peer observing this exact frame) may ignore it;
     /// FEC group accumulation must not.
     pub async fn wg_send(&self, frame: &[u8]) -> Result<bool> {
+        self.wg_send_parts(&[frame]).await
+    }
+
+    /// `wg_send` for a frame given as consecutive pieces (header, payload)
+    /// -- see `WgTunnel::encapsulate_parts`. Same contract and return
+    /// value as `wg_send`.
+    pub async fn wg_send_parts(&self, parts: &[&[u8]]) -> Result<bool> {
         let remote = self.remote.ok_or_else(|| {
             MlvpnError::Protocol(format!(
                 "wg_send: link '{}' has no remote address to send to yet",
                 self.config.name
             ))
         })?;
-        let (datagram, carries_frame) = self.wg.encapsulate(frame)?;
+        let (datagram, carries_frame) = self.wg.encapsulate_parts(parts)?;
         let socket = self.current_socket().await;
         socket
             .send_to(&datagram, remote)
@@ -401,20 +408,29 @@ impl LinkHandle {
     /// comment), and that's only ever observable from the raw socket
     /// read, not from anything `WgTunnel` itself exposes.
     pub async fn wg_recv(&self) -> Result<(Vec<u8>, SocketAddr)> {
-        // Sized the same way tunnel.rs's own largest raw-recv buffers
-        // are (see e.g. `tunnel.rs`'s `u16::MAX as usize + 64` buffer) --
-        // large enough for any legitimate UDP datagram this link could
-        // ever receive, not just a "should be enough" round number.
         let mut buf = vec![0u8; u16::MAX as usize + 64];
+        let mut frame = Vec::new();
+        let from = self.wg_recv_into(&mut buf, &mut frame).await?;
+        Ok((frame, from))
+    }
+
+    /// Hot-path form of `wg_recv`: the receive loop owns `buf` (raw
+    /// datagram scratch, must be at least `u16::MAX + 64` bytes so any
+    /// legitimate UDP datagram fits -- the same sizing rule `tunnel.rs`'s
+    /// other raw-recv buffers follow) and `frame` (the decrypted mlvpn
+    /// frame lands here) once for its whole lifetime, so a received
+    /// packet costs no allocation and no 64 KB zero-fill. Returns only
+    /// the source address; the frame is in `frame` on `Ok`.
+    pub async fn wg_recv_into(&self, buf: &mut [u8], frame: &mut Vec<u8>) -> Result<SocketAddr> {
         loop {
             let socket = self.current_socket().await;
-            let (n, from) = socket.recv_from(&mut buf).await.map_err(MlvpnError::Io)?;
-            match self.wg.decapsulate(&buf[..n])? {
-                wireguard::DecapsulateOutcome::Frame(frame) => return Ok((frame, from)),
-                wireguard::DecapsulateOutcome::SendReply(reply) => {
+            let (n, from) = socket.recv_from(buf).await.map_err(MlvpnError::Io)?;
+            match self.wg.decapsulate_into(&buf[..n], frame)? {
+                wireguard::DecapsulateKind::Frame => return Ok(from),
+                wireguard::DecapsulateKind::SendReply(reply) => {
                     socket.send_to(&reply, from).await.map_err(MlvpnError::Io)?;
                 }
-                wireguard::DecapsulateOutcome::Consumed => {}
+                wireguard::DecapsulateKind::Consumed => {}
             }
         }
     }

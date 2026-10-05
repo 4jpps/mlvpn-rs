@@ -168,12 +168,21 @@ pub struct Header {
 }
 
 impl Header {
+    /// Fixed-size wire form, for hot paths that pass the header and the
+    /// payload to `WgTunnel::encapsulate_parts` separately rather than
+    /// building a frame `Vec` first.
+    pub fn to_bytes(&self) -> [u8; HEADER_LEN] {
+        let mut b = [0u8; HEADER_LEN];
+        b[0] = MAGIC;
+        b[1] = VERSION;
+        b[2] = self.ptype as u8;
+        b[3] = self.link_id;
+        b[4..12].copy_from_slice(&self.seq.to_be_bytes());
+        b
+    }
+
     pub fn encode(&self, out: &mut Vec<u8>) {
-        out.push(MAGIC);
-        out.push(VERSION);
-        out.push(self.ptype as u8);
-        out.push(self.link_id);
-        out.extend_from_slice(&self.seq.to_be_bytes());
+        out.extend_from_slice(&self.to_bytes());
     }
 
     pub fn decode(buf: &[u8]) -> Result<(Self, &[u8])> {

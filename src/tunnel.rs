@@ -552,9 +552,7 @@ pub async fn run(
     // completing.
     tracing::info!("tunnel starting; each link will handshake independently");
 
-    let reorder = Arc::new(AsyncMutex::new(ReorderBuffer::new(
-        params.scheduler_cfg.reorder_window_ms,
-    )));
+    let reorder = Arc::new(SharedReorder::new(params.scheduler_cfg.reorder_window_ms));
 
     // Shared across both links (a FEC group's members can arrive on
     // either physical link), same reasoning as `reorder` above. Its own
@@ -1374,16 +1372,14 @@ async fn send_scheduled(
         return false;
     };
 
-    let mut frame = Vec::with_capacity(frame_len);
-    Header {
+    let header = Header {
         ptype,
         link_id,
         seq,
     }
-    .encode(&mut frame);
-    frame.extend_from_slice(plaintext);
+    .to_bytes();
 
-    match handle.wg_send(&frame).await {
+    match handle.wg_send_parts(&[&header, plaintext]).await {
         Ok(carried) => {
             // Re-lock just the winning link, only on success, purely to
             // update the lifetime tx counters -- everything else in this
@@ -1464,15 +1460,13 @@ async fn send_redundant(links: &Links, plaintext: &[u8]) {
     let frame_len = HEADER_LEN + plaintext.len();
 
     for (link_id, handle, link_name) in targets {
-        let mut frame = Vec::with_capacity(frame_len);
-        Header {
+        let header = Header {
             ptype: PacketType::Data,
             link_id,
             seq,
         }
-        .encode(&mut frame);
-        frame.extend_from_slice(plaintext);
-        match handle.wg_send(&frame).await {
+        .to_bytes();
+        match handle.wg_send_parts(&[&header, plaintext]).await {
             // Redundant mode has no FEC group to corrupt (FEC and
             // redundant mode are mutually exclusive send paths in
             // `outbound_sender`), so `wg_send`'s new bool is irrelevant
@@ -1512,7 +1506,7 @@ async fn link_receiver(
     links: Links,
     scheduler: Arc<std::sync::Mutex<Scheduler>>,
     tun: Arc<AsyncDevice>,
-    reorder: Arc<AsyncMutex<ReorderBuffer>>,
+    reorder: Arc<SharedReorder>,
     fec_recovery: Arc<AsyncMutex<fec::FecRecoveryBuffer>>,
     fec_recovered_total: Arc<AtomicU64>,
     fec_unrecoverable_total: Arc<AtomicU64>,
@@ -1534,15 +1528,20 @@ async fn link_receiver(
 
     let mut consecutive_failures = 0u32;
     let mut backoff_ms = RECONNECT_BACKOFF_INITIAL_MS;
+    // Owned once for this task's lifetime: the raw-datagram scratch and the
+    // decrypted-frame buffer `wg_recv_into` fills on every packet. Sized to
+    // hold any legitimate UDP datagram (see `wg_recv_into`).
+    let mut recv_buf = vec![0u8; u16::MAX as usize + 64];
+    let mut frame: Vec<u8> = Vec::with_capacity(2048);
     loop {
-        // `wg_recv` loops internally past any handshake/keepalive
+        // `wg_recv_into` loops internally past any handshake/keepalive
         // traffic on this link's socket -- what comes back here is
         // always either a genuine decrypted mlvpn frame plus the
         // datagram's source address, or a real error (a socket I/O
         // failure, or a malformed/oversized datagram that
         // `wireguard::WgTunnel::decapsulate` rejected outright).
-        match handle.wg_recv().await {
-            Ok((frame, from)) => {
+        match handle.wg_recv_into(&mut recv_buf, &mut frame).await {
+            Ok(from) => {
                 consecutive_failures = 0;
                 handle_incoming(
                     idx,
@@ -2601,7 +2600,7 @@ async fn handle_incoming(
     links: &Links,
     scheduler: &Arc<std::sync::Mutex<Scheduler>>,
     tun: &Arc<AsyncDevice>,
-    reorder: &Arc<AsyncMutex<ReorderBuffer>>,
+    reorder: &Arc<SharedReorder>,
     fec_recovery: &Arc<AsyncMutex<fec::FecRecoveryBuffer>>,
     fec_recovered_total: &Arc<AtomicU64>,
     fec_unrecoverable_total: &Arc<AtomicU64>,
@@ -2626,10 +2625,10 @@ async fn handle_incoming(
     let Ok((hdr, plaintext)) = Header::decode(frame) else {
         return;
     };
-    // Owned copy: several branches below (`ReorderBuffer::insert`, the
-    // `ThroughputTestReverseRequest` spawn) need to hold onto this past
-    // `frame`'s own borrow.
-    let plaintext = plaintext.to_vec();
+    // Borrowed from `frame` (the receive loop's reusable buffer), not
+    // copied: only the branch that must outlive this call
+    // (`ReorderBuffer::insert`) takes an owned copy, and only when it
+    // actually buffers.
     if matches!(
         hdr.ptype,
         PacketType::HandshakeInit | PacketType::HandshakeResp
@@ -2703,7 +2702,7 @@ async fn handle_incoming(
                 // -scope rules.
                 let deliver = {
                     let mut buf = fec_recovery.lock().await;
-                    buf.observe_data(hdr.seq, &plaintext)
+                    buf.observe_data(hdr.seq, plaintext)
                 };
                 if !deliver {
                     return;
@@ -2727,12 +2726,12 @@ async fn handle_incoming(
                 // (invisibly to this module), so there is no longer an
                 // app-level session-change event to reset `peer_primary_link`
                 // on here.
-                reorder.lock().await.note_delivered(hdr.seq);
-                let _ = tun.send(&plaintext).await;
+                reorder.note_delivered(hdr.seq);
+                let _ = tun.send(plaintext).await;
             } else {
                 let ready = {
                     let mut ro = reorder.lock().await;
-                    ro.insert(hdr.seq, plaintext);
+                    ro.insert(hdr.seq, plaintext.to_vec());
                     ro.drain_ready()
                 };
                 for pkt in ready {
@@ -2750,7 +2749,7 @@ async fn handle_incoming(
                 // same way any other unwanted frame type is dropped.
                 return;
             }
-            let Ok(parity) = crate::protocol::FecParityPayload::decode(&plaintext) else {
+            let Ok(parity) = crate::protocol::FecParityPayload::decode(plaintext) else {
                 tracing::debug!("malformed FecParity payload, ignoring");
                 return;
             };
@@ -2763,7 +2762,7 @@ async fn handle_incoming(
                     // delivered the same way a real Data frame with the
                     // same `seq` would have been.
                     if scheduler.lock().unwrap().primary().is_some() {
-                        reorder.lock().await.note_delivered(seq);
+                        reorder.note_delivered(seq);
                         let _ = tun.send(&plaintext).await;
                     } else {
                         let ready = {
@@ -2801,11 +2800,11 @@ async fn handle_incoming(
                 seq: next_send_seq(),
             }
             .encode(&mut out);
-            out.extend_from_slice(&plaintext);
+            out.extend_from_slice(plaintext);
             let _ = handle.wg_send(&out).await;
         }
         PacketType::ProbeReply => {
-            let Ok(probe) = ProbePayload::decode(&plaintext) else {
+            let Ok(probe) = ProbePayload::decode(plaintext) else {
                 return;
             };
             let rtt_ms = {
@@ -2825,14 +2824,14 @@ async fn handle_incoming(
             }
         }
         PacketType::StatsShare => {
-            if let Ok(payload) = StatsPayload::decode(&plaintext) {
+            if let Ok(payload) = StatsPayload::decode(plaintext) {
                 // Keyed by our own idx (the link we received this on),
                 // not anything the sender included -- see StatsPayload's
                 // doc comment for why that's the correct choice here.
                 peer_stats.update(idx as u8, &payload);
             }
         }
-        PacketType::VersionInfo => match VersionInfoPayload::decode(&plaintext) {
+        PacketType::VersionInfo => match VersionInfoPayload::decode(plaintext) {
             Ok(payload) => {
                 *peer_version.lock().unwrap() = Some(payload.version_str());
                 *peer_mtu.lock().unwrap() = Some(payload.tunnel_mtu);
@@ -2849,7 +2848,7 @@ async fn handle_incoming(
             }
         },
         PacketType::ThroughputTestData => {
-            let Ok(data) = ThroughputTestDataPayload::decode(&plaintext) else {
+            let Ok(data) = ThroughputTestDataPayload::decode(plaintext) else {
                 return;
             };
             let mut state = throughput_test_state.lock().await;
@@ -2928,7 +2927,7 @@ async fn handle_incoming(
             }
         }
         PacketType::ThroughputTestResult => {
-            let Ok(result) = ThroughputTestResultPayload::decode(&plaintext) else {
+            let Ok(result) = ThroughputTestResultPayload::decode(plaintext) else {
                 return;
             };
             // The peer measuring a stream *we* sent them -- deliver to
@@ -2939,7 +2938,7 @@ async fn handle_incoming(
             throughput_test_ctx.forward_result(result.test_id, result.achieved_mbps as f64);
         }
         PacketType::ThroughputTestReverseRequest => {
-            let Ok(req) = ThroughputTestReverseRequestPayload::decode(&plaintext) else {
+            let Ok(req) = ThroughputTestReverseRequestPayload::decode(plaintext) else {
                 return;
             };
             let target_mbps = {
@@ -3234,6 +3233,54 @@ async fn send_version_info(
     let _ = handle.wg_send(&frame).await;
 }
 
+/// The high-watermark is stored as `seq + 1` (0 = nothing delivered yet) so
+/// "advance to at least `seq`" is a single `fetch_max`. `seq` comes from
+/// `next_send_seq`, a counter that cannot realistically reach `u64::MAX`.
+fn advance_watermark(wm: &AtomicU64, seq: u64) {
+    wm.fetch_max(seq.saturating_add(1), Ordering::Relaxed);
+}
+
+fn watermark_value(wm: &AtomicU64) -> Option<u64> {
+    wm.load(Ordering::Relaxed).checked_sub(1)
+}
+
+/// `ReorderBuffer` behind its async mutex, plus a lock-free handle to the
+/// buffer's high-watermark. The settled-single-link bypass path delivers
+/// every packet immediately and only needs to advance the watermark; doing
+/// that through the atomic keeps the receive hot path off this mutex (and
+/// off the contention between both links' receiver tasks) whenever the
+/// time-based buffering isn't in use.
+struct SharedReorder {
+    buf: AsyncMutex<ReorderBuffer>,
+    watermark: Arc<AtomicU64>,
+}
+
+impl SharedReorder {
+    fn new(window_ms: u64) -> Self {
+        let buf = ReorderBuffer::new(window_ms);
+        let watermark = buf.high_watermark.clone();
+        Self {
+            buf: AsyncMutex::new(buf),
+            watermark,
+        }
+    }
+
+    fn note_delivered(&self, seq: u64) {
+        advance_watermark(&self.watermark, seq);
+    }
+
+    async fn lock(&self) -> tokio::sync::MutexGuard<'_, ReorderBuffer> {
+        self.buf.lock().await
+    }
+
+    fn try_lock(
+        &self,
+    ) -> std::result::Result<tokio::sync::MutexGuard<'_, ReorderBuffer>, tokio::sync::TryLockError>
+    {
+        self.buf.try_lock()
+    }
+}
+
 /// Holds decrypted, still-possibly-out-of-order Data payloads keyed by the
 /// global session sequence number, and releases them to the TUN device
 /// once either the gap in front of them is filled or they've waited
@@ -3257,7 +3304,7 @@ struct ReorderBuffer {
     /// longer an app-level discontinuity in `seq` for this buffer to
     /// guard against the way the old per-rekey `crypto::Session::next_send_seq`
     /// restarting near zero required.
-    high_watermark: Option<u64>,
+    high_watermark: Arc<AtomicU64>,
     pending: BTreeMap<u64, (tokio::time::Instant, Vec<u8>)>,
 }
 
@@ -3265,7 +3312,7 @@ impl ReorderBuffer {
     fn new(window_ms: u64) -> Self {
         Self {
             window: Duration::from_millis(window_ms),
-            high_watermark: None,
+            high_watermark: Arc::new(AtomicU64::new(0)),
             pending: BTreeMap::new(),
         }
     }
@@ -3282,8 +3329,13 @@ impl ReorderBuffer {
     /// forward-progress frame, WITHOUT touching `pending` -- keeps the
     /// watermark accurate for whenever buffered mode resumes (the
     /// primary goes Down, falling back to multi-link delivery).
-    fn note_delivered(&mut self, seq: u64) {
-        self.high_watermark = Some(self.high_watermark.map_or(seq, |wm| wm.max(seq)));
+    fn note_delivered(&self, seq: u64) {
+        advance_watermark(&self.high_watermark, seq);
+    }
+
+    /// Highest Data `seq` delivered so far, or `None` before any.
+    fn watermark(&self) -> Option<u64> {
+        watermark_value(&self.high_watermark)
     }
 
     /// Current window, in milliseconds -- used by `reorder_tuning_loop`
@@ -3344,12 +3396,12 @@ impl ReorderBuffer {
         let now = tokio::time::Instant::now();
 
         while let Some((&seq, (sent_at, _))) = self.pending.iter().next() {
-            let is_forward_progress = self.high_watermark.is_none_or(|wm| seq > wm);
+            let is_forward_progress = self.watermark().is_none_or(|wm| seq > wm);
             let is_stale = now.duration_since(*sent_at) >= self.window;
             if is_forward_progress || is_stale {
                 let (_sent_at, payload) = self.pending.remove(&seq).unwrap();
                 out.push(payload);
-                self.high_watermark = Some(self.high_watermark.map_or(seq, |wm| wm.max(seq)));
+                self.note_delivered(seq);
             } else {
                 break;
             }
@@ -3358,7 +3410,7 @@ impl ReorderBuffer {
     }
 }
 
-async fn reorder_flush(reorder: Arc<AsyncMutex<ReorderBuffer>>, tun: Arc<AsyncDevice>) {
+async fn reorder_flush(reorder: Arc<SharedReorder>, tun: Arc<AsyncDevice>) {
     let mut tick = interval(Duration::from_millis(10));
     loop {
         tick.tick().await;
@@ -3542,7 +3594,7 @@ fn suggest_reorder_window_ms(
 /// See `ARCHITECTURE.md` §7 for the original design this extends.
 async fn reorder_tuning_loop(
     links: Links,
-    reorder: Arc<AsyncMutex<ReorderBuffer>>,
+    reorder: Arc<SharedReorder>,
     cfg: SchedulerConfig,
     scheduler: Arc<std::sync::Mutex<Scheduler>>,
 ) {
@@ -3652,7 +3704,7 @@ mod reorder_tuning_tests {
         // resumes) would treat it as forward-progress-eligible... but
         // note_delivered itself must not have removed or delivered it:
         // pending still holds it exactly as inserted.
-        assert_eq!(buf.high_watermark, Some(100));
+        assert_eq!(buf.watermark(), Some(100));
         assert_eq!(buf.pending.len(), 1);
         assert!(buf.pending.contains_key(&5));
     }

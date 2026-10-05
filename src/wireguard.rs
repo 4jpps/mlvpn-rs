@@ -83,6 +83,16 @@ pub enum DecapsulateOutcome {
     Consumed,
 }
 
+/// Result of `WgTunnel::decapsulate_into`: like `DecapsulateOutcome`, except
+/// a decrypted frame was written into the caller's buffer rather than
+/// returned by value.
+#[derive(Debug)]
+pub enum DecapsulateKind {
+    Frame,
+    SendReply(Vec<u8>),
+    Consumed,
+}
+
 /// Minimal synthetic IPv4 header prepended to every plaintext frame before
 /// it's handed to `boringtun`, and stripped back off on receive -- see
 /// this module's own doc comment above for why this exists. `pub` so
@@ -129,43 +139,49 @@ const MAX_WG_PACKET: usize = u16::MAX as usize + 64;
 /// plus a 16-byte Poly1305 AEAD tag.
 pub const WG_OVERHEAD_BYTES: u32 = 32;
 
-/// Wraps `plaintext` in a minimal fake IPv4 header so it survives
-/// boringtun's receive-side IP-packet validation (see module doc).
-fn wrap_fake_ipv4(plaintext: &[u8]) -> Result<Vec<u8>> {
-    let total_len = FAKE_IPV4_HEADER_LEN + plaintext.len();
+/// Writes the minimal fake IPv4 header (see module doc) for a payload of
+/// `payload_len` bytes into `out`, replacing its previous contents. The
+/// caller appends the payload itself right after, so the whole wrapped
+/// packet is assembled in one reusable buffer with no intermediate `Vec`.
+fn write_fake_ipv4_header(out: &mut Vec<u8>, payload_len: usize) -> Result<()> {
+    let total_len = FAKE_IPV4_HEADER_LEN + payload_len;
     let total_len_u16 = u16::try_from(total_len).map_err(|_| {
         MlvpnError::Protocol(format!(
-            "wg encapsulate: frame too large ({} bytes) to fit boringtun's fake IPv4 wrapper",
-            plaintext.len()
+            "wg encapsulate: frame too large ({payload_len} bytes) to fit boringtun's fake IPv4 wrapper"
         ))
     })?;
 
-    let mut wrapped = Vec::with_capacity(total_len);
-    wrapped.push(0x45); // version 4, IHL 5 (20-byte header, no options)
-    wrapped.push(0x00); // DSCP/ECN
-    wrapped.extend_from_slice(&total_len_u16.to_be_bytes()); // total length
-    wrapped.extend_from_slice(&[0x00, 0x00]); // identification
-    wrapped.extend_from_slice(&[0x00, 0x00]); // flags/fragment offset
-    wrapped.push(64); // TTL, unused, arbitrary
-    wrapped.push(FAKE_IPV4_PROTOCOL);
-    wrapped.extend_from_slice(&[0x00, 0x00]); // header checksum, unchecked by boringtun
-    wrapped.extend_from_slice(&[0, 0, 0, 0]); // source address, unused
-    wrapped.extend_from_slice(&[0, 0, 0, 0]); // destination address, unused
-    debug_assert_eq!(wrapped.len(), FAKE_IPV4_HEADER_LEN);
-    wrapped.extend_from_slice(plaintext);
-    Ok(wrapped)
+    out.clear();
+    out.push(0x45); // version 4, IHL 5 (20-byte header, no options)
+    out.push(0x00); // DSCP/ECN
+    out.extend_from_slice(&total_len_u16.to_be_bytes()); // total length
+    out.extend_from_slice(&[0x00, 0x00]); // identification
+    out.extend_from_slice(&[0x00, 0x00]); // flags/fragment offset
+    out.push(64); // TTL, unused, arbitrary
+    out.push(FAKE_IPV4_PROTOCOL);
+    out.extend_from_slice(&[0x00, 0x00]); // header checksum, unchecked by boringtun
+    out.extend_from_slice(&[0, 0, 0, 0]); // source address, unused
+    out.extend_from_slice(&[0, 0, 0, 0]); // destination address, unused
+    debug_assert_eq!(out.len(), FAKE_IPV4_HEADER_LEN);
+    Ok(())
 }
 
-/// Strips the fake IPv4 header `wrap_fake_ipv4` added, recovering the
-/// original mlvpn frame.
-fn unwrap_fake_ipv4(bytes: &[u8]) -> Result<Vec<u8>> {
-    if bytes.len() < FAKE_IPV4_HEADER_LEN {
-        return Err(MlvpnError::Protocol(format!(
-            "wg decapsulate: decrypted packet ({} bytes) shorter than the fake IPv4 header we always add",
-            bytes.len()
-        )));
-    }
-    Ok(bytes[FAKE_IPV4_HEADER_LEN..].to_vec())
+/// Everything guarded by `WgTunnel`'s one lock: the boringtun state plus the
+/// scratch buffers its calls need. Keeping the scratch under the same lock
+/// (already held for the duration of every encapsulate/decapsulate) means
+/// the hot path allocates and zero-fills nothing per packet.
+struct Inner {
+    tunn: Tunn,
+    /// Wrapped (fake-IPv4 + frame) plaintext being assembled for `encapsulate`.
+    wrap_scratch: Vec<u8>,
+    /// Ciphertext output for `encapsulate`. Only ever grown, never zeroed
+    /// per call.
+    enc_scratch: Vec<u8>,
+    /// `MAX_WG_PACKET`-sized output for `decapsulate`/`tick`, allocated
+    /// once. Needs the full size, not "typical" size: see
+    /// `MAX_WG_PACKET`'s doc comment on boringtun's unauthenticated
+    /// length-check panic.
+    dec_scratch: Vec<u8>,
 }
 
 /// One physical link's independent WireGuard tunnel: its own keypair,
@@ -183,7 +199,7 @@ pub struct WgTunnel {
     // task) whether this is still needed once the real call sites are
     // wired up, or whether a plain `&mut self` is achievable there
     // instead.
-    inner: Mutex<Tunn>,
+    inner: Mutex<Inner>,
     /// Lifetime count of datagrams `decapsulate` rejected outright
     /// (`TunnResult::Err` -- bad MAC, replay-window miss, garbled data,
     /// oversized datagram). This class of loss was previously invisible
@@ -251,7 +267,12 @@ impl WgTunnel {
                   // assumed.
         );
         Ok(Self {
-            inner: Mutex::new(tunn),
+            inner: Mutex::new(Inner {
+                tunn,
+                wrap_scratch: Vec::with_capacity(2048),
+                enc_scratch: vec![0u8; 2048],
+                dec_scratch: vec![0u8; MAX_WG_PACKET],
+            }),
             rejected_total: AtomicU64::new(0),
             substituted_total: AtomicU64::new(0),
         })
@@ -295,7 +316,26 @@ impl WgTunnel {
     /// group's single-erasure recovery budget -- must gate on this bool
     /// rather than on `Ok(..)` alone.
     pub fn encapsulate(&self, plaintext: &[u8]) -> Result<(Vec<u8>, bool)> {
-        let wrapped = wrap_fake_ipv4(plaintext)?;
+        self.encapsulate_parts(&[plaintext])
+    }
+
+    /// Same as `encapsulate`, but the plaintext is the concatenation of
+    /// `parts` -- lets the hot path pass the 12-byte mlvpn header (a stack
+    /// array) and the payload separately instead of first copying both into
+    /// a freshly allocated frame `Vec`.
+    pub fn encapsulate_parts(&self, parts: &[&[u8]]) -> Result<(Vec<u8>, bool)> {
+        let payload_len: usize = parts.iter().map(|p| p.len()).sum();
+        let mut guard = self.inner.lock().unwrap();
+        let Inner {
+            tunn,
+            wrap_scratch,
+            enc_scratch,
+            ..
+        } = &mut *guard;
+        write_fake_ipv4_header(wrap_scratch, payload_len)?;
+        for p in parts {
+            wrap_scratch.extend_from_slice(p);
+        }
         // WG overhead + slack, but never smaller than the largest
         // possible outbound message (a 148-byte handshake initiation,
         // per boringtun's own `Tunn::encapsulate` doc comment) -- a
@@ -303,10 +343,11 @@ impl WgTunnel {
         // a handshake init instead of the actual (usually much smaller)
         // queued frame, and boringtun errors with
         // `DestinationBufferTooSmall` rather than silently truncating.
-        let buf_len = (wrapped.len() + 64).max(148);
-        let mut buf = vec![0u8; buf_len];
-        let mut tunn = self.inner.lock().unwrap();
-        match tunn.encapsulate(&wrapped, &mut buf) {
+        let buf_len = (wrap_scratch.len() + 64).max(148);
+        if enc_scratch.len() < buf_len {
+            enc_scratch.resize(buf_len, 0);
+        }
+        match tunn.encapsulate(wrap_scratch, &mut enc_scratch[..buf_len]) {
             TunnResult::WriteToNetwork(bytes) => {
                 // Message type is a little-endian u32 at offset 0 of every
                 // WireGuard datagram (confirmed against boringtun-0.7.1's
@@ -340,8 +381,26 @@ impl WgTunnel {
 
     /// Feeds one received datagram (raw bytes off the link's UDP socket)
     /// to boringtun. See `DecapsulateOutcome` for the three possible
-    /// results.
+    /// results. Allocating convenience wrapper over `decapsulate_into`.
     pub fn decapsulate(&self, datagram: &[u8]) -> Result<DecapsulateOutcome> {
+        let mut frame = Vec::new();
+        Ok(match self.decapsulate_into(datagram, &mut frame)? {
+            DecapsulateKind::Frame => DecapsulateOutcome::Frame(frame),
+            DecapsulateKind::SendReply(reply) => DecapsulateOutcome::SendReply(reply),
+            DecapsulateKind::Consumed => DecapsulateOutcome::Consumed,
+        })
+    }
+
+    /// Hot-path form of `decapsulate`: a decrypted mlvpn frame is written
+    /// into the caller's reusable `frame_out` (cleared first) instead of a
+    /// fresh `Vec`, and boringtun's own output scratch is the persistent
+    /// one inside this tunnel rather than a zeroed `MAX_WG_PACKET` buffer
+    /// per call.
+    pub fn decapsulate_into(
+        &self,
+        datagram: &[u8],
+        frame_out: &mut Vec<u8>,
+    ) -> Result<DecapsulateKind> {
         // Explicit pre-check, independent of `MAX_WG_PACKET`'s own
         // sizing above: a real UDP datagram can never exceed 65507 bytes
         // (the IPv4 UDP payload ceiling), so this can only ever reject
@@ -360,17 +419,27 @@ impl WgTunnel {
                 MAX_WG_PACKET
             )));
         }
-        let mut buf = vec![0u8; MAX_WG_PACKET];
-        let mut tunn = self.inner.lock().unwrap();
-        match tunn.decapsulate(None, datagram, &mut buf) {
-            TunnResult::Done => Ok(DecapsulateOutcome::Consumed),
+        let mut guard = self.inner.lock().unwrap();
+        let Inner {
+            tunn, dec_scratch, ..
+        } = &mut *guard;
+        match tunn.decapsulate(None, datagram, dec_scratch) {
+            TunnResult::Done => Ok(DecapsulateKind::Consumed),
             TunnResult::Err(e) => {
                 self.rejected_total.fetch_add(1, Ordering::Relaxed);
                 Err(MlvpnError::Protocol(format!("wg decapsulate: {e:?}")))
             }
-            TunnResult::WriteToNetwork(bytes) => Ok(DecapsulateOutcome::SendReply(bytes.to_vec())),
+            TunnResult::WriteToNetwork(bytes) => Ok(DecapsulateKind::SendReply(bytes.to_vec())),
             TunnResult::WriteToTunnelV4(bytes, _) => {
-                Ok(DecapsulateOutcome::Frame(unwrap_fake_ipv4(bytes)?))
+                if bytes.len() < FAKE_IPV4_HEADER_LEN {
+                    return Err(MlvpnError::Protocol(format!(
+                        "wg decapsulate: decrypted packet ({} bytes) shorter than the fake IPv4 header we always add",
+                        bytes.len()
+                    )));
+                }
+                frame_out.clear();
+                frame_out.extend_from_slice(&bytes[FAKE_IPV4_HEADER_LEN..]);
+                Ok(DecapsulateKind::Frame)
             }
             TunnResult::WriteToTunnelV6(_, _) => {
                 // mlvpn's own encapsulate() always sets the fake header's
@@ -391,9 +460,11 @@ impl WgTunnel {
     /// Callers invoke this periodically (a later task wires this to each
     /// link's existing probe-timer cadence).
     pub fn tick(&self) -> Option<Vec<u8>> {
-        let mut buf = vec![0u8; MAX_WG_PACKET];
-        let mut tunn = self.inner.lock().unwrap();
-        match tunn.update_timers(&mut buf) {
+        let mut guard = self.inner.lock().unwrap();
+        let Inner {
+            tunn, dec_scratch, ..
+        } = &mut *guard;
+        match tunn.update_timers(dec_scratch) {
             TunnResult::WriteToNetwork(bytes) => Some(bytes.to_vec()),
             _ => None,
         }
@@ -561,6 +632,13 @@ mod tests {
         assert!(tunnel.tick().is_none());
     }
 
+    fn wrap_fake_ipv4(plaintext: &[u8]) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        write_fake_ipv4_header(&mut out, plaintext.len())?;
+        out.extend_from_slice(plaintext);
+        Ok(out)
+    }
+
     /// Pins the exact fake-IPv4 header bytes for a known plaintext, so a
     /// future `boringtun` version bump (or any refactor of this
     /// function) has something concrete to diff against -- this header
@@ -599,34 +677,75 @@ mod tests {
         );
     }
 
-    /// `wrap_fake_ipv4`/`unwrap_fake_ipv4` round-trip exactly for a
-    /// variety of lengths, including the empty case.
+    /// Frames round-trip exactly through two real tunnels for a variety of
+    /// lengths, whether passed whole (`encapsulate`) or scattered
+    /// (`encapsulate_parts`), and the caller-owned `decapsulate_into`
+    /// buffer is correctly reused (shrinking to a shorter frame leaves no
+    /// stale bytes from the previous, longer one).
     #[test]
-    fn wrap_and_unwrap_fake_ipv4_round_trip() {
-        for plaintext in [&b""[..], &b"x"[..], &b"a longer mlvpn-shaped frame"[..]] {
-            let wrapped = wrap_fake_ipv4(plaintext).unwrap();
-            assert_eq!(wrapped.len(), FAKE_IPV4_HEADER_LEN + plaintext.len());
-            let unwrapped = unwrap_fake_ipv4(&wrapped).unwrap();
-            assert_eq!(unwrapped, plaintext);
+    fn frames_round_trip_whole_scattered_and_through_a_reused_buffer() {
+        let (client_priv, client_pub) = generate_test_keypair();
+        let (server_priv, server_pub) = generate_test_keypair();
+        let client = WgTunnel::new(client_priv, server_pub, true).unwrap();
+        let server = WgTunnel::new(server_priv, client_pub, false).unwrap();
+        let (init, _) = client.encapsulate(b"x").unwrap();
+        let reply = match server.decapsulate(&init).unwrap() {
+            DecapsulateOutcome::SendReply(b) => b,
+            other => panic!("expected SendReply, got {other:?}"),
+        };
+        let ka = match client.decapsulate(&reply).unwrap() {
+            DecapsulateOutcome::SendReply(b) => b,
+            other => panic!("expected SendReply, got {other:?}"),
+        };
+        assert!(matches!(
+            server.decapsulate(&ka).unwrap(),
+            DecapsulateOutcome::Consumed
+        ));
+
+        let mut out = Vec::new();
+        for plaintext in [
+            vec![7u8; 1400],
+            b"x".to_vec(),
+            b"a longer mlvpn-shaped frame".to_vec(),
+            vec![9u8; 3000],
+        ] {
+            let (dg, carried) = client.encapsulate(&plaintext).unwrap();
+            assert!(carried);
+            assert!(matches!(
+                server.decapsulate_into(&dg, &mut out).unwrap(),
+                DecapsulateKind::Frame
+            ));
+            assert_eq!(out, plaintext);
+
+            let split = plaintext.len() / 3;
+            let (dg, carried) = client
+                .encapsulate_parts(&[&plaintext[..split], &plaintext[split..]])
+                .unwrap();
+            assert!(carried);
+            assert!(matches!(
+                server.decapsulate_into(&dg, &mut out).unwrap(),
+                DecapsulateKind::Frame
+            ));
+            assert_eq!(out, plaintext);
         }
     }
 
-    /// `wrap_fake_ipv4`'s total-length field is a `u16`, so anything that
+    /// The fake header's total-length field is a `u16`, so anything that
     /// would push `20 + plaintext.len()` past `u16::MAX` must be rejected
     /// with a clean `Err`, not silently wrap around or panic on the
-    /// `u16::try_from` conversion.
+    /// `u16::try_from` conversion -- both at the helper and through the
+    /// public `encapsulate_parts` entry point, summing across parts.
     #[test]
     fn wrap_fake_ipv4_rejects_oversized_plaintext() {
         let max_ok_len = u16::MAX as usize - FAKE_IPV4_HEADER_LEN; // 65515
         assert!(wrap_fake_ipv4(&vec![0u8; max_ok_len]).is_ok());
         assert!(wrap_fake_ipv4(&vec![0u8; max_ok_len + 1]).is_err());
-    }
 
-    /// `unwrap_fake_ipv4` must reject anything shorter than the header it
-    /// always expects, rather than panicking on the slice index.
-    #[test]
-    fn unwrap_fake_ipv4_rejects_input_shorter_than_the_header() {
-        assert!(unwrap_fake_ipv4(&[0u8; FAKE_IPV4_HEADER_LEN - 1]).is_err());
+        let (priv_key, _pub) = generate_test_keypair();
+        let (_other_priv, other_pub) = generate_test_keypair();
+        let tunnel = WgTunnel::new(priv_key, other_pub, true).unwrap();
+        let half = vec![0u8; max_ok_len / 2 + 1];
+        assert!(tunnel.encapsulate_parts(&[&half, &half]).is_err());
     }
 
     /// `decapsulate` must reject an oversized datagram with a clean

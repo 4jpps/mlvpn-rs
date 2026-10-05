@@ -10,6 +10,15 @@ For implementation detail beyond what's here, read the code -- most
 modules and non-trivial functions have doc comments explaining the
 design, and `ARCHITECTURE.md` covers the system as a whole.
 
+## [Unreleased]
+
+### Changed
+
+- **Per-packet hot-path allocation cleanup (no wire or config change).** Receive previously allocated and zero-filled a fresh ~64 KB scratch buffer for every datagram (`wg_recv`), plus a second buffer inside `WgTunnel::decapsulate`, plus an extra `plaintext.to_vec()` in `handle_incoming`; transmit built a frame `Vec`, a fake-IPv4-wrapped copy, and an encryption buffer per packet. Now `link_receiver` owns one reusable receive buffer and one frame buffer (`Link::wg_recv_into` / `WgTunnel::decapsulate_into`), `WgTunnel` keeps reusable wrap/encrypt/decrypt scratch buffers behind its existing lock, and transmit encapsulates a header + payload pair directly (`encapsulate_parts`, `Header::to_bytes`) without building an intermediate frame. `benches/wg_path.rs` (`cargo bench --bench wg_path`) measures it with a counting allocator: receive goes from ~131 KB and 4 allocations per packet to 0 (about 10x faster for small packets, 6.0 us -> 0.6 us at 100 B), transmit from 5 allocations to 2.
+- **Settled-single-link ("bypass") mode no longer takes the reorder-buffer lock per packet.** The reorder buffer's high watermark is now a shared atomic (`SharedReorder`), so delivering a frame in bypass mode just advances it lock-free.
+
+Measured on a veth pair with no netem (`veth_tcp_selftest`, 4 alternating runs per build): tunnel TCP throughput ~220 -> ~325 Mbps upload and ~257 -> ~337 Mbps download, with far fewer TCP retransmits.
+
 ## [0.7.5] - 2026-09-24
 
 ### Fixed
