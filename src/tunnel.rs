@@ -45,10 +45,13 @@
 //!   quality most needs fresh measurement. Giving the prober its own task
 //!   with its own timer removes that failure mode entirely instead of
 //!   just making it statistically rare.
-//! - one `reorder_flush` task: releases packets from the reorder buffer
-//!   that have waited past `reorder_window_ms`, so a permanently missing
-//!   packet degrades to out-of-order delivery instead of stalling the
-//!   tunnel forever.
+//! - one `rx_pipeline` task: the single owner of the reorder buffer and
+//!   the FEC recovery buffer. Link receivers only decrypt and hand frames
+//!   over a bounded channel (`RxEvent`), so neither structure sits behind
+//!   a lock on the hot path. It also releases packets that have waited
+//!   past `reorder_window_ms` (a permanently missing packet degrades to
+//!   out-of-order delivery instead of stalling the tunnel forever) and
+//!   expires stale FEC groups.
 //! - one `reorder_tuning_loop` task (no-op unless
 //!   `scheduler.auto_tune_reorder_window` is set): periodically re-tunes
 //!   `reorder_window_ms` itself from the live RTT spread across Up
@@ -578,7 +581,12 @@ pub async fn run(
     // completing.
     tracing::info!("tunnel starting; each link will handshake independently");
 
-    let reorder = Arc::new(SharedReorder::new(params.scheduler_cfg.reorder_window_ms));
+    let (rx_pipeline_tx_chan, rx_pipeline_rx) = mpsc::channel::<RxEvent>(RX_PIPELINE_CAPACITY);
+    let rx_pipeline_dropped = Arc::new(AtomicU64::new(0));
+    let rx_pipeline_tx = RxPipelineTx {
+        tx: rx_pipeline_tx_chan,
+        dropped: rx_pipeline_dropped.clone(),
+    };
 
     // Shared across both links (a FEC group's members can arrive on
     // either physical link), same reasoning as `reorder` above. Its own
@@ -586,9 +594,7 @@ pub async fn run(
     // see `fec::PAYLOAD_TTL`'s doc comment for why those are unrelated
     // timescales. Built unconditionally (it is empty and never touched
     // when FEC is disabled) so nothing downstream needs an Option.
-    let fec_recovery = Arc::new(AsyncMutex::new(fec::FecRecoveryBuffer::new(
-        params.scheduler_cfg.fec_group_size,
-    )));
+    let fec_recovery = fec::FecRecoveryBuffer::new(params.scheduler_cfg.fec_group_size);
     let fec_recovered_total = Arc::new(AtomicU64::new(0));
     let fec_unrecoverable_total = Arc::new(AtomicU64::new(0));
 
@@ -708,11 +714,7 @@ pub async fn run(
         {
             let links = links.clone();
             let scheduler = scheduler.clone();
-            let tun = tun.clone();
-            let reorder = reorder.clone();
-            let fec_recovery = fec_recovery.clone();
-            let fec_recovered_total = fec_recovered_total.clone();
-            let fec_unrecoverable_total = fec_unrecoverable_total.clone();
+            let rx_pipeline_tx = rx_pipeline_tx.clone();
             let cfg = params.scheduler_cfg.clone();
             let tracker = tracker.clone();
             let peer_stats = peer_stats.clone();
@@ -733,11 +735,7 @@ pub async fn run(
                     idx,
                     links,
                     scheduler,
-                    tun,
-                    reorder,
-                    fec_recovery,
-                    fec_recovered_total,
-                    fec_unrecoverable_total,
+                    rx_pipeline_tx,
                     cfg,
                     tracker,
                     peer_stats,
@@ -1029,27 +1027,35 @@ pub async fn run(
     }
 
     {
-        let reorder = reorder.clone();
         let tun = tun.clone();
+        let scheduler = scheduler.clone();
+        let reorder_window_ms = params.scheduler_cfg.reorder_window_ms;
+        let fec_enabled = params.scheduler_cfg.fec_enabled;
+        let fec_recovered_total = fec_recovered_total.clone();
+        let fec_unrecoverable_total = fec_unrecoverable_total.clone();
         handles.push(tokio::spawn(async move {
-            reorder_flush(reorder, tun).await;
-        }));
-    }
-
-    if params.scheduler_cfg.fec_enabled {
-        let fec_recovery = fec_recovery.clone();
-        handles.push(tokio::spawn(async move {
-            fec_expiry_loop(fec_recovery).await;
+            rx_pipeline(
+                rx_pipeline_rx,
+                tun,
+                scheduler,
+                reorder_window_ms,
+                fec_recovery,
+                fec_enabled,
+                fec_recovered_total,
+                fec_unrecoverable_total,
+                rx_pipeline_dropped,
+            )
+            .await;
         }));
     }
 
     {
         let links = links.clone();
-        let reorder = reorder.clone();
+        let rx_pipeline_tx = rx_pipeline_tx.clone();
         let cfg = params.scheduler_cfg.clone();
         let scheduler = scheduler.clone();
         handles.push(tokio::spawn(async move {
-            reorder_tuning_loop(links, reorder, cfg, scheduler).await;
+            reorder_tuning_loop(links, rx_pipeline_tx, cfg, scheduler).await;
         }));
     }
 
@@ -1742,11 +1748,7 @@ async fn link_receiver(
     idx: usize,
     links: Links,
     scheduler: Arc<std::sync::Mutex<Scheduler>>,
-    tun: Arc<AsyncDevice>,
-    reorder: Arc<SharedReorder>,
-    fec_recovery: Arc<AsyncMutex<fec::FecRecoveryBuffer>>,
-    fec_recovered_total: Arc<AtomicU64>,
-    fec_unrecoverable_total: Arc<AtomicU64>,
+    rx_pipeline: RxPipelineTx,
     cfg: SchedulerConfig,
     tracker: Arc<AsyncMutex<ProbeTracker>>,
     peer_stats: Arc<PeerStatsTable>,
@@ -1787,11 +1789,7 @@ async fn link_receiver(
                     from,
                     &links,
                     &scheduler,
-                    &tun,
-                    &reorder,
-                    &fec_recovery,
-                    &fec_recovered_total,
-                    &fec_unrecoverable_total,
+                    &rx_pipeline,
                     &cfg,
                     &tracker,
                     &peer_stats,
@@ -2836,11 +2834,7 @@ async fn handle_incoming(
     from: SocketAddr,
     links: &Links,
     scheduler: &Arc<std::sync::Mutex<Scheduler>>,
-    tun: &Arc<AsyncDevice>,
-    reorder: &Arc<SharedReorder>,
-    fec_recovery: &Arc<AsyncMutex<fec::FecRecoveryBuffer>>,
-    fec_recovered_total: &Arc<AtomicU64>,
-    fec_unrecoverable_total: &Arc<AtomicU64>,
+    rx_pipeline: &RxPipelineTx,
     cfg: &SchedulerConfig,
     tracker: &Arc<AsyncMutex<ProbeTracker>>,
     peer_stats: &Arc<PeerStatsTable>,
@@ -2908,115 +2902,27 @@ async fn handle_incoming(
 
     match hdr.ptype {
         PacketType::Data => {
-            // Every real Data frame is a potential FEC group member --
-            // this has to run regardless of which delivery branch below
-            // handles the frame next, since `FecRecoveryBuffer` needs to
-            // see every arriving member to ever recover a *different*
-            // missing one later.
-            //
-            // Guarded on `cfg.fec_enabled` so a default-config daemon
-            // genuinely pays nothing for a feature it isn't using: with
-            // FEC off this skips a shared async-Mutex acquisition (a
-            // cross-link contention point both `link_receiver` tasks
-            // would otherwise hit on every single packet), a full heap
-            // copy of the plaintext, and a HashMap insert -- on exactly
-            // the hot path v0.6.1-v0.6.4 spent a whole release cycle
-            // stripping per-packet locks out of.
-            //
-            // When it *is* enabled, `observe_data`'s return value is the
-            // duplicate guard: `false` means FEC already reconstructed
-            // and delivered this seq (its parity frame beat the real
-            // copy through a slower link), so delivering it now would
-            // put a byte-identical duplicate IP packet into the TUN
-            // device -- dup-ACKs, spurious fast retransmit, the exact
-            // congestion behavior this feature exists to reduce.
-            if cfg.fec_enabled {
-                // Scoped binding, not an inline condition: the guard is
-                // explicitly dropped before any other lock below is
-                // touched, keeping this module's "every lock
-                // acquisition is a scoped temporary, never nested"
-                // invariant obvious rather than dependent on temporary
-                // -scope rules.
-                let deliver = {
-                    let mut buf = fec_recovery.lock().await;
-                    buf.observe_data(hdr.seq, plaintext)
-                };
-                if !deliver {
-                    return;
-                }
-            }
-            // Cheap, uncontended std::sync::Mutex lock (same pattern
-            // established by this project's earlier select_fast and
-            // reorder_tuning_loop fixes) -- read once per packet, not
-            // cached in a persistent flag, so a mid-stream transition
-            // (the primary going Down or a peer-followed primary
-            // settling) is picked up on the very next packet either
-            // way, correctly.
-            if scheduler.lock().unwrap().primary().is_some() {
-                // Settled single active link: no cross-link reordering
-                // is possible, so skip time-based buffering entirely
-                // and deliver immediately, matching WireGuard's own
-                // architecture for single-path tunnels -- see this
-                // module's doc comment and `ReorderBuffer::note_delivered`'s
-                // own doc comment for the full reasoning. Each link's
-                // own WireGuard session now rekeys entirely internally
-                // (invisibly to this module), so there is no longer an
-                // app-level session-change event to reset `peer_primary_link`
-                // on here.
-                reorder.note_delivered(hdr.seq);
-                let _ = tun.send(plaintext).await;
-            } else {
-                let ready = {
-                    let mut ro = reorder.lock().await;
-                    ro.insert(hdr.seq, plaintext.to_vec());
-                    ro.drain_ready()
-                };
-                for pkt in ready {
-                    let _ = tun.send(&pkt).await;
-                }
-            }
+            // FEC observation, the duplicate guard, reordering and TUN
+            // delivery all live in the single `rx_pipeline` owner, so the
+            // receiving link's task only has to hand the frame over.
+            rx_pipeline.deliver(RxEvent::Data {
+                seq: hdr.seq,
+                plaintext: plaintext.to_vec(),
+            });
         }
         PacketType::FecParity => {
             if !cfg.fec_enabled {
                 // A peer with FEC on talking to a receiver with it off:
-                // nothing here can help (nothing is being observed to
-                // reconstruct against), and running the machinery anyway
-                // would both cost the hot-path lock #2 exists to avoid
-                // and report every group as unrecoverable. Drop it the
-                // same way any other unwanted frame type is dropped.
+                // nothing is being observed to reconstruct against, and
+                // running the machinery anyway would report every group
+                // as unrecoverable. Drop it like any other unwanted frame.
                 return;
             }
             let Ok(parity) = crate::protocol::FecParityPayload::decode(plaintext) else {
                 tracing::debug!("malformed FecParity payload, ignoring");
                 return;
             };
-            let outcome = fec_recovery.lock().await.try_recover(&parity);
-            match outcome {
-                fec::RecoveryOutcome::Recovered { seq, plaintext } => {
-                    fec_recovered_total.fetch_add(1, Ordering::Relaxed);
-                    // Mirrors the Data arm's own settled-primary/buffered
-                    // delivery branch exactly -- a recovered frame is
-                    // delivered the same way a real Data frame with the
-                    // same `seq` would have been.
-                    if scheduler.lock().unwrap().primary().is_some() {
-                        reorder.note_delivered(seq);
-                        let _ = tun.send(&plaintext).await;
-                    } else {
-                        let ready = {
-                            let mut ro = reorder.lock().await;
-                            ro.insert(seq, plaintext);
-                            ro.drain_ready()
-                        };
-                        for pkt in ready {
-                            let _ = tun.send(&pkt).await;
-                        }
-                    }
-                }
-                fec::RecoveryOutcome::Unrecoverable => {
-                    fec_unrecoverable_total.fetch_add(1, Ordering::Relaxed);
-                }
-                fec::RecoveryOutcome::AlreadyComplete => {}
-            }
+            rx_pipeline.deliver(RxEvent::Parity(parity));
         }
         PacketType::Probe => {
             // Echo the decrypted probe payload straight back, so the
@@ -3481,43 +3387,6 @@ fn watermark_value(wm: &AtomicU64) -> Option<u64> {
     wm.load(Ordering::Relaxed).checked_sub(1)
 }
 
-/// `ReorderBuffer` behind its async mutex, plus a lock-free handle to the
-/// buffer's high-watermark. The settled-single-link bypass path delivers
-/// every packet immediately and only needs to advance the watermark; doing
-/// that through the atomic keeps the receive hot path off this mutex (and
-/// off the contention between both links' receiver tasks) whenever the
-/// time-based buffering isn't in use.
-struct SharedReorder {
-    buf: AsyncMutex<ReorderBuffer>,
-    watermark: Arc<AtomicU64>,
-}
-
-impl SharedReorder {
-    fn new(window_ms: u64) -> Self {
-        let buf = ReorderBuffer::new(window_ms);
-        let watermark = buf.high_watermark.clone();
-        Self {
-            buf: AsyncMutex::new(buf),
-            watermark,
-        }
-    }
-
-    fn note_delivered(&self, seq: u64) {
-        advance_watermark(&self.watermark, seq);
-    }
-
-    async fn lock(&self) -> tokio::sync::MutexGuard<'_, ReorderBuffer> {
-        self.buf.lock().await
-    }
-
-    fn try_lock(
-        &self,
-    ) -> std::result::Result<tokio::sync::MutexGuard<'_, ReorderBuffer>, tokio::sync::TryLockError>
-    {
-        self.buf.try_lock()
-    }
-}
-
 /// Holds decrypted, still-possibly-out-of-order Data payloads keyed by the
 /// global session sequence number, and releases them to the TUN device
 /// once either the gap in front of them is filled or they've waited
@@ -3541,7 +3410,7 @@ struct ReorderBuffer {
     /// longer an app-level discontinuity in `seq` for this buffer to
     /// guard against the way the old per-rekey `crypto::Session::next_send_seq`
     /// restarting near zero required.
-    high_watermark: Arc<AtomicU64>,
+    high_watermark: AtomicU64,
     pending: BTreeMap<u64, (tokio::time::Instant, Vec<u8>)>,
 }
 
@@ -3549,7 +3418,7 @@ impl ReorderBuffer {
     fn new(window_ms: u64) -> Self {
         Self {
             window: Duration::from_millis(window_ms),
-            high_watermark: Arc::new(AtomicU64::new(0)),
+            high_watermark: AtomicU64::new(0),
             pending: BTreeMap::new(),
         }
     }
@@ -3570,16 +3439,14 @@ impl ReorderBuffer {
         advance_watermark(&self.high_watermark, seq);
     }
 
+    #[cfg(test)]
+    fn window_ms(&self) -> u64 {
+        self.window.as_millis() as u64
+    }
+
     /// Highest Data `seq` delivered so far, or `None` before any.
     fn watermark(&self) -> Option<u64> {
         watermark_value(&self.high_watermark)
-    }
-
-    /// Current window, in milliseconds -- used by `reorder_tuning_loop`
-    /// to compare a freshly suggested value against what's actually in
-    /// effect right now (hysteresis).
-    fn window_ms(&self) -> u64 {
-        self.window.as_millis() as u64
     }
 
     /// Replace the window in effect from this point on. Deliberately
@@ -3647,82 +3514,186 @@ impl ReorderBuffer {
     }
 }
 
-async fn reorder_flush(reorder: Arc<SharedReorder>, tun: Arc<AsyncDevice>) {
-    let mut tick = interval(Duration::from_millis(10));
-    loop {
-        tick.tick().await;
-        // `try_lock`, not `.lock().await`: this tick's only job is to
-        // flush entries that would otherwise sit until they age out
-        // with no new packet arriving to trigger `handle_incoming`'s
-        // own inline `insert` + `drain_ready` (which already does this
-        // same draining on every real Data frame, under the same
-        // lock). Under real load, `handle_incoming` already holds this
-        // lock far more often than this 100-times-a-second timer needs
-        // to contend with it -- confirmed live via `strace -f -c` that
-        // per-packet lock contention was the dominant cost in mlvpnd's
-        // wall-clock time (see `Scheduler::select_fast`'s and
-        // `SessionState`'s own doc comments for the two earlier fixes
-        // in this same investigation). Skipping a tick when the lock is
-        // currently held is free: whatever's holding it right now is
-        // either the same drain this tick would have performed, or
-        // about to make the same call fresh from an insert -- the
-        // worst case is a genuinely idle straggler waits one extra
-        // ~10ms tick before its own staleness timeout flushes it,
-        // negligible next to `reorder_window_ms`'s own 10-500ms range.
-        // Requires no changes for settled-single-link bypass mode
-        // (`ReorderBuffer::note_delivered`): bypass-mode packets never go
-        // through `insert`, so this tick's `drain_ready` correctly finds
-        // nothing new to flush while bypass mode is active -- a harmless
-        // no-op, not a bug. Note this only holds once bypass mode has
-        // been active long enough to drain whatever the buffered branch
-        // left in `pending` at the moment of the transition; `pending`
-        // isn't guaranteed empty at the instant bypass mode first
-        // engages.
-        let Ok(mut ro) = reorder.try_lock() else {
-            continue;
-        };
-        let ready = ro.drain_ready();
-        drop(ro);
-        for pkt in ready {
-            let _ = tun.send(&pkt).await;
+/// Capacity of the bounded channel from every `link_receiver` to the
+/// single `rx_pipeline` owner. Sized for a burst across all links while
+/// the owner is busy writing to the TUN device; a full channel drops the
+/// packet and counts it (see `RxPipelineTx::deliver`) rather than
+/// blocking a receiver, which would also stall that link's probe and
+/// control-frame handling.
+const RX_PIPELINE_CAPACITY: usize = 1024;
+
+/// Max events `rx_pipeline` takes from its channel per wakeup.
+const RX_PIPELINE_BATCH: usize = 64;
+
+/// How often `rx_pipeline` flushes aged-out reorder-buffer stragglers.
+const REORDER_FLUSH_INTERVAL: Duration = Duration::from_millis(10);
+
+/// How often `rx_pipeline` runs `FecRecoveryBuffer`'s maintenance pass
+/// (ageing out retained plaintexts, rotating seen-seq generations).
+/// Much slower than the reorder flush: nothing is waiting on it and the
+/// timescales it manages are seconds.
+const FEC_EXPIRY_INTERVAL: Duration = Duration::from_millis(250);
+
+/// How often `rx_pipeline` reports (and resets) its overflow counter.
+const RX_PIPELINE_DROP_REPORT_INTERVAL: Duration = Duration::from_secs(2);
+
+/// What a `link_receiver` hands to the `rx_pipeline` owner. Only frames
+/// that need FEC/reorder/TUN-delivery state go through here; probes,
+/// stats and every other control frame are still handled inline by the
+/// receiving link's own task.
+enum RxEvent {
+    Data { seq: u64, plaintext: Vec<u8> },
+    Parity(crate::protocol::FecParityPayload),
+    SetReorderWindow(u64),
+}
+
+/// Producer half of the receive pipeline, cloned into every
+/// `link_receiver`.
+#[derive(Clone)]
+struct RxPipelineTx {
+    tx: mpsc::Sender<RxEvent>,
+    dropped: Arc<AtomicU64>,
+}
+
+impl RxPipelineTx {
+    /// Non-blocking hand-off. A full channel means the TUN write side is
+    /// slower than the combined links' receive rate; dropping here is the
+    /// same outcome the kernel's socket receive buffer would have had,
+    /// but it keeps this link's task free to answer probes.
+    fn deliver(&self, ev: RxEvent) {
+        if self.tx.try_send(ev).is_err() {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
 
-/// How often `fec_expiry_loop` runs its maintenance pass.
-const FEC_EXPIRY_INTERVAL: Duration = Duration::from_millis(250);
+/// Where the receive pipeline writes delivered packets. The TUN device in
+/// production; a plain channel in unit tests, which can't open a TUN.
+trait RxSink: Send + Sync + 'static {
+    fn send(&self, pkt: &[u8]) -> impl std::future::Future<Output = ()> + Send;
+}
 
-/// Periodically ages out `FecRecoveryBuffer`'s retained plaintexts and
-/// rotates its seen-seq generations. Only spawned when
-/// `scheduler.fec_enabled` is set (see `run`), so a default-config
-/// daemon doesn't even have this task.
+impl RxSink for AsyncDevice {
+    async fn send(&self, pkt: &[u8]) {
+        let _ = AsyncDevice::send(self, pkt).await;
+    }
+}
+
+/// The single owner of all receive-side delivery state: the
+/// `ReorderBuffer`, the `FecRecoveryBuffer`, and the only writer of
+/// received packets to the TUN device. Every link's receiver task feeds
+/// it through one bounded channel, so none of this state needs a lock
+/// and a recovered or reordered frame can never be delivered
+/// concurrently with another link's frame.
 ///
-/// `try_lock()`, not `.lock().await`, for exactly the reason
-/// `reorder_flush` was switched to it in v0.6.4: this lock *is* taken
-/// on the per-packet receive path (`handle_incoming`'s `observe_data`
-/// call, on both links' receiver tasks), so a blocking acquisition here
-/// every 10ms would inject a contention point into the hot path purely
-/// to do housekeeping. Skipping a contended tick is free: everything
-/// this buffer relies on for its memory bound is also enforced inline
-/// on insert (`MAX_PAYLOADS`, `MAX_SEEN_PER_GENERATION`), so a missed
-/// tick only means state is remembered slightly longer.
-///
-/// Cadence is much slower than `reorder_flush`'s 10ms: nothing is
-/// waiting on this (unlike a reorder-buffer straggler, which delays
-/// real delivery), and the timescales it manages are seconds.
-async fn fec_expiry_loop(fec_recovery: Arc<AsyncMutex<fec::FecRecoveryBuffer>>) {
-    let mut tick = interval(FEC_EXPIRY_INTERVAL);
+/// Also performs the periodic maintenance that used to be separate
+/// tasks: flushing reorder stragglers (`REORDER_FLUSH_INTERVAL`) and
+/// expiring FEC state (`FEC_EXPIRY_INTERVAL`, only when FEC is enabled).
+/// Returns only when every sender is dropped, i.e. during shutdown.
+#[allow(clippy::too_many_arguments)]
+async fn rx_pipeline<S: RxSink>(
+    mut rx: mpsc::Receiver<RxEvent>,
+    tun: Arc<S>,
+    scheduler: Arc<std::sync::Mutex<Scheduler>>,
+    reorder_window_ms: u64,
+    mut fec_recovery: fec::FecRecoveryBuffer,
+    fec_enabled: bool,
+    fec_recovered_total: Arc<AtomicU64>,
+    fec_unrecoverable_total: Arc<AtomicU64>,
+    dropped: Arc<AtomicU64>,
+) {
+    let mut reorder = ReorderBuffer::new(reorder_window_ms);
+    let mut flush_tick = interval(REORDER_FLUSH_INTERVAL);
+    let mut fec_tick = interval(FEC_EXPIRY_INTERVAL);
+    let mut report_tick = interval(RX_PIPELINE_DROP_REPORT_INTERVAL);
+    let mut batch: Vec<RxEvent> = Vec::with_capacity(RX_PIPELINE_BATCH);
     loop {
-        tick.tick().await;
-        if let Ok(mut buf) = fec_recovery.try_lock() {
-            buf.tick(Instant::now());
+        tokio::select! {
+            n = rx.recv_many(&mut batch, RX_PIPELINE_BATCH) => {
+                if n == 0 {
+                    return;
+                }
+                for ev in batch.drain(..) {
+                    match ev {
+                        RxEvent::Data { seq, plaintext } => {
+                            // `observe_data`'s `false` means FEC already
+                            // reconstructed and delivered this seq (its
+                            // parity frame beat the real copy through a
+                            // slower link); delivering it again would put
+                            // a byte-identical duplicate IP packet into
+                            // the TUN device.
+                            if fec_enabled && !fec_recovery.observe_data(seq, &plaintext) {
+                                continue;
+                            }
+                            rx_deliver(&*tun, &scheduler, &mut reorder, seq, plaintext).await;
+                        }
+                        RxEvent::Parity(parity) => match fec_recovery.try_recover(&parity) {
+                            fec::RecoveryOutcome::Recovered { seq, plaintext } => {
+                                fec_recovered_total.fetch_add(1, Ordering::Relaxed);
+                                rx_deliver(&*tun, &scheduler, &mut reorder, seq, plaintext).await;
+                            }
+                            fec::RecoveryOutcome::Unrecoverable => {
+                                fec_unrecoverable_total.fetch_add(1, Ordering::Relaxed);
+                            }
+                            fec::RecoveryOutcome::AlreadyComplete => {}
+                        },
+                        RxEvent::SetReorderWindow(ms) => reorder.set_window(ms),
+                    }
+                }
+            }
+            _ = flush_tick.tick() => {
+                // Flushes entries that would otherwise sit until they age
+                // out with no new packet arriving to trigger the inline
+                // `insert` + `drain_ready` in `rx_deliver`.
+                for pkt in reorder.drain_ready() {
+                    tun.send(&pkt).await;
+                }
+            }
+            _ = fec_tick.tick(), if fec_enabled => {
+                fec_recovery.tick(Instant::now());
+            }
+            _ = report_tick.tick() => {
+                let n = dropped.swap(0, Ordering::Relaxed);
+                if n > 0 {
+                    tracing::warn!(
+                        dropped_packets = n,
+                        window_secs = RX_PIPELINE_DROP_REPORT_INTERVAL.as_secs(),
+                        queue_capacity = RX_PIPELINE_CAPACITY,
+                        "receive pipeline overflowed: writing received packets to the TUN device is falling behind the links' receive rate, so packets were dropped here"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Delivers one Data frame (real or FEC-recovered) to the TUN device:
+/// immediately when a single link is the settled primary (no cross-link
+/// reordering is possible, matching WireGuard's own single-path
+/// architecture -- see `ReorderBuffer::note_delivered`), otherwise via
+/// the reorder buffer. The primary check is read once per packet, not
+/// cached, so a mid-stream transition is picked up on the very next one.
+async fn rx_deliver<S: RxSink>(
+    tun: &S,
+    scheduler: &std::sync::Mutex<Scheduler>,
+    reorder: &mut ReorderBuffer,
+    seq: u64,
+    plaintext: Vec<u8>,
+) {
+    if scheduler.lock().unwrap().primary().is_some() {
+        reorder.note_delivered(seq);
+        tun.send(&plaintext).await;
+    } else {
+        reorder.insert(seq, plaintext);
+        for pkt in reorder.drain_ready() {
+            tun.send(&pkt).await;
         }
     }
 }
 
 /// How often `reorder_tuning_loop` re-evaluates the reorder window.
-/// Deliberately much slower than the probe interval or `reorder_flush`'s
-/// own 10ms tick -- this is tuning a *policy* parameter from an EWMA
+/// Deliberately much slower than the probe interval or the pipeline's
+/// own 10ms flush tick -- this is tuning a *policy* parameter from an EWMA
 /// that already smooths out single-sample noise, not reacting to
 /// individual packets, so there is nothing to gain from checking more
 /// often than a link's characteristics could plausibly have drifted.
@@ -3831,13 +3802,17 @@ fn suggest_reorder_window_ms(
 /// See `ARCHITECTURE.md` §7 for the original design this extends.
 async fn reorder_tuning_loop(
     links: Links,
-    reorder: Arc<SharedReorder>,
+    rx_pipeline: RxPipelineTx,
     cfg: SchedulerConfig,
     scheduler: Arc<std::sync::Mutex<Scheduler>>,
 ) {
     if !cfg.auto_tune_reorder_window {
         return;
     }
+
+    // This loop is the only thing that ever changes the window, so it
+    // tracks the value in effect locally instead of asking the pipeline.
+    let mut current = cfg.reorder_window_ms;
 
     let mut tick = interval(REORDER_TUNING_INTERVAL);
     loop {
@@ -3855,8 +3830,6 @@ async fn reorder_tuning_loop(
             continue;
         };
 
-        let mut ro = reorder.lock().await;
-        let current = ro.window_ms();
         // Hysteresis: only move if the suggestion differs from the
         // current value by more than 20% of it (minimum 10ms, so a
         // small current window still has a meaningful floor to clear).
@@ -3867,7 +3840,16 @@ async fn reorder_tuning_loop(
                 new_ms = suggested,
                 "auto-tuned reorder_window_ms"
             );
-            ro.set_window(suggested);
+            // Control message, not a droppable packet: wait for room.
+            if rx_pipeline
+                .tx
+                .send(RxEvent::SetReorderWindow(suggested))
+                .await
+                .is_err()
+            {
+                return;
+            }
+            current = suggested;
         }
     }
 }
@@ -4579,5 +4561,189 @@ mod active_bandwidth_prober_tick_tests {
             state_since_after_bounce,
             state_since_before_ramp
         ));
+    }
+}
+
+#[cfg(test)]
+mod rx_pipeline_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[derive(Default)]
+    struct VecSink(std::sync::Mutex<Vec<Vec<u8>>>);
+
+    impl RxSink for VecSink {
+        async fn send(&self, pkt: &[u8]) {
+            self.0.lock().unwrap().push(pkt.to_vec());
+        }
+    }
+
+    struct Harness {
+        tx: RxPipelineTx,
+        sink: Arc<VecSink>,
+        recovered: Arc<AtomicU64>,
+        unrecoverable: Arc<AtomicU64>,
+        dropped: Arc<AtomicU64>,
+    }
+
+    fn spawn_pipeline(window_ms: u64, fec_group: Option<u8>) -> Harness {
+        let (chan_tx, chan_rx) = mpsc::channel(RX_PIPELINE_CAPACITY);
+        let dropped = Arc::new(AtomicU64::new(0));
+        let sink = Arc::new(VecSink::default());
+        let recovered = Arc::new(AtomicU64::new(0));
+        let unrecoverable = Arc::new(AtomicU64::new(0));
+        tokio::spawn(rx_pipeline(
+            chan_rx,
+            sink.clone(),
+            Arc::new(std::sync::Mutex::new(Scheduler::new())),
+            window_ms,
+            fec::FecRecoveryBuffer::new(fec_group.unwrap_or(4)),
+            fec_group.is_some(),
+            recovered.clone(),
+            unrecoverable.clone(),
+            dropped.clone(),
+        ));
+        Harness {
+            tx: RxPipelineTx {
+                tx: chan_tx,
+                dropped: dropped.clone(),
+            },
+            sink,
+            recovered,
+            unrecoverable,
+            dropped,
+        }
+    }
+
+    async fn wait_for_len(sink: &VecSink, want: usize) -> bool {
+        for _ in 0..200 {
+            if sink.0.lock().unwrap().len() >= want {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        false
+    }
+
+    fn seq_of(pkt: &[u8]) -> u64 {
+        u64::from_be_bytes(pkt[..8].try_into().unwrap())
+    }
+
+    /// Several links feeding the pipeline at once: every frame comes out
+    /// exactly once, none lost, none duplicated, regardless of how the
+    /// senders interleave.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_senders_deliver_every_frame_exactly_once() {
+        const SENDERS: u64 = 4;
+        const PER_SENDER: u64 = 200;
+        let h = spawn_pipeline(30, None);
+        let mut joins = Vec::new();
+        for s in 0..SENDERS {
+            let tx = h.tx.tx.clone();
+            joins.push(tokio::spawn(async move {
+                for i in 0..PER_SENDER {
+                    let seq = i * SENDERS + s + 1;
+                    tx.send(RxEvent::Data {
+                        seq,
+                        plaintext: seq.to_be_bytes().to_vec(),
+                    })
+                    .await
+                    .unwrap();
+                    if i % 16 == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                }
+            }));
+        }
+        for j in joins {
+            j.await.unwrap();
+        }
+        let total = (SENDERS * PER_SENDER) as usize;
+        assert!(
+            wait_for_len(&h.sink, total).await,
+            "only {} of {total} frames delivered",
+            h.sink.0.lock().unwrap().len()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let out = h.sink.0.lock().unwrap();
+        assert_eq!(out.len(), total, "duplicate delivery");
+        let seqs: HashSet<u64> = out.iter().map(|p| seq_of(p)).collect();
+        assert_eq!(seqs.len(), total);
+        assert_eq!(h.dropped.load(Ordering::Relaxed), 0);
+    }
+
+    /// A frame older than the high watermark is held back, then released
+    /// by the periodic flush once the reorder window passes -- with no
+    /// further traffic needed to trigger it.
+    #[tokio::test]
+    async fn late_frame_is_flushed_after_window_without_new_traffic() {
+        let h = spawn_pipeline(40, None);
+        for seq in [10u64, 5] {
+            h.tx.deliver(RxEvent::Data {
+                seq,
+                plaintext: seq.to_be_bytes().to_vec(),
+            });
+        }
+        assert!(wait_for_len(&h.sink, 2).await);
+        let out = h.sink.0.lock().unwrap();
+        assert_eq!(seq_of(&out[0]), 10);
+        assert_eq!(seq_of(&out[1]), 5);
+    }
+
+    /// FEC reconstructs a missing member; the real copy arriving later
+    /// through a slower link must not be delivered a second time.
+    #[tokio::test]
+    async fn fec_recovered_frame_is_not_delivered_twice() {
+        let h = spawn_pipeline(20, Some(4));
+        let mut sender = fec::FecSender::new(4);
+        let mut parity = None;
+        let frames: Vec<(u64, Vec<u8>)> = (1u64..=4)
+            .map(|seq| {
+                let mut p = seq.to_be_bytes().to_vec();
+                p.extend_from_slice(&[seq as u8; 20]);
+                (seq, p)
+            })
+            .collect();
+        for (seq, p) in &frames {
+            parity = sender.accumulate(*seq, p);
+        }
+        let parity = parity.expect("group of 4 completes parity");
+
+        for (seq, p) in frames.iter().take(3) {
+            h.tx.deliver(RxEvent::Data {
+                seq: *seq,
+                plaintext: p.clone(),
+            });
+        }
+        h.tx.deliver(RxEvent::Parity(parity));
+        assert!(wait_for_len(&h.sink, 4).await);
+        assert_eq!(h.recovered.load(Ordering::Relaxed), 1);
+
+        let (seq4, p4) = frames[3].clone();
+        h.tx.deliver(RxEvent::Data {
+            seq: seq4,
+            plaintext: p4,
+        });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let out = h.sink.0.lock().unwrap();
+        assert_eq!(out.len(), 4, "late real copy was delivered as a duplicate");
+        assert_eq!(h.unrecoverable.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn full_channel_drops_and_counts_instead_of_blocking() {
+        let (tx, _rx) = mpsc::channel(2);
+        let dropped = Arc::new(AtomicU64::new(0));
+        let p = RxPipelineTx {
+            tx,
+            dropped: dropped.clone(),
+        };
+        for seq in 0..5u64 {
+            p.deliver(RxEvent::Data {
+                seq,
+                plaintext: vec![0],
+            });
+        }
+        assert_eq!(dropped.load(Ordering::Relaxed), 3);
     }
 }
