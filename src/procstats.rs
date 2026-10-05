@@ -85,6 +85,70 @@ fn parse_uptime(s: &str) -> Option<u64> {
     Some(secs as u64)
 }
 
+/// The daemon's own resource use, from `/proc/self`. Every field is
+/// `Option` since each file is read and parsed independently.
+#[derive(Debug, Clone, Default)]
+pub struct ProcessStats {
+    /// utime + stime, in clock ticks (`sysconf(_SC_CLK_TCK)` per second).
+    pub cpu_ticks: Option<u64>,
+    pub rss_kb: Option<u64>,
+    pub threads: Option<u64>,
+    pub open_fds: Option<u64>,
+}
+
+pub fn clock_ticks_per_sec() -> u64 {
+    // SAFETY: sysconf has no preconditions.
+    let v = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if v > 0 {
+        v as u64
+    } else {
+        100
+    }
+}
+
+pub fn read_process_stats() -> ProcessStats {
+    let (cpu_ticks, threads) = std::fs::read_to_string("/proc/self/stat")
+        .ok()
+        .and_then(|s| parse_self_stat(&s))
+        .map_or((None, None), |(c, t)| (Some(c), Some(t)));
+    let rss_kb = std::fs::read_to_string("/proc/self/statm")
+        .ok()
+        .and_then(|s| parse_statm_rss_pages(&s))
+        .map(|pages| {
+            // SAFETY: sysconf has no preconditions.
+            let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+            let page = if page > 0 { page as u64 } else { 4096 };
+            pages * page / 1024
+        });
+    let open_fds = std::fs::read_dir("/proc/self/fd")
+        .ok()
+        .map(|d| d.count() as u64);
+    ProcessStats {
+        cpu_ticks,
+        rss_kb,
+        threads,
+        open_fds,
+    }
+}
+
+/// `/proc/self/stat` is `pid (comm) state ppid ...`; `comm` may contain
+/// spaces and parentheses, so fields are counted from the *last* `)`.
+/// After it: field 3 is state, utime/stime are fields 14/15 and
+/// num_threads is field 20 (1-based, per proc(5)).
+fn parse_self_stat(s: &str) -> Option<(u64, u64)> {
+    let rest = &s[s.rfind(')')? + 1..];
+    let f: Vec<&str> = rest.split_whitespace().collect();
+    let utime: u64 = f.get(11)?.parse().ok()?;
+    let stime: u64 = f.get(12)?.parse().ok()?;
+    let threads: u64 = f.get(17)?.parse().ok()?;
+    Some((utime + stime, threads))
+}
+
+/// `/proc/self/statm`: size resident shared ... (pages).
+fn parse_statm_rss_pages(s: &str) -> Option<u64> {
+    s.split_whitespace().nth(1)?.parse().ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,5 +210,23 @@ mod tests {
         // that; it only asserts read_system_stats never panics, since
         // the string-based parser tests above already cover correctness.
         let _ = read_system_stats();
+    }
+    #[test]
+    fn self_stat_parses_with_awkward_comm() {
+        let line = "42 (my (weird) name) S 1 42 42 0 -1 4194560 100 0 0 0 7 5 0 0 20 0 9 0 12345 1000 200 rest";
+        assert_eq!(parse_self_stat(line), Some((12, 9)));
+    }
+
+    #[test]
+    fn statm_rss_is_second_field() {
+        assert_eq!(parse_statm_rss_pages("1000 250 10 1 0 5 0\n"), Some(250));
+    }
+
+    #[test]
+    fn live_process_stats_are_populated() {
+        let p = read_process_stats();
+        assert!(p.rss_kb.unwrap_or(0) > 0);
+        assert!(p.threads.unwrap_or(0) >= 1);
+        assert!(p.open_fds.unwrap_or(0) >= 3);
     }
 }

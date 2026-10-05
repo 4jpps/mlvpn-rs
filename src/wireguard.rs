@@ -67,6 +67,7 @@ use boringtun::noise::{Tunn, TunnResult};
 use boringtun::x25519;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::time::Duration;
 
 /// The outcome of feeding one received datagram to `WgTunnel::decapsulate`.
 #[derive(Debug)]
@@ -289,6 +290,13 @@ impl WgTunnel {
     /// `substituted_total`'s doc comment.
     pub fn substituted_count(&self) -> u64 {
         self.substituted_total.load(Ordering::Relaxed)
+    }
+
+    /// Time since this link's current WireGuard session was established
+    /// (its last completed handshake), or `None` before the first one.
+    /// Resets to near zero on every rekey.
+    pub fn last_handshake_age(&self) -> Option<Duration> {
+        self.inner.lock().unwrap().tunn.time_since_last_handshake()
     }
 
     /// Wraps `plaintext` (mlvpn's own already-serialized frame) into a

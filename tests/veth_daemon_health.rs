@@ -243,6 +243,54 @@ async fn daemon_snapshot_and_log_streaming_report_real_data() {
         "mem_total_kb should be readable from /proc/meminfo on any real Linux host"
     );
 
+    // --- Telemetry: health state, structured events, reorder/rate
+    // counters. `poll_snapshot_until` opens a fresh connection, so the
+    // first snapshot replays the whole event ring.
+    let snapshot = poll_snapshot_until(&client_ctl, Duration::from_secs(15), |s| {
+        s.daemon.telemetry.health == "HEALTHY"
+    })
+    .await
+    .expect("telemetry health never reached HEALTHY with the only link up");
+    assert!(
+        snapshot.daemon.telemetry.tunnel_uptime_secs < 600,
+        "tunnel_uptime_secs should be a small number for a freshly started tunnel"
+    );
+    assert_eq!(snapshot.daemon.telemetry.scheduler_mode, "weighted");
+    assert!(
+        snapshot
+            .new_events
+            .iter()
+            .any(|e| e.kind == "LINK_UP" && e.link.as_deref() == Some("link0")),
+        "expected a LINK_UP event for link0 in the replayed event ring, got: {:?}",
+        snapshot
+            .new_events
+            .iter()
+            .map(|e| e.kind.as_str())
+            .collect::<Vec<_>>()
+    );
+
+    let ns_name = ns_client.name.clone();
+    let pinger = std::thread::spawn(move || {
+        let _ = std::process::Command::new("ip")
+            .args([
+                "netns", "exec", &ns_name, "ping", "-q", "-c", "60", "-i", "0.1",
+            ])
+            .arg(SERVER_TUNNEL_HOST)
+            .output();
+    });
+    let snapshot = poll_snapshot_until(&client_ctl, Duration::from_secs(10), |s| {
+        let r = &s.daemon.telemetry.rates;
+        r.tx_pps > 0.0 && r.rx_pps > 0.0
+    })
+    .await
+    .expect("telemetry rates never became positive while pinging across the tunnel");
+    assert!(snapshot.daemon.telemetry.rates.tx_mbps > 0.0);
+    let _ = pinger.join();
+    assert!(
+        snapshot.daemon.telemetry.process.rss_kb.unwrap_or(0) > 0,
+        "process RSS should be readable from /proc/self/statm"
+    );
+
     // NOTE: this section used to also assert `session_id`/`rekey_count`
     // changed here, same timing pattern as `veth_rekey.rs` (rekey_loop
     // skips its first, immediate tick, so the first real attempt fired

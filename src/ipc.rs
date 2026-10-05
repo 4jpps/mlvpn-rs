@@ -35,6 +35,104 @@ pub struct Snapshot {
     /// for the per-connection `last_log_seq` cursor that makes this a
     /// delta rather than the whole ring resent every tick.
     pub new_log_lines: Vec<LogEntry>,
+    /// Structured events (`events::EventRing`) produced since the
+    /// connected client's last poll -- same per-connection cursor
+    /// delta as `new_log_lines`, but typed and bounded to the
+    /// operationally interesting transitions rather than free text.
+    #[serde(default)]
+    pub new_events: Vec<EventRecord>,
+}
+
+/// One structured daemon event. `kind` and `severity` are strings (not
+/// enums) so a newer daemon's unknown kinds still deserialize in an older
+/// client; `events::EventKind` is the authoritative list.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventRecord {
+    /// Monotonic within one daemon process, starting at 1 -- the cursor
+    /// for delta streaming (see `LogEntry::seq`).
+    pub seq: u64,
+    pub unix_ts_ms: u64,
+    /// "info" | "warn" | "error"
+    pub severity: String,
+    /// SCREAMING_SNAKE_CASE, e.g. "LINK_DOWN".
+    pub kind: String,
+    /// Link name when the event concerns one link.
+    #[serde(default)]
+    pub link: Option<String>,
+    pub message: String,
+    /// Small machine-readable details (counts, old/new values).
+    #[serde(default)]
+    pub fields: std::collections::BTreeMap<String, String>,
+}
+
+/// Derived tunnel-level telemetry the daemon computes once so every
+/// consumer (TUI, web) shows the same answer. All-default (empty
+/// `health`) from an older daemon.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TelemetrySnapshot {
+    /// "STARTING" | "HEALTHY" | "DEGRADED" | "FAILOVER" | "DOWN"
+    pub health: String,
+    pub health_reason: String,
+    pub tunnel_uptime_secs: u64,
+    /// "weighted" | "primary" | "follow-peer" | "redundant"
+    pub scheduler_mode: String,
+    pub fec: FecConfigSnapshot,
+    pub reorder: ReorderSnapshot,
+    pub rates: RateSnapshot,
+    /// Sum of every link's `tx_rerouted_total`.
+    pub reroutes_total: u64,
+    /// Lifetime frames dropped because the receive pipeline's channel
+    /// was full.
+    pub rx_pipeline_dropped_total: u64,
+    pub process: ProcessSnapshot,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FecConfigSnapshot {
+    pub enabled: bool,
+    pub group_size: u8,
+    pub parity: u8,
+    pub placement: String,
+}
+
+/// Receive-side reorder buffer state. `late_total` counts frames that
+/// arrived at or below the delivered high-watermark (genuine cross-link
+/// reordering); `timeout_total` those of them released only because they
+/// aged out of the window; `duplicate_total` a seq arriving again while
+/// its first copy was still buffered.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ReorderSnapshot {
+    pub window_ms: u64,
+    pub depth: u64,
+    pub max_depth: u64,
+    pub wait_recent_us: u64,
+    pub wait_max_us: u64,
+    pub late_total: u64,
+    pub duplicate_total: u64,
+    pub timeout_total: u64,
+}
+
+/// Tunnel (TUN device) throughput over the last sampling interval.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RateSnapshot {
+    pub tx_pps: f64,
+    pub rx_pps: f64,
+    pub tx_mbps: f64,
+    pub rx_mbps: f64,
+}
+
+/// The daemon process itself, as opposed to `SystemSnapshot`'s host view.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProcessSnapshot {
+    pub cpu_pct: Option<f64>,
+    pub rss_kb: Option<u64>,
+    pub threads: Option<u64>,
+    pub open_fds: Option<u64>,
 }
 
 /// One captured log line, INFO-severity or higher (see
@@ -186,6 +284,8 @@ pub struct DaemonSnapshot {
     pub fec_parity_p_sent_total: u64,
     #[serde(default)]
     pub fec_parity_q_sent_total: u64,
+    #[serde(default)]
+    pub telemetry: TelemetrySnapshot,
 }
 
 /// Host-wide load/memory/uptime, independent of anything tunnel- or
@@ -638,6 +738,11 @@ mod tests {
             local_tunnel_mtu: 1420,
             peer_tunnel_mtu: Some(1420),
             peer_applied_tunnel_mtu: Some(1420),
+            telemetry: TelemetrySnapshot {
+                health: "DEGRADED".to_string(),
+                reroutes_total: 3,
+                ..Default::default()
+            },
         };
         let json = serde_json::to_string(&snap).expect("serialize");
         let back: DaemonSnapshot = serde_json::from_str(&json).expect("deserialize");
@@ -658,6 +763,8 @@ mod tests {
         assert_eq!(back.system.mem_available_kb, Some(8_192_000));
         assert_eq!(back.local_version, "0.4.5");
         assert_eq!(back.peer_version, Some("0.4.5".to_string()));
+        assert_eq!(back.telemetry.health, "DEGRADED");
+        assert_eq!(back.telemetry.reroutes_total, 3);
         assert_eq!(back.local_tunnel_mtu, 1420);
         assert_eq!(back.peer_tunnel_mtu, Some(1420));
     }

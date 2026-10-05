@@ -583,6 +583,8 @@ pub async fn run(
 
     let (rx_pipeline_tx_chan, rx_pipeline_rx) = mpsc::channel::<RxEvent>(RX_PIPELINE_CAPACITY);
     let rx_pipeline_dropped = Arc::new(AtomicU64::new(0));
+    let rx_stats = Arc::new(crate::telemetry::RxPipelineStats::default());
+    let telemetry = Arc::new(crate::telemetry::Telemetry::new(rx_stats.clone()));
     let rx_pipeline_tx = RxPipelineTx {
         tx: rx_pipeline_tx_chan,
         dropped: rx_pipeline_dropped.clone(),
@@ -790,6 +792,23 @@ pub async fn run(
         }
     }
 
+    {
+        let inputs = crate::telemetry::WatchInputs {
+            links: links.clone(),
+            scheduler: scheduler.clone(),
+            tunnel_name: params.tunnel_name.clone(),
+            outbound_dropped_total: outbound_dropped_total.clone(),
+            fec_recovered_total: fec_recovered_total.clone(),
+            fec_unrecoverable_total: fec_unrecoverable_total.clone(),
+            mtu: live_mtu.clone(),
+            cfg: crate::telemetry::StaticConfig::from_scheduler(&params.scheduler_cfg),
+        };
+        let telemetry = telemetry.clone();
+        handles.push(tokio::spawn(async move {
+            crate::telemetry::run(telemetry, inputs).await;
+        }));
+    }
+
     if let Some(path) = params.control_socket.clone() {
         let links = links.clone();
         let peer_stats = peer_stats.clone();
@@ -806,6 +825,7 @@ pub async fn run(
         let fec_recovered_total = fec_recovered_total.clone();
         let fec_unrecoverable_total = fec_unrecoverable_total.clone();
         let fec_send_stats = fec_send_stats.clone();
+        let telemetry = telemetry.clone();
         handles.push(tokio::spawn(async move {
             control::serve(
                 path,
@@ -824,6 +844,7 @@ pub async fn run(
                 fec_recovered_total,
                 fec_unrecoverable_total,
                 fec_send_stats,
+                telemetry,
             )
             .await;
         }));
@@ -849,6 +870,7 @@ pub async fn run(
             fec_recovered_total: fec_recovered_total.clone(),
             fec_unrecoverable_total: fec_unrecoverable_total.clone(),
             fec_send_stats: fec_send_stats.clone(),
+            telemetry: telemetry.clone(),
         };
         handles.push(tokio::spawn(async move {
             // NOTE(task 5): same `SessionMeta`/`session` removal as
@@ -922,6 +944,7 @@ pub async fn run(
             fec_recovered_total: fec_recovered_total.clone(),
             fec_unrecoverable_total: fec_unrecoverable_total.clone(),
             fec_send_stats: fec_send_stats.clone(),
+            telemetry: telemetry.clone(),
         };
         handles.push(tokio::spawn(async move {
             control::diagnostics_watch_loop(watch, links, diag_ctx).await;
@@ -1060,6 +1083,7 @@ pub async fn run(
                 fec_recovered_total,
                 fec_unrecoverable_total,
                 rx_pipeline_dropped,
+                rx_stats,
             )
             .await;
         }));
@@ -3641,6 +3665,26 @@ struct ReorderBuffer {
     /// restarting near zero required.
     high_watermark: AtomicU64,
     pending: BTreeMap<u64, (tokio::time::Instant, Vec<u8>)>,
+    counters: ReorderCounters,
+}
+
+/// Lifetime reorder-buffer observations, plain integers because the
+/// buffer is owned by the single `rx_pipeline` task; `publish` copies
+/// them into the shared `RxPipelineStats` on the pipeline's flush tick.
+#[derive(Default)]
+struct ReorderCounters {
+    /// Frames inserted at or below the delivered watermark (genuine
+    /// cross-link reordering).
+    late: u64,
+    /// A seq inserted again while its first copy was still buffered.
+    duplicate: u64,
+    /// Late frames released only because they aged out of the window.
+    timeout: u64,
+    /// EWMA (alpha 1/8) and lifetime peak of how long a buffered frame
+    /// waited before delivery, in microseconds.
+    wait_recent_us: u64,
+    wait_max_us: u64,
+    max_depth: u64,
 }
 
 impl ReorderBuffer {
@@ -3649,7 +3693,26 @@ impl ReorderBuffer {
             window: Duration::from_millis(window_ms),
             high_watermark: AtomicU64::new(0),
             pending: BTreeMap::new(),
+            counters: ReorderCounters::default(),
         }
+    }
+
+    fn publish(&self, stats: &crate::telemetry::RxPipelineStats) {
+        let c = &self.counters;
+        stats
+            .window_ms
+            .store(self.window.as_millis() as u64, Ordering::Relaxed);
+        stats
+            .depth
+            .store(self.pending.len() as u64, Ordering::Relaxed);
+        stats.max_depth.store(c.max_depth, Ordering::Relaxed);
+        stats
+            .wait_recent_us
+            .store(c.wait_recent_us, Ordering::Relaxed);
+        stats.wait_max_us.store(c.wait_max_us, Ordering::Relaxed);
+        stats.late_total.store(c.late, Ordering::Relaxed);
+        stats.duplicate_total.store(c.duplicate, Ordering::Relaxed);
+        stats.timeout_total.store(c.timeout, Ordering::Relaxed);
     }
 
     /// Bypass-mode counterpart to `insert`+`drain_ready`: used when
@@ -3690,8 +3753,17 @@ impl ReorderBuffer {
     }
 
     fn insert(&mut self, seq: u64, payload: Vec<u8>) {
-        self.pending
-            .insert(seq, (tokio::time::Instant::now(), payload));
+        if self.watermark().is_some_and(|wm| seq <= wm) {
+            self.counters.late += 1;
+        }
+        if self
+            .pending
+            .insert(seq, (tokio::time::Instant::now(), payload))
+            .is_some()
+        {
+            self.counters.duplicate += 1;
+        }
+        self.counters.max_depth = self.counters.max_depth.max(self.pending.len() as u64);
     }
 
     /// Drain everything now safe to deliver.
@@ -3732,7 +3804,14 @@ impl ReorderBuffer {
             let is_forward_progress = self.watermark().is_none_or(|wm| seq > wm);
             let is_stale = now.duration_since(*sent_at) >= self.window;
             if is_forward_progress || is_stale {
-                let (_sent_at, payload) = self.pending.remove(&seq).unwrap();
+                let (sent_at, payload) = self.pending.remove(&seq).unwrap();
+                if !is_forward_progress {
+                    self.counters.timeout += 1;
+                }
+                let waited_us = now.duration_since(sent_at).as_micros() as u64;
+                let c = &mut self.counters;
+                c.wait_recent_us = c.wait_recent_us - c.wait_recent_us / 8 + waited_us / 8;
+                c.wait_max_us = c.wait_max_us.max(waited_us);
                 out.push(payload);
                 self.note_delivered(seq);
             } else {
@@ -3830,6 +3909,7 @@ async fn rx_pipeline<S: RxSink>(
     fec_recovered_total: Arc<AtomicU64>,
     fec_unrecoverable_total: Arc<AtomicU64>,
     dropped: Arc<AtomicU64>,
+    stats: Arc<crate::telemetry::RxPipelineStats>,
 ) {
     let mut reorder = ReorderBuffer::new(reorder_window_ms);
     let mut flush_tick = interval(REORDER_FLUSH_INTERVAL);
@@ -3888,6 +3968,7 @@ async fn rx_pipeline<S: RxSink>(
                 for pkt in reorder.drain_ready() {
                     tun.send(&pkt).await;
                 }
+                reorder.publish(&stats);
             }
             _ = fec_tick.tick(), if fec_enabled => {
                 let given_up = fec_recovery.tick(Instant::now());
@@ -3898,6 +3979,7 @@ async fn rx_pipeline<S: RxSink>(
             _ = report_tick.tick() => {
                 let n = dropped.swap(0, Ordering::Relaxed);
                 if n > 0 {
+                    stats.dropped_total.fetch_add(n, Ordering::Relaxed);
                     tracing::warn!(
                         dropped_packets = n,
                         window_secs = RX_PIPELINE_DROP_REPORT_INTERVAL.as_secs(),
@@ -4932,6 +5014,7 @@ mod rx_pipeline_tests {
             recovered.clone(),
             unrecoverable.clone(),
             dropped.clone(),
+            Arc::new(crate::telemetry::RxPipelineStats::default()),
         ));
         Harness {
             tx: RxPipelineTx {

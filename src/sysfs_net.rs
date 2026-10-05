@@ -19,13 +19,15 @@ use std::path::Path;
 pub struct TunIfaceStats {
     pub rx_bytes: Option<u64>,
     pub tx_bytes: Option<u64>,
+    pub rx_packets: Option<u64>,
+    pub tx_packets: Option<u64>,
     pub rx_errors: Option<u64>,
     pub tx_errors: Option<u64>,
     pub rx_dropped: Option<u64>,
     pub tx_dropped: Option<u64>,
 }
 
-/// Reads all six counters for `iface`. Never panics -- a torn-down or
+/// Reads all eight counters for `iface`. Never panics -- a torn-down or
 /// renamed interface (or an environment without sysfs) just yields a
 /// `TunIfaceStats` full of `None`s.
 pub fn read_tun_stats(iface: &str) -> TunIfaceStats {
@@ -33,6 +35,8 @@ pub fn read_tun_stats(iface: &str) -> TunIfaceStats {
     TunIfaceStats {
         rx_bytes: read_counter(&base, "rx_bytes"),
         tx_bytes: read_counter(&base, "tx_bytes"),
+        rx_packets: read_counter(&base, "rx_packets"),
+        tx_packets: read_counter(&base, "tx_packets"),
         rx_errors: read_counter(&base, "rx_errors"),
         tx_errors: read_counter(&base, "tx_errors"),
         rx_dropped: read_counter(&base, "rx_dropped"),
@@ -57,6 +61,8 @@ mod tests {
         let stats = read_tun_stats("mlvpn-definitely-does-not-exist-0");
         assert_eq!(stats.rx_bytes, None);
         assert_eq!(stats.tx_bytes, None);
+        assert_eq!(stats.rx_packets, None);
+        assert_eq!(stats.tx_packets, None);
         assert_eq!(stats.rx_errors, None);
         assert_eq!(stats.tx_errors, None);
         assert_eq!(stats.rx_dropped, None);

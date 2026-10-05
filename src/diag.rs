@@ -121,6 +121,44 @@ pub fn format_dump(snapshot: &Snapshot, trigger: &str) -> String {
         "fec_sent: groups={} parity_p={} parity_q={}\n",
         d.fec_groups_sent_total, d.fec_parity_p_sent_total, d.fec_parity_q_sent_total
     ));
+    let t = &d.telemetry;
+    out.push_str(&format!(
+        "health: {} ({}) tunnel_uptime_secs={} scheduler={}\n",
+        t.health, t.health_reason, t.tunnel_uptime_secs, t.scheduler_mode
+    ));
+    out.push_str(&format!(
+        "fec_config: enabled={} group_size={} parity={} placement={}\n",
+        t.fec.enabled, t.fec.group_size, t.fec.parity, t.fec.placement
+    ));
+    out.push_str(&format!(
+        "reorder: window_ms={} depth={} max_depth={} wait_recent_us={} wait_max_us={} \
+         late={} duplicate={} timeout={}\n",
+        t.reorder.window_ms,
+        t.reorder.depth,
+        t.reorder.max_depth,
+        t.reorder.wait_recent_us,
+        t.reorder.wait_max_us,
+        t.reorder.late_total,
+        t.reorder.duplicate_total,
+        t.reorder.timeout_total
+    ));
+    out.push_str(&format!(
+        "rates: tx={:.1} pps / {:.2} Mbps rx={:.1} pps / {:.2} Mbps reroutes_total={} \
+         rx_pipeline_dropped_total={}\n",
+        t.rates.tx_pps,
+        t.rates.tx_mbps,
+        t.rates.rx_pps,
+        t.rates.rx_mbps,
+        t.reroutes_total,
+        t.rx_pipeline_dropped_total
+    ));
+    out.push_str(&format!(
+        "process: cpu_pct={} rss_kb={} threads={} open_fds={}\n",
+        fmt_opt_f64(t.process.cpu_pct),
+        fmt_opt_u64(t.process.rss_kb),
+        fmt_opt_u64(t.process.threads),
+        fmt_opt_u64(t.process.open_fds)
+    ));
     out.push_str(&format!(
         "tun({}): rx_bytes={} tx_bytes={} rx_errors={} tx_errors={} rx_dropped={} \
          tx_dropped={}\n",
@@ -141,6 +179,25 @@ pub fn format_dump(snapshot: &Snapshot, trigger: &str) -> String {
         fmt_opt_u64(d.system.mem_available_kb),
         fmt_opt_u64(d.system.uptime_secs),
     ));
+
+    out.push_str(&format!(
+        "--- Recent events ({}) ---\n",
+        snapshot.new_events.len()
+    ));
+    for ev in &snapshot.new_events {
+        out.push_str(&format!(
+            "[{}] {} {}{}: {}\n",
+            ev.unix_ts_ms,
+            ev.severity,
+            ev.kind,
+            ev.link
+                .as_deref()
+                .map(|l| format!(" link={l}"))
+                .unwrap_or_default(),
+            ev.message,
+        ));
+    }
+    out.push('\n');
 
     out.push_str(&format!(
         "--- Recent log lines ({}) ---\n",
@@ -288,8 +345,10 @@ mod tests {
                 local_tunnel_mtu: 1420,
                 peer_tunnel_mtu: Some(1420),
                 peer_applied_tunnel_mtu: Some(1420),
+                telemetry: Default::default(),
             },
             new_log_lines: Vec::new(),
+            new_events: Vec::new(),
         }
     }
 

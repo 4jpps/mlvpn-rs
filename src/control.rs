@@ -84,6 +84,7 @@ pub(crate) async fn serve(
     fec_recovered_total: Arc<AtomicU64>,
     fec_unrecoverable_total: Arc<AtomicU64>,
     fec_send_stats: Arc<crate::fec::FecSendStats>,
+    telemetry: Arc<crate::telemetry::Telemetry>,
 ) {
     if let Some(parent) = path.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
@@ -178,6 +179,7 @@ pub(crate) async fn serve(
         let fec_recovered_total = fec_recovered_total.clone();
         let fec_unrecoverable_total = fec_unrecoverable_total.clone();
         let fec_send_stats = fec_send_stats.clone();
+        let telemetry = telemetry.clone();
         tokio::spawn(async move {
             serve_client(
                 stream,
@@ -196,6 +198,7 @@ pub(crate) async fn serve(
                 fec_recovered_total,
                 fec_unrecoverable_total,
                 fec_send_stats,
+                telemetry,
             )
             .await;
         });
@@ -220,6 +223,7 @@ async fn serve_client(
     fec_recovered_total: Arc<AtomicU64>,
     fec_unrecoverable_total: Arc<AtomicU64>,
     fec_send_stats: Arc<crate::fec::FecSendStats>,
+    telemetry: Arc<crate::telemetry::Telemetry>,
 ) {
     let mut tick = interval(Duration::from_millis(SNAPSHOT_INTERVAL_MS));
     // Per-connection cursor into `log_ring` -- each connected client
@@ -228,9 +232,10 @@ async fn serve_client(
     // `seq`s start at 1, making 0 mean "nothing sent yet" rather than
     // needing an `Option<u64>` here).
     let mut last_log_seq = 0u64;
+    let mut last_event_seq = 0u64;
     loop {
         tick.tick().await;
-        let (snapshot, new_last_log_seq) = build_snapshot(
+        let (snapshot, new_last_log_seq, new_last_event_seq) = build_snapshot(
             &links,
             &peer_stats,
             &tunnel_name,
@@ -247,9 +252,12 @@ async fn serve_client(
             &fec_recovered_total,
             &fec_unrecoverable_total,
             &fec_send_stats,
+            &telemetry,
+            last_event_seq,
         )
         .await;
         last_log_seq = new_last_log_seq;
+        last_event_seq = new_last_event_seq;
         let Ok(mut line) = serde_json::to_vec(&snapshot) else {
             continue;
         };
@@ -278,7 +286,9 @@ async fn build_snapshot(
     fec_recovered_total: &AtomicU64,
     fec_unrecoverable_total: &AtomicU64,
     fec_send_stats: &crate::fec::FecSendStats,
-) -> (Snapshot, u64) {
+    telemetry: &crate::telemetry::Telemetry,
+    last_event_seq: u64,
+) -> (Snapshot, u64, u64) {
     let snap = link::snapshot_links(links).await;
     // `Scheduler::primary()` returns `None` under plain SWRR (no single
     // primary concept there) -- every link's `is_primary` is correctly
@@ -377,6 +387,8 @@ async fn build_snapshot(
 
     let new_log_lines = log_ring.entries_since(last_log_seq);
     let new_last_log_seq = new_log_lines.last().map(|e| e.seq).unwrap_or(last_log_seq);
+    let new_events = telemetry.events.entries_since(last_event_seq);
+    let new_last_event_seq = new_events.last().map(|e| e.seq).unwrap_or(last_event_seq);
 
     let snapshot = Snapshot {
         tunnel_name: tunnel_name.to_string(),
@@ -419,11 +431,13 @@ async fn build_snapshot(
             local_tunnel_mtu: mtu.load(Ordering::Relaxed),
             peer_tunnel_mtu: *peer_mtu.lock().unwrap(),
             peer_applied_tunnel_mtu: *peer_live_mtu.lock().unwrap(),
+            telemetry: telemetry.current(),
         },
         new_log_lines,
+        new_events,
     };
 
-    (snapshot, new_last_log_seq)
+    (snapshot, new_last_log_seq, new_last_event_seq)
 }
 
 /// Bundles the pieces `apply_command`'s `Command::DiagDump` handler
@@ -451,6 +465,7 @@ pub(crate) struct DiagContext {
     pub(crate) fec_recovered_total: Arc<AtomicU64>,
     pub(crate) fec_unrecoverable_total: Arc<AtomicU64>,
     pub(crate) fec_send_stats: Arc<crate::fec::FecSendStats>,
+    pub(crate) telemetry: Arc<crate::telemetry::Telemetry>,
 }
 
 /// Bind the command socket and serve `ipc::Command` requests until the
@@ -806,7 +821,7 @@ async fn run_tunnel_throughput_test_command(
 /// short of a bug -- unlike `RunThroughputTest`, nothing here waits on
 /// the peer or can time out).
 async fn run_diag_dump_command(links: &Links, diag_ctx: &DiagContext) -> CommandResult {
-    let (snapshot, _) = build_snapshot(
+    let (snapshot, _, _) = build_snapshot(
         links,
         &diag_ctx.peer_stats,
         &diag_ctx.tunnel_name,
@@ -823,6 +838,8 @@ async fn run_diag_dump_command(links: &Links, diag_ctx: &DiagContext) -> Command
         &diag_ctx.fec_recovered_total,
         &diag_ctx.fec_unrecoverable_total,
         &diag_ctx.fec_send_stats,
+        &diag_ctx.telemetry,
+        0,
     )
     .await;
     let text = diag::format_dump(&snapshot, "manual (mlvpnd diag-dump)");
@@ -1266,7 +1283,7 @@ pub(crate) async fn diagnostics_watch_loop(
             }
         }
 
-        let (snapshot, _) = build_snapshot(
+        let (snapshot, _, _) = build_snapshot(
             &links,
             &diag_ctx.peer_stats,
             &diag_ctx.tunnel_name,
@@ -1283,6 +1300,8 @@ pub(crate) async fn diagnostics_watch_loop(
             &diag_ctx.fec_recovered_total,
             &diag_ctx.fec_unrecoverable_total,
             &diag_ctx.fec_send_stats,
+            &diag_ctx.telemetry,
+            0,
         )
         .await;
 

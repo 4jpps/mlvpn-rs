@@ -873,6 +873,13 @@ impl Link {
         self.wg.substituted_count()
     }
 
+    /// Milliseconds since this link's WireGuard session was established,
+    /// `None` before the first handshake -- see
+    /// `WgTunnel::last_handshake_age`.
+    pub fn wg_handshake_age_ms(&self) -> Option<u64> {
+        self.wg.last_handshake_age().map(|d| d.as_millis() as u64)
+    }
+
     /// Bundle this link's shareable state for its per-link tasks
     /// (`link_receiver`, `link_prober` in `tunnel.rs`). See
     /// `LinkHandle`'s doc comment for why tasks capture this once
