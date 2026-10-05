@@ -2,7 +2,7 @@
 
 `mlvpnd` exposes live per-link and daemon/host health over a local Unix
 socket (on by default; see `[control]` in the example configs).
-`mlvpn-tui` connects to it and renders a continuously-updating, tabbed
+`mlvpn-tui` connects to it and renders a continuously-updating terminal
 view:
 
 ```sh
@@ -10,35 +10,52 @@ mlvpn-tui                    # auto-detects the socket under /run/mlvpn
 mlvpn-tui --socket /run/mlvpn/mlvpn0.sock
 ```
 
-- **Overview** -- the default tab at startup: condensed panes from
-  every other tab stacked into one screen (the Links table, a 2x2 grid
-  of the four Daemon panels, and a following Logs tail) so the whole
-  picture is visible -- and screenshot-friendly -- without switching
-  tabs.
-- **Links** -- every bonded link's state, current SWRR score (colored
-  by how much traffic it's actually carrying), how long it's held that
-  state, cumulative tx/rx byte totals, and both this side's own
-  measured RTT/jitter/loss/throughput *and* the peer's self-reported
-  view of the same link (received over the tunnel itself, so one
-  terminal on either end shows the full picture without
-  cross-referencing logs on both machines) -- the loss percentage in
-  each is colored by severity.
-- **Daemon** -- session id/uptime/rekey count, the outbound queue's
-  current depth and lifetime drop count, the TUN interface's own
-  kernel-tracked byte/error/drop counters, and machine-wide load
-  average/memory/uptime (memory-used percentage colored by severity).
-- **Logs** -- a live tail of the daemon's own log output (INFO and
-  above, streamed incrementally over the same control socket), so an
-  operator doesn't need a separate `journalctl -f` window open
-  alongside `mlvpn-tui`.
+A health banner is always on screen: one state, `● HEALTHY`,
+`! DEGRADED`, `↻ FAILOVER`, `× DOWN`, `… STARTING` or `⊘ DISCONNECTED`,
+with a one-line reason, the host name, the tunnel and how long it has
+been up. Every state has a symbol as well as a color, so it still reads
+on a monochrome terminal. The daemon decides the state (see
+`telemetry.rs`); DEGRADED is an overlay (a link not up, congested, at 5%
+loss or more, or a recent loss event), not a link state. DISCONNECTED is
+the one state only the TUI can show: the control socket is gone or has
+stopped updating for 3 seconds, and it takes precedence over whatever
+the last snapshot said.
 
-Switch tabs with `Tab`/`Shift+Tab` or `1`/`2`/`3`/`4`. On the Logs tab,
-`Up`/`Down`/`PageUp`/`PageDown` scroll back through history; scrolling
-back to the newest line (or never having scrolled at all) keeps the
-view pinned to the tail, same as `tail -f`. Press `q` or `Esc` to quit
-from any tab. See [ARCHITECTURE.md](../ARCHITECTURE.md)'s "Monitoring"
-section for the wire/IPC details (`ipc.rs`, `control.rs`,
-`PacketType::StatsShare`, `logbuf.rs`).
+- **1 Overview** -- the default: the Links table, tunnel and reliability
+  summaries, and the most recent events, so the whole picture fits one
+  screenshot.
+- **2 Links** -- a compact table (state, role, how long it has held
+  that state, RTT, jitter, loss, rx/tx, score, and DEG/QF/ERR flags).
+  `Up`/`Down` selects a row and `Enter` opens a detail panel for it:
+  this side's own measurements, the peer's self-reported view of the
+  same link (received over the tunnel itself), totals, the send queue
+  and per-link error counters. `Esc` closes the panel.
+- **3 Traffic** -- tunnel and per-link tx/rx rates as bars, each link's
+  share of tx, and a one-minute sparkline.
+- **4 Reliability** -- FEC (mode, groups and parity sent, frames
+  recovered, unrecoverable groups), the reorder buffer (window, depth,
+  wait, late/duplicate/timed-out frames), and every drop and error
+  counter in one place. Nonzero counters are highlighted, so a clean
+  tunnel is a quiet screen.
+- **5 System** -- host load/memory/uptime, the daemon process (CPU,
+  RSS, threads, open files), the TUN interface's counters, the outbound
+  queue, and version and MTU agreement with the peer.
+- **6 Debug** -- connection details, the structured event list
+  (`LINK_DOWN`, `FEC_UNRECOVERABLE`, ...) and a live tail of the
+  daemon's own log, so a separate `journalctl -f` window isn't needed.
+
+Switch views with `Tab`/`Shift+Tab` or `1`-`6`. On the Debug view,
+`Up`/`Down`/`PageUp`/`PageDown` scroll back through the log; scrolling
+back to the newest line keeps the view pinned to the tail, like
+`tail -f`. `q` quits from any view, and `Esc` quits too (after closing
+an open link detail panel). On a terminal narrower than 80 columns or
+shorter than 20 rows the layout switches to a compact form: no borders,
+fewer table columns, short tab names. Reconnecting to a restarted
+daemon clears the buffered events, logs and history, because the daemon
+replays its rings to every new connection. See
+[ARCHITECTURE.md](../ARCHITECTURE.md)'s "Monitoring" section for the
+wire/IPC details (`ipc.rs`, `control.rs`, `PacketType::StatsShare`,
+`logbuf.rs`, `events.rs`).
 
 The control socket is mode 0600 under `/run/mlvpn` (mode 0750), both
 owned by `mlvpn`. Run `sudo mlvpn-tui`, or add your own account to the
@@ -55,7 +72,7 @@ Auto-detecting (no `--socket` given) with nothing found under
 
 - **Active**: prints a note that it's likely still waiting for the
   remote end to connect, then goes straight to the full-screen view
-  (default Overview tab), which keeps watching `/run/mlvpn` in the
+  (default Overview), which keeps watching `/run/mlvpn` in the
   background and starts populating live the moment the socket appears
   -- no restart needed.
 - **Not running**: offers to start it (`systemctl start mlvpn.service`,

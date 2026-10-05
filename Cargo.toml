@@ -22,7 +22,7 @@ path = "src/main.rs"
 name = "wg_path"
 harness = false
 
-# src/bin/mlvpn-tui.rs is picked up automatically by cargo's default
+# src/bin/mlvpn-tui/main.rs is picked up automatically by cargo's default
 # `autobins` discovery -- no explicit [[bin]] section needed for it.
 
 [profile.release]
@@ -55,7 +55,7 @@ base64 = "0.22"
 boringtun = "0.7"
 hex = "0.4"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
-# Monitoring TUI (src/bin/mlvpn-tui.rs) only -- not used by mlvpnd itself,
+# Monitoring TUI (src/bin/mlvpn-tui/) only -- not used by mlvpnd itself,
 # but cargo builds both binaries from one dependency set regardless.
 #
 # 0.30 (not 0.29): 0.29 pins its internal `lru` dependency to "0.12.0",

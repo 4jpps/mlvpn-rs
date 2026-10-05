@@ -98,10 +98,11 @@ src/
                   and (opt-in) accepts runtime link-control commands
   sysfs_net.rs    TUN interface's own kernel byte/error/drop counters
   procstats.rs    Machine-wide load/memory/uptime from /proc
-  logbuf.rs       In-memory log ring + tracing layer feeding mlvpn-tui's Logs tab
+  logbuf.rs       In-memory log ring + tracing layer feeding mlvpn-tui's Debug view
   firewall.rs     mlvpnd firewall-setup: detects/drives firewalld, ufw,
                   nftables, iptables
-  bin/mlvpn-tui.rs  Terminal monitoring view: Links/Daemon/Logs tabs
+  bin/mlvpn-tui/    Terminal monitoring view: health banner + Overview/Links/
+                    Traffic/Reliability/System/Debug views
                   (see docs/monitoring.md)
 config/          Example client/server TOML configs
 systemd/         Hardened systemd unit

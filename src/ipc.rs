@@ -163,7 +163,7 @@ pub struct LogEntry {
 /// running by the time anything is connected to read this; individual
 /// fields inside `tun`/`system` are `Option` where the underlying
 /// read (sysfs/`/proc`) can fail independently.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DaemonSnapshot {
     // NOTE: `session_id`/`session_uptime_ms`/`rekey_count` were removed
     // here -- they described the old tunnel-wide shared Noise transport
@@ -294,7 +294,7 @@ pub struct DaemonSnapshot {
 /// or low on memory. Every field is `Option` since `/proc/loadavg`,
 /// `/proc/meminfo`, and `/proc/uptime` are read and parsed
 /// independently and any one of them can fail on its own.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SystemSnapshot {
     pub load1: Option<f64>,
     pub load5: Option<f64>,
@@ -311,7 +311,7 @@ pub struct SystemSnapshot {
 /// of the TUN device as a whole). Every counter is `Option` since the
 /// sysfs read can fail independently of everything else in a
 /// `Snapshot` (e.g. the interface was renamed or torn down).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TunSnapshot {
     /// The TUN interface name this data was read for -- same string as
     /// `Snapshot::tunnel_name`, included here too so a viewer never has
@@ -329,7 +329,7 @@ fn default_congestion_factor() -> f64 {
     1.0
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LinkSnapshot {
     pub name: String,
     pub bind_interface: String,
