@@ -125,6 +125,7 @@ struct FecTestRig {
 }
 
 async fn setup_fec_rig(label: &str, scheduler: SchedulerOverrides) -> FecTestRig {
+    let scheduler_fec_enabled = scheduler.fec_enabled;
     require_root();
     require_ip_command();
     require_tc_command();
@@ -133,6 +134,19 @@ async fn setup_fec_rig(label: &str, scheduler: SchedulerOverrides) -> FecTestRig
     let id = unique_id();
     let ns_client = NetNs::create(&format!("mfc{label}c{id}")).expect("create client netns");
     let ns_server = NetNs::create(&format!("mfc{label}s{id}")).expect("create server netns");
+
+    // Kernel IPv6 chatter (router solicitations, MLD reports) written to the
+    // TUN device would be extra Data frames that shift the client's FEC group
+    // boundaries at unpredictable moments; these tests count frames exactly.
+    for ns in [&ns_client, &ns_server] {
+        for scope in ["all", "default"] {
+            ns.exec(
+                "sysctl",
+                &["-q", "-w", &format!("net.ipv6.conf.{scope}.disable_ipv6=1")],
+            )
+            .expect("disable IPv6 in test namespace");
+        }
+    }
 
     let vc0 = format!("mfc0c{id}");
     let vs0 = format!("mfc0s{id}");
@@ -216,6 +230,9 @@ async fn setup_fec_rig(label: &str, scheduler: SchedulerOverrides) -> FecTestRig
     .expect("link0 never reached 'up'");
 
     let ns_client_name = ns_client.name.clone();
+    if scheduler_fec_enabled {
+        align_client_fec_group(&ns_client_name, &client_ctl).await;
+    }
     FecTestRig {
         _ns_client: ns_client,
         ns_client_name,
@@ -226,6 +243,41 @@ async fn setup_fec_rig(label: &str, scheduler: SchedulerOverrides) -> FecTestRig
         server_ctl,
         vc0,
     }
+}
+
+/// Bring the client's FEC accumulator to a group boundary, so the next
+/// ping a test sends is member 1 of a fresh group.
+///
+/// A group closing shows up on the client as exactly one of two counters
+/// moving: `fec_groups_sent_total` (parity went out) or
+/// `fec_unrecoverable_total` (the group held a member that never reached
+/// the wire -- e.g. the frame the WireGuard handshake initiation
+/// replaced -- and was sent without parity, see `FecGate`). Warm-up pings
+/// fill the group until either ticks.
+async fn align_client_fec_group(ns_client: &str, client_ctl: &std::path::Path) {
+    let closed_groups = |s: &mlvpn::ipc::Snapshot| {
+        s.daemon.fec_groups_sent_total + s.daemon.fec_unrecoverable_total
+    };
+    let baseline = closed_groups(
+        &poll_snapshot_until(client_ctl, Duration::from_secs(5), |_| true)
+            .await
+            .expect("read client snapshot"),
+    );
+    for _ in 0..FEC_GROUP_SIZE {
+        let status = ping_once(ns_client, SERVER_TUNNEL_HOST, "2").expect("run warm-up ping");
+        assert!(status.success(), "warm-up ping should succeed");
+        // The group is sealed a moment after its last member resolves;
+        // give the counter a short window to move before the next ping.
+        if poll_snapshot_until(client_ctl, Duration::from_millis(700), |s| {
+            closed_groups(s) > baseline
+        })
+        .await
+        .is_ok()
+        {
+            return;
+        }
+    }
+    panic!("the client's first FEC group never closed during warm-up");
 }
 
 #[tokio::test]
@@ -697,4 +749,275 @@ async fn fec_disabled_by_default_has_no_effect() {
         snapshot.daemon.fec_unrecoverable_total, 0,
         "fec_unrecoverable_total must stay 0 when scheduler.fec_enabled is false"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Loss-pattern matrix (single link).
+//
+// Every case sends exactly one FEC group (`FEC_GROUP_SIZE` pings) and drops a
+// chosen subset of its members on the wire. Dropping uses a size-selective
+// netem so the group's *parity* frames -- always larger than any data frame in
+// the group -- are never caught in the same window; without that, losing the
+// last member would take its own parity with it (parity leaves the worker a
+// few microseconds after the member that closes the group).
+// ---------------------------------------------------------------------------
+
+/// How long loss stays on for one lost member: enough for the ping process to
+/// start and its single echo request to be transmitted (and dropped).
+const LOST_MEMBER_WINDOW: Duration = Duration::from_millis(150);
+
+fn tc_in_ns(ns: &str, args: &[&str]) {
+    let status = Command::new("ip")
+        .args(["netns", "exec", ns, "tc"])
+        .args(args)
+        .status()
+        .expect("run tc");
+    assert!(status.success(), "tc {args:?} failed in {ns}");
+}
+
+fn read_tx_counter(ns: &str, dev: &str, which: &str) -> u64 {
+    let out = Command::new("ip")
+        .args([
+            "netns",
+            "exec",
+            ns,
+            "cat",
+            &format!("/sys/class/net/{dev}/statistics/{which}"),
+        ])
+        .output()
+        .expect("read interface statistics");
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse()
+        .unwrap_or_else(|_| panic!("unparseable {which} for {dev}"))
+}
+
+/// Wire size of one ordinary Data frame (a 56-byte ping). Sends exactly one
+/// group's worth of pings, so the client's group boundary is preserved; the
+/// closing ping also emits parity (two packets) and is excluded from the
+/// sample, as is any ping that raced with a link probe.
+fn measure_data_frame_len(rig: &FecTestRig) -> u64 {
+    let mut smallest = None;
+    for _ in 0..FEC_GROUP_SIZE {
+        let p0 = read_tx_counter(&rig.ns_client_name, &rig.vc0, "tx_packets");
+        let b0 = read_tx_counter(&rig.ns_client_name, &rig.vc0, "tx_bytes");
+        let status = ping_once(&rig.ns_client_name, SERVER_TUNNEL_HOST, "2").expect("run ping");
+        assert!(status.success(), "measurement ping should succeed");
+        let p1 = read_tx_counter(&rig.ns_client_name, &rig.vc0, "tx_packets");
+        let b1 = read_tx_counter(&rig.ns_client_name, &rig.vc0, "tx_bytes");
+        if p1 - p0 == 1 {
+            let len = b1 - b0;
+            smallest = Some(smallest.map_or(len, |s: u64| s.min(len)));
+        }
+    }
+    smallest.expect("no clean single-frame measurement sample")
+}
+
+/// Installs a shaper on the client's egress that, when armed, drops every
+/// frame shorter than `data_len + 20` (data frames, handshake chatter, link
+/// probes) while letting larger frames (FEC parity, which carries a 43-byte
+/// member table on top of a full payload) through untouched.
+fn install_member_shaper(ns: &str, dev: &str, data_len: u64) {
+    tc_in_ns(
+        ns,
+        &[
+            "qdisc", "add", "dev", dev, "root", "handle", "1:", "prio", "bands", "2", "priomap",
+            "1", "1", "1", "1", "1", "1", "1", "1", "1", "1", "1", "1", "1", "1", "1", "1",
+        ],
+    );
+    tc_in_ns(
+        ns,
+        &[
+            "qdisc", "add", "dev", dev, "parent", "1:1", "handle", "10:", "netem", "loss", "0%",
+        ],
+    );
+    let expr = format!("meta(pkt_len lt {})", data_len + 20);
+    tc_in_ns(
+        ns,
+        &[
+            "filter", "add", "dev", dev, "parent", "1:", "protocol", "all", "prio", "1", "basic",
+            "match", &expr, "flowid", "1:1",
+        ],
+    );
+}
+
+fn set_member_loss(ns: &str, dev: &str, on: bool) {
+    tc_in_ns(
+        ns,
+        &[
+            "qdisc",
+            "change",
+            "dev",
+            dev,
+            "parent",
+            "1:1",
+            "handle",
+            "10:",
+            "netem",
+            "loss",
+            if on { "100%" } else { "0%" },
+        ],
+    );
+}
+
+/// Sends one group, dropping the members flagged in `lost`, and checks the
+/// server's FEC accounting plus whether the lost members' pings were
+/// answered. `lost[i]` is member `i + 1`.
+async fn run_loss_pattern(rig: &FecTestRig, parity: u8, lost: [bool; FEC_GROUP_SIZE as usize]) {
+    let tag = format!(
+        "parity={parity} lost={:?}",
+        lost.iter()
+            .enumerate()
+            .filter(|(_, l)| **l)
+            .map(|(i, _)| i + 1)
+            .collect::<Vec<_>>()
+    );
+    let losses = lost.iter().filter(|l| **l).count();
+    let recoverable = losses <= parity as usize;
+
+    let baseline = poll_snapshot_until(&rig.server_ctl, Duration::from_secs(5), |_| true)
+        .await
+        .expect("read baseline server snapshot");
+    let base_rec = baseline.daemon.fec_recovered_total;
+    let base_unr = baseline.daemon.fec_unrecoverable_total;
+
+    let started = std::time::Instant::now();
+    let mut pending = Vec::new();
+    for (i, is_lost) in lost.iter().enumerate() {
+        if *is_lost {
+            set_member_loss(&rig.ns_client_name, &rig.vc0, true);
+            let ns = rig.ns_client_name.clone();
+            let wait = if recoverable { "6" } else { "3" };
+            pending.push((
+                i + 1,
+                std::thread::spawn(move || ping_once(&ns, SERVER_TUNNEL_HOST, wait)),
+            ));
+            tokio::time::sleep(LOST_MEMBER_WINDOW).await;
+            set_member_loss(&rig.ns_client_name, &rig.vc0, false);
+        } else {
+            let status = ping_once(&rig.ns_client_name, SERVER_TUNNEL_HOST, "2")
+                .unwrap_or_else(|e| panic!("[{tag}] run ping for member {}: {e}", i + 1));
+            assert!(
+                status.success(),
+                "[{tag}] member {}'s ping should succeed cleanly",
+                i + 1
+            );
+        }
+    }
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < GROUP_BUDGET,
+        "[{tag}] the group took {elapsed:?}, past the {GROUP_BUDGET:?} budget -- result not meaningful"
+    );
+
+    let mut answered = Vec::new();
+    for (member, handle) in pending {
+        let status = handle
+            .join()
+            .unwrap_or_else(|_| panic!("[{tag}] member {member}'s ping thread panicked"))
+            .unwrap_or_else(|e| panic!("[{tag}] run ping for member {member}: {e}"));
+        answered.push((member, status.success()));
+    }
+    println!("[{tag}] lost members answered: {answered:?}");
+    for (member, ok) in answered {
+        assert_eq!(
+            ok, recoverable,
+            "[{tag}] member {member}: lost-on-the-wire ping should be answered iff the loss is within parity"
+        );
+    }
+
+    if losses == 0 {
+        tokio::time::sleep(Duration::from_millis(400)).await;
+    }
+    let snapshot = poll_snapshot_until(&rig.server_ctl, Duration::from_secs(5), |s| {
+        if losses == 0 {
+            true
+        } else if recoverable {
+            s.daemon.fec_recovered_total >= base_rec + losses as u64
+        } else {
+            s.daemon.fec_unrecoverable_total > base_unr
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("[{tag}] server FEC counters never reached the expected state"));
+    let recovered = snapshot.daemon.fec_recovered_total - base_rec;
+    let unrecoverable = snapshot.daemon.fec_unrecoverable_total - base_unr;
+    println!("[{tag}] recovered +{recovered}, unrecoverable +{unrecoverable}");
+    if recoverable {
+        assert_eq!(recovered, losses as u64, "[{tag}] recovered members");
+        assert_eq!(unrecoverable, 0, "[{tag}] nothing should be unrecoverable");
+    } else {
+        // Counted once per parity share that arrives and cannot repair the
+        // group, so one group yields between 1 and `parity` ticks.
+        assert_eq!(recovered, 0, "[{tag}] nothing should be recovered");
+        assert!(
+            (1..=parity as u64).contains(&unrecoverable),
+            "[{tag}] expected 1..={parity} unrecoverable ticks, got {unrecoverable}"
+        );
+    }
+}
+
+fn pattern(members: &[usize]) -> [bool; FEC_GROUP_SIZE as usize] {
+    let mut mask = [false; FEC_GROUP_SIZE as usize];
+    for m in members {
+        mask[m - 1] = true;
+    }
+    mask
+}
+
+async fn run_patterns(label: &str, parity: u8, patterns: &[&[usize]]) {
+    let rig = setup_fec_rig(
+        label,
+        SchedulerOverrides {
+            fec_enabled: true,
+            fec_group_size: Some(FEC_GROUP_SIZE),
+            fec_parity: if parity == 2 { Some(2) } else { None },
+            ..Default::default()
+        },
+    )
+    .await;
+    let data_len = measure_data_frame_len(&rig);
+    install_member_shaper(&rig.ns_client_name, &rig.vc0, data_len);
+    for members in patterns {
+        run_loss_pattern(&rig, parity, pattern(members)).await;
+    }
+}
+
+/// Single parity: 0 and 1 losses repair, 2 and 3 do not -- across first, last
+/// and middle positions.
+#[tokio::test]
+#[ignore = "needs root, iproute2 (incl. tc), and network namespaces -- see module doc comment"]
+async fn parity_one_loss_patterns() {
+    run_patterns(
+        "m1",
+        1,
+        &[&[], &[1], &[4], &[2], &[2, 3], &[1, 4], &[1, 2, 3]],
+    )
+    .await;
+}
+
+/// P+Q parity: 0, 1 and 2 losses repair (first/last/adjacent/non-adjacent
+/// positions, including a lost final member whose parity follows
+/// immediately); 3 losses do not.
+#[tokio::test]
+#[ignore = "needs root, iproute2 (incl. tc), and network namespaces -- see module doc comment"]
+async fn parity_two_loss_patterns() {
+    run_patterns(
+        "m2",
+        2,
+        &[
+            &[],
+            &[1],
+            &[4],
+            &[1, 2],
+            &[3, 4],
+            &[1, 3],
+            &[2, 4],
+            &[1, 4],
+            &[1, 2, 3],
+            &[2, 3, 4],
+            &[1, 2, 4],
+        ],
+    )
+    .await;
 }

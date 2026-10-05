@@ -658,7 +658,7 @@ pub async fn snapshot_links(links: &Links) -> Vec<Link> {
 /// `bind_interface`, `local_addr`, `remote_addr`), `remote`, and the
 /// socket handle, every one of which `snapshot_links` above *does*
 /// clone. That distinction matters here specifically because
-/// `tunnel::send_scheduled` calls this once per outgoing packet (not at
+/// `tunnel::pick_link` calls this once per outgoing packet (not at
 /// probe-interval frequency the way `Scheduler::refresh`'s callers do):
 /// a real 200 Mbps / ~19k pps UDP test showed a hard, dead-flat ~65%
 /// loss ceiling traced to exactly this -- `snapshot_links` cloning every

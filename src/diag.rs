@@ -118,6 +118,10 @@ pub fn format_dump(snapshot: &Snapshot, trigger: &str) -> String {
         d.fec_unrecoverable_total
     ));
     out.push_str(&format!(
+        "fec_sent: groups={} parity_p={} parity_q={}\n",
+        d.fec_groups_sent_total, d.fec_parity_p_sent_total, d.fec_parity_q_sent_total
+    ));
+    out.push_str(&format!(
         "tun({}): rx_bytes={} tx_bytes={} rx_errors={} tx_errors={} rx_dropped={} \
          tx_dropped={}\n",
         d.tun.iface,
@@ -259,6 +263,9 @@ mod tests {
                 wg_substituted_total: 0,
                 fec_recovered_total: 0,
                 fec_unrecoverable_total: 0,
+                fec_groups_sent_total: 0,
+                fec_parity_p_sent_total: 0,
+                fec_parity_q_sent_total: 0,
                 tun: TunSnapshot {
                     iface: "mlvpn0".to_string(),
                     rx_bytes: Some(1_000_000),

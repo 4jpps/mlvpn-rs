@@ -110,7 +110,7 @@ fn spawn_blaster(ns: &NetNs, secs: u32, pps: u32) -> Child {
 #[tokio::test]
 #[ignore = "needs root, iproute2 (incl. tc), python3, and network namespaces -- see module doc comment"]
 async fn stalled_link_does_not_stall_other_links_and_recovers() {
-    run_scenario(false).await;
+    run_scenario(false, false).await;
 }
 
 /// `redundant_mode` sends every packet to every Up link regardless of
@@ -121,12 +121,24 @@ async fn stalled_link_does_not_stall_other_links_and_recovers() {
 #[tokio::test]
 #[ignore = "needs root, iproute2 (incl. tc), python3, and network namespaces -- see module doc comment"]
 async fn stalled_link_does_not_stall_redundant_mode() {
-    run_scenario(true).await;
+    run_scenario(true, false).await;
 }
 
-async fn run_scenario(redundant: bool) {
+/// The default-scheduling stall with P+Q FEC on: FEC data and parity both go
+/// through the per-link TX workers, so a stalled link's blocked send must
+/// not hold up link0 (the FEC accumulator reserves a queue slot per member
+/// and never sends inline).
+#[tokio::test]
+#[ignore = "needs root, iproute2 (incl. tc), python3, and network namespaces -- see module doc comment"]
+async fn stalled_link_does_not_stall_other_links_with_fec() {
+    run_scenario(false, true).await;
+}
+
+async fn run_scenario(redundant: bool, fec: bool) {
     let overrides = || SchedulerOverrides {
         redundant_mode: redundant,
+        fec_enabled: fec,
+        fec_parity: if fec { Some(2) } else { None },
         ..Default::default()
     };
     require_root();

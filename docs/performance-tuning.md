@@ -121,7 +121,7 @@ congestion produces -- that's a packets-per-second processing ceiling in
 the outbound send path, not link bandwidth or the §3 lock contention
 (that fix is orthogonal to this one and doesn't affect it).
 
-Versions before this fix had `tunnel::send_scheduled` calling
+Versions before this fix had the send path (`send_scheduled`, since replaced by `TxDispatcher`) calling
 `link::snapshot_links` -- a full clone of every configured link,
 including every `LinkConfig` `String` field -- on **every single
 outgoing packet**, just to let `Scheduler::select` pick one link and
@@ -131,7 +131,7 @@ packet outpaced how fast packets arrived from the TUN device, so the
 kernel's TUN queue silently overflowed and dropped datagrams before
 `mlvpnd` ever read them -- the same "invisible from inside the process"
 failure mode as §1's socket buffer overflow, just one level up the
-stack. `send_scheduled` now calls `link::snapshot_scores` instead: a
+stack. `pick_link` now calls `link::snapshot_scores` instead: a
 `Copy`-only snapshot (no `String`/heap data at all) used purely to pick
 a winner, with only that one winning link ever locked-and-cloned for
 its remote address and socket handle. If you still see a flat,

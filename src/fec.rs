@@ -103,6 +103,17 @@ pub mod gf {
     }
 }
 
+/// Sender-side FEC counters, shared with the control socket so a
+/// snapshot can report how much parity actually left the sender.
+#[derive(Debug, Default)]
+pub struct FecSendStats {
+    /// Groups whose parity was queued for the wire.
+    pub groups: std::sync::atomic::AtomicU64,
+    /// P / Q parity frames queued.
+    pub parity_p: std::sync::atomic::AtomicU64,
+    pub parity_q: std::sync::atomic::AtomicU64,
+}
+
 /// One completed sender-side group: the `P` share, the `Q` share when
 /// `fec_parity = 2`, and which link carried each member (for parity
 /// placement).

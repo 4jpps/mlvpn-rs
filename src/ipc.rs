@@ -176,6 +176,16 @@ pub struct DaemonSnapshot {
     /// `fec_recovered_total`.
     #[serde(default)]
     pub fec_unrecoverable_total: u64,
+    /// Sender side: FEC groups whose parity was queued, and the P / Q
+    /// parity frames queued for them. A group skipped because it held a
+    /// member that never reached the wire (or an oversized parity frame)
+    /// is *not* counted here -- it bumps `fec_unrecoverable_total`.
+    #[serde(default)]
+    pub fec_groups_sent_total: u64,
+    #[serde(default)]
+    pub fec_parity_p_sent_total: u64,
+    #[serde(default)]
+    pub fec_parity_q_sent_total: u64,
 }
 
 /// Host-wide load/memory/uptime, independent of anything tunnel- or
@@ -603,6 +613,9 @@ mod tests {
             wg_substituted_total: 5,
             fec_recovered_total: 9,
             fec_unrecoverable_total: 2,
+            fec_groups_sent_total: 7,
+            fec_parity_p_sent_total: 7,
+            fec_parity_q_sent_total: 5,
             tun: TunSnapshot {
                 iface: "mlvpn0".to_string(),
                 rx_bytes: Some(1_000),
@@ -635,6 +648,8 @@ mod tests {
         assert_eq!(back.wg_substituted_total, 5);
         assert_eq!(back.fec_recovered_total, 9);
         assert_eq!(back.fec_unrecoverable_total, 2);
+        assert_eq!(back.fec_groups_sent_total, 7);
+        assert_eq!(back.fec_parity_q_sent_total, 5);
         assert_eq!(back.tun.iface, "mlvpn0");
         assert_eq!(back.tun.rx_bytes, Some(1_000));
         assert_eq!(back.tun.tx_errors, None);

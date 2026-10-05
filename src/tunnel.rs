@@ -18,10 +18,10 @@
 //!   only backs up its own queue (counted in `TxCounters::queue_full`);
 //!   other links keep transmitting. A packet that finds its link's queue
 //!   full spills to the freest other link, or is dropped under
-//!   `primary_link_mode`/`follow_peer_primary`. With FEC enabled (and not
-//!   `redundant_mode`) `outbound_sender` still sends inline via
-//!   `send_scheduled`, because FEC group accumulation needs to know a
-//!   frame actually went out.
+//!   `primary_link_mode`/`follow_peer_primary`. FEC traffic (Data
+//!   members and parity shares) goes through the same queues; see
+//!   `FecGate` for how group parity still excludes frames that never
+//!   reached the wire.
 //! - one `outbound_queue_drop_reporter` task: silent on a healthy
 //!   tunnel, periodically logs (and resets) the outbound queue's drop
 //!   counter otherwise. The original C `MLVPN`'s equivalent mechanism
@@ -120,10 +120,10 @@
 //! though: fixing the lock contention above wasn't enough on its own --
 //! a real two-link deployment test pushing 200 Mbps of small UDP
 //! datagrams (~19k packets/sec) found a hard, flat ~65% loss ceiling
-//! traced to `send_scheduled` calling `snapshot_links` (cloning every
+//! traced to the old inline send path calling `snapshot_links` (cloning every
 //! link's full `Link`, including heap-allocating every `LinkConfig`
 //! `String` field) on *every outgoing packet*, just to let the scheduler
-//! pick one and throw the rest away. `send_scheduled` now calls
+//! pick one and throw the rest away. `pick_link` now calls
 //! `link::snapshot_scores` instead -- a `Copy`-only snapshot with no
 //! `String`/heap data at all -- and `Scheduler::select` returns just the
 //! winning index, so only that *one* link ever gets locked-and-cloned
@@ -154,7 +154,7 @@
 //! see a genuine decrypted mlvpn frame). Because encryption is now tied
 //! to *which link* a frame goes out on, a frame can no longer be
 //! encrypted once, tunnel-wide, before a link is chosen the way the old
-//! shared-session design did -- `TxDispatcher`/`send_scheduled` below
+//! shared-session design did -- `TxDispatcher` below
 //! pick the link first, then build and encrypt that specific frame via
 //! the chosen link's own `wg_send`.
 //!
@@ -600,6 +600,7 @@ pub async fn run(
     );
     let fec_recovered_total = Arc::new(AtomicU64::new(0));
     let fec_unrecoverable_total = Arc::new(AtomicU64::new(0));
+    let fec_send_stats = Arc::new(crate::fec::FecSendStats::default());
 
     // One ProbeTracker per link, shared between that link's receiver and
     // prober tasks: the prober records when a probe was sent
@@ -804,6 +805,7 @@ pub async fn run(
         let scheduler = scheduler.clone();
         let fec_recovered_total = fec_recovered_total.clone();
         let fec_unrecoverable_total = fec_unrecoverable_total.clone();
+        let fec_send_stats = fec_send_stats.clone();
         handles.push(tokio::spawn(async move {
             control::serve(
                 path,
@@ -821,6 +823,7 @@ pub async fn run(
                 scheduler,
                 fec_recovered_total,
                 fec_unrecoverable_total,
+                fec_send_stats,
             )
             .await;
         }));
@@ -845,6 +848,7 @@ pub async fn run(
             scheduler: scheduler.clone(),
             fec_recovered_total: fec_recovered_total.clone(),
             fec_unrecoverable_total: fec_unrecoverable_total.clone(),
+            fec_send_stats: fec_send_stats.clone(),
         };
         handles.push(tokio::spawn(async move {
             // NOTE(task 5): same `SessionMeta`/`session` removal as
@@ -917,6 +921,7 @@ pub async fn run(
             scheduler: scheduler.clone(),
             fec_recovered_total: fec_recovered_total.clone(),
             fec_unrecoverable_total: fec_unrecoverable_total.clone(),
+            fec_send_stats: fec_send_stats.clone(),
         };
         handles.push(tokio::spawn(async move {
             control::diagnostics_watch_loop(watch, links, diag_ctx).await;
@@ -953,12 +958,11 @@ pub async fn run(
         let redundant_mode = params.scheduler_cfg.redundant_mode;
         let fec_enabled = params.scheduler_cfg.fec_enabled;
 
-        // Per-link TX workers (Phase 2). Everything except FEC sends via
-        // them; FEC keeps the inline `send_scheduled` path because it
-        // needs each frame's `carried` result to decide FEC group
-        // membership, which a queued hand-off cannot report back
-        // synchronously. Revisit with the single-owner FEC pipeline.
-        let dispatcher = if !fec_enabled || redundant_mode {
+        // Per-link TX workers: every frame -- Data, FEC parity, redundant
+        // copies -- reaches the wire through them, so no mode (FEC
+        // included) can bring back head-of-line blocking on a stalled
+        // socket.
+        let dispatcher = {
             let mut senders = Vec::with_capacity(links.len());
             let mut receivers = Vec::with_capacity(links.len());
             for l in links.iter() {
@@ -992,23 +996,18 @@ pub async fn run(
             handles.push(tokio::spawn(async move {
                 congestion_loop(sched, counters).await;
             }));
-            Some(dispatcher)
-        } else {
-            None
+            dispatcher
         };
 
-        let links = links.clone();
-        let scheduler = scheduler.clone();
         let fec_group_size = params.scheduler_cfg.fec_group_size;
         let fec_parity = params.scheduler_cfg.fec_parity;
         let fec_placement = params.scheduler_cfg.fec_parity_placement;
         let live_mtu = live_mtu.clone();
         let fec_unrecoverable_total = fec_unrecoverable_total.clone();
+        let fec_send_stats = fec_send_stats.clone();
         handles.push(tokio::spawn(async move {
             outbound_sender(
                 outbound_rx,
-                links,
-                scheduler,
                 redundant_mode,
                 fec_enabled,
                 fec_group_size,
@@ -1016,6 +1015,7 @@ pub async fn run(
                 fec_placement,
                 live_mtu,
                 fec_unrecoverable_total,
+                fec_send_stats,
                 dispatcher,
             )
             .await;
@@ -1146,7 +1146,7 @@ async fn broadcast_disconnect(links: &Links) {
 /// and `outbound_queue_drop_reporter` for the drop-and-log side of it.
 ///
 /// This exists specifically because of a real, hard-to-diagnose bug: the
-/// per-packet overhead `send_scheduled` used to have (cloning every
+/// per-packet overhead the old inline send path used to have (cloning every
 /// configured link's full `Link` just to pick one, see this module's
 /// module doc comment) made the *combined* read-encrypt-select-send
 /// pipeline unable to keep up with a high packet rate, and the resulting
@@ -1187,7 +1187,7 @@ const OUTBOUND_QUEUE_DROP_REPORT_INTERVAL: Duration = Duration::from_secs(2);
 /// design, this is deliberately *not* pre-encrypted: encryption now
 /// happens per-link (`wireguard::WgTunnel`, via `LinkHandle::wg_send`),
 /// so which link's key material applies is only known once
-/// the dispatcher/`send_scheduled` has actually picked a link -- see
+/// the dispatcher has actually picked a link -- see
 /// this module's doc comment.
 pub(crate) struct OutboundFrame {
     plaintext: Vec<u8>,
@@ -1265,19 +1265,145 @@ const LINK_TX_QUEUE_CAPACITY: usize = 128;
 /// instead of two per packet).
 const TX_WORKER_BATCH: usize = 32;
 
-/// One Data frame handed to a link's TX worker. `seq` is allocated by the
+/// One frame handed to a link's TX worker. `seq` is allocated by the
 /// dispatcher (not the worker) so a packet rerouted to another link keeps
 /// its sequence number, and redundant mode can send the *same* seq on
 /// every link.
 struct TxJob {
+    /// `Data`, or a FEC parity share (`FecParity` / `FecParityQ`).
+    ptype: PacketType,
     seq: u64,
     plaintext: Vec<u8>,
     /// Already redirected once after a send failure -- a second failure
     /// drops the packet rather than bouncing it between links forever.
     rerouted: bool,
     /// When this job was last handed to a link's queue (stamped by
-    /// `try_enqueue`); the worker turns it into the link's queue delay.
+    /// `try_enqueue` / `send_reserved`); the worker turns it into the
+    /// link's queue delay.
     enqueued: Instant,
+    /// Present on a Data frame that was folded into a FEC group: how the
+    /// worker reports back whether the frame genuinely reached the wire.
+    member: Option<FecMember>,
+}
+
+impl TxJob {
+    fn new(ptype: PacketType, seq: u64, plaintext: Vec<u8>) -> Self {
+        Self {
+            ptype,
+            seq,
+            plaintext,
+            rerouted: false,
+            enqueued: Instant::now(),
+            member: None,
+        }
+    }
+}
+
+/// Bounded hand-off from the TX workers back to the FEC owner
+/// (`outbound_sender`) for groups whose members have all been resolved.
+const FEC_READY_CAPACITY: usize = 256;
+
+/// Gate on one open FEC group. The FEC owner folds a frame into the group
+/// the moment a TX queue accepts it, but whether that frame actually
+/// reaches the wire is only known later, on the link's worker: a frame
+/// can be dropped after acceptance (send error and a failed reroute), or
+/// substituted by a WireGuard handshake datagram (every handshake/rekey).
+/// Such a frame is a *phantom member* -- one the receiver can never
+/// observe. It permanently burns a share of the group's erasure budget,
+/// and a group whose only missing member is a phantom would
+/// "reconstruct" and inject a datagram that was never sent (seen live as
+/// a fabricated IPv6 Router Solicitation).
+///
+/// So a group's parity is released only once every member is resolved,
+/// and only if none was a phantom; a group with a phantom is skipped (the
+/// real members still travel unprotected, counted in
+/// `fec_unrecoverable_total`). Resolution is tracked with one counter:
+/// the owner holds a "seal" token from the group's creation, each member
+/// holds one, and whoever drops the last token releases the group --
+/// usually the worker that sent the final member, so parity follows its
+/// members onto the wire without the owner ever waiting on a socket.
+struct FecGate {
+    outstanding: AtomicU32,
+    phantom: std::sync::atomic::AtomicBool,
+    group: std::sync::Mutex<Option<fec::FecGroup>>,
+    ready: mpsc::Sender<fec::FecGroup>,
+    unrecoverable: Arc<AtomicU64>,
+}
+
+impl FecGate {
+    fn new(ready: mpsc::Sender<fec::FecGroup>, unrecoverable: Arc<AtomicU64>) -> Arc<Self> {
+        Arc::new(Self {
+            outstanding: AtomicU32::new(1),
+            phantom: std::sync::atomic::AtomicBool::new(false),
+            group: std::sync::Mutex::new(None),
+            ready,
+            unrecoverable,
+        })
+    }
+
+    /// Register one more member. Must be called before the member's job is
+    /// queued (and before the group is sealed).
+    fn join(self: &Arc<Self>) -> FecMember {
+        self.outstanding.fetch_add(1, Ordering::Relaxed);
+        FecMember {
+            gate: self.clone(),
+            carried: false,
+        }
+    }
+
+    /// The group is complete: store its parity and drop the owner's seal
+    /// token. If every member is already resolved this releases the parity
+    /// immediately.
+    fn seal(&self, group: fec::FecGroup) {
+        *self.group.lock().unwrap() = Some(group);
+        self.release();
+    }
+
+    fn release(&self) {
+        if self.outstanding.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.emit();
+        }
+    }
+
+    fn emit(&self) {
+        let Some(group) = self.group.lock().unwrap().take() else {
+            return;
+        };
+        if self.phantom.load(Ordering::Acquire) {
+            self.unrecoverable.fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(
+                "skipping FEC parity for a group with a member that never reached the wire"
+            );
+            return;
+        }
+        if self.ready.try_send(group).is_err() {
+            self.unrecoverable.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// A FEC group member's claim on its gate. A member counts as having
+/// reached the wire only if `mark_carried` was called before it dropped;
+/// any other way of disappearing (dropped queue, failed reroute,
+/// substituted by a handshake, shutdown) makes the group's parity unsafe.
+struct FecMember {
+    gate: Arc<FecGate>,
+    carried: bool,
+}
+
+impl FecMember {
+    fn mark_carried(&mut self) {
+        self.carried = true;
+    }
+}
+
+impl Drop for FecMember {
+    fn drop(&mut self) {
+        if !self.carried {
+            self.gate.phantom.store(true, Ordering::Release);
+        }
+        self.gate.release();
+    }
 }
 
 /// Enqueue `job` on `q` with the depth / enqueue-time accounting the
@@ -1377,46 +1503,94 @@ impl TxDispatcher {
         self.dropped_total.fetch_add(1, Ordering::Relaxed);
     }
 
-    async fn dispatch(&self, job: TxJob) {
-        let frame_len = HEADER_LEN + job.plaintext.len();
-        let Some(idx) = pick_link(&self.links, &self.scheduler, frame_len).await else {
+    /// Reserve a slot on the queue of the link this frame should use,
+    /// without blocking: `forced` pins the choice when that link is Up,
+    /// enabled and has a remote (FEC parity placement), otherwise the
+    /// scheduler picks. A full queue spills to the freest other link
+    /// (unless `allow_spill` is off, which drops instead).
+    ///
+    /// Returns the accepting link's index and a permit that makes the
+    /// matching `send_reserved` infallible. Because the link is known
+    /// *before* the frame is handed over, the FEC owner can fold the
+    /// frame into its group (needing the plaintext and the carrying
+    /// link) and only then queue it.
+    async fn reserve(
+        &self,
+        forced: Option<usize>,
+        frame_len: usize,
+    ) -> Option<(usize, mpsc::Permit<'_, TxJob>)> {
+        let mut chosen = None;
+        if let Some(f) = forced {
+            if let Some(l) = self.links.get(f) {
+                let g = l.lock().await;
+                if g.state == LinkState::Up && !g.admin_disabled && g.remote.is_some() {
+                    chosen = Some(f);
+                }
+            }
+        }
+        if chosen.is_none() {
+            chosen = pick_link(&self.links, &self.scheduler, frame_len).await;
+        }
+        let Some(idx) = chosen else {
             tracing::warn!("no link available to send on; dropping packet");
-            return;
+            return None;
         };
         let Some(q) = self.queues.get(idx) else {
             tracing::warn!("no link available to send on; dropping packet");
-            return;
+            return None;
         };
-        match try_enqueue(q, job) {
-            Ok(()) => {}
-            Err(TrySendError::Full(job)) => {
+        match q.tx.try_reserve() {
+            Ok(permit) => Some((idx, permit)),
+            Err(TrySendError::Full(())) => {
                 q.counters.queue_full.fetch_add(1, Ordering::Relaxed);
                 self.scheduler.lock().unwrap().note_queue_full(idx);
                 if self.allow_spill {
-                    self.spill(idx, job).await;
+                    self.spill_reserve(idx).await
                 } else {
                     self.drop_job();
+                    None
                 }
             }
             // Only possible once the worker is gone (shutdown).
-            Err(TrySendError::Closed(job)) => self.spill(idx, job).await,
+            Err(TrySendError::Closed(())) => self.spill_reserve(idx).await,
+        }
+    }
+
+    /// Consume a reservation: stamp the enqueue time, raise the queue's
+    /// depth (before the worker can ever decrement it) and hand over.
+    fn send_reserved(q: &LinkTx, permit: mpsc::Permit<'_, TxJob>, mut job: TxJob) {
+        job.enqueued = Instant::now();
+        q.counters.depth.fetch_add(1, Ordering::Relaxed);
+        permit.send(job);
+    }
+
+    /// Queue one frame without blocking (see `reserve`). A frame that
+    /// finds no room anywhere is dropped and counted.
+    async fn dispatch(&self, job: TxJob, forced: Option<usize>) {
+        let frame_len = HEADER_LEN + job.plaintext.len();
+        if let Some((idx, permit)) = self.reserve(forced, frame_len).await {
+            Self::send_reserved(&self.queues[idx], permit, job);
         }
     }
 
     /// A worker could not put `job` on the wire (socket error, or the
     /// link has no remote yet): give it one more chance on another link.
+    /// A job that cannot be placed is dropped here -- for a FEC member
+    /// that drop is what marks the group's parity unsafe.
     async fn reroute(&self, from: usize, mut job: TxJob) {
         if job.rerouted {
             self.drop_job();
             return;
         }
         job.rerouted = true;
-        self.spill(from, job).await;
+        if let Some((idx, permit)) = self.spill_reserve(from).await {
+            Self::send_reserved(&self.queues[idx], permit, job);
+        }
     }
 
-    /// Redirect `job` away from link `from` to the usable link with the
-    /// most free queue room, or drop it if there is none.
-    async fn spill(&self, from: usize, mut job: TxJob) {
+    /// Reserve a slot on the usable link with the most free queue room
+    /// other than `from`, or count a drop if there is none.
+    async fn spill_reserve(&self, from: usize) -> Option<(usize, mpsc::Permit<'_, TxJob>)> {
         let free: Vec<usize> = self.queues.iter().map(|q| q.tx.capacity()).collect();
         for cand in spill_candidates(&free, from) {
             {
@@ -1425,18 +1599,16 @@ impl TxDispatcher {
                     continue;
                 }
             }
-            match try_enqueue(&self.queues[cand], job) {
-                Ok(()) => {
-                    self.queues[from]
-                        .counters
-                        .rerouted_away
-                        .fetch_add(1, Ordering::Relaxed);
-                    return;
-                }
-                Err(TrySendError::Full(j) | TrySendError::Closed(j)) => job = j,
+            if let Ok(permit) = self.queues[cand].tx.try_reserve() {
+                self.queues[from]
+                    .counters
+                    .rerouted_away
+                    .fetch_add(1, Ordering::Relaxed);
+                return Some((cand, permit));
             }
         }
         self.drop_job();
+        None
     }
 
     /// Redundancy mode (`scheduler.redundant_mode`): send the same frame
@@ -1476,12 +1648,8 @@ impl TxDispatcher {
         let seq = next_send_seq();
         for idx in targets {
             let q = &self.queues[idx];
-            let job = TxJob {
-                seq,
-                plaintext: plaintext.clone(),
-                rerouted: true,
-                enqueued: Instant::now(),
-            };
+            let mut job = TxJob::new(PacketType::Data, seq, plaintext.clone());
+            job.rerouted = true;
             if let Err(TrySendError::Full(_)) = try_enqueue(q, job) {
                 q.counters.queue_full.fetch_add(1, Ordering::Relaxed);
             }
@@ -1526,7 +1694,7 @@ async fn link_tx_worker(idx: usize, mut rx: mpsc::Receiver<TxJob>, d: TxDispatch
         let send_started = Instant::now();
         let mut bytes = 0u64;
         let mut pkts = 0u64;
-        for job in batch.drain(..) {
+        for mut job in batch.drain(..) {
             let Some((link_id, handle, name)) = &target else {
                 counters.send_failed.fetch_add(1, Ordering::Relaxed);
                 d.scheduler.lock().unwrap().note_send_failed(idx);
@@ -1534,7 +1702,7 @@ async fn link_tx_worker(idx: usize, mut rx: mpsc::Receiver<TxJob>, d: TxDispatch
                 continue;
             };
             let header = Header {
-                ptype: PacketType::Data,
+                ptype: job.ptype,
                 link_id: *link_id,
                 seq: job.seq,
             }
@@ -1543,14 +1711,18 @@ async fn link_tx_worker(idx: usize, mut rx: mpsc::Receiver<TxJob>, d: TxDispatch
                 .wg_send_parts(&[&header, job.plaintext.as_slice()])
                 .await
             {
-                // `carried` ignored: only the FEC path (which does not
-                // use workers) needs to know whether a frame was
-                // substituted by a handshake datagram. `record_tx` keeps
-                // its existing "bytes this link put on the wire"
-                // semantics.
-                Ok(_carried) => {
+                // `record_tx` keeps its "bytes this link put on the wire"
+                // semantics, so a substituted handshake datagram still
+                // counts; only a FEC member cares whether the datagram
+                // actually carried its frame.
+                Ok(carried) => {
                     bytes += (HEADER_LEN + job.plaintext.len()) as u64;
                     pkts += 1;
+                    if carried {
+                        if let Some(m) = job.member.as_mut() {
+                            m.mark_carried();
+                        }
+                    }
                 }
                 Err(e) => {
                     tracing::debug!(link = %name, error = %e, "send failed");
@@ -1574,16 +1746,34 @@ async fn link_tx_worker(idx: usize, mut rx: mpsc::Receiver<TxJob>, d: TxDispatch
     }
 }
 
-/// Pulls encrypted frames off the outbound queue and actually sends
-/// them -- the other half of `tun_reader`'s split, see
+/// FEC state owned by `outbound_sender`: the group accumulator plus the
+/// gate on the group currently being filled.
+struct FecTx {
+    sender: fec::FecSender,
+    gate: Arc<FecGate>,
+    ready: mpsc::Sender<fec::FecGroup>,
+    unrecoverable: Arc<AtomicU64>,
+}
+
+/// Pulls frames off the outbound queue and hands them to the per-link TX
+/// workers -- the other half of `tun_reader`'s split, see
 /// `OUTBOUND_QUEUE_CAPACITY`'s doc comment for why this is a separate
-/// task rather than `tun_reader` sending directly. Returns once `tx` (held by `tun_reader`) is dropped, i.e.
-/// only during shutdown.
+/// task rather than `tun_reader` sending directly. This loop never waits
+/// on a socket, in any mode: every send (Data, FEC parity, redundant
+/// copies) is a non-blocking queue hand-off, so one stalled link cannot
+/// stall the rest. Returns once `tx` (held by `tun_reader`) is dropped,
+/// i.e. only during shutdown.
+///
+/// With FEC on (and not `redundant_mode`) this task is also the single
+/// owner of the FEC group accumulator. A frame joins the group on the
+/// link whose queue accepted it, and the group's parity is released by
+/// its `FecGate` once every member has been resolved on a worker -- see
+/// `FecGate` for how that keeps phantom members out of parity -- then
+/// queued here like any other frame, so parity follows its members onto
+/// the wire.
 #[allow(clippy::too_many_arguments)]
 async fn outbound_sender(
     mut rx: mpsc::Receiver<OutboundFrame>,
-    links: Links,
-    scheduler: Arc<std::sync::Mutex<Scheduler>>,
     redundant_mode: bool,
     fec_enabled: bool,
     fec_group_size: u8,
@@ -1591,10 +1781,18 @@ async fn outbound_sender(
     fec_placement: crate::config::FecParityPlacement,
     mtu: LiveMtu,
     fec_unrecoverable_total: Arc<AtomicU64>,
-    dispatcher: Option<TxDispatcher>,
+    fec_send_stats: Arc<fec::FecSendStats>,
+    d: TxDispatcher,
 ) {
-    let mut fec_sender =
-        fec_enabled.then(|| crate::fec::FecSender::new(fec_group_size, fec_parity));
+    let (ready_tx, mut ready_rx) = mpsc::channel::<fec::FecGroup>(FEC_READY_CAPACITY);
+    // Redundant mode already sends every frame on every link; FEC adds
+    // nothing there, so it keeps ignoring FEC exactly as before.
+    let mut fec_tx = (fec_enabled && !redundant_mode).then(|| FecTx {
+        sender: fec::FecSender::new(fec_group_size, fec_parity),
+        gate: FecGate::new(ready_tx.clone(), fec_unrecoverable_total.clone()),
+        ready: ready_tx.clone(),
+        unrecoverable: fec_unrecoverable_total.clone(),
+    });
     // What a parity frame is allowed to cost beyond the tunnel MTU: the
     // exact same number of bytes `control::effective_tunnel_mtu` already
     // reserved out of the tunnel MTU for this group size, so a parity
@@ -1605,117 +1803,117 @@ async fn outbound_sender(
     } else {
         0
     };
-    while let Some(frame) = rx.recv().await {
-        // Worker path (every mode except FEC, see `TxDispatcher`): hand
-        // the frame to a per-link queue and move on -- this loop never
-        // waits on a socket, so one stalled link cannot stall the rest.
-        if let Some(d) = &dispatcher {
-            if redundant_mode {
-                d.send_redundant(frame.plaintext).await;
-            } else {
-                d.dispatch(TxJob {
-                    seq: next_send_seq(),
-                    plaintext: frame.plaintext,
-                    rerouted: false,
-                    enqueued: Instant::now(),
-                })
-                .await;
-            }
-            continue;
-        }
-        let seq = next_send_seq();
-        let sent_on = send_scheduled(
-            &links,
-            &scheduler,
-            PacketType::Data,
-            seq,
-            &frame.plaintext,
-            None,
-        )
-        .await;
-        // Only a frame that genuinely reached the wire may join the
-        // current FEC group. A frame that was dropped here (no link
-        // available) or whose payload boringtun substituted with a
-        // handshake datagram (every WireGuard handshake/rekey) is one the
-        // receiver can never observe -- accumulating it anyway made it a
-        // phantom group member that permanently consumed the group's one
-        // erasure, so a later *real* loss in the same group became
-        // unrecoverable, and a group whose phantom was its only missing
-        // seq would "reconstruct" and inject into the TUN device a
-        // datagram the peer never sent (observed live as a fabricated
-        // IPv6 Router Solicitation).
-        let Some(link_idx) = sent_on else {
-            continue;
-        };
-        if let Some(sender) = fec_sender.as_mut() {
-            if let Some(group) = sender.accumulate(seq, &frame.plaintext, link_idx) {
-                let parity_bytes = group.p.encode();
-                // Belt-and-braces against the MTU reservation being
-                // momentarily wrong: `mtu_monitor_loop` can *shrink* the
-                // live tunnel MTU (a link reconnecting on smaller
-                // hardware) after a group has already accumulated
-                // members sized for the old, larger one. Sending an
-                // oversized parity frame is strictly worse than sending
-                // none at all -- it either gets fragmented (needing
-                // *both* fragments to survive, making it less likely to
-                // arrive than the data it protects) or fails outright --
-                // so drop it and count the group as one FEC could not
-                // help with. The Q share is exactly as wide as P, so one
-                // check covers both.
-                let budget = mtu.load(Ordering::Relaxed) as usize + parity_headroom;
-                if parity_bytes.len() > budget {
-                    fec_unrecoverable_total.fetch_add(1, Ordering::Relaxed);
-                    tracing::debug!(
-                        parity_bytes = parity_bytes.len(),
-                        budget,
-                        "skipping an oversized FEC parity frame (tunnel MTU shrank mid-group)"
-                    );
-                    continue;
-                }
-                let forced = if fec_placement == crate::config::FecParityPlacement::Scheduler {
-                    None
-                } else {
-                    let mut usable = Vec::with_capacity(links.len());
-                    for l in links.iter() {
-                        let g = l.lock().await;
-                        usable.push(
-                            g.state == link::LinkState::Up
-                                && !g.admin_disabled
-                                && g.remote.is_some(),
-                        );
-                    }
-                    crate::fec::choose_parity_link(fec_placement, &group.member_links, &usable)
-                };
-                let parity_seq = next_send_seq();
-                // Return value deliberately ignored: a parity frame is
-                // not itself a group member, so a failed/substituted
-                // parity send simply means the receiver never sees it and
-                // the group times out as unrecoverable -- already the
-                // correct existing behavior, nothing to gate.
-                let _ = send_scheduled(
-                    &links,
-                    &scheduler,
-                    PacketType::FecParity,
-                    parity_seq,
-                    &parity_bytes,
-                    forced,
+    loop {
+        tokio::select! {
+            biased;
+            Some(group) = ready_rx.recv() => {
+                send_fec_parity(
+                    &d,
+                    group,
+                    fec_placement,
+                    parity_headroom,
+                    &mtu,
+                    &fec_unrecoverable_total,
+                    &fec_send_stats,
                 )
                 .await;
-                if let Some(q) = group.q {
-                    let q_bytes = q.encode();
-                    let q_seq = next_send_seq();
-                    let _ = send_scheduled(
-                        &links,
-                        &scheduler,
-                        PacketType::FecParityQ,
-                        q_seq,
-                        &q_bytes,
-                        forced,
-                    )
-                    .await;
+            }
+            frame = rx.recv() => {
+                let Some(frame) = frame else { return };
+                if redundant_mode {
+                    d.send_redundant(frame.plaintext).await;
+                    continue;
                 }
+                let Some(fec_tx) = fec_tx.as_mut() else {
+                    d.dispatch(TxJob::new(PacketType::Data, next_send_seq(), frame.plaintext), None)
+                        .await;
+                    continue;
+                };
+                // A frame may join a FEC group only once a queue has
+                // accepted it: one that is dropped here (no link, every
+                // queue full) never existed as far as the receiver is
+                // concerned. Whether an accepted frame then reaches the
+                // wire is the gate's job.
+                let frame_len = HEADER_LEN + frame.plaintext.len();
+                let Some((link_idx, permit)) = d.reserve(None, frame_len).await else {
+                    continue;
+                };
+                let seq = next_send_seq();
+                let member = fec_tx.gate.join();
+                if let Some(group) = fec_tx.sender.accumulate(seq, &frame.plaintext, link_idx) {
+                    let next = FecGate::new(fec_tx.ready.clone(), fec_tx.unrecoverable.clone());
+                    std::mem::replace(&mut fec_tx.gate, next).seal(group);
+                }
+                let mut job = TxJob::new(PacketType::Data, seq, frame.plaintext);
+                job.member = Some(member);
+                TxDispatcher::send_reserved(&d.queues[link_idx], permit, job);
             }
         }
+    }
+}
+
+/// Queue the parity shares (P, then Q when configured) of a completed
+/// group, honoring the configured placement.
+async fn send_fec_parity(
+    d: &TxDispatcher,
+    group: fec::FecGroup,
+    placement: crate::config::FecParityPlacement,
+    parity_headroom: usize,
+    mtu: &LiveMtu,
+    fec_unrecoverable_total: &AtomicU64,
+    stats: &fec::FecSendStats,
+) {
+    let parity_bytes = group.p.encode();
+    // Belt-and-braces against the MTU reservation being momentarily
+    // wrong: `mtu_monitor_loop` can *shrink* the live tunnel MTU (a link
+    // reconnecting on smaller hardware) after a group has already
+    // accumulated members sized for the old, larger one. Sending an
+    // oversized parity frame is strictly worse than sending none at all
+    // -- it either gets fragmented (needing *both* fragments to survive,
+    // making it less likely to arrive than the data it protects) or
+    // fails outright -- so drop it and count the group as one FEC could
+    // not help with. The Q share is exactly as wide as P, so one check
+    // covers both.
+    let budget = mtu.load(Ordering::Relaxed) as usize + parity_headroom;
+    if parity_bytes.len() > budget {
+        fec_unrecoverable_total.fetch_add(1, Ordering::Relaxed);
+        tracing::debug!(
+            parity_bytes = parity_bytes.len(),
+            budget,
+            "skipping an oversized FEC parity frame (tunnel MTU shrank mid-group)"
+        );
+        return;
+    }
+    let forced = if placement == crate::config::FecParityPlacement::Scheduler {
+        None
+    } else {
+        let mut usable = Vec::with_capacity(d.links.len());
+        for l in d.links.iter() {
+            let g = l.lock().await;
+            usable.push(g.state == LinkState::Up && !g.admin_disabled && g.remote.is_some());
+        }
+        crate::fec::choose_parity_link(placement, &group.member_links, &usable)
+    };
+    stats.groups.fetch_add(1, Ordering::Relaxed);
+    stats.parity_p.fetch_add(1, Ordering::Relaxed);
+    if group.q.is_some() {
+        stats.parity_q.fetch_add(1, Ordering::Relaxed);
+    }
+    // A parity frame is not itself a group member: one that is dropped or
+    // substituted just means the receiver never sees it and the group
+    // times out as unrecoverable -- already the correct behavior, so
+    // there is nothing to gate.
+    d.dispatch(
+        TxJob::new(PacketType::FecParity, next_send_seq(), parity_bytes),
+        forced,
+    )
+    .await;
+    if let Some(q) = group.q {
+        d.dispatch(
+            TxJob::new(PacketType::FecParityQ, next_send_seq(), q.encode()),
+            forced,
+        )
+        .await;
     }
 }
 
@@ -1753,110 +1951,6 @@ async fn outbound_queue_drop_reporter(dropped_total: Arc<AtomicU64>) {
                  dropped here rather than stalling the TUN read loop. If this persists, see \
                  docs/performance-tuning.md."
             );
-        }
-    }
-}
-
-/// Normal (non-redundant) send path: ask the `Scheduler` for exactly one
-/// link and send there. Split out of `tun_reader` purely to keep that
-/// loop body readable now that it branches on `redundant_mode`.
-///
-/// `forced` pins the send to one link (FEC parity placement) when that
-/// link is `Up`, not admin-disabled and has a remote; otherwise the
-/// normal scheduler pick is used.
-///
-/// Returns the index of the link `plaintext` genuinely reached the wire
-/// on, or `None` for
-/// every "no link available to send on" early return, for a failed
-/// `wg_send`, and for a `wg_send` that succeeded at the socket level but
-/// whose payload boringtun substituted with a handshake datagram (see
-/// `LinkHandle::wg_send`). `outbound_sender` gates FEC group
-/// accumulation on this -- a frame counted as a group member the peer
-/// never saw is a phantom that permanently consumes the group's single
-/// erasure, making a later *real* loss unrecoverable or, worse, letting
-/// FEC "reconstruct" and deliver a datagram that was never transmitted.
-async fn send_scheduled(
-    links: &Links,
-    scheduler: &Arc<std::sync::Mutex<Scheduler>>,
-    ptype: PacketType,
-    seq: u64,
-    plaintext: &[u8],
-    forced: Option<usize>,
-) -> Option<usize> {
-    // Not the real on-wire size (WireGuard adds its own AEAD overhead on
-    // top, invisibly to this layer), but the same approximation the old
-    // shared-session design used for the scheduler's own cap-check
-    // accounting, which only ever needed a reasonable estimate, not an
-    // exact byte count.
-    let frame_len = HEADER_LEN + plaintext.len();
-
-    let mut chosen_idx = None;
-    if let Some(f) = forced {
-        if let Some(l) = links.get(f) {
-            let g = l.lock().await;
-            if g.state == link::LinkState::Up && !g.admin_disabled && g.remote.is_some() {
-                chosen_idx = Some(f);
-            }
-        }
-    }
-    if chosen_idx.is_none() {
-        chosen_idx = pick_link(links, scheduler, frame_len).await;
-    }
-    let Some(idx) = chosen_idx else {
-        tracing::warn!("no link available to send on; dropping packet");
-        return None;
-    };
-    let Some(link_mutex) = links.get(idx) else {
-        tracing::warn!("no link available to send on; dropping packet");
-        return None;
-    };
-
-    // Only *now*, having already picked a winner, do we lock a link at
-    // all for its full data -- and only this one, not every candidate
-    // that didn't win. `LinkHandle` (which owns this link's own
-    // `WgTunnel`) rather than a resolved socket here, specifically so
-    // the actual send below always encrypts/sends through whatever
-    // socket is current at send time (post-reconnect if one just
-    // happened) instead of one captured slightly stale.
-    let chosen: Option<(u8, LinkHandle, String)> = {
-        let guard = link_mutex.lock().await;
-        guard
-            .remote
-            .map(|_| (guard.id, guard.handle(), guard.config.name.clone()))
-    };
-    let Some((link_id, handle, link_name)) = chosen else {
-        tracing::warn!("no link available to send on; dropping packet");
-        return None;
-    };
-
-    let header = Header {
-        ptype,
-        link_id,
-        seq,
-    }
-    .to_bytes();
-
-    match handle.wg_send_parts(&[&header, plaintext]).await {
-        Ok(carried) => {
-            // Re-lock just the winning link, only on success, purely to
-            // update the lifetime tx counters -- everything else in this
-            // function already released `link_mutex` before the `.await`
-            // above (see the comment on `chosen` for why), so this is one
-            // more short lock on one link, not a scan over every
-            // candidate that didn't win.
-            //
-            // Deliberately unconditional on `carried`: `record_tx`'s own
-            // "bytes this link put on the wire" semantics are unchanged
-            // by this fix (a substituted handshake datagram really was
-            // transmitted, just not carrying this frame). That stat being
-            // slightly optimistic during a handshake is a separate,
-            // pre-existing concern -- only the returned bool is new.
-            link_mutex.lock().await.stats.record_tx(frame_len as u64);
-            carried.then_some(idx)
-        }
-        Err(e) => {
-            tracing::debug!(link = %link_name, error = %e, "send failed");
-            None
         }
     }
 }
@@ -3017,7 +3111,7 @@ async fn handle_incoming(
         // (the remote-address check below, plus a Data-only record_rx
         // that used to re-lock the same link right after) -- confirmed
         // live via `strace -f -c` that per-packet lock acquisitions
-        // dominate mlvpnd's wall-clock time (see send_scheduled's
+        // dominate mlvpnd's wall-clock time (see `pick_link`'s
         // select_fast for the sibling fix on the send side); this halves
         // the lock count on the hottest part of the receive path too.
         let mut link = l.lock().await;
@@ -3373,7 +3467,7 @@ async fn send_probe(
     // so a stale captured copy would never observe a remote address
     // learned later (e.g. a server-mode link whose peer address is only
     // known once the client's first authenticated frame arrives). See
-    // `send_scheduled`'s own comment for the same reasoning.
+    // `pick_link`'s own comment for the same reasoning.
     let handle = links[idx].lock().await.handle();
 
     let probe_seq = probe_seq_counter.fetch_add(1, Ordering::Relaxed);
@@ -4004,29 +4098,94 @@ async fn reorder_tuning_loop(
 }
 
 #[cfg(test)]
-mod send_scheduled_tests {
+mod fec_gate_tests {
     use super::*;
 
-    /// The "no link available to send on" early return must report
-    /// `false`, not silently look like a successful send -- that return
-    /// value is what stops `outbound_sender` from accumulating a dropped
-    /// frame into its FEC group as a phantom member (see
-    /// `send_scheduled`'s own doc comment).
-    ///
-    /// An empty `Links` reaches the first of the three early returns:
-    /// `Scheduler::select_fast` has nothing cached, and the
-    /// `snapshot_scores` fallback has no candidates either, so no index
-    /// is chosen. The other two early returns need a live, bound `Link`
-    /// to construct and are covered by the veth integration tests.
-    #[tokio::test]
-    async fn send_scheduled_reports_false_when_no_link_is_available() {
-        let links: link::Links = Arc::new(Vec::new());
-        let scheduler = Arc::new(std::sync::Mutex::new(Scheduler::new()));
-        let sent = send_scheduled(&links, &scheduler, PacketType::Data, 1, b"payload", None).await;
+    fn group() -> fec::FecGroup {
+        let mut sender = fec::FecSender::new(2, 1);
+        assert!(sender.accumulate(1, b"aa", 0).is_none());
+        sender
+            .accumulate(2, b"bb", 1)
+            .expect("2nd member completes a 2-group")
+    }
+
+    fn gate(cap: usize) -> (Arc<FecGate>, mpsc::Receiver<fec::FecGroup>, Arc<AtomicU64>) {
+        let (tx, rx) = mpsc::channel(cap);
+        let unrecoverable = Arc::new(AtomicU64::new(0));
+        (FecGate::new(tx, unrecoverable.clone()), rx, unrecoverable)
+    }
+
+    fn carried(g: &Arc<FecGate>) -> FecMember {
+        let mut m = g.join();
+        m.mark_carried();
+        m
+    }
+
+    #[test]
+    fn parity_is_released_once_every_member_reached_the_wire() {
+        let (g, mut rx, unrec) = gate(4);
+        let a = carried(&g);
+        let b = carried(&g);
+        g.seal(group());
+        // Sealed but members still outstanding: nothing yet.
+        assert!(rx.try_recv().is_err());
+        drop(a);
+        assert!(rx.try_recv().is_err());
+        drop(b);
         assert!(
-            sent.is_none(),
-            "a dropped packet must never be reported as transmitted"
+            rx.try_recv().is_ok(),
+            "last resolved member releases the group"
         );
+        assert!(rx.try_recv().is_err(), "released exactly once");
+        assert_eq!(unrec.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn members_resolving_before_the_seal_wait_for_it() {
+        let (g, mut rx, _) = gate(4);
+        drop(carried(&g));
+        drop(carried(&g));
+        assert!(
+            rx.try_recv().is_err(),
+            "the group is not complete until the owner seals it"
+        );
+        g.seal(group());
+        assert!(rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn a_member_that_never_reached_the_wire_suppresses_parity() {
+        // Dropped after queue acceptance, or substituted by a handshake
+        // datagram: either way `mark_carried` is never called.
+        let (g, mut rx, unrec) = gate(4);
+        drop(carried(&g));
+        drop(g.join());
+        g.seal(group());
+        assert!(
+            rx.try_recv().is_err(),
+            "a phantom member must poison the group"
+        );
+        assert_eq!(unrec.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn a_full_ready_queue_counts_the_group_as_unrecoverable() {
+        let (tx, _rx) = mpsc::channel(1);
+        let unrec = Arc::new(AtomicU64::new(0));
+        let g1 = FecGate::new(tx.clone(), unrec.clone());
+        g1.seal(group());
+        let g2 = FecGate::new(tx, unrec.clone());
+        g2.seal(group());
+        assert_eq!(unrec.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn a_member_moved_to_another_thread_still_releases_the_group() {
+        let (g, mut rx, _) = gate(4);
+        let m = carried(&g);
+        g.seal(group());
+        std::thread::spawn(move || drop(m)).join().unwrap();
+        assert!(rx.try_recv().is_ok());
     }
 }
 
@@ -4052,12 +4211,7 @@ mod spill_candidate_tests {
     }
 
     fn job() -> TxJob {
-        TxJob {
-            seq: 1,
-            plaintext: vec![0; 10],
-            rerouted: false,
-            enqueued: Instant::now(),
-        }
+        TxJob::new(PacketType::Data, 1, vec![0; 10])
     }
 
     #[test]

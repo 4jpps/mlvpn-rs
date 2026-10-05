@@ -338,7 +338,7 @@ impl Scheduler {
     /// Deliberately takes `&[LinkScore]` (a cheap, `Copy`-only snapshot --
     /// see `link::snapshot_scores`) rather than `&[Link]`, and returns
     /// `Option<usize>` rather than `Option<&Link>`: this is called once
-    /// per outgoing packet (`tunnel::send_scheduled`), and the normal
+    /// per outgoing packet (`tunnel::pick_link`), and the normal
     /// (non-fallback) path below doesn't actually need anything from
     /// `Link` at all -- `refresh()` already cached each candidate's
     /// `bandwidth_cap_mbps` in its own `SwrrEntry` above, so
@@ -380,7 +380,7 @@ impl Scheduler {
     }
 
     /// Lock-free-for-links fast path for the hot per-packet send call
-    /// (`tunnel::send_scheduled`). `select`'s own `self.primary`/
+    /// (`tunnel::pick_link`). `select`'s own `self.primary`/
     /// `self.entries` branches never actually read the `links:
     /// &[LinkScore]` slice they're handed -- both are populated entirely
     /// by the last periodic `refresh()`, not by anything live at send
