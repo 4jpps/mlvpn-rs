@@ -22,8 +22,9 @@ path = "src/main.rs"
 name = "wg_path"
 harness = false
 
-# src/bin/mlvpn-tui/main.rs is picked up automatically by cargo's default
-# `autobins` discovery -- no explicit [[bin]] section needed for it.
+# src/bin/mlvpn-tui/main.rs and src/bin/mlvpn-web/main.rs are picked up
+# automatically by cargo's default `autobins` discovery -- no explicit
+# [[bin]] section needed for them.
 
 [profile.release]
 opt-level = 3

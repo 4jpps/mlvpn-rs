@@ -104,8 +104,10 @@ src/
   bin/mlvpn-tui/    Terminal monitoring view: health banner + Overview/Links/
                     Traffic/Reliability/System/Debug views
                   (see docs/monitoring.md)
+  bin/mlvpn-web/    Optional read-only loopback HTTP telemetry API
+                    (http.rs, api.rs; see docs/monitoring.md)
 config/          Example client/server TOML configs
-systemd/         Hardened systemd unit
+systemd/         Hardened systemd units (mlvpn.service, optional mlvpn-web.service)
 debian/          .deb packaging
 packaging/rpm/   .rpm packaging (Fedora/RHEL-family)
 docs/            Full documentation -- see docs/README.md

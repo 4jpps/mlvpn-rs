@@ -1,0 +1,66 @@
+# Install to /etc/systemd/system/mlvpn-web.service
+#
+# Optional read-only HTTP telemetry API for mlvpnd (see docs/monitoring.md,
+# "Web telemetry API"). Not enabled by default: nothing listens on any TCP
+# port unless you run `systemctl enable --now mlvpn-web.service`.
+#
+# Runs as the same unprivileged `mlvpn` user as mlvpn.service because the
+# daemon's control socket is mode 0600 owned by that user. It has no
+# capabilities, makes no outbound connections, and only reads the control
+# socket under /run/mlvpn. mlvpn-web refuses to bind anything other than a
+# loopback address, so the default 127.0.0.1:8765 is also the only place
+# it can listen.
+#
+# To read it from another machine, forward the port over SSH
+# (`ssh -L 8765:127.0.0.1:8765 host`); do not put it behind a reverse proxy
+# without authentication in front.
+
+[Unit]
+Description=mlvpn read-only web telemetry API
+Documentation=https://github.com/4jpps/mlvpn-rs/blob/main/docs/monitoring.md
+After=mlvpn.service
+Requires=mlvpn.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/mlvpn-web --listen 127.0.0.1:8765
+Restart=on-failure
+RestartSec=2
+
+User=mlvpn
+Group=mlvpn
+CapabilityBoundingSet=
+AmbientCapabilities=
+SupplementaryGroups=
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+UMask=0077
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @mount @debug @cpu-emulation @obsolete
+SystemCallErrorNumber=EPERM
+TasksMax=128
+MemoryMax=64M
+InaccessiblePaths=-/root -/home
+ReadOnlyPaths=/run/mlvpn
+
+[Install]
+WantedBy=multi-user.target

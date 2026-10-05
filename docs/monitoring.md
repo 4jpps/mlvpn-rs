@@ -82,6 +82,60 @@ Auto-detecting (no `--socket` given) with nothing found under
   other way): falls back to the original plain error asking you to pass
   `--socket` explicitly or check `mlvpnd` yourself.
 
+## Web telemetry API
+
+`mlvpn-web` is an optional, read-only HTTP API for the same data the TUI
+shows. It is a separate process, so `mlvpnd` itself gains no listening
+socket and no HTTP code. It connects to the daemon's control socket,
+keeps the latest snapshot, the last 600 samples (about five minutes) of
+throughput/RTT/loss history and the last 500 events in memory, and
+serves them as JSON. It is off by default: nothing listens until you run
+
+```
+sudo systemctl enable --now mlvpn-web.service
+```
+
+(`systemd/mlvpn-web.service`; the unit runs as the `mlvpn` user with no
+capabilities.) Or run it by hand as a user that can read the control
+socket: `mlvpn-web [--socket PATH] [--listen 127.0.0.1:8765]`.
+
+| Endpoint | Returns |
+|---|---|
+| `/api/v1/version` | API version, `mlvpn-web` version, local and peer daemon versions |
+| `/api/v1/snapshot` | The full snapshot (health, links, daemon, FEC, reorder, system) |
+| `/api/v1/links` | Per-link state and counters only |
+| `/api/v1/events?since=<seq>&limit=<n>` | Structured events newer than `since` (default 100, max 500), oldest first; poll with the returned `next_since` |
+| `/api/v1/history?limit=<n>` | Up to 600 samples at 500 ms: tunnel tx/rx Mbps plus per-link tx/rx Mbps, RTT and loss (default 120) |
+
+Every response is `{"api": 1, "connected": bool, "age_ms": ms-or-null,
+"data": ...}`. `connected` is false while the daemon is unreachable and
+`age_ms` is how old the data is, so a client can tell stale from live.
+Before the first snapshot arrives, `snapshot` and `links` return 503.
+Errors are `{"api": 1, "error": "..."}`.
+
+What it will and won't do:
+
+- **Read-only.** Only `GET` and `HEAD`; anything else is a 405, and a
+  request with a body is a 400.
+- **Loopback only.** Any `--listen` address that isn't loopback is
+  refused at startup, because exposing it beyond the host would need
+  authentication, which doesn't exist yet. To read it remotely, forward
+  the port over SSH. The `Host` header must also be `localhost`,
+  `127.0.0.1` or `[::1]` (otherwise 421), which blocks DNS-rebinding
+  from a browser on the same machine. No CORS headers are sent.
+- **No logs, no secrets.** The daemon's log ring is never served and the
+  control socket carries no key material. The snapshot does include each
+  link's `remote_addr` and `bind_interface`, which describe your network
+  topology, so treat access to the port as access to that.
+- **Bounded.** Requests are capped at 8 KiB and 64 headers, must
+  complete within 10 s, and at most 32 connections are served at once
+  (further ones get an immediate 503). Each connection serves one
+  request and closes.
+
+Reconnecting to a restarted daemon clears the buffered events and
+history, as in the TUI. There is no dashboard yet; this is the data
+layer for one.
+
 ## Runtime link control
 
 A separate, off-by-default `[command]` socket lets an operator pin a
