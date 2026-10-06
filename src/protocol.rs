@@ -277,11 +277,16 @@ pub struct StatsPayload {
     /// Wire encoding of `link::LinkState` (0 = Probing, 1 = Up, 2 =
     /// Down) -- see `link::LinkState::to_wire`/`from_wire`.
     pub state: u8,
+    /// Lifetime Data bytes received on this link (`LinkStats::rx_bytes`).
+    /// Delivery feedback compares byte deltas between reports instead of
+    /// the lagging throughput EWMAs. `None` from a peer that predates it.
+    pub rx_bytes: Option<u64>,
 }
 
 impl StatsPayload {
     pub const NAME_LEN: usize = 16;
-    pub const LEN: usize = Self::NAME_LEN + 4 * 4 + 1;
+    const LEGACY_LEN: usize = Self::NAME_LEN + 4 * 4 + 1;
+    pub const LEN: usize = Self::LEGACY_LEN + 8;
 
     /// Truncate (to `NAME_LEN` bytes, on a UTF-8 boundary) and zero-pad a
     /// link name for the fixed-size wire field.
@@ -318,11 +323,13 @@ impl StatsPayload {
         out[off..off + 4].copy_from_slice(&self.throughput_mbps.to_be_bytes());
         off += 4;
         out[off] = self.state;
+        off += 1;
+        out[off..off + 8].copy_from_slice(&self.rx_bytes.unwrap_or(0).to_be_bytes());
         out
     }
 
     pub fn decode(buf: &[u8]) -> Result<Self> {
-        if buf.len() < Self::LEN {
+        if buf.len() < Self::LEGACY_LEN {
             return Err(MlvpnError::Protocol("stats payload too short".into()));
         }
         let mut name = [0u8; Self::NAME_LEN];
@@ -337,6 +344,9 @@ impl StatsPayload {
         let throughput_mbps = f32::from_be_bytes(buf[off..off + 4].try_into().unwrap());
         off += 4;
         let state = buf[off];
+        off += 1;
+        let rx_bytes = (buf.len() >= Self::LEN)
+            .then(|| u64::from_be_bytes(buf[off..off + 8].try_into().unwrap()));
         Ok(Self {
             name,
             rtt_ms,
@@ -344,6 +354,7 @@ impl StatsPayload {
             loss_pct,
             throughput_mbps,
             state,
+            rx_bytes,
         })
     }
 }

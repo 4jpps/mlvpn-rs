@@ -1472,8 +1472,9 @@ async fn congestion_loop(
 const DELIVERY_TICK: Duration = Duration::from_millis(250);
 
 /// Compare what we offer each link with what the peer reports receiving on
-/// it (`delivery.rs`). Offered is read from the local tx-throughput EWMA,
-/// treated as zero once it stops being updated (an idle link).
+/// it (`delivery.rs`). Both sides are byte-counter deltas between two
+/// consecutive peer reports, not throughput EWMAs: the EWMAs lag and sit on
+/// unaligned windows, which made a healthy ramping link look lossy.
 async fn delivery_loop(
     scheduler: Arc<std::sync::Mutex<Scheduler>>,
     links: Links,
@@ -1483,27 +1484,33 @@ async fn delivery_loop(
     let mut tick = tokio::time::interval(DELIVERY_TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut samples: Vec<Option<DeliverySample>> = Vec::with_capacity(links.len());
+    let mut windows: Vec<delivery::ReportWindow> =
+        (0..links.len()).map(|_| Default::default()).collect();
     loop {
         tick.tick().await;
         samples.clear();
         for (idx, l) in links.iter().enumerate() {
-            let (offered, idle, up) = {
+            let (idle, up) = {
                 let g = l.lock().await;
                 (
-                    g.stats.tx_throughput_mbps.get().unwrap_or(0.0),
                     g.stats.last_tx_throughput_sample.elapsed() > delivery::IDLE_AFTER,
                     g.state == LinkState::Up,
                 )
             };
-            let sample = peer_stats.get(idx as u8).and_then(|p| {
-                (up && !idle && LinkState::from_wire(p.state) == LinkState::Up).then_some(
-                    DeliverySample {
-                        offered_mbps: offered,
-                        delivered_mbps: p.throughput_mbps,
-                        stamp: p.received_at,
-                    },
-                )
-            });
+            let peer = peer_stats
+                .get(idx as u8)
+                .filter(|p| up && !idle && LinkState::from_wire(p.state) == LinkState::Up);
+            let sample = match peer.and_then(|p| p.rx_bytes.map(|rx| (p, rx))) {
+                Some((p, rx)) => windows[idx].observe(delivery::Report {
+                    stamp: p.received_at,
+                    peer_rx_bytes: rx,
+                    local_tx_bytes: p.local_tx_bytes,
+                }),
+                None => {
+                    windows[idx].reset();
+                    None
+                }
+            };
             samples.push(sample);
         }
         scheduler
@@ -3199,6 +3206,7 @@ async fn handle_incoming(
     // automatically if a link's source address changes mid-session (e.g.
     // mobile roaming, NAT rebinding) -- without letting an unauthenticated
     // spoofed packet redirect where we send subsequent traffic.
+    let mut local_tx_bytes = 0;
     if let Some(l) = links.get(idx) {
         // Merged into one lock acquisition rather than two adjacent ones
         // (the remote-address check below, plus a Data-only record_rx
@@ -3215,6 +3223,7 @@ async fn handle_incoming(
         if hdr.ptype == PacketType::Data {
             link.stats.record_rx(frame.len() as u64);
         }
+        local_tx_bytes = link.stats.tx_bytes;
     }
 
     match hdr.ptype {
@@ -3293,7 +3302,7 @@ async fn handle_incoming(
                 // Keyed by our own idx (the link we received this on),
                 // not anything the sender included -- see StatsPayload's
                 // doc comment for why that's the correct choice here.
-                peer_stats.update(idx as u8, &payload);
+                peer_stats.update(idx as u8, &payload, local_tx_bytes);
             }
         }
         PacketType::VersionInfo => match VersionInfoPayload::decode(plaintext) {
@@ -3625,6 +3634,7 @@ async fn send_stats_share(link_id: u8, links: &Links, idx: usize) {
             loss_pct: (link.stats.loss_rate.get().unwrap_or(0.0) * 100.0) as f32,
             throughput_mbps: link.stats.rx_throughput_mbps.get().unwrap_or(0.0) as f32,
             state: link.state.to_wire(),
+            rx_bytes: Some(link.stats.rx_bytes),
         };
         (link.handle(), payload)
     };

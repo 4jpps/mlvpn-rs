@@ -25,6 +25,12 @@ pub struct PeerLinkStats {
     /// module doesn't need to depend on `link.rs`; callers decode with
     /// `link::LinkState::from_wire`.
     pub state: u8,
+    /// Peer's lifetime Data bytes received on this link; `None` from an
+    /// older peer that doesn't report it.
+    pub rx_bytes: Option<u64>,
+    /// Our own lifetime `tx_bytes` on this link at the moment this report
+    /// arrived, so two reports bracket the same interval on both sides.
+    pub local_tx_bytes: u64,
     pub received_at: Instant,
 }
 
@@ -40,7 +46,7 @@ impl PeerStatsTable {
         Self::default()
     }
 
-    pub fn update(&self, local_idx: u8, payload: &StatsPayload) {
+    pub fn update(&self, local_idx: u8, payload: &StatsPayload, local_tx_bytes: u64) {
         let mut map = self.0.lock().unwrap();
         map.insert(
             local_idx,
@@ -51,6 +57,8 @@ impl PeerStatsTable {
                 loss_pct: payload.loss_pct as f64,
                 throughput_mbps: payload.throughput_mbps as f64,
                 state: payload.state,
+                rx_bytes: payload.rx_bytes,
+                local_tx_bytes,
                 received_at: Instant::now(),
             },
         );

@@ -3,12 +3,13 @@
 //! A link whose probes succeed can still be a bad data path: a policed or
 //! throttled link answers tiny probes fine while silently discarding most
 //! of a bulk flow. This tracker compares what we *offered* a link (local
-//! `tx_throughput_mbps`) with what the peer says it *received* on it
-//! (`StatsShare` throughput, which we already receive once a second) and
+//! `tx_bytes`) with what the peer says it *received* on it
+//! (`StatsShare` `rx_bytes`, which we already receive once a second) and
 //! derives a `factor` in `[MIN_FACTOR, 1.0]` that scales the link's SWRR
-//! weight. Offered and delivered are both EWMAs sampled the same way on
-//! each side, and the delivered/offered ratio is direction-specific by
-//! construction: it only ever describes our own transmissions.
+//! weight. Offered and delivered are byte deltas between consecutive peer
+//! reports (`ReportWindow`), and the delivered/offered ratio is
+//! direction-specific by construction: it only ever describes our own
+//! transmissions.
 //!
 //! State machine: `Normal` -> congestion detected (cut `factor` by the
 //! delivered/offered ratio at once, so the offered rate lands just under
@@ -50,6 +51,8 @@ pub const RESET_AFTER: Duration = Duration::from_secs(60);
 /// A link's `tx_throughput_mbps` EWMA only moves while it sends; a sample
 /// older than this means the link is idle, not that it offers its last rate.
 pub const IDLE_AFTER: Duration = Duration::from_millis(2500);
+/// Reports closer together than this are not a usable window.
+pub const MIN_WINDOW: Duration = Duration::from_millis(200);
 /// A link below this factor is reported as degraded.
 pub const DEGRADED_BELOW: f64 = 0.7;
 
@@ -66,6 +69,60 @@ pub struct DeliverySample {
     pub delivered_mbps: f64,
     /// When the peer's stats frame arrived; identifies a fresh window.
     pub stamp: Instant,
+}
+
+/// One peer report, paired with our own `tx_bytes` at the moment it arrived.
+#[derive(Clone, Copy, Debug)]
+pub struct Report {
+    pub stamp: Instant,
+    pub peer_rx_bytes: u64,
+    pub local_tx_bytes: u64,
+}
+
+/// Turns successive peer reports into byte-delta samples. A window's
+/// offered and delivered rates cover the same report-to-report interval,
+/// so a ramping or bursty flow cannot make delivery look worse than it is.
+#[derive(Debug, Default)]
+pub struct ReportWindow {
+    prev: Option<Report>,
+    last: Option<DeliverySample>,
+}
+
+impl ReportWindow {
+    /// Forget history (link idle, down, or peer not reporting).
+    pub fn reset(&mut self) {
+        self.prev = None;
+        self.last = None;
+    }
+
+    /// The sample for the newest complete window; repeats the previous one
+    /// (same stamp) until a new report arrives.
+    pub fn observe(&mut self, r: Report) -> Option<DeliverySample> {
+        let Some(prev) = self.prev else {
+            self.prev = Some(r);
+            return None;
+        };
+        if prev.stamp == r.stamp {
+            return self.last;
+        }
+        self.prev = Some(r);
+        let dt = r.stamp.saturating_duration_since(prev.stamp);
+        if r.peer_rx_bytes < prev.peer_rx_bytes
+            || r.local_tx_bytes < prev.local_tx_bytes
+            || dt < MIN_WINDOW
+            || dt > STALE_AFTER
+        {
+            self.last = None;
+            return None;
+        }
+        let mbps = |bytes: u64| bytes as f64 * 8.0 / dt.as_secs_f64() / 1e6;
+        self.last = Some(DeliverySample {
+            offered_mbps: mbps(r.local_tx_bytes - prev.local_tx_bytes),
+            delivered_mbps: mbps(r.peer_rx_bytes - prev.peer_rx_bytes),
+            stamp: r.stamp,
+        });
+        self.last
+    }
 }
 
 #[derive(Debug)]
@@ -242,6 +299,72 @@ mod tests {
     fn policed(tr_factor: f64, total: f64, cap: f64) -> (f64, f64) {
         let offered = tr_factor * total / (1.0 + tr_factor);
         (offered, offered.min(cap))
+    }
+
+    fn report(t0: Instant, ms: u64, rx: u64, tx: u64) -> Report {
+        Report {
+            stamp: t0 + Duration::from_millis(ms),
+            peer_rx_bytes: rx,
+            local_tx_bytes: tx,
+        }
+    }
+
+    #[test]
+    fn ramping_flow_with_full_delivery_is_never_cut() {
+        // Offered doubles every second, nothing lost: the old EWMA compare
+        // read this as ~50% delivery and cut the link.
+        let t0 = Instant::now();
+        let mut w = ReportWindow::default();
+        let mut tr = DeliveryTracker::default();
+        let (mut tx, mut rx) = (0u64, 0u64);
+        assert!(w.observe(report(t0, 0, 0, 0)).is_none());
+        for sec in 1..=12u64 {
+            let step = 1_000_000u64 << sec.min(8);
+            tx += step;
+            rx += step;
+            let s = w.observe(report(t0, sec * 1000, rx, tx));
+            assert_eq!(tr.observe(t0 + Duration::from_millis(sec * 1000), s), 1.0);
+        }
+        assert_eq!(tr.phase(), Phase::Normal);
+    }
+
+    #[test]
+    fn first_report_after_reset_is_only_a_baseline() {
+        let t0 = Instant::now();
+        let mut w = ReportWindow::default();
+        assert!(w.observe(report(t0, 0, 0, 50_000)).is_none());
+        w.reset();
+        assert!(w.observe(report(t0, 1000, 0, 90_000)).is_none());
+    }
+
+    #[test]
+    fn real_loss_shows_in_byte_deltas() {
+        let t0 = Instant::now();
+        let mut w = ReportWindow::default();
+        w.observe(report(t0, 0, 0, 0));
+        let s = w.observe(report(t0, 1000, 125_000, 1_250_000)).unwrap();
+        assert!((s.offered_mbps - 10.0).abs() < 1e-9);
+        assert!((s.delivered_mbps - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn same_report_repeats_sample_and_counter_reset_is_dropped() {
+        let t0 = Instant::now();
+        let mut w = ReportWindow::default();
+        w.observe(report(t0, 0, 0, 0));
+        let a = w.observe(report(t0, 1000, 100, 100)).unwrap();
+        let b = w.observe(report(t0, 1000, 100, 100)).unwrap();
+        assert_eq!(a.stamp, b.stamp);
+        assert!(w.observe(report(t0, 2000, 5, 200)).is_none());
+        assert!(w.observe(report(t0, 3000, 500, 900)).is_some());
+    }
+
+    #[test]
+    fn stale_gap_between_reports_is_not_a_window() {
+        let t0 = Instant::now();
+        let mut w = ReportWindow::default();
+        w.observe(report(t0, 0, 0, 0));
+        assert!(w.observe(report(t0, 5000, 100, 100)).is_none());
     }
 
     #[test]

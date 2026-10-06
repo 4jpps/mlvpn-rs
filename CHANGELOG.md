@@ -12,6 +12,10 @@ design, and `ARCHITECTURE.md` covers the system as a whole.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Delivery-feedback false positives removed (bonded TCP ceiling ~620 -> ~650 Mbps, download variance eliminated).** The delivery tracker compared two lagging, unaligned throughput EWMAs (local TX vs. the peer's reported RX, shared ~1/s and up to 3 s stale), so TCP flow start and ramp-up looked like loss and a healthy link was cut (Comcast factor 0.27 -> 0.08 in one 489 Mbps run). `StatsShare` now carries the peer's cumulative `rx_bytes` (payload 33 -> 41 bytes; legacy 33-byte peers still decode, and their links are simply not judged), and the tracker compares byte-counter deltas between consecutive peer reports against the local `tx_bytes` snapshotted when each report arrived. Bonded TCP -P 4 download on the production pair: 489/641/619 -> 642/641/656 Mbps, delivery factor 1.00 on both links in every run.
+
 ## [0.7.7] - 2026-10-06
 
 ### Added
