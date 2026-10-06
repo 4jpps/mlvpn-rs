@@ -85,6 +85,12 @@ pub struct TelemetrySnapshot {
     /// Lifetime frames dropped because the receive pipeline's channel
     /// was full.
     pub rx_pipeline_dropped_total: u64,
+    /// Lifetime nanoseconds the receive pipeline task spent processing
+    /// batches (excludes time parked waiting for events).
+    pub rx_pipeline_busy_ns_total: u64,
+    /// Highest receive-pipeline channel backlog observed at the start of
+    /// a batch (capacity is `RX_PIPELINE_CAPACITY`).
+    pub rx_pipeline_max_backlog: u64,
     pub process: ProcessSnapshot,
 }
 

@@ -228,7 +228,7 @@ use crate::protocol::{
     ThroughputTestResultPayload, ThroughputTestReverseRequestPayload, VersionInfoPayload,
     HEADER_LEN,
 };
-use crate::scheduler::Scheduler;
+use crate::scheduler::{PrimaryFlag, Scheduler};
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -3640,13 +3640,15 @@ fn watermark_value(wm: &AtomicU64) -> Option<u64> {
     wm.load(Ordering::Relaxed).checked_sub(1)
 }
 
-/// Holds decrypted, still-possibly-out-of-order Data payloads keyed by the
-/// global session sequence number, and releases them to the TUN device
-/// once either the gap in front of them is filled or they've waited
-/// longer than `window`. This bounds the extra latency multipath
-/// reordering can introduce: we would rather deliver a packet slightly
-/// out of order than hold up the whole tunnel waiting for one that may
-/// never arrive.
+/// Sorts decrypted Data payloads by global session sequence number and
+/// releases them to the TUN device as soon as the `rx_pipeline` drains
+/// its channel batch. It never holds a frame back waiting for a missing
+/// predecessor: a held frame stalls everything behind it (head-of-line
+/// blocking), which measured as a 4.6x bonded TCP download loss when
+/// cross-link skew made some frame arrive tens of milliseconds late.
+/// Ordering is therefore best-effort within one batch; a frame that
+/// arrives after a higher seq was already delivered is counted as `late`
+/// and delivered anyway.
 struct ReorderBuffer {
     window: Duration,
     /// Highest Data-frame `hdr.seq` delivered so far, or `None` before
@@ -3678,7 +3680,8 @@ struct ReorderCounters {
     late: u64,
     /// A seq inserted again while its first copy was still buffered.
     duplicate: u64,
-    /// Late frames released only because they aged out of the window.
+    /// Always 0 since late frames are delivered immediately; kept so the
+    /// telemetry schema does not change.
     timeout: u64,
     /// EWMA (alpha 1/8) and lifetime peak of how long a buffered frame
     /// waited before delivery, in microseconds.
@@ -3766,69 +3769,41 @@ impl ReorderBuffer {
         self.counters.max_depth = self.counters.max_depth.max(self.pending.len() as u64);
     }
 
-    /// Drain everything now safe to deliver.
+    /// Drain every pending frame in ascending seq order.
     ///
-    /// `hdr.seq` (the value `insert` is keyed on) is not a Data-only
-    /// sequence space -- it is `Session::next_send_seq()`, a single
-    /// counter shared by every packet type sent over the session
-    /// (Data, Probe, ProbeReply, StatsShare, ThroughputTestData,
-    /// VersionInfo, and more). Periodic non-Data traffic constantly
-    /// consumes sequence numbers from that same counter, so a real
-    /// Data frame's `seq` essentially never equals "the previous
-    /// Data frame's seq, plus one" -- the numbers in between were
-    /// never going to arrive as Data. An admission test requiring
-    /// exact contiguity therefore treats nearly every Data frame as
-    /// "not next," forcing it through the slow staleness path and
-    /// adding close to the full reorder window's worth of needless
-    /// latency to almost all real traffic -- confirmed as a genuine,
-    /// severe production bug (see
-    /// `docs/superpowers/specs/2026-08-29-reorder-buffer-watermark-fix-design.md`).
-    ///
-    /// The fix: track the highest seq delivered so far
-    /// (`high_watermark`) instead of the specific next integer. A
-    /// frame whose seq exceeds the watermark represents forward
-    /// progress -- it can never be "late" relative to anything already
-    /// delivered, regardless of how large the gap from the previous
-    /// Data frame is -- so it is always immediately safe to deliver.
-    /// A frame at or below the watermark is genuine evidence of
-    /// cross-link reordering (arriving after a later-sequenced frame
-    /// already went out) -- exactly the case this buffer exists to
-    /// handle -- and is buffered until either enough of its neighbors
-    /// arrive to flush it in order, or it ages out via the existing
-    /// staleness window.
+    /// `hdr.seq` is shared by every packet type sent over the session
+    /// (Data, Probe, StatsShare, ...), so Data seqs are never contiguous
+    /// and "wait for the next integer" can never be satisfied. Beyond
+    /// that, holding a below-watermark frame for `window` blocks every
+    /// frame behind it, so nothing is held: the sort only repairs
+    /// reordering that happened inside one batch of `RX_PIPELINE_BATCH`
+    /// events. `window` is retained for config/telemetry compatibility
+    /// but no longer delays delivery.
     fn drain_ready(&mut self) -> Vec<Vec<u8>> {
         let mut out = Vec::new();
         let now = tokio::time::Instant::now();
 
-        while let Some((&seq, (sent_at, _))) = self.pending.iter().next() {
-            let is_forward_progress = self.watermark().is_none_or(|wm| seq > wm);
-            let is_stale = now.duration_since(*sent_at) >= self.window;
-            if is_forward_progress || is_stale {
-                let (sent_at, payload) = self.pending.remove(&seq).unwrap();
-                if !is_forward_progress {
-                    self.counters.timeout += 1;
-                }
-                let waited_us = now.duration_since(sent_at).as_micros() as u64;
-                let c = &mut self.counters;
-                c.wait_recent_us = c.wait_recent_us - c.wait_recent_us / 8 + waited_us / 8;
-                c.wait_max_us = c.wait_max_us.max(waited_us);
-                out.push(payload);
-                self.note_delivered(seq);
-            } else {
-                break;
-            }
+        while let Some((&seq, _)) = self.pending.iter().next() {
+            let (sent_at, payload) = self.pending.remove(&seq).unwrap();
+            let waited_us = now.duration_since(sent_at).as_micros() as u64;
+            let c = &mut self.counters;
+            c.wait_recent_us = c.wait_recent_us - c.wait_recent_us / 8 + waited_us / 8;
+            c.wait_max_us = c.wait_max_us.max(waited_us);
+            out.push(payload);
+            self.note_delivered(seq);
         }
         out
     }
 }
 
 /// Capacity of the bounded channel from every `link_receiver` to the
-/// single `rx_pipeline` owner. Sized for a burst across all links while
-/// the owner is busy writing to the TUN device; a full channel drops the
+/// single `rx_pipeline` owner. Sized (8192, up from 1024) so a bonded
+/// download burst never overflows it while the owner is busy writing to
+/// the TUN device -- 1024 dropped packets at ~500 Mbps; a full channel drops the
 /// packet and counts it (see `RxPipelineTx::deliver`) rather than
 /// blocking a receiver, which would also stall that link's probe and
 /// control-frame handling.
-const RX_PIPELINE_CAPACITY: usize = 1024;
+const RX_PIPELINE_CAPACITY: usize = 8192;
 
 /// Max events `rx_pipeline` takes from its channel per wakeup.
 const RX_PIPELINE_BATCH: usize = 64;
@@ -3911,6 +3886,7 @@ async fn rx_pipeline<S: RxSink>(
     dropped: Arc<AtomicU64>,
     stats: Arc<crate::telemetry::RxPipelineStats>,
 ) {
+    let primary = scheduler.lock().unwrap().primary_flag();
     let mut reorder = ReorderBuffer::new(reorder_window_ms);
     let mut flush_tick = interval(REORDER_FLUSH_INTERVAL);
     let mut fec_tick = interval(FEC_EXPIRY_INTERVAL);
@@ -3922,6 +3898,8 @@ async fn rx_pipeline<S: RxSink>(
                 if n == 0 {
                     return;
                 }
+                let batch_start = Instant::now();
+                stats.max_backlog.fetch_max((rx.len() + n) as u64, Ordering::Relaxed);
                 for ev in batch.drain(..) {
                     match ev {
                         RxEvent::Data { seq, plaintext } => {
@@ -3934,13 +3912,13 @@ async fn rx_pipeline<S: RxSink>(
                             if fec_enabled && !fec_recovery.observe_data(seq, &plaintext) {
                                 continue;
                             }
-                            rx_deliver(&*tun, &scheduler, &mut reorder, seq, plaintext).await;
+                            rx_deliver(&*tun, &primary, &mut reorder, seq, plaintext).await;
                             // A late member can complete a parked
                             // two-erasure group (`fec_parity = 2`).
                             if fec_enabled && fec_recovery.has_late_recoveries() {
                                 for (seq, plaintext) in fec_recovery.take_late_recoveries() {
                                     fec_recovered_total.fetch_add(1, Ordering::Relaxed);
-                                    rx_deliver(&*tun, &scheduler, &mut reorder, seq, plaintext).await;
+                                    rx_deliver(&*tun, &primary, &mut reorder, seq, plaintext).await;
                                 }
                             }
                         }
@@ -3948,7 +3926,7 @@ async fn rx_pipeline<S: RxSink>(
                             fec::RecoveryOutcome::Recovered(frames) => {
                                 for (seq, plaintext) in frames {
                                     fec_recovered_total.fetch_add(1, Ordering::Relaxed);
-                                    rx_deliver(&*tun, &scheduler, &mut reorder, seq, plaintext).await;
+                                    rx_deliver(&*tun, &primary, &mut reorder, seq, plaintext).await;
                                 }
                             }
                             fec::RecoveryOutcome::Unrecoverable => {
@@ -3960,6 +3938,9 @@ async fn rx_pipeline<S: RxSink>(
                         RxEvent::SetReorderWindow(ms) => reorder.set_window(ms),
                     }
                 }
+                stats
+                    .busy_ns_total
+                    .fetch_add(batch_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
             }
             _ = flush_tick.tick() => {
                 // Flushes entries that would otherwise sit until they age
@@ -4000,12 +3981,12 @@ async fn rx_pipeline<S: RxSink>(
 /// cached, so a mid-stream transition is picked up on the very next one.
 async fn rx_deliver<S: RxSink>(
     tun: &S,
-    scheduler: &std::sync::Mutex<Scheduler>,
+    primary: &PrimaryFlag,
     reorder: &mut ReorderBuffer,
     seq: u64,
     plaintext: Vec<u8>,
 ) {
-    if scheduler.lock().unwrap().primary().is_some() {
+    if primary.is_set() {
         reorder.note_delivered(seq);
         tun.send(&plaintext).await;
     } else {
@@ -4333,96 +4314,42 @@ mod reorder_tuning_tests {
     }
 
     #[test]
-    fn note_delivered_updates_watermark_without_touching_pending() {
+    fn note_delivered_advances_watermark_without_touching_pending() {
         let mut buf = ReorderBuffer::new(50);
-        // Prime a watermark ahead of 5 first -- on a genuinely fresh
-        // buffer (high_watermark still None), drain_ready's own
-        // forward-progress test (`is_none_or`) treats *any* first
-        // frame as forward progress, so this out-of-order case only
-        // arises once something later has already been delivered.
         buf.insert(10, vec![10]);
-        assert_eq!(buf.drain_ready(), vec![vec![10]]); // watermark now 10
+        assert_eq!(buf.drain_ready(), vec![vec![10]]);
+        assert_eq!(buf.watermark(), Some(10));
 
-        // A genuinely out-of-order entry sitting in pending, buffered
-        // the normal way.
-        buf.insert(5, vec![5]);
-        assert_eq!(buf.drain_ready(), Vec::<Vec<u8>>::new()); // nothing forward-progress yet (5 < 10)
-
-        // note_delivered (the bypass-mode path) advances the watermark
-        // directly, without going through insert/drain_ready at all.
         buf.note_delivered(100);
-
-        // The watermark is now 100 -- entry 5 is far behind it, so a
-        // later drain_ready (e.g. if bypass mode ends and buffered mode
-        // resumes) would treat it as forward-progress-eligible... but
-        // note_delivered itself must not have removed or delivered it:
-        // pending still holds it exactly as inserted.
         assert_eq!(buf.watermark(), Some(100));
-        assert_eq!(buf.pending.len(), 1);
-        assert!(buf.pending.contains_key(&5));
+        assert!(buf.pending.is_empty());
     }
 
     #[test]
     fn note_delivered_advances_watermark_monotonically() {
-        let mut buf = ReorderBuffer::new(50);
+        let buf = ReorderBuffer::new(50);
         buf.note_delivered(10);
         buf.note_delivered(50);
-        // A lower seq arriving after a higher one (still real, on a
-        // single link occasionally) must not move the watermark
-        // backward.
         buf.note_delivered(20);
-
-        // Confirm indirectly via drain_ready's own forward-progress
-        // test: inserting exactly at the current watermark (50) must
-        // NOT be treated as forward progress (a real regression this
-        // test would catch: if note_delivered had let the watermark
-        // fall back to 20, seq 50 would wrongly look like forward
-        // progress here).
-        buf.insert(50, vec![50]);
-        assert_eq!(buf.drain_ready(), Vec::<Vec<u8>>::new());
+        assert_eq!(buf.watermark(), Some(50));
     }
 
     #[test]
-    fn bypass_then_resume_buffered_mode_keeps_watermark_accurate() {
-        // The full transition scenario the watermark-staleness fix
-        // exists for: buffered mode, then bypass mode advances the
-        // watermark far ahead via note_delivered, then buffered mode
-        // resumes and must not treat already-passed sequence numbers
-        // as forward progress just because it never itself saw them.
+    fn bypass_then_resume_keeps_watermark_and_delivers_late_frames() {
         let mut buf = ReorderBuffer::new(50);
-
-        // Buffered mode: seq 10 delivered normally.
         buf.insert(10, vec![10]);
-        assert_eq!(buf.drain_ready(), vec![vec![10]]); // watermark now 10
+        assert_eq!(buf.drain_ready(), vec![vec![10]]);
 
-        // Bypass mode takes over (e.g. primary_link_mode settles):
-        // real traffic keeps flowing via note_delivered, advancing far
-        // past what buffered mode itself ever processed.
         buf.note_delivered(500);
 
-        // Buffered mode resumes (e.g. the primary went Down). A late
-        // frame with a seq between the old and new watermark must be
-        // correctly recognized as behind the watermark, not wrongly
-        // treated as forward progress just because buffered mode
-        // itself never saw seq 500 go by.
         buf.insert(200, vec![200]);
-        assert_eq!(buf.drain_ready(), Vec::<Vec<u8>>::new());
+        assert_eq!(buf.drain_ready(), vec![vec![200]]);
+        assert_eq!(buf.watermark(), Some(500));
+        assert_eq!(buf.counters.late, 1);
 
-        // drain_ready only ever delivers from the front of `pending` in
-        // ascending-seq order (pre-existing, unmodified behavior --
-        // see reorder_buffer_preserves_order_for_buffered_frames_below_
-        // watermark) -- so the still-stuck 200 entry would otherwise
-        // block 600 from ever being reached, regardless of 600 being
-        // past the watermark. That in-order blocking is intentional
-        // and out of scope for this task; remove the stuck entry
-        // directly so this assertion isolates exactly what this test
-        // is for: that note_delivered's watermark stayed accurate.
-        buf.pending.remove(&200);
-
-        // A genuinely new frame past the bypass-mode watermark is
-        // still correctly forward progress.
-        buf.insert(600, vec![600u64 as u8]);
-        assert_eq!(buf.drain_ready(), vec![vec![600u64 as u8]]);
+        buf.insert(600, vec![88]);
+        assert_eq!(buf.drain_ready(), vec![vec![88]]);
+        assert_eq!(buf.watermark(), Some(600));
     }
 
     #[test]
@@ -4459,47 +4386,29 @@ mod reorder_tuning_tests {
         assert_eq!(buf.drain_ready(), vec![vec![1, 2, 3]]);
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn reorder_buffer_holds_genuine_reordering_until_stale() {
-        // A frame arriving at or below the current watermark is real
-        // evidence of cross-link reordering (the buffer's actual intended
-        // purpose) -- unlike the "gap" case above, this one legitimately
-        // has to wait, same as today's behavior, bounded by the window.
+    #[test]
+    fn reorder_buffer_delivers_late_frames_immediately_and_counts_them() {
         let mut buf = ReorderBuffer::new(50);
         buf.insert(10, vec![10]);
-        assert_eq!(buf.drain_ready(), vec![vec![10]]); // advances watermark to 10
+        assert_eq!(buf.drain_ready(), vec![vec![10]]);
 
-        // seq 5 arrives "late" -- below the watermark. Not immediately
-        // delivered.
         buf.insert(5, vec![5]);
-        assert_eq!(buf.drain_ready(), Vec::<Vec<u8>>::new());
-
-        // Still not stale yet.
-        tokio::time::advance(Duration::from_millis(30)).await;
-        assert_eq!(buf.drain_ready(), Vec::<Vec<u8>>::new());
-
-        // Past the 50ms window: delivered via the staleness path, same as
-        // today's existing behavior.
-        tokio::time::advance(Duration::from_millis(25)).await;
         assert_eq!(buf.drain_ready(), vec![vec![5]]);
+        assert_eq!(buf.counters.late, 1);
+        assert_eq!(buf.watermark(), Some(10));
+        assert!(buf.pending.is_empty());
     }
 
     #[test]
-    fn reorder_buffer_preserves_order_for_buffered_frames_below_watermark() {
-        // Two frames both below/at the watermark, inserted out of order,
-        // must still be delivered in ascending seq order relative to each
-        // other once they're eligible -- ordering within the genuinely
-        // buffered set is still respected, only the "wait for an exact
-        // next integer" requirement is gone.
+    fn reorder_buffer_sorts_one_batch_by_seq() {
         let mut buf = ReorderBuffer::new(50);
         buf.insert(100, vec![100]);
-        assert_eq!(buf.drain_ready(), vec![vec![100]]); // watermark now 100
+        assert_eq!(buf.drain_ready(), vec![vec![100]]);
 
-        // Two "late" frames below the watermark, inserted in reverse order.
         buf.insert(99, vec![99]);
         buf.insert(98, vec![98]);
-        // Neither is a forward-progress delivery, so nothing comes out yet.
-        assert_eq!(buf.drain_ready(), Vec::<Vec<u8>>::new());
+        buf.insert(101, vec![101]);
+        assert_eq!(buf.drain_ready(), vec![vec![98], vec![99], vec![101]]);
     }
 
     fn score(link_index: usize, rtt_ms: f64, jitter_ms: f64) -> LinkScore {

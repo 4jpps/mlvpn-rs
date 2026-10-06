@@ -53,6 +53,8 @@ pub struct RxPipelineStats {
     pub timeout_total: AtomicU64,
     /// Lifetime frames dropped because the pipeline channel was full.
     pub dropped_total: AtomicU64,
+    pub busy_ns_total: AtomicU64,
+    pub max_backlog: AtomicU64,
 }
 
 impl RxPipelineStats {
@@ -452,6 +454,8 @@ pub async fn run(telemetry: Arc<Telemetry>, inputs: WatchInputs) {
             rates: sampler.rates.clone(),
             reroutes_total,
             rx_pipeline_dropped_total: rx.dropped_total.load(Ordering::Relaxed),
+            rx_pipeline_busy_ns_total: rx.busy_ns_total.load(Ordering::Relaxed),
+            rx_pipeline_max_backlog: rx.max_backlog.load(Ordering::Relaxed),
             process: ProcessSnapshot {
                 cpu_pct: sampler.cpu_pct,
                 rss_kb: process.rss_kb,

@@ -24,7 +24,7 @@ use crate::congestion::{CongestionTracker, CounterSnapshot};
 use crate::link::{Link, LinkScore, LinkState, TxCounters};
 use crate::monitor;
 use std::collections::HashMap;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -106,6 +106,18 @@ const QUEUE_FULL_PENALTY: Duration = Duration::from_millis(200);
 /// 200 ms than one that merely had a burst.
 const SEND_FAILED_PENALTY: Duration = Duration::from_millis(500);
 
+const NO_PRIMARY: usize = usize::MAX;
+
+/// Cheap, lock-free read of the scheduler's current primary link.
+#[derive(Clone)]
+pub struct PrimaryFlag(Arc<AtomicUsize>);
+
+impl PrimaryFlag {
+    pub fn is_set(&self) -> bool {
+        self.0.load(Ordering::Acquire) != NO_PRIMARY
+    }
+}
+
 pub struct Scheduler {
     entries: Vec<SwrrEntry>,
     rate_limits: HashMap<usize, RateLimitState>,
@@ -121,6 +133,10 @@ pub struct Scheduler {
     /// currently Down. See `refresh_from_scores`'s doc comment for
     /// the full selection/hysteresis logic.
     primary: Option<usize>,
+    /// Lock-free mirror of `primary` (`NO_PRIMARY` when `None`), written by
+    /// `set_primary` and read per packet by the RX pipeline so it never
+    /// has to take the scheduler mutex.
+    primary_published: Arc<AtomicUsize>,
     /// A link that has been beating the current primary's score by
     /// `PRIMARY_SWITCH_MARGIN` for `count` consecutive refreshes in a
     /// row, tracked so a switch only happens once that streak reaches
@@ -139,8 +155,20 @@ impl Scheduler {
             penalized: Vec::new(),
             congestion: Vec::new(),
             primary: None,
+            primary_published: Arc::new(AtomicUsize::new(NO_PRIMARY)),
             candidate: None,
         }
+    }
+
+    fn set_primary(&mut self, primary: Option<usize>) {
+        self.primary = primary;
+        self.primary_published
+            .store(primary.unwrap_or(NO_PRIMARY), Ordering::Release);
+    }
+
+    /// Shared handle to the published primary, for hot-path readers.
+    pub fn primary_flag(&self) -> PrimaryFlag {
+        PrimaryFlag(self.primary_published.clone())
     }
 
     /// This scheduler's currently-selected primary link, as a local
@@ -272,14 +300,15 @@ impl Scheduler {
             // hasn't chosen one yet, or chose one that isn't Up on this
             // side (e.g. this side's own view of that link's health
             // differs from the peer's -- possible with asymmetric loss).
-            self.primary =
-                peer_primary_index.filter(|idx| up_indices.iter().any(|(i, _)| i == idx));
+            self.set_primary(
+                peer_primary_index.filter(|idx| up_indices.iter().any(|(i, _)| i == idx)),
+            );
             self.candidate = None;
             return;
         }
 
         if !cfg.primary_link_mode {
-            self.primary = None;
+            self.set_primary(None);
             self.candidate = None;
             return;
         }
@@ -292,10 +321,11 @@ impl Scheduler {
             // No current primary, or it just went Down -- immediate
             // (re)selection, no hysteresis. Picks the best of whatever
             // is currently Up; None if nothing is.
-            self.primary = up_indices
+            let best = up_indices
                 .iter()
                 .max_by(|(_, a), (_, b)| a.total_cmp(b))
                 .map(|(i, _)| *i);
+            self.set_primary(best);
             self.candidate = None;
             return;
         };
@@ -315,7 +345,7 @@ impl Scheduler {
                 Some((idx, count)) if *idx == *other_idx => {
                     *count += 1;
                     if *count >= cfg.up_threshold {
-                        self.primary = Some(*other_idx);
+                        self.set_primary(Some(*other_idx));
                         self.candidate = None;
                     }
                 }
@@ -543,6 +573,17 @@ impl Default for Scheduler {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn primary_flag_tracks_published_primary() {
+        let mut sched = Scheduler::new();
+        let flag = sched.primary_flag();
+        assert!(!flag.is_set());
+        sched.set_primary(Some(1));
+        assert!(flag.is_set());
+        sched.set_primary(None);
+        assert!(!flag.is_set());
+    }
+
     use super::*;
 
     /// SWRR should, over many picks, distribute roughly proportionally to
