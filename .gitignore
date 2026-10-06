@@ -40,3 +40,9 @@ CLAUDE.local.md
 # field, never the private half.
 *.key
 private.key
+
+# Local working material: not published to GitLab
+/benchmark/
+/MLVPN-Benchmark-Report.md
+/.superpowers/
+/docs/superpowers/
