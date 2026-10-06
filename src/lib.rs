@@ -13,6 +13,7 @@ pub mod config;
 pub mod congestion;
 pub mod control;
 pub mod crypto;
+pub mod delivery;
 pub mod diag;
 pub mod diagnostics;
 pub mod error;

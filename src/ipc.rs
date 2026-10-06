@@ -455,6 +455,12 @@ pub struct LinkSnapshot {
     /// while the link's queue delay / send failures say it is congested.
     #[serde(default = "default_congestion_factor")]
     pub congestion_factor: f64,
+    /// Scheduler weight multiplier from delivery feedback (what the peer
+    /// reports receiving vs. what we offered this link): 1.0 healthy,
+    /// down to 0.001 for a link that drops most of a bulk flow even
+    /// though its probes succeed.
+    #[serde(default = "default_congestion_factor")]
+    pub delivery_factor: f64,
     /// The link is Up but congested enough (`congestion_factor` below
     /// 0.7) that the scheduler is steering traffic away from it. A
     /// derived overlay on `state`, not a separate state.
@@ -679,6 +685,7 @@ mod tests {
             tx_queue_delay_max_us: 0,
             tx_send_wait_us: 0,
             congestion_factor: 1.0,
+            delivery_factor: 1.0,
             degraded: false,
             peer_name: None,
             peer_state: None,

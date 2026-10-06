@@ -21,6 +21,7 @@
 
 use crate::config::SchedulerConfig;
 use crate::congestion::{CongestionTracker, CounterSnapshot};
+use crate::delivery::{DeliverySample, DeliveryTracker};
 use crate::link::{Link, LinkScore, LinkState, TxCounters};
 use crate::monitor;
 use std::collections::HashMap;
@@ -106,6 +107,11 @@ const QUEUE_FULL_PENALTY: Duration = Duration::from_millis(200);
 /// 200 ms than one that merely had a burst.
 const SEND_FAILED_PENALTY: Duration = Duration::from_millis(500);
 
+/// A link below this delivery factor is not preferred as the "unpenalized"
+/// refuge when another link reports queue-full: steering a whole burst onto a
+/// policed link would defeat its delivery-driven weight cut.
+const PENALTY_FALLBACK_MIN_DELIVERY: f64 = 0.5;
+
 const NO_PRIMARY: usize = usize::MAX;
 
 /// Cheap, lock-free read of the scheduler's current primary link.
@@ -128,6 +134,9 @@ pub struct Scheduler {
     /// `entries` because `refresh()` rebuilds those from scratch while the
     /// factor has to persist (and recover gradually) across rebuilds.
     congestion: Vec<CongestionTracker>,
+    /// Per-link delivery-feedback state (offered vs. peer-received rate),
+    /// persisting across `refresh()` rebuilds like `congestion`.
+    delivery: Vec<DeliveryTracker>,
     /// Current primary link's index, when `scheduler.primary_link_mode`
     /// is on. `None` before the first `refresh()`, or if every link is
     /// currently Down. See `refresh_from_scores`'s doc comment for
@@ -154,6 +163,7 @@ impl Scheduler {
             rate_limits: HashMap::new(),
             penalized: Vec::new(),
             congestion: Vec::new(),
+            delivery: Vec::new(),
             primary: None,
             primary_published: Arc::new(AtomicUsize::new(NO_PRIMARY)),
             candidate: None,
@@ -213,6 +223,61 @@ impl Scheduler {
         self.congestion.get(idx).map_or(1.0, |t| t.factor())
     }
 
+    /// Delivery-feedback factor for link `idx` relative to the best link
+    /// (1.0 when unknown). Relative, not absolute: when every link shows
+    /// the same shortfall the cause is shared (sender or peer overload,
+    /// stale EWMAs), not one bad link, and that must not look like a
+    /// collapse to the spill/penalty steering or to diagnostics.
+    pub fn delivery_factor(&self, idx: usize) -> f64 {
+        let Some(t) = self.delivery.get(idx) else {
+            return 1.0;
+        };
+        let best = self
+            .delivery
+            .iter()
+            .map(|d| d.factor())
+            .fold(0.0_f64, f64::max);
+        if best <= 0.0 {
+            return 1.0;
+        }
+        (t.factor() / best).clamp(crate::delivery::MIN_FACTOR, 1.0)
+    }
+
+    /// Combined weight multiplier: queue congestion x delivery feedback.
+    fn link_factor(&self, idx: usize) -> f64 {
+        self.congestion_factor(idx) * self.delivery_factor(idx)
+    }
+
+    /// Fold each link's offered-vs-delivered observation into its
+    /// delivery factor and re-scale the SWRR weights. `samples` is in
+    /// `Links` order; `None` means no usable evidence (idle link, peer
+    /// stats missing or reporting the link down). Publishes the factor on
+    /// `counters` for diagnostics.
+    pub fn update_delivery(
+        &mut self,
+        now: Instant,
+        samples: &[Option<DeliverySample>],
+        counters: &[Arc<TxCounters>],
+    ) {
+        if self.delivery.len() < samples.len() {
+            self.delivery
+                .resize_with(samples.len(), DeliveryTracker::default);
+        }
+        for (i, s) in samples.iter().enumerate() {
+            self.delivery[i].observe(now, *s);
+        }
+        for (i, c) in counters.iter().enumerate() {
+            c.delivery_ppm.store(
+                (self.delivery_factor(i) * 1_000_000.0).round() as u32,
+                Ordering::Relaxed,
+            );
+        }
+        for k in 0..self.entries.len() {
+            let f = self.link_factor(self.entries[k].link_index);
+            self.entries[k].effective_weight = self.entries[k].base_weight * f;
+        }
+    }
+
     /// Fold each link's TX counters into its congestion factor and
     /// re-scale the SWRR weights; also publishes the recent delay / send
     /// wait / factor back onto the counters for diagnostics. Cheap (atomic
@@ -235,12 +300,9 @@ impl Scheduler {
             c.congestion_milli
                 .store((t.factor() * 1000.0).round() as u32, Ordering::Relaxed);
         }
-        for e in &mut self.entries {
-            e.effective_weight = e.base_weight
-                * self
-                    .congestion
-                    .get(e.link_index)
-                    .map_or(1.0, |t| t.factor());
+        for k in 0..self.entries.len() {
+            let f = self.link_factor(self.entries[k].link_index);
+            self.entries[k].effective_weight = self.entries[k].base_weight * f;
         }
     }
 
@@ -271,7 +333,7 @@ impl Scheduler {
             .map(|(i, w)| SwrrEntry {
                 link_index: i,
                 base_weight: w,
-                effective_weight: w * self.congestion_factor(i),
+                effective_weight: w * self.link_factor(i),
                 current_weight: 0.0,
                 bandwidth_cap_mbps: links[i].config.bandwidth_cap_mbps,
             })
@@ -517,7 +579,11 @@ impl Scheduler {
                 let unpenalized: Vec<usize> = eligible
                     .iter()
                     .copied()
-                    .filter(|&pos| !penalized.iter().any(|(i, _)| *i == entries[pos].link_index))
+                    .filter(|&pos| {
+                        let idx = entries[pos].link_index;
+                        !penalized.iter().any(|(i, _)| *i == idx)
+                            && self.delivery_factor(idx) >= PENALTY_FALLBACK_MIN_DELIVERY
+                    })
                     .collect();
                 if !unpenalized.is_empty() {
                     eligible = unpenalized;
@@ -664,6 +730,54 @@ mod tests {
             seen[s.select_fast(2, 100).unwrap()] = true;
         }
         assert!(seen[0] && seen[1], "all-penalized must fall back to SWRR");
+    }
+
+    #[test]
+    fn queue_full_burst_is_not_steered_onto_a_collapsed_delivery_link() {
+        let mut s = two_entry_scheduler();
+        let counters = counters_pair();
+        let t0 = Instant::now();
+        for k in 0..12u64 {
+            let now = t0 + Duration::from_millis(250 * k);
+            let policed = DeliverySample {
+                offered_mbps: 50.0,
+                delivered_mbps: 0.5,
+                stamp: now,
+            };
+            let ok = DeliverySample {
+                offered_mbps: 50.0,
+                delivered_mbps: 50.0,
+                stamp: now,
+            };
+            s.update_delivery(now, &[Some(ok), Some(policed)], &counters);
+        }
+        assert!(s.delivery_factor(1) < 0.5, "link 1 should have collapsed");
+        s.note_queue_full(0);
+        let to_policed = (0..200)
+            .filter(|_| s.select_fast(2, 100) == Some(1))
+            .count();
+        assert!(
+            to_policed < 5,
+            "burst leaked {to_policed}/200 onto policed link"
+        );
+    }
+
+    #[test]
+    fn uniform_delivery_shortfall_is_not_a_collapse() {
+        let mut s = two_entry_scheduler();
+        let counters = counters_pair();
+        let t0 = Instant::now();
+        for k in 0..12u64 {
+            let now = t0 + Duration::from_millis(250 * k);
+            let bad = DeliverySample {
+                offered_mbps: 50.0,
+                delivered_mbps: 0.5,
+                stamp: now,
+            };
+            s.update_delivery(now, &[Some(bad), Some(bad)], &counters);
+        }
+        assert!(s.delivery_factor(0) > 0.99 && s.delivery_factor(1) > 0.99);
+        assert!(counters[0].delivery_ppm.load(Ordering::Relaxed) > 990_000);
     }
 
     fn counters_pair() -> Vec<Arc<TxCounters>> {

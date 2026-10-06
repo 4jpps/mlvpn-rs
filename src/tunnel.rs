@@ -218,6 +218,7 @@ use crate::config;
 use crate::config::{Mode, SchedulerConfig};
 use crate::control;
 use crate::crypto;
+use crate::delivery::{self, DeliverySample};
 use crate::error::{MlvpnError, Result};
 use crate::fec;
 use crate::link::{self, is_interface_gone_error, Link, LinkHandle, LinkScore, LinkState, Links};
@@ -1016,8 +1017,15 @@ pub async fn run(
                 .map(|q| q.counters.clone())
                 .collect();
             let sched = scheduler.clone();
+            let congestion_counters = counters.clone();
             handles.push(tokio::spawn(async move {
-                congestion_loop(sched, counters).await;
+                congestion_loop(sched, congestion_counters).await;
+            }));
+            let sched = scheduler.clone();
+            let delivery_links = links.clone();
+            let delivery_peer_stats = peer_stats.clone();
+            handles.push(tokio::spawn(async move {
+                delivery_loop(sched, delivery_links, delivery_peer_stats, counters).await;
             }));
             dispatcher
         };
@@ -1458,6 +1466,53 @@ async fn congestion_loop(
     }
 }
 
+/// How often the scheduler looks for fresh peer stats to judge each link's
+/// delivery by. The peer reports once a second, so most ticks find nothing
+/// new; this only bounds how late a fresh report is noticed.
+const DELIVERY_TICK: Duration = Duration::from_millis(250);
+
+/// Compare what we offer each link with what the peer reports receiving on
+/// it (`delivery.rs`). Offered is read from the local tx-throughput EWMA,
+/// treated as zero once it stops being updated (an idle link).
+async fn delivery_loop(
+    scheduler: Arc<std::sync::Mutex<Scheduler>>,
+    links: Links,
+    peer_stats: Arc<PeerStatsTable>,
+    counters: Vec<Arc<link::TxCounters>>,
+) {
+    let mut tick = tokio::time::interval(DELIVERY_TICK);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut samples: Vec<Option<DeliverySample>> = Vec::with_capacity(links.len());
+    loop {
+        tick.tick().await;
+        samples.clear();
+        for (idx, l) in links.iter().enumerate() {
+            let (offered, idle, up) = {
+                let g = l.lock().await;
+                (
+                    g.stats.tx_throughput_mbps.get().unwrap_or(0.0),
+                    g.stats.last_tx_throughput_sample.elapsed() > delivery::IDLE_AFTER,
+                    g.state == LinkState::Up,
+                )
+            };
+            let sample = peer_stats.get(idx as u8).and_then(|p| {
+                (up && !idle && LinkState::from_wire(p.state) == LinkState::Up).then_some(
+                    DeliverySample {
+                        offered_mbps: offered,
+                        delivered_mbps: p.throughput_mbps,
+                        stamp: p.received_at,
+                    },
+                )
+            });
+            samples.push(sample);
+        }
+        scheduler
+            .lock()
+            .unwrap()
+            .update_delivery(Instant::now(), &samples, &counters);
+    }
+}
+
 /// A link's TX queue sender plus its lock-free health counters.
 struct LinkTx {
     tx: mpsc::Sender<TxJob>,
@@ -1467,14 +1522,23 @@ struct LinkTx {
 /// Links in `Links` order: `TxQueues[i]` feeds link `i`'s worker.
 type TxQueues = Arc<Vec<LinkTx>>;
 
+const SPILL_MIN_DELIVERY_PPM: u32 = 500_000;
+
 /// Links to try, best first, when a packet cannot go to `from`: every
 /// other link with free queue room, most free slots first (ties broken by
 /// index for determinism). Pure so the spill policy is unit-testable
 /// without sockets; link *usability* (Up, enabled, has a remote) is
 /// checked separately by the caller because it needs the link locks.
-fn spill_candidates(free: &[usize], from: usize) -> Vec<usize> {
+/// A link whose delivery feedback has collapsed (`delivery_ppm` below
+/// `SPILL_MIN_DELIVERY_PPM`) is never a spill target: the peer is not
+/// receiving what it is sent, so spilling onto it just feeds the policer.
+fn spill_candidates(free: &[usize], delivery_ppm: &[u32], from: usize) -> Vec<usize> {
     let mut c: Vec<usize> = (0..free.len())
-        .filter(|&i| i != from && free[i] > 0)
+        .filter(|&i| {
+            i != from
+                && free[i] > 0
+                && delivery_ppm.get(i).copied().unwrap_or(1_000_000) >= SPILL_MIN_DELIVERY_PPM
+        })
         .collect();
     c.sort_by(|&a, &b| free[b].cmp(&free[a]).then(a.cmp(&b)));
     c
@@ -1616,7 +1680,12 @@ impl TxDispatcher {
     /// other than `from`, or count a drop if there is none.
     async fn spill_reserve(&self, from: usize) -> Option<(usize, mpsc::Permit<'_, TxJob>)> {
         let free: Vec<usize> = self.queues.iter().map(|q| q.tx.capacity()).collect();
-        for cand in spill_candidates(&free, from) {
+        let delivery: Vec<u32> = self
+            .queues
+            .iter()
+            .map(|q| q.counters.delivery_ppm.load(Ordering::Relaxed))
+            .collect();
+        for cand in spill_candidates(&free, &delivery, from) {
             {
                 let g = self.links[cand].lock().await;
                 if g.state == LinkState::Down || g.admin_disabled || g.remote.is_none() {
@@ -4259,18 +4328,32 @@ mod spill_candidate_tests {
     #[test]
     fn spill_prefers_most_free_slots_and_skips_origin_and_full_queues() {
         // link 0 is the origin, link 1 is full, 2 has the most room.
-        assert_eq!(spill_candidates(&[10, 0, 100, 50], 0), vec![2, 3]);
+        assert_eq!(
+            spill_candidates(&[10, 0, 100, 50], &[1_000_000; 4], 0),
+            vec![2, 3]
+        );
     }
 
     #[test]
     fn spill_breaks_ties_by_index() {
-        assert_eq!(spill_candidates(&[5, 9, 9, 9], 0), vec![1, 2, 3]);
+        assert_eq!(
+            spill_candidates(&[5, 9, 9, 9], &[1_000_000; 4], 0),
+            vec![1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn spill_skips_links_with_collapsed_delivery() {
+        assert_eq!(
+            spill_candidates(&[10, 100, 50], &[1_000_000, 1_000, 900_000], 0),
+            vec![2]
+        );
     }
 
     #[test]
     fn spill_has_no_candidate_when_everything_else_is_full() {
-        assert!(spill_candidates(&[128, 0, 0], 0).is_empty());
-        assert!(spill_candidates(&[128], 0).is_empty());
+        assert!(spill_candidates(&[128, 0, 0], &[1_000_000; 3], 0).is_empty());
+        assert!(spill_candidates(&[128], &[1_000_000], 0).is_empty());
     }
 
     fn job() -> TxJob {

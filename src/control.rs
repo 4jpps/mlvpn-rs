@@ -306,6 +306,8 @@ async fn build_snapshot(
                 .congestion_milli
                 .load(Ordering::Relaxed) as f64
                 / 1000.0;
+            let delivery =
+                link.stats.tx_counters.delivery_ppm.load(Ordering::Relaxed) as f64 / 1_000_000.0;
             LinkSnapshot {
                 name: link.config.name.clone(),
                 bind_interface: link.config.bind_interface.clone(),
@@ -350,8 +352,10 @@ async fn build_snapshot(
                     .send_wait_recent_us
                     .load(Ordering::Relaxed),
                 congestion_factor: congestion,
+                delivery_factor: delivery,
                 degraded: link.state == LinkState::Up
-                    && congestion < crate::congestion::DEGRADED_BELOW,
+                    && (congestion < crate::congestion::DEGRADED_BELOW
+                        || delivery < crate::delivery::DEGRADED_BELOW),
                 peer_name: peer.as_ref().map(|p| p.name.clone()),
                 peer_state: peer
                     .as_ref()

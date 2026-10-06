@@ -233,12 +233,16 @@ pub struct TxCounters {
     pub queue_delay_recent_us: AtomicU64,
     pub send_wait_recent_us: AtomicU64,
     pub congestion_milli: AtomicU32,
+    /// Delivery-feedback factor in millionths (1_000_000 = healthy); see
+    /// `delivery.rs`.
+    pub delivery_ppm: AtomicU32,
 }
 
 impl TxCounters {
     pub fn new() -> Self {
         let c = Self::default();
         c.congestion_milli.store(1000, Ordering::Relaxed);
+        c.delivery_ppm.store(1_000_000, Ordering::Relaxed);
         c
     }
 }
