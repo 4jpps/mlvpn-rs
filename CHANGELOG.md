@@ -12,6 +12,24 @@ design, and `ARCHITECTURE.md` covers the system as a whole.
 
 ## [Unreleased]
 
+## [0.7.7] - 2026-10-06
+
+### Added
+
+- **Delivery-feedback scheduling (no wire or config change).** Healthy probes do not prove the data path is healthy: with one link shaped to 1 Mbit the scheduler kept sending ~13% of bulk download traffic onto it and bonded throughput collapsed to ~3-4 Mbps. New `delivery` module: a per-link `DeliveryTracker` compares what was offered to a link (local TX throughput) with what the peer reports receiving (`StatsShare` `rx_throughput_mbps`). A sustained shortfall cuts the link's weight factor fast, holds it down (5 s, doubling to 60 s on relapse), then recovers slowly (+10%/s) to avoid oscillation; tiny offered rates and stale or idle samples are ignored. The factor is relative to the best link, so a uniform shortfall across every link is not a per-link collapse. It multiplies into the effective SWRR weight alongside the congestion factor, queue-full spill skips links whose relative delivery is below 0.5, and such links are no longer the "unpenalized refuge" when another link reports queue-full. `delivery_factor` is exposed per link in telemetry and `diag-dump`.
+
+  Measured on the production pair (Comcast + T-Mobile, FEC off, iperf3 TCP -P 4): T-Mobile shaped to 1 Mbit, upload 3.7 -> ~38 Mbps (equal to Comcast alone), download 3.4 -> 130-390 Mbps (cold start slower than warm); healthy bonded throughput unchanged within run-to-run noise.
+
+### Fixed
+
+- **Reorder buffer head-of-line blocking removed.** Delayed frames no longer hold back later ones that are already deliverable; bonded TCP download on the production pair rose from ~50 to ~265 Mbps with this change alone.
+- **Receive pipeline channel capacity 1024 -> 8192**, which stopped drops under bursty bonded download (~265 -> ~335 Mbps).
+
+### Changed
+
+- **Primary-link lookup on the send path is lock-free.** Throughput-neutral in measurement; removes a lock from the per-packet path.
+- **Recommendation: run with FEC off on this deployment.** On the final build FEC 8+1 cost ~30% of bonded download (~430 vs ~620 Mbps) and 8+2 ~40%, with no measured benefit.
+
 ### Added
 
 - **Per-link bounded TX workers (failure isolation).** Previously a single `outbound_sender` task did every link's `send_to` inline, so one blocked socket (a WAN path that stops draining while its send buffer is full) froze transmission on every link until it cleared. `outbound_sender` now only picks a link and `try_send`s onto that link's own 128-slot queue (`TxDispatcher`); a `link_tx_worker` per link encrypts and sends, batching up to 32 frames per wakeup. A full queue is counted (`tx_queue_full`), applies a 200 ms scheduler penalty to that link (`Scheduler::note_queue_full`), and spills the packet to the usable link with the most free slots; under `primary_link_mode`/`follow_peer_primary` there is no spill and the packet is dropped and counted in `outbound_dropped_total`, so traffic never leaks onto a backup. A worker send failure (or a link with no remote yet) reroutes the packet once to another link. `redundant_mode` enqueues a clone on every Up link's queue (no spill), replacing the old inline `send_redundant`. FEC traffic uses the same queues (see the next entry).
