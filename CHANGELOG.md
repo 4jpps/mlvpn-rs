@@ -12,6 +12,10 @@ design, and `ARCHITECTURE.md` covers the system as a whole.
 
 ## [Unreleased]
 
+### Added
+
+- **`tx_send_mode` per-link option (default `"sendto"`, so no behavior change unless set).** `tx_send_mode = "sendmmsg"` makes a link's TX worker hand each batch (up to `TX_WORKER_BATCH` = 32 packets) to the kernel in one `sendmmsg()` call instead of one `sendto()` per packet. Promoted from the `experiment/sendmmsg` branch after a controlled A/B on the production Comcast link (iperf3 -P16 -R BBR, 12 counterbalanced runs): wire pps 53.3k -> 73.4k (+37.5%), goodput 549 -> 754 Mbps, send time 16.8 -> 11.6 us/packet, queue delay -41%, no send failures or partial calls. The per-packet `sendto()` path is unchanged and remains both the default and the automatic fallback (on `ENOSYS` the worker logs a warning and drops back to `sendto()` for good). Per link and restart-required, so one link can run `sendmmsg` while another stays on `sendto`. A rejected datagram inside a batch is reported individually and the rest of the batch still goes out. Files: `src/config.rs` (`TxSendMode`), `src/link.rs` (`wg_send_batch`, `sendmmsg_all`), `src/tunnel.rs` (`mmsg_tx`, `link_tx_worker`), example configs. The experimental `experimental-sendmmsg` Cargo feature and its toggle-file are gone.
+
 ## [0.7.7] - 2026-10-06
 
 ### Added

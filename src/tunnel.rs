@@ -1766,8 +1766,11 @@ impl TxDispatcher {
 async fn link_tx_worker(idx: usize, mut rx: mpsc::Receiver<TxJob>, d: TxDispatcher) {
     let counters = d.queues[idx].counters.clone();
     let mut batch: Vec<TxJob> = Vec::with_capacity(TX_WORKER_BATCH);
-    #[cfg(feature = "experimental-sendmmsg")]
-    let mut mmsg = mmsg_experiment::State::default();
+    let send_mode = d.links[idx].lock().await.config.tx_send_mode;
+    if send_mode == crate::config::TxSendMode::Sendmmsg {
+        tracing::info!(link = idx, "TX send mode: sendmmsg (batched)");
+    }
+    let mut mmsg = mmsg_tx::State::new(send_mode);
     loop {
         if rx.recv_many(&mut batch, TX_WORKER_BATCH).await == 0 {
             return;
@@ -1796,11 +1799,10 @@ async fn link_tx_worker(idx: usize, mut rx: mpsc::Receiver<TxJob>, d: TxDispatch
         let send_started = Instant::now();
         let mut bytes = 0u64;
         let mut pkts = 0u64;
-        // Drains `batch` when enabled for this link; otherwise leaves it
-        // untouched and the per-packet loop below runs exactly as before.
-        #[cfg(feature = "experimental-sendmmsg")]
+        // Drains `batch` in `sendmmsg` mode; otherwise leaves it untouched
+        // and the per-packet loop below sends it.
         {
-            let (b, p) = mmsg_experiment::send_batch(&d, idx, &target, &mut batch, &mut mmsg).await;
+            let (b, p) = mmsg_tx::send_batch(&d, idx, &target, &mut batch, &mut mmsg).await;
             bytes += b;
             pkts += p;
         }
@@ -1856,19 +1858,15 @@ async fn link_tx_worker(idx: usize, mut rx: mpsc::Receiver<TxJob>, d: TxDispatch
     }
 }
 
-/// EXPERIMENT (`experimental-sendmmsg`, branch experiment/sendmmsg): one
-/// `sendmmsg(2)` per worker batch instead of one `sendto(2)` per packet.
-/// Enabled per link at runtime by `MLVPN_EXPERIMENTAL_SENDMMSG`
-/// (`all`, or a comma-separated list of link names); unset means the
-/// per-packet path is used unchanged.
-#[cfg(feature = "experimental-sendmmsg")]
-mod mmsg_experiment {
+/// `tx_send_mode = "sendmmsg"`: one `sendmmsg(2)` per worker batch instead of
+/// one `sendto(2)` per packet. The per-packet path in `link_tx_worker` stays
+/// the default and is also the fallback if the kernel refuses `sendmmsg`.
+mod mmsg_tx {
     use super::*;
 
-    #[derive(Default)]
     pub(super) struct State {
-        enabled: bool,
-        checked: Option<Instant>,
+        /// Cleared for good if the kernel reports `sendmmsg` unsupported.
+        active: bool,
         calls: u64,
         partial: u64,
         pkts: u64,
@@ -1876,30 +1874,22 @@ mod mmsg_experiment {
         last_log: Option<Instant>,
     }
 
-    /// The link spec comes from `MLVPN_EXPERIMENTAL_SENDMMSG`; when
-    /// `MLVPN_EXPERIMENTAL_SENDMMSG_FILE` is set instead, the spec is that
-    /// file's contents (a missing file means disabled), re-read at most once
-    /// a second so a benchmark can flip sendto/sendmmsg without a restart.
-    fn spec() -> Option<String> {
-        match std::env::var("MLVPN_EXPERIMENTAL_SENDMMSG_FILE") {
-            Ok(path) => std::fs::read_to_string(path).ok(),
-            Err(_) => std::env::var("MLVPN_EXPERIMENTAL_SENDMMSG").ok(),
+    impl State {
+        pub(super) fn new(mode: crate::config::TxSendMode) -> Self {
+            Self {
+                active: mode == crate::config::TxSendMode::Sendmmsg,
+                calls: 0,
+                partial: 0,
+                pkts: 0,
+                batches: 0,
+                last_log: None,
+            }
         }
     }
 
-    fn enabled_for(link_name: &str) -> bool {
-        spec()
-            .map(|v| {
-                v.split([',', '\n'])
-                    .map(str::trim)
-                    .any(|t| t == "all" || t == link_name)
-            })
-            .unwrap_or(false)
-    }
-
-    /// Returns `(bytes, packets)` put on the wire. When the experiment is
-    /// not enabled for this link it returns `(0, 0)` without touching
-    /// `batch`.
+    /// Returns `(bytes, packets)` put on the wire. When this link is not in
+    /// `sendmmsg` mode (or has fallen back) it returns `(0, 0)` without
+    /// touching `batch`, and the caller's per-packet loop sends it.
     pub(super) async fn send_batch(
         d: &TxDispatcher,
         idx: usize,
@@ -1907,24 +1897,12 @@ mod mmsg_experiment {
         batch: &mut Vec<TxJob>,
         st: &mut State,
     ) -> (u64, u64) {
+        if !st.active {
+            return (0, 0);
+        }
         let Some((link_id, handle, name)) = target else {
             return (0, 0);
         };
-        let now = Instant::now();
-        if st
-            .checked
-            .is_none_or(|t| now.duration_since(t) >= Duration::from_secs(1))
-        {
-            st.checked = Some(now);
-            let on = enabled_for(name);
-            if on != st.enabled {
-                tracing::warn!(link = %name, enabled = on, "EXPERIMENTAL sendmmsg TX path switched");
-                st.enabled = on;
-            }
-        }
-        if !st.enabled {
-            return (0, 0);
-        }
         let headers: Vec<_> = batch
             .iter()
             .map(|job| {
@@ -1946,6 +1924,7 @@ mod mmsg_experiment {
         };
         let counters = &d.queues[idx].counters;
         let (mut bytes, mut pkts) = (0u64, 0u64);
+        let mut unsupported = false;
         for (mut job, res) in batch.drain(..).zip(results) {
             match res {
                 Ok(carried) => {
@@ -1958,12 +1937,20 @@ mod mmsg_experiment {
                     }
                 }
                 Err(e) => {
+                    if matches!(&e, MlvpnError::Io(io) if io.raw_os_error() == Some(libc::ENOSYS)) {
+                        unsupported = true;
+                    }
                     tracing::debug!(link = %name, error = %e, "send failed");
                     counters.send_failed.fetch_add(1, Ordering::Relaxed);
                     d.scheduler.lock().unwrap().note_send_failed(idx);
                     d.reroute(idx, job).await;
                 }
             }
+        }
+        if unsupported {
+            tracing::warn!(link = %name, "sendmmsg(2) not supported here; falling back to per-packet sendto");
+            st.active = false;
+            return (bytes, pkts);
         }
         st.calls += stats.calls;
         st.partial += stats.partial;
@@ -1972,14 +1959,14 @@ mod mmsg_experiment {
         let now = Instant::now();
         let last = *st.last_log.get_or_insert(now);
         if now.duration_since(last) >= Duration::from_secs(10) {
-            tracing::warn!(
+            tracing::debug!(
                 link = %name,
                 batches = st.batches,
                 sendmmsg_calls = st.calls,
                 partial_calls = st.partial,
                 packets = st.pkts,
                 pkts_per_call = format!("{:.2}", st.pkts as f64 / st.calls.max(1) as f64),
-                "EXPERIMENTAL sendmmsg stats (last 10s)"
+                "sendmmsg TX stats (last 10s)"
             );
             st.calls = 0;
             st.partial = 0;

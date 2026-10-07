@@ -86,15 +86,6 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 ratatui = { version = "0.30", default-features = false, features = ["crossterm", "underline-color", "layout-cache"] }
 crossterm = "0.28"
 
-[features]
-# EXPERIMENT (branch experiment/sendmmsg): batch each TX-worker wakeup into
-# one sendmmsg(2) per link instead of one sendto(2) per packet. Off by
-# default, and even when compiled in it does nothing unless the daemon is
-# started with MLVPN_EXPERIMENTAL_SENDMMSG=<link name[,link name]|all> (or
-# MLVPN_EXPERIMENTAL_SENDMMSG_FILE=<path>, re-read every second).
-# The default build contains none of this code.
-experimental-sendmmsg = []
-
 [dev-dependencies]
 proptest = "1"
 # test-util (tokio::time::{pause,advance}, #[tokio::test(start_paused = true)])

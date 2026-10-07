@@ -461,14 +461,13 @@ impl LinkHandle {
         Ok(carries_frame)
     }
 
-    /// EXPERIMENT (`experimental-sendmmsg`): `wg_send_parts` for a whole
-    /// worker batch. Every frame is encapsulated in order exactly as the
+    /// `wg_send_parts` for a whole worker batch (`tx_send_mode = "sendmmsg"`).
+    /// Every frame is encapsulated in order exactly as the
     /// per-packet path would, then all resulting datagrams go out through
     /// `sendmmsg(2)` (one syscall per kernel-accepted run instead of one
     /// `sendto` each). Returns one result per input frame, same contract
     /// as `wg_send_parts` (`Ok(carries_frame)` / `Err`), so the caller's
     /// per-packet failure handling is unchanged.
-    #[cfg(feature = "experimental-sendmmsg")]
     pub async fn wg_send_batch(&self, frames: &[[&[u8]; 2]]) -> (Vec<Result<bool>>, SendmmsgStats) {
         let Some(remote) = self.remote else {
             let errs = frames
@@ -1682,7 +1681,6 @@ impl MtuResizer {
 }
 
 /// Per-call sendmmsg accounting returned alongside a batch send.
-#[cfg(feature = "experimental-sendmmsg")]
 #[derive(Default, Clone, Copy, Debug)]
 pub struct SendmmsgStats {
     /// `sendmmsg(2)` invocations that were actually issued (a call that
@@ -1696,12 +1694,10 @@ pub struct SendmmsgStats {
 
 /// Most datagrams handed to one `sendmmsg` call; the TX worker batch
 /// (`TX_WORKER_BATCH`) is well under this.
-#[cfg(feature = "experimental-sendmmsg")]
 const SENDMMSG_MAX: usize = 64;
 
 /// One non-blocking `sendmmsg(2)` over `dgs` (at most `SENDMMSG_MAX`) to
 /// `addr`. Returns how many leading datagrams the kernel accepted.
-#[cfg(feature = "experimental-sendmmsg")]
 fn raw_sendmmsg(
     fd: std::os::unix::io::RawFd,
     addr: &socket2::SockAddr,
@@ -1738,7 +1734,6 @@ fn raw_sendmmsg(
 /// datagram, in order: a datagram the kernel rejected gets that error and
 /// the run continues with the next one, matching the per-packet path
 /// where one failed `send_to` does not stop the rest of the batch.
-#[cfg(feature = "experimental-sendmmsg")]
 pub async fn sendmmsg_all(
     socket: &UdpSocket,
     remote: SocketAddr,
@@ -1807,6 +1802,7 @@ pub(crate) async fn test_link_for_state_transitions(state: LinkState, stats: Lin
             weight: 1.0,
             bandwidth_cap_mbps: None,
             probe_interval_ms: 200,
+            tx_send_mode: crate::config::TxSendMode::default(),
             private_key_file: std::path::PathBuf::from("/tmp/test.key"),
             peer_public_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string(),
         },
@@ -1901,6 +1897,7 @@ mod tests {
             weight: 1.0,
             bandwidth_cap_mbps: None,
             probe_interval_ms: 200,
+            tx_send_mode: crate::config::TxSendMode::default(),
             private_key_file: std::path::PathBuf::from("/tmp/test.key"),
             peer_public_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string(),
         }
@@ -2274,7 +2271,6 @@ mod tests {
         assert!((stats.tx_throughput_mbps.update(0.0) - 18.0).abs() < 1e-9);
     }
 
-    #[cfg(feature = "experimental-sendmmsg")]
     #[tokio::test]
     async fn sendmmsg_all_delivers_every_datagram_in_order() {
         let rx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -2302,7 +2298,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "experimental-sendmmsg")]
     #[tokio::test]
     async fn sendmmsg_all_reports_a_bad_datagram_and_keeps_going() {
         let rx = UdpSocket::bind("127.0.0.1:0").await.unwrap();

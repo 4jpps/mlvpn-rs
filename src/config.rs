@@ -497,6 +497,23 @@ impl Default for SchedulerConfig {
     }
 }
 
+/// How a link's TX worker puts datagrams on the wire.
+///
+/// Measured on the production cloud host (3-vCPU KVM guest, Comcast link,
+/// iperf3 -P16 -R BBR, 6 runs each): `sendmmsg` moved the link from ~53k to
+/// ~73k pps (+37%) with ~31% less send time per packet and no change in
+/// total CPU. It stays opt-in until it has soaked in production.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TxSendMode {
+    /// One `sendto(2)` per packet (default).
+    #[default]
+    Sendto,
+    /// One `sendmmsg(2)` per TX-worker batch (up to 32 packets). Encryption
+    /// and per-packet failure handling are identical to `sendto`.
+    Sendmmsg,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct LinkConfig {
     /// Human-readable name for logs/metrics, e.g. "fiber", "lte0".
@@ -551,6 +568,12 @@ pub struct LinkConfig {
     pub bandwidth_cap_mbps: Option<f64>,
     #[serde(default = "default_probe_interval_ms")]
     pub probe_interval_ms: u64,
+    /// How this link's TX worker sends: `"sendto"` (default, one syscall per
+    /// packet) or `"sendmmsg"` (one syscall per worker batch). Per link, so
+    /// it can be trialled on one link while the others stay on the default.
+    /// Changing it needs a restart.
+    #[serde(default)]
+    pub tx_send_mode: TxSendMode,
     /// Path to a file containing this link's base64 Curve25519 static
     /// private key (32 bytes, base64-encoded). File must be mode 0600.
     /// Generate with `mlvpnd genkey --link <name>`.
@@ -1000,6 +1023,7 @@ mod tests {
                 weight: 1.0,
                 bandwidth_cap_mbps: None,
                 probe_interval_ms: default_probe_interval_ms(),
+                tx_send_mode: TxSendMode::default(),
                 private_key_file: key_path,
                 peer_public_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string(),
             }],
@@ -1178,6 +1202,50 @@ mod tests {
             cfg.scheduler.fec_parity_placement,
             FecParityPlacement::Dominant
         );
+    }
+
+    fn link_toml(extra: &str) -> String {
+        format!(
+            r#"
+        mode = "client"
+        [tunnel]
+        name = "mlvpn0"
+        address = "10.200.0.1/30"
+        [[links]]
+        name = "a"
+        bind_interface = "eth0"
+        local_port = 6900
+        private_key_file = "/tmp/a.key"
+        peer_public_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+        {extra}
+    "#
+        )
+    }
+
+    #[test]
+    fn tx_send_mode_defaults_to_sendto() {
+        let cfg: Config = toml::from_str(&link_toml("")).expect("parse");
+        assert_eq!(cfg.links[0].tx_send_mode, TxSendMode::Sendto);
+    }
+
+    #[test]
+    fn tx_send_mode_sendmmsg_parses_from_toml() {
+        let cfg: Config =
+            toml::from_str(&link_toml(r#"tx_send_mode = "sendmmsg""#)).expect("parse");
+        assert_eq!(cfg.links[0].tx_send_mode, TxSendMode::Sendmmsg);
+        let cfg: Config = toml::from_str(&link_toml(r#"tx_send_mode = "sendto""#)).expect("parse");
+        assert_eq!(cfg.links[0].tx_send_mode, TxSendMode::Sendto);
+    }
+
+    #[test]
+    fn tx_send_mode_rejects_unknown_value() {
+        for bad in ["sendmsg", "SENDMMSG", "gso", ""] {
+            let toml_str = link_toml(&format!(r#"tx_send_mode = "{bad}""#));
+            assert!(
+                toml::from_str::<Config>(&toml_str).is_err(),
+                "tx_send_mode {bad:?} should be rejected"
+            );
+        }
     }
 
     #[test]
