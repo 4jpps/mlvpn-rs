@@ -186,8 +186,14 @@ pub struct DaemonSnapshot {
     /// included alongside `outbound_queue_len` so a viewer can show a
     /// fill ratio without hardcoding the constant.
     pub outbound_queue_capacity: u64,
-    /// Lifetime count of packets dropped because the outbound queue was
-    /// full when `tun_reader` tried to enqueue them -- monotonic, never
+    /// Lifetime count of packets dropped on the TX path, despite the
+    /// name: (1) the outbound queue was full when `tun_reader` tried to
+    /// enqueue (the send path as a whole is behind), plus (2) every
+    /// `TxDispatcher` drop -- all per-link TX queues full, no-spill
+    /// `primary_link_mode`/`follow_peer_primary` overflow, and a failed
+    /// reroute. Under a fast TCP sender (e.g. BBR) this tracks the sender's
+    /// own TCP retransmits, so it is local backpressure, not path loss.
+    /// Monotonic, never
     /// reset, same "only ever grows" convention as `LinkSnapshot`'s
     /// `tx_bytes`/`rx_bytes`. See `outbound_queue_drop_reporter`'s doc
     /// comment for why this counter and its periodic log line are now

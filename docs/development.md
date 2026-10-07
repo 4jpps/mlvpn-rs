@@ -165,7 +165,8 @@ dpkg-buildpackage -us -uc -b -d
 
 # .rpm (needs rpm-build, rpmdevtools, systemd-rpm-macros, gcc, pkgconf-pkg-config)
 rpmdev-setuptree
-git archive --prefix=mlvpn-0.4.6/ -o ~/rpmbuild/SOURCES/mlvpn-0.4.6.tar.gz HEAD
+VERSION=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+git archive --prefix=mlvpn-$VERSION/ -o ~/rpmbuild/SOURCES/mlvpn-$VERSION.tar.gz HEAD
 cp packaging/rpm/mlvpn.spec ~/rpmbuild/SPECS/
 rpmbuild -ba ~/rpmbuild/SPECS/mlvpn.spec
 ```
@@ -175,11 +176,12 @@ there's no `rpmbuild` on Debian/Ubuntu. Easiest local approximation of
 what CI does:
 
 ```sh
-docker run --rm -v "$PWD":/src -w /src fedora:latest bash -c '
+docker run --rm -e VERSION="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)" \
+  -v "$PWD":/src -w /src fedora:latest bash -c '
   dnf -y install git tar rust cargo gcc pkgconf-pkg-config systemd-rpm-macros rpm-build rpmdevtools &&
   git config --global --add safe.directory /src &&
   rpmdev-setuptree &&
-  git archive --prefix=mlvpn-0.4.6/ -o ~/rpmbuild/SOURCES/mlvpn-0.4.6.tar.gz HEAD &&
+  git archive --prefix=mlvpn-$VERSION/ -o ~/rpmbuild/SOURCES/mlvpn-$VERSION.tar.gz HEAD &&
   cp packaging/rpm/mlvpn.spec ~/rpmbuild/SPECS/ &&
   rpmbuild -ba ~/rpmbuild/SPECS/mlvpn.spec &&
   find ~/rpmbuild/RPMS -name "*.rpm" -exec cp {} /src/ \;
