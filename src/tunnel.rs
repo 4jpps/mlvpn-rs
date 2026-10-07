@@ -1766,6 +1766,8 @@ impl TxDispatcher {
 async fn link_tx_worker(idx: usize, mut rx: mpsc::Receiver<TxJob>, d: TxDispatcher) {
     let counters = d.queues[idx].counters.clone();
     let mut batch: Vec<TxJob> = Vec::with_capacity(TX_WORKER_BATCH);
+    #[cfg(feature = "experimental-sendmmsg")]
+    let mut mmsg = mmsg_experiment::State::default();
     loop {
         if rx.recv_many(&mut batch, TX_WORKER_BATCH).await == 0 {
             return;
@@ -1794,6 +1796,14 @@ async fn link_tx_worker(idx: usize, mut rx: mpsc::Receiver<TxJob>, d: TxDispatch
         let send_started = Instant::now();
         let mut bytes = 0u64;
         let mut pkts = 0u64;
+        // Drains `batch` when enabled for this link; otherwise leaves it
+        // untouched and the per-packet loop below runs exactly as before.
+        #[cfg(feature = "experimental-sendmmsg")]
+        {
+            let (b, p) = mmsg_experiment::send_batch(&d, idx, &target, &mut batch, &mut mmsg).await;
+            bytes += b;
+            pkts += p;
+        }
         for mut job in batch.drain(..) {
             let Some((link_id, handle, name)) = &target else {
                 counters.send_failed.fetch_add(1, Ordering::Relaxed);
@@ -1843,6 +1853,124 @@ async fn link_tx_worker(idx: usize, mut rx: mpsc::Receiver<TxJob>, d: TxDispatch
         counters
             .last_progress_us
             .store(link::mono_us(), Ordering::Relaxed);
+    }
+}
+
+/// EXPERIMENT (`experimental-sendmmsg`, branch experiment/sendmmsg): one
+/// `sendmmsg(2)` per worker batch instead of one `sendto(2)` per packet.
+/// Enabled per link at runtime by `MLVPN_EXPERIMENTAL_SENDMMSG`
+/// (`all`, or a comma-separated list of link names); unset means the
+/// per-packet path is used unchanged.
+#[cfg(feature = "experimental-sendmmsg")]
+mod mmsg_experiment {
+    use super::*;
+
+    #[derive(Default)]
+    pub(super) struct State {
+        enabled: Option<bool>,
+        calls: u64,
+        partial: u64,
+        pkts: u64,
+        batches: u64,
+        last_log: Option<Instant>,
+    }
+
+    fn enabled_for(link_name: &str) -> bool {
+        std::env::var("MLVPN_EXPERIMENTAL_SENDMMSG")
+            .map(|v| {
+                v.split(',')
+                    .map(str::trim)
+                    .any(|t| t == "all" || t == link_name)
+            })
+            .unwrap_or(false)
+    }
+
+    /// Returns `(bytes, packets)` put on the wire. When the experiment is
+    /// not enabled for this link it returns `(0, 0)` without touching
+    /// `batch`.
+    pub(super) async fn send_batch(
+        d: &TxDispatcher,
+        idx: usize,
+        target: &Option<(u8, LinkHandle, String)>,
+        batch: &mut Vec<TxJob>,
+        st: &mut State,
+    ) -> (u64, u64) {
+        let Some((link_id, handle, name)) = target else {
+            return (0, 0);
+        };
+        let on = *st.enabled.get_or_insert_with(|| {
+            let on = enabled_for(name);
+            if on {
+                tracing::warn!(link = %name, "EXPERIMENTAL sendmmsg TX path enabled for this link");
+            }
+            on
+        });
+        if !on {
+            return (0, 0);
+        }
+        let headers: Vec<_> = batch
+            .iter()
+            .map(|job| {
+                Header {
+                    ptype: job.ptype,
+                    link_id: *link_id,
+                    seq: job.seq,
+                }
+                .to_bytes()
+            })
+            .collect();
+        let (results, stats) = {
+            let frames: Vec<[&[u8]; 2]> = batch
+                .iter()
+                .zip(headers.iter())
+                .map(|(job, h)| [&h[..], job.plaintext.as_slice()])
+                .collect();
+            handle.wg_send_batch(&frames).await
+        };
+        let counters = &d.queues[idx].counters;
+        let (mut bytes, mut pkts) = (0u64, 0u64);
+        for (mut job, res) in batch.drain(..).zip(results) {
+            match res {
+                Ok(carried) => {
+                    bytes += (HEADER_LEN + job.plaintext.len()) as u64;
+                    pkts += 1;
+                    if carried {
+                        if let Some(m) = job.member.as_mut() {
+                            m.mark_carried();
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(link = %name, error = %e, "send failed");
+                    counters.send_failed.fetch_add(1, Ordering::Relaxed);
+                    d.scheduler.lock().unwrap().note_send_failed(idx);
+                    d.reroute(idx, job).await;
+                }
+            }
+        }
+        st.calls += stats.calls;
+        st.partial += stats.partial;
+        st.pkts += pkts;
+        st.batches += 1;
+        let now = Instant::now();
+        let last = *st.last_log.get_or_insert(now);
+        if now.duration_since(last) >= Duration::from_secs(10) {
+            tracing::warn!(
+                link = %name,
+                batches = st.batches,
+                sendmmsg_calls = st.calls,
+                partial_calls = st.partial,
+                packets = st.pkts,
+                pkts_per_call = format!("{:.2}", st.pkts as f64 / st.calls.max(1) as f64),
+                "EXPERIMENTAL sendmmsg stats (last 10s)"
+            );
+            st.calls = 0;
+            st.partial = 0;
+            st.pkts = 0;
+            st.batches = 0;
+            st.last_log = Some(now);
+        }
+        (bytes, pkts)
     }
 }
 

@@ -461,6 +461,50 @@ impl LinkHandle {
         Ok(carries_frame)
     }
 
+    /// EXPERIMENT (`experimental-sendmmsg`): `wg_send_parts` for a whole
+    /// worker batch. Every frame is encapsulated in order exactly as the
+    /// per-packet path would, then all resulting datagrams go out through
+    /// `sendmmsg(2)` (one syscall per kernel-accepted run instead of one
+    /// `sendto` each). Returns one result per input frame, same contract
+    /// as `wg_send_parts` (`Ok(carries_frame)` / `Err`), so the caller's
+    /// per-packet failure handling is unchanged.
+    #[cfg(feature = "experimental-sendmmsg")]
+    pub async fn wg_send_batch(&self, frames: &[[&[u8]; 2]]) -> (Vec<Result<bool>>, SendmmsgStats) {
+        let Some(remote) = self.remote else {
+            let errs = frames
+                .iter()
+                .map(|_| {
+                    Err(MlvpnError::Protocol(format!(
+                        "wg_send: link '{}' has no remote address to send to yet",
+                        self.config.name
+                    )))
+                })
+                .collect();
+            return (errs, SendmmsgStats::default());
+        };
+        let mut results: Vec<Result<bool>> = Vec::with_capacity(frames.len());
+        let mut datagrams: Vec<Vec<u8>> = Vec::with_capacity(frames.len());
+        let mut slot: Vec<usize> = Vec::with_capacity(frames.len());
+        for (i, parts) in frames.iter().enumerate() {
+            match self.wg.encapsulate_parts(&parts[..]) {
+                Ok((datagram, carries)) => {
+                    results.push(Ok(carries));
+                    datagrams.push(datagram);
+                    slot.push(i);
+                }
+                Err(e) => results.push(Err(e)),
+            }
+        }
+        let socket = self.current_socket().await;
+        let (outcomes, stats) = sendmmsg_all(&socket, remote, &datagrams).await;
+        for (k, outcome) in outcomes.into_iter().enumerate() {
+            if let Err(e) = outcome {
+                results[slot[k]] = Err(MlvpnError::Io(e));
+            }
+        }
+        (results, stats)
+    }
+
     /// Receive one raw datagram off this link's *current* socket and
     /// feed it through this link's own `WgTunnel`, looping internally
     /// until an actual decrypted mlvpn frame comes out -- callers never
@@ -1637,6 +1681,99 @@ impl MtuResizer {
     }
 }
 
+/// Per-call sendmmsg accounting returned alongside a batch send.
+#[cfg(feature = "experimental-sendmmsg")]
+#[derive(Default, Clone, Copy, Debug)]
+pub struct SendmmsgStats {
+    /// `sendmmsg(2)` invocations that were actually issued (a call that
+    /// returned `EAGAIN` and was retried after the socket became
+    /// writable counts each attempt).
+    pub calls: u64,
+    /// Calls that the kernel only partially accepted (fewer messages
+    /// sent than requested, no error).
+    pub partial: u64,
+}
+
+/// Most datagrams handed to one `sendmmsg` call; the TX worker batch
+/// (`TX_WORKER_BATCH`) is well under this.
+#[cfg(feature = "experimental-sendmmsg")]
+const SENDMMSG_MAX: usize = 64;
+
+/// One non-blocking `sendmmsg(2)` over `dgs` (at most `SENDMMSG_MAX`) to
+/// `addr`. Returns how many leading datagrams the kernel accepted.
+#[cfg(feature = "experimental-sendmmsg")]
+fn raw_sendmmsg(
+    fd: std::os::unix::io::RawFd,
+    addr: &socket2::SockAddr,
+    dgs: &[Vec<u8>],
+) -> std::io::Result<usize> {
+    let n = dgs.len().min(SENDMMSG_MAX);
+    // SAFETY: iovec/mmsghdr are plain C structs for which all-zero is a
+    // valid value; every field the kernel reads is filled in below, and
+    // every pointer stored (datagram buffers, `addr`) outlives the call.
+    let mut iovs: [libc::iovec; SENDMMSG_MAX] = unsafe { std::mem::zeroed() };
+    let mut msgs: [libc::mmsghdr; SENDMMSG_MAX] = unsafe { std::mem::zeroed() };
+    for i in 0..n {
+        iovs[i].iov_base = dgs[i].as_ptr() as *mut libc::c_void;
+        iovs[i].iov_len = dgs[i].len();
+        msgs[i].msg_hdr.msg_name = addr.as_ptr() as *mut libc::c_void;
+        msgs[i].msg_hdr.msg_namelen = addr.len();
+        msgs[i].msg_hdr.msg_iov = &mut iovs[i];
+        msgs[i].msg_hdr.msg_iovlen = 1;
+    }
+    // SAFETY: `msgs[..n]` is initialised above and `fd` is a live socket
+    // owned by the caller's `UdpSocket` for the duration of the call.
+    let rc = unsafe { libc::sendmmsg(fd, msgs.as_mut_ptr(), n as libc::c_uint, 0) };
+    if rc < 0 {
+        Err(std::io::Error::last_os_error())
+    } else if rc == 0 {
+        Err(std::io::Error::from(std::io::ErrorKind::WriteZero))
+    } else {
+        Ok(rc as usize)
+    }
+}
+
+/// Send every datagram in `dgs` to `remote` through `sendmmsg(2)`,
+/// waiting for socket writability like `send_to` does. One outcome per
+/// datagram, in order: a datagram the kernel rejected gets that error and
+/// the run continues with the next one, matching the per-packet path
+/// where one failed `send_to` does not stop the rest of the batch.
+#[cfg(feature = "experimental-sendmmsg")]
+pub async fn sendmmsg_all(
+    socket: &UdpSocket,
+    remote: SocketAddr,
+    dgs: &[Vec<u8>],
+) -> (Vec<std::io::Result<()>>, SendmmsgStats) {
+    let addr = socket2::SockAddr::from(remote);
+    let fd = socket.as_raw_fd();
+    let mut out: Vec<std::io::Result<()>> = Vec::with_capacity(dgs.len());
+    let mut stats = SendmmsgStats::default();
+    let mut start = 0;
+    while start < dgs.len() {
+        let want = (dgs.len() - start).min(SENDMMSG_MAX);
+        let r = socket
+            .async_io(tokio::io::Interest::WRITABLE, || {
+                raw_sendmmsg(fd, &addr, &dgs[start..])
+            })
+            .await;
+        stats.calls += 1;
+        match r {
+            Ok(k) => {
+                if k < want {
+                    stats.partial += 1;
+                }
+                out.extend((0..k).map(|_| Ok(())));
+                start += k;
+            }
+            Err(e) => {
+                out.push(Err(e));
+                start += 1;
+            }
+        }
+    }
+    (out, stats)
+}
+
 /// A `WgTunnel` with a fresh, throwaway keypair on both ends -- only
 /// good for filling in `Link::wg` in tests that never actually drive a
 /// real handshake (`test_link_for_state_transitions`,
@@ -2135,5 +2272,53 @@ mod tests {
         assert!((stats.jitter_ms.update(0.0) - 9.0).abs() < 1e-9);
         assert!((stats.rx_throughput_mbps.update(0.0) - 45.0).abs() < 1e-9);
         assert!((stats.tx_throughput_mbps.update(0.0) - 18.0).abs() < 1e-9);
+    }
+
+    #[cfg(feature = "experimental-sendmmsg")]
+    #[tokio::test]
+    async fn sendmmsg_all_delivers_every_datagram_in_order() {
+        let rx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let tx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let remote = rx.local_addr().unwrap();
+        // 150 > SENDMMSG_MAX, so this spans several sendmmsg calls.
+        let dgs: Vec<Vec<u8>> = (0u32..150)
+            .map(|i| {
+                let mut v = i.to_be_bytes().to_vec();
+                v.extend(std::iter::repeat_n((i % 251) as u8, 1 + (i as usize % 200)));
+                v
+            })
+            .collect();
+        let (out, stats) = sendmmsg_all(&tx, remote, &dgs).await;
+        assert_eq!(out.len(), dgs.len());
+        assert!(out.iter().all(|r| r.is_ok()));
+        assert!(stats.calls >= 3, "150 datagrams need >=3 calls of <=64");
+        let mut buf = vec![0u8; 2048];
+        for want in &dgs {
+            let (n, _) = tokio::time::timeout(Duration::from_secs(2), rx.recv_from(&mut buf))
+                .await
+                .expect("datagram not received")
+                .unwrap();
+            assert_eq!(&buf[..n], &want[..]);
+        }
+    }
+
+    #[cfg(feature = "experimental-sendmmsg")]
+    #[tokio::test]
+    async fn sendmmsg_all_reports_a_bad_datagram_and_keeps_going() {
+        let rx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let tx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let remote = rx.local_addr().unwrap();
+        // Larger than the 65507-byte UDP payload limit -> EMSGSIZE.
+        let dgs = vec![vec![1u8; 10], vec![2u8; 70_000], vec![3u8; 10]];
+        let (out, _) = sendmmsg_all(&tx, remote, &dgs).await;
+        assert_eq!(out.len(), 3);
+        assert!(out[0].is_ok());
+        assert!(out[1].is_err());
+        assert!(out[2].is_ok());
+        let mut buf = vec![0u8; 2048];
+        let (n, _) = rx.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], &[1u8; 10][..]);
+        let (n, _) = rx.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], &[3u8; 10][..]);
     }
 }
