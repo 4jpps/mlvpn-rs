@@ -468,7 +468,12 @@ impl LinkHandle {
     /// `sendto` each). Returns one result per input frame, same contract
     /// as `wg_send_parts` (`Ok(carries_frame)` / `Err`), so the caller's
     /// per-packet failure handling is unchanged.
-    pub async fn wg_send_batch(&self, frames: &[[&[u8]; 2]]) -> (Vec<Result<bool>>, SendmmsgStats) {
+    /// `gso` additionally coalesces equal-size runs via `UDP_SEGMENT`.
+    pub async fn wg_send_batch(
+        &self,
+        frames: &[[&[u8]; 2]],
+        gso: bool,
+    ) -> (Vec<Result<bool>>, SendmmsgStats) {
         let Some(remote) = self.remote else {
             let errs = frames
                 .iter()
@@ -495,7 +500,11 @@ impl LinkHandle {
             }
         }
         let socket = self.current_socket().await;
-        let (outcomes, stats) = sendmmsg_all(&socket, remote, &datagrams).await;
+        let (outcomes, stats) = if gso {
+            sendmmsg_gso_all(&socket, remote, &datagrams).await
+        } else {
+            sendmmsg_all(&socket, remote, &datagrams).await
+        };
         for (k, outcome) in outcomes.into_iter().enumerate() {
             if let Err(e) = outcome {
                 results[slot[k]] = Err(MlvpnError::Io(e));
@@ -1690,6 +1699,55 @@ pub struct SendmmsgStats {
     /// Calls that the kernel only partially accepted (fewer messages
     /// sent than requested, no error).
     pub partial: u64,
+    /// Messages sent that coalesced more than one datagram via
+    /// `UDP_SEGMENT` (`sendmmsg_gso` mode only).
+    pub gso_runs: u64,
+    /// Datagrams carried inside those coalesced messages.
+    pub gso_segments: u64,
+    /// The kernel rejected a GSO message during this call; the call fell
+    /// back to plain `sendmmsg` and the caller should stop asking for GSO.
+    pub gso_disabled: bool,
+}
+
+/// A contiguous run of datagrams sent as one `sendmmsg` message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GsoRun {
+    start: usize,
+    len: usize,
+}
+
+/// Kernel `UDP_MAX_SEGMENTS`.
+const GSO_MAX_SEGS: usize = 64;
+/// Stay under the 65507-byte UDP payload limit with headroom.
+const GSO_MAX_BYTES: usize = 65_000;
+
+/// Split `dgs` into the fewest valid GSO runs: every datagram of a run has
+/// the first one's size, except that the last may be shorter (the kernel
+/// allows a short tail segment). Runs never reorder datagrams.
+fn plan_gso_runs(dgs: &[Vec<u8>]) -> Vec<GsoRun> {
+    let mut runs = Vec::new();
+    let mut i = 0;
+    while i < dgs.len() {
+        let size = dgs[i].len();
+        let (mut len, mut bytes) = (1usize, size);
+        if size > 0 && size <= u16::MAX as usize {
+            while i + len < dgs.len() && len < GSO_MAX_SEGS {
+                let s = dgs[i + len].len();
+                if s == size && bytes + s <= GSO_MAX_BYTES {
+                    len += 1;
+                    bytes += s;
+                } else {
+                    if s > 0 && s < size && bytes + s <= GSO_MAX_BYTES {
+                        len += 1;
+                    }
+                    break;
+                }
+            }
+        }
+        runs.push(GsoRun { start: i, len });
+        i += len;
+    }
+    runs
 }
 
 /// Most datagrams handed to one `sendmmsg` call; the TX worker batch
@@ -1759,6 +1817,119 @@ pub async fn sendmmsg_all(
                 }
                 out.extend((0..k).map(|_| Ok(())));
                 start += k;
+            }
+            Err(e) => {
+                out.push(Err(e));
+                start += 1;
+            }
+        }
+    }
+    (out, stats)
+}
+
+/// One non-blocking `sendmmsg(2)` over `runs` (which must cover at most
+/// `SENDMMSG_MAX` datagrams of `dgs`, starting at `dgs[0]`): each run is one
+/// message, with a `UDP_SEGMENT` control message when it holds more than
+/// one datagram. Returns how many leading runs the kernel accepted.
+fn raw_sendmmsg_gso(
+    fd: std::os::unix::io::RawFd,
+    addr: &socket2::SockAddr,
+    dgs: &[Vec<u8>],
+    runs: &[GsoRun],
+) -> std::io::Result<usize> {
+    let n = runs.len().min(SENDMMSG_MAX);
+    // SAFETY: as in `raw_sendmmsg`; additionally every control buffer is a
+    // `[u64; 3]` (8-aligned, 24 bytes) and `CMSG_SPACE(2)` is checked to fit.
+    let mut iovs: [libc::iovec; SENDMMSG_MAX] = unsafe { std::mem::zeroed() };
+    let mut msgs: [libc::mmsghdr; SENDMMSG_MAX] = unsafe { std::mem::zeroed() };
+    let mut ctrl = [[0u64; 3]; SENDMMSG_MAX];
+    let space = unsafe { libc::CMSG_SPACE(std::mem::size_of::<u16>() as u32) } as usize;
+    debug_assert!(space <= std::mem::size_of::<[u64; 3]>());
+    for (k, run) in runs[..n].iter().enumerate() {
+        for j in run.start..run.start + run.len {
+            iovs[j].iov_base = dgs[j].as_ptr() as *mut libc::c_void;
+            iovs[j].iov_len = dgs[j].len();
+        }
+        let hdr = &mut msgs[k].msg_hdr;
+        hdr.msg_name = addr.as_ptr() as *mut libc::c_void;
+        hdr.msg_namelen = addr.len();
+        hdr.msg_iov = &mut iovs[run.start];
+        hdr.msg_iovlen = run.len;
+        if run.len > 1 {
+            hdr.msg_control = ctrl[k].as_mut_ptr() as *mut libc::c_void;
+            hdr.msg_controllen = space;
+            // SAFETY: `msg_control`/`msg_controllen` were just set to a
+            // buffer large enough for one u16 cmsg.
+            unsafe {
+                let cm = libc::CMSG_FIRSTHDR(hdr);
+                (*cm).cmsg_level = libc::SOL_UDP;
+                (*cm).cmsg_type = libc::UDP_SEGMENT;
+                (*cm).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<u16>() as u32) as _;
+                std::ptr::write_unaligned(
+                    libc::CMSG_DATA(cm) as *mut u16,
+                    dgs[run.start].len() as u16,
+                );
+            }
+        }
+    }
+    // SAFETY: `msgs[..n]` is initialised above; `fd` is live for the call.
+    let rc = unsafe { libc::sendmmsg(fd, msgs.as_mut_ptr(), n as libc::c_uint, 0) };
+    if rc < 0 {
+        Err(std::io::Error::last_os_error())
+    } else if rc == 0 {
+        Err(std::io::Error::from(std::io::ErrorKind::WriteZero))
+    } else {
+        Ok(rc as usize)
+    }
+}
+
+/// `sendmmsg_all` plus UDP GSO coalescing of equal-size runs. Same
+/// per-datagram outcome contract. If the kernel rejects a coalesced
+/// message, `stats.gso_disabled` is set and everything not yet sent goes
+/// out through plain `sendmmsg_all`, so a GSO failure never costs a packet.
+pub async fn sendmmsg_gso_all(
+    socket: &UdpSocket,
+    remote: SocketAddr,
+    dgs: &[Vec<u8>],
+) -> (Vec<std::io::Result<()>>, SendmmsgStats) {
+    let addr = socket2::SockAddr::from(remote);
+    let fd = socket.as_raw_fd();
+    let mut out: Vec<std::io::Result<()>> = Vec::with_capacity(dgs.len());
+    let mut stats = SendmmsgStats::default();
+    let mut start = 0;
+    while start < dgs.len() {
+        let window = &dgs[start..(start + SENDMMSG_MAX).min(dgs.len())];
+        let runs = plan_gso_runs(window);
+        let r = socket
+            .async_io(tokio::io::Interest::WRITABLE, || {
+                raw_sendmmsg_gso(fd, &addr, window, &runs)
+            })
+            .await;
+        stats.calls += 1;
+        match r {
+            Ok(k) => {
+                if k < runs.len() {
+                    stats.partial += 1;
+                }
+                let mut sent = 0;
+                for run in &runs[..k] {
+                    if run.len > 1 {
+                        stats.gso_runs += 1;
+                        stats.gso_segments += run.len as u64;
+                    }
+                    sent += run.len;
+                }
+                out.extend((0..sent).map(|_| Ok(())));
+                start += sent;
+            }
+            Err(e) if runs[0].len > 1 => {
+                tracing::debug!(error = %e, "UDP GSO message rejected; disabling GSO");
+                stats.gso_disabled = true;
+                let (rest, s2) = sendmmsg_all(socket, remote, &dgs[start..]).await;
+                out.extend(rest);
+                stats.calls += s2.calls;
+                stats.partial += s2.partial;
+                return (out, stats);
             }
             Err(e) => {
                 out.push(Err(e));
@@ -2315,5 +2486,101 @@ mod tests {
         assert_eq!(&buf[..n], &[1u8; 10][..]);
         let (n, _) = rx.recv_from(&mut buf).await.unwrap();
         assert_eq!(&buf[..n], &[3u8; 10][..]);
+    }
+
+    fn sized(sizes: &[usize]) -> Vec<Vec<u8>> {
+        sizes.iter().map(|&n| vec![0u8; n]).collect()
+    }
+
+    fn runs(sizes: &[usize]) -> Vec<(usize, usize)> {
+        plan_gso_runs(&sized(sizes))
+            .into_iter()
+            .map(|r| (r.start, r.len))
+            .collect()
+    }
+
+    #[test]
+    fn gso_plan_groups_equal_sizes_and_allows_a_short_tail() {
+        assert_eq!(runs(&[]), vec![]);
+        assert_eq!(runs(&[1400]), vec![(0, 1)]);
+        assert_eq!(runs(&[1400, 1400, 1400]), vec![(0, 3)]);
+        // a shorter datagram may end a run; a longer one starts the next
+        assert_eq!(runs(&[1400, 1400, 200]), vec![(0, 3)]);
+        assert_eq!(runs(&[200, 1400]), vec![(0, 1), (1, 1)]);
+        // after a short tail, a new run begins
+        assert_eq!(runs(&[1400, 200, 200, 200]), vec![(0, 2), (2, 2)]);
+    }
+
+    #[test]
+    fn gso_plan_respects_segment_and_byte_limits() {
+        // 100 tiny equal datagrams: capped at 64 segments per run
+        let r = runs(&vec![100; 100]);
+        assert_eq!(r, vec![(0, 64), (64, 36)]);
+        // 1400-byte datagrams: 65_000 / 1400 = 46 per run
+        let r = runs(&vec![1400; 100]);
+        assert_eq!(r[0], (0, 46));
+        assert_eq!(r.iter().map(|x| x.1).sum::<usize>(), 100);
+        // empty datagrams are never coalesced
+        assert_eq!(runs(&[0, 0, 0]), vec![(0, 1), (1, 1), (2, 1)]);
+    }
+
+    #[tokio::test]
+    async fn sendmmsg_gso_all_preserves_every_datagram_boundary_and_order() {
+        let rx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let tx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let remote = rx.local_addr().unwrap();
+        // Mostly full-size with periodic short ones and a few odd sizes, so
+        // there are long runs, short tails and single-datagram runs.
+        let dgs: Vec<Vec<u8>> = (0u32..80)
+            .map(|i| {
+                let len = match i % 13 {
+                    5 => 90,
+                    9 => 700,
+                    _ => 1380,
+                };
+                let mut v = i.to_be_bytes().to_vec();
+                v.extend(std::iter::repeat_n((i % 251) as u8, len - 4));
+                v
+            })
+            .collect();
+        let (out, stats) = sendmmsg_gso_all(&tx, remote, &dgs).await;
+        assert_eq!(out.len(), dgs.len());
+        assert!(out.iter().all(|r| r.is_ok()), "{out:?}");
+        if stats.gso_disabled {
+            eprintln!("kernel refused UDP GSO here; fallback path exercised instead");
+        } else {
+            assert!(
+                stats.gso_runs > 0,
+                "expected some coalesced runs: {stats:?}"
+            );
+            assert!(stats.gso_segments > stats.gso_runs);
+        }
+        // 80 datagrams still span two sendmmsg windows but fit in the default
+        // loopback receive buffer, so none can be dropped before we read.
+        let mut buf = vec![0u8; 2048];
+        for (i, want) in dgs.iter().enumerate() {
+            let (n, _) = tokio::time::timeout(Duration::from_secs(2), rx.recv_from(&mut buf))
+                .await
+                .expect("datagram not received")
+                .unwrap();
+            assert!(
+                buf[..n] == want[..],
+                "datagram {i} differs (got {n} bytes, want {})",
+                want.len()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn sendmmsg_gso_all_reports_a_bad_datagram_and_keeps_going() {
+        let rx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let tx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let remote = rx.local_addr().unwrap();
+        let dgs = vec![vec![1u8; 10], vec![2u8; 70_000], vec![3u8; 10]];
+        let (out, _) = sendmmsg_gso_all(&tx, remote, &dgs).await;
+        assert_eq!(out.len(), 3);
+        assert!(out[0].is_ok());
+        assert!(out[1].is_err());
+        assert!(out[2].is_ok());
     }
 }

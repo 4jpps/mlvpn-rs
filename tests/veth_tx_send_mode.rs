@@ -1,6 +1,7 @@
 //! End-to-end test of the per-link `tx_send_mode = "sendmmsg"` option.
 //!
-//! Two links between client and server: `link0` runs `sendmmsg` on both
+//! Two links between client and server: `link0` runs `sendmmsg` (or
+//! `sendmmsg_gso`, in the second test) on both
 //! ends, `link1` keeps the default `sendto` -- so the test also covers the
 //! per-link, mixed-mode case. A real tunnel comes up, the TX worker logs
 //! which mode it picked, and a burst of full-size pings (which the
@@ -29,17 +30,27 @@ use support::{
     SERVER_TUNNEL_ADDR, SERVER_TUNNEL_HOST,
 };
 
-fn enable_sendmmsg_on_link0(config_path: &Path) {
+fn enable_mode_on_link0(config_path: &Path, mode: &str) {
     let toml = std::fs::read_to_string(config_path).expect("read config");
     let needle = "name = \"link0\"\n";
     assert_eq!(toml.matches(needle).count(), 1, "link0 block not found");
-    let toml = toml.replace(needle, &format!("{needle}tx_send_mode = \"sendmmsg\"\n"));
+    let toml = toml.replace(needle, &format!("{needle}tx_send_mode = \"{mode}\"\n"));
     std::fs::write(config_path, toml).expect("rewrite config");
 }
 
 #[tokio::test]
 #[ignore = "needs root, iproute2, and network namespaces -- see module doc comment"]
 async fn sendmmsg_link_carries_traffic_with_no_loss_alongside_a_sendto_link() {
+    run_mixed_mode("sendmmsg", "TX send mode: sendmmsg (batched)").await;
+}
+
+#[tokio::test]
+#[ignore = "needs root, iproute2, and network namespaces -- see module doc comment"]
+async fn sendmmsg_gso_link_carries_traffic_with_no_loss_alongside_a_sendto_link() {
+    run_mixed_mode("sendmmsg_gso", "TX send mode: sendmmsg_gso").await;
+}
+
+async fn run_mixed_mode(mode: &str, expect_log: &str) {
     require_root();
     require_ip_command();
     ensure_mlvpn_system_user().expect("ensure mlvpn system user/group exists");
@@ -129,8 +140,8 @@ async fn sendmmsg_link_carries_traffic_with_no_loss_alongside_a_sendto_link() {
     )
     .expect("write client config");
 
-    enable_sendmmsg_on_link0(&server_cfg);
-    enable_sendmmsg_on_link0(&client_cfg);
+    enable_mode_on_link0(&server_cfg, mode);
+    enable_mode_on_link0(&client_cfg, mode);
 
     let (_server, server_logs) =
         MlvpnProcess::spawn_with_log_capture(&ns_server.name, &server_cfg).expect("spawn server");
@@ -147,9 +158,9 @@ async fn sendmmsg_link_carries_traffic_with_no_loss_alongside_a_sendto_link() {
 
     for (who, logs) in [("client", &client_logs), ("server", &server_logs)] {
         assert!(
-            logs.wait_for_line_containing("TX send mode: sendmmsg", Duration::from_secs(5))
+            logs.wait_for_line_containing(expect_log, Duration::from_secs(5))
                 .await,
-            "{who} never logged that link0's TX worker picked sendmmsg"
+            "{who} never logged that link0's TX worker picked {mode}"
         );
     }
 
@@ -164,7 +175,7 @@ async fn sendmmsg_link_carries_traffic_with_no_loss_alongside_a_sendto_link() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains(" 0% packet loss"),
-        "ping across a sendmmsg+sendto bonded tunnel lost packets:\n{stdout}"
+        "ping across a {mode}+sendto bonded tunnel lost packets:\n{stdout}"
     );
 
     for link in ["link0", "link1"] {

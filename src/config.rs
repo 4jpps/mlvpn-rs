@@ -512,6 +512,14 @@ pub enum TxSendMode {
     /// One `sendmmsg(2)` per TX-worker batch (up to 32 packets). Encryption
     /// and per-packet failure handling are identical to `sendto`.
     Sendmmsg,
+    /// EXPERIMENTAL. `sendmmsg(2)` as above, but runs of equal-size
+    /// datagrams are additionally coalesced into one message with a
+    /// `UDP_SEGMENT` (UDP GSO) control message, so the kernel walks the
+    /// IP/UDP stack once per run instead of once per packet. Falls back to
+    /// plain `sendmmsg` for the rest of the process if the kernel or NIC
+    /// rejects GSO.
+    #[serde(rename = "sendmmsg_gso")]
+    SendmmsgGso,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1235,6 +1243,13 @@ mod tests {
         assert_eq!(cfg.links[0].tx_send_mode, TxSendMode::Sendmmsg);
         let cfg: Config = toml::from_str(&link_toml(r#"tx_send_mode = "sendto""#)).expect("parse");
         assert_eq!(cfg.links[0].tx_send_mode, TxSendMode::Sendto);
+    }
+
+    #[test]
+    fn tx_send_mode_sendmmsg_gso_parses_from_toml() {
+        let cfg: Config =
+            toml::from_str(&link_toml(r#"tx_send_mode = "sendmmsg_gso""#)).expect("parse");
+        assert_eq!(cfg.links[0].tx_send_mode, TxSendMode::SendmmsgGso);
     }
 
     #[test]

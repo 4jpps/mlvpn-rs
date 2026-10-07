@@ -1767,8 +1767,14 @@ async fn link_tx_worker(idx: usize, mut rx: mpsc::Receiver<TxJob>, d: TxDispatch
     let counters = d.queues[idx].counters.clone();
     let mut batch: Vec<TxJob> = Vec::with_capacity(TX_WORKER_BATCH);
     let send_mode = d.links[idx].lock().await.config.tx_send_mode;
-    if send_mode == crate::config::TxSendMode::Sendmmsg {
-        tracing::info!(link = idx, "TX send mode: sendmmsg (batched)");
+    match send_mode {
+        crate::config::TxSendMode::Sendto => {}
+        crate::config::TxSendMode::Sendmmsg => {
+            tracing::info!(link = idx, "TX send mode: sendmmsg (batched)");
+        }
+        crate::config::TxSendMode::SendmmsgGso => {
+            tracing::info!(link = idx, "TX send mode: sendmmsg_gso (batched, UDP GSO)");
+        }
     }
     let mut mmsg = mmsg_tx::State::new(send_mode);
     loop {
@@ -1867,6 +1873,10 @@ mod mmsg_tx {
     pub(super) struct State {
         /// Cleared for good if the kernel reports `sendmmsg` unsupported.
         active: bool,
+        /// Cleared for good if the kernel/NIC rejects a UDP GSO message.
+        gso: bool,
+        gso_runs: u64,
+        gso_segments: u64,
         calls: u64,
         partial: u64,
         pkts: u64,
@@ -1877,7 +1887,10 @@ mod mmsg_tx {
     impl State {
         pub(super) fn new(mode: crate::config::TxSendMode) -> Self {
             Self {
-                active: mode == crate::config::TxSendMode::Sendmmsg,
+                active: mode != crate::config::TxSendMode::Sendto,
+                gso: mode == crate::config::TxSendMode::SendmmsgGso,
+                gso_runs: 0,
+                gso_segments: 0,
                 calls: 0,
                 partial: 0,
                 pkts: 0,
@@ -1920,7 +1933,7 @@ mod mmsg_tx {
                 .zip(headers.iter())
                 .map(|(job, h)| [&h[..], job.plaintext.as_slice()])
                 .collect();
-            handle.wg_send_batch(&frames).await
+            handle.wg_send_batch(&frames, st.gso).await
         };
         let counters = &d.queues[idx].counters;
         let (mut bytes, mut pkts) = (0u64, 0u64);
@@ -1952,8 +1965,14 @@ mod mmsg_tx {
             st.active = false;
             return (bytes, pkts);
         }
+        if stats.gso_disabled && st.gso {
+            tracing::warn!(link = %name, "UDP GSO rejected by the kernel; continuing with plain sendmmsg");
+            st.gso = false;
+        }
         st.calls += stats.calls;
         st.partial += stats.partial;
+        st.gso_runs += stats.gso_runs;
+        st.gso_segments += stats.gso_segments;
         st.pkts += pkts;
         st.batches += 1;
         let now = Instant::now();
@@ -1964,12 +1983,16 @@ mod mmsg_tx {
                 batches = st.batches,
                 sendmmsg_calls = st.calls,
                 partial_calls = st.partial,
+                gso_runs = st.gso_runs,
+                gso_segments = st.gso_segments,
                 packets = st.pkts,
                 pkts_per_call = format!("{:.2}", st.pkts as f64 / st.calls.max(1) as f64),
                 "sendmmsg TX stats (last 10s)"
             );
             st.calls = 0;
             st.partial = 0;
+            st.gso_runs = 0;
+            st.gso_segments = 0;
             st.pkts = 0;
             st.batches = 0;
             st.last_log = Some(now);

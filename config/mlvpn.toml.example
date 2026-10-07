@@ -192,6 +192,10 @@ probe_interval_ms = 200
                               # +37% packets/s when one serial TX worker is the ceiling.
                               # Per link, restart required. Unsupported kernels
                               # fall back to "sendto" automatically.
+                              # "sendmmsg_gso" (EXPERIMENTAL) additionally coalesces
+                              # runs of equal-size datagrams into one UDP_SEGMENT
+                              # send; falls back to plain "sendmmsg" if the kernel
+                              # or NIC rejects it. Not yet production-validated.
 private_key_file = "/etc/mlvpn/fiber.key"   # must be mode 0600; generate with
                                             # `mlvpnd genkey --link fiber`
 peer_public_key = "REPLACE_WITH_PEER_PUBLIC_KEY_BASE64"
