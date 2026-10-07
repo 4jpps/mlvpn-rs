@@ -1867,7 +1867,8 @@ mod mmsg_experiment {
 
     #[derive(Default)]
     pub(super) struct State {
-        enabled: Option<bool>,
+        enabled: bool,
+        checked: Option<Instant>,
         calls: u64,
         partial: u64,
         pkts: u64,
@@ -1875,10 +1876,21 @@ mod mmsg_experiment {
         last_log: Option<Instant>,
     }
 
+    /// The link spec comes from `MLVPN_EXPERIMENTAL_SENDMMSG`; when
+    /// `MLVPN_EXPERIMENTAL_SENDMMSG_FILE` is set instead, the spec is that
+    /// file's contents (a missing file means disabled), re-read at most once
+    /// a second so a benchmark can flip sendto/sendmmsg without a restart.
+    fn spec() -> Option<String> {
+        match std::env::var("MLVPN_EXPERIMENTAL_SENDMMSG_FILE") {
+            Ok(path) => std::fs::read_to_string(path).ok(),
+            Err(_) => std::env::var("MLVPN_EXPERIMENTAL_SENDMMSG").ok(),
+        }
+    }
+
     fn enabled_for(link_name: &str) -> bool {
-        std::env::var("MLVPN_EXPERIMENTAL_SENDMMSG")
+        spec()
             .map(|v| {
-                v.split(',')
+                v.split([',', '\n'])
                     .map(str::trim)
                     .any(|t| t == "all" || t == link_name)
             })
@@ -1898,14 +1910,19 @@ mod mmsg_experiment {
         let Some((link_id, handle, name)) = target else {
             return (0, 0);
         };
-        let on = *st.enabled.get_or_insert_with(|| {
+        let now = Instant::now();
+        if st
+            .checked
+            .is_none_or(|t| now.duration_since(t) >= Duration::from_secs(1))
+        {
+            st.checked = Some(now);
             let on = enabled_for(name);
-            if on {
-                tracing::warn!(link = %name, "EXPERIMENTAL sendmmsg TX path enabled for this link");
+            if on != st.enabled {
+                tracing::warn!(link = %name, enabled = on, "EXPERIMENTAL sendmmsg TX path switched");
+                st.enabled = on;
             }
-            on
-        });
-        if !on {
+        }
+        if !st.enabled {
             return (0, 0);
         }
         let headers: Vec<_> = batch
