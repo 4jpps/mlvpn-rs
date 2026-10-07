@@ -63,6 +63,11 @@ ewma_alpha = 0.2         # smoothing factor for latency/jitter/loss/throughput s
                            # across bonded links, instead of leaving it fixed.
                            # Useful when bonding links with very different
                            # latency (e.g. fiber + a high-latency LTE link).
+# fec_enabled = false      # opt-in XOR forward error correction (see fec_group_size /
+                           # fec_parity). OFF by default and recommended OFF: on the
+                           # production Comcast + T-Mobile pair 8+1 FEC cost ~30% of
+                           # bonded download (~430 vs ~620 Mbps) with no measured
+                           # benefit. Both peers must use identical FEC settings.
 # reorder_window_min_ms = 10    # bounds the auto-tuner above; only consulted
 # reorder_window_max_ms = 500   # when auto_tune_reorder_window is true
 # auto_tune_probe_interval = false   # opt-in: let a link's probe interval

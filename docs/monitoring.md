@@ -247,7 +247,7 @@ upload: 148.3 Mbps
   real TCP goodput, retransmits: 12
 download: 151.9 Mbps
   retransmits: unavailable for the download leg -- the peer is the real sender for this leg and has no way to report its own TCP_INFO reading back to us (see docs/monitoring.md)
-peer version: 0.4.6 (matches this host)
+peer version: 0.7.7 (matches this host)
 ```
 
 Sample output (`--protocol udp`):
@@ -258,7 +258,7 @@ upload: 148.3 Mbps
   our own outbound queue dropped 0 packets during this leg
 download: 151.9 Mbps
   peer's outbound queue dropped 0 packets during this leg
-peer version: 0.4.6 (matches this host)
+peer version: 0.7.7 (matches this host)
 ```
 
 In UDP mode, each direction reports its own outbound-queue drop count
@@ -413,3 +413,7 @@ link show` above rather than assuming it was a one-off.
 Note that the two ends pick their MTUs independently, with no
 negotiation between them -- see the same section for what that means
 when bonding hardware whose links differ substantially in MTU.
+
+## Reading `outbound_queue_dropped_total`
+
+Despite the name, this lifetime counter (also `dropped_lifetime` in `diag-dump`) counts every packet dropped on the local TX path: the outbound queue overflowing *and* the per-link TX queues all being full (or, under `primary_link_mode`/`follow_peer_primary`, the primary's queue being full, since there is no spill). It is local backpressure, not wire loss. Under a fast TCP sender such as BBR it normally tracks that sender's retransmit count; a rising value with zero UDP errors on the peer means the send path is the bottleneck, not the network.
