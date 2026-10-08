@@ -7,8 +7,9 @@ connections -- a fiber line plus a cellular modem, two different ISPs,
 whatever -- mlvpn-rs combines them into one connection that's both
 faster (it uses all of them at once, not just one as backup) and more
 reliable (if one connection slows down or drops out, traffic
-automatically shifts to the others, with no manual intervention and
-no dropped sessions). It runs as a background service on two Linux
+automatically shifts to the others, with no manual intervention;
+connections you already have open normally carry on, perhaps with a
+brief pause while it shifts). It runs as a background service on two Linux
 machines, one at each end of the link you want to bond, and everything
 in between is encrypted.
 
@@ -44,18 +45,70 @@ anything real. See [CHANGELOG.md](CHANGELOG.md) for release history.
 
 ## Quick start
 
-```sh
-# Debian/Ubuntu
-sudo apt install ./mlvpn_<version>-1_amd64.deb
+Do these steps on **both** machines (the "client" at the site with the
+multiple connections, and the "server" with one stable public address).
+[Getting started](docs/getting-started.md) walks through a full worked
+example with the config filled in.
 
-# Fedora/RHEL/Rocky/Alma
-sudo dnf install ./mlvpn-<version>-1.x86_64.rpm
-```
+1. **Install the package.** Grab the one matching your distro and
+   architecture from the
+   [latest release](https://gitlab.jpps.us/jpps/mlvpn-rs/-/releases)
+   (replace `<version>` with the number on the release page, e.g. the
+   `0.7.7` in `mlvpn_0.7.7-1_amd64.deb`). It creates the unprivileged
+   `mlvpn` user and `/etc/mlvpn` for you.
 
-Grab the package matching your distro/architecture from the
-[latest release](https://gitlab.jpps.us/jpps/mlvpn-rs/-/releases) (replace `<version>` with the number shown on the release page, e.g. the `0.7.7` in `mlvpn_0.7.7-1_amd64.deb`). Both
-package types automatically create the unprivileged `mlvpn` user and
-`/etc/mlvpn` for you.
+   ```sh
+   # Debian/Ubuntu
+   sudo apt install ./mlvpn_<version>-1_amd64.deb
+
+   # Fedora/RHEL/Rocky/Alma
+   sudo dnf install ./mlvpn-<version>-1.x86_64.rpm
+   ```
+
+2. **Generate a key for each link** (one per link name, on both ends),
+   and note the public key each command prints.
+
+   ```sh
+   sudo mlvpnd genkey --link fiber --out /etc/mlvpn/fiber.key
+   sudo chown mlvpn:mlvpn /etc/mlvpn/fiber.key
+   ```
+
+3. **Copy the example config** (`mlvpn.toml.example` on the client,
+   `mlvpn-server.toml.example` on the server), then edit it: your link
+   names, the network interface for each link, the server's address, and
+   the *other* end's public keys.
+
+   ```sh
+   sudo cp /usr/share/doc/mlvpn/mlvpn.toml.example /etc/mlvpn/mlvpn.toml
+   sudo chown mlvpn:mlvpn /etc/mlvpn/mlvpn.toml
+   sudo chmod 600 /etc/mlvpn/mlvpn.toml
+   ```
+
+4. **Open the firewall** for the link ports: `sudo mlvpnd firewall-setup --dry-run`
+   shows what it would do. See [Firewall](docs/firewall.md).
+
+5. **Start it** on both ends, then check that every link shows `up`:
+
+   ```sh
+   sudo systemctl enable --now mlvpn.service
+   sudo mlvpn-tui
+   ```
+
+## Running a VPN through the tunnel
+
+Anything can run over the tunnel, including another VPN. The tunnel's
+packet size (MTU) is set automatically from your links, typically a bit
+under 1400 bytes, and TCP traffic is adjusted to fit. Check the current
+value with `ip link show mlvpn0`.
+
+- **VPNs that run over TCP** (OpenVPN in TCP mode, SSTP) need no changes.
+- **VPNs that run over UDP** (WireGuard, OpenVPN in UDP mode) work, but
+  their default packet size is larger than the tunnel can carry in one
+  piece, so big packets get split in two. That costs speed, and a VPN
+  that forbids splitting will lose those packets. Set the VPN's own MTU
+  to **1280**:
+  - WireGuard: add `MTU = 1280` to its `[Interface]` section.
+  - OpenVPN: add `tun-mtu 1280` and `mssfix 1240` to its config.
 
 ## Documentation
 
