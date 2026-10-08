@@ -3,7 +3,7 @@
 ## Option A: install a package (recommended)
 
 Grab the package matching your distro and architecture from the
-[latest GitHub Release](https://github.com/4jpps/mlvpn-rs/releases):
+[latest release](https://gitlab.jpps.us/jpps/mlvpn-rs/-/releases):
 
 ```sh
 # Debian/Ubuntu

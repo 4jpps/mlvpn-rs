@@ -20,10 +20,9 @@ releases rather than backports.
 ## Reporting a vulnerability
 
 Preferred: open a
-[GitHub Security Advisory](https://github.com/4jpps/mlvpn-rs/security/advisories/new)
-for this repository (Security tab -> "Report a vulnerability"). This
-creates a private discussion visible only to maintainers until a fix is
-ready.
+[confidential issue](https://gitlab.jpps.us/jpps/mlvpn-rs/-/issues/new?issue[confidential]=true)
+on the GitLab project (tick "This issue is confidential"). It is
+visible only to maintainers until a fix is ready.
 
 Alternative: email **security reports to Jeff Parrish PC Services LLC**
 via [www.jpps.us](https://www.jpps.us) with "mlvpn-rs security" in the

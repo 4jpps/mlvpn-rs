@@ -1,5 +1,7 @@
 # mlvpn-rs
 
+Primary home: https://gitlab.jpps.us/jpps/mlvpn-rs (issues and releases live there). The GitHub copy is read-only.
+
 **In plain terms:** if a site has two or more separate internet
 connections -- a fiber line plus a cellular modem, two different ISPs,
 whatever -- mlvpn-rs combines them into one connection that's both
@@ -51,7 +53,7 @@ sudo dnf install ./mlvpn-<version>-1.x86_64.rpm
 ```
 
 Grab the package matching your distro/architecture from the
-[latest release](https://github.com/4jpps/mlvpn-rs/releases). Both
+[latest release](https://gitlab.jpps.us/jpps/mlvpn-rs/-/releases) (replace `<version>` with the number shown on the release page, e.g. the `0.7.7` in `mlvpn_0.7.7-1_amd64.deb`). Both
 package types automatically create the unprivileged `mlvpn` user and
 `/etc/mlvpn` for you.
 

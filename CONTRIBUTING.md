@@ -20,7 +20,7 @@ NTFS-backed paths break `chmod`/git filemode handling that `cargo` and
 the full VS Code + WSL + rust-analyzer setup.
 
 ```sh
-git clone https://github.com/4jpps/mlvpn-rs.git
+git clone https://gitlab.jpps.us/jpps/mlvpn-rs.git
 cd mlvpn-rs
 cargo build --release
 cargo test --release --lib
