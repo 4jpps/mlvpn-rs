@@ -323,7 +323,7 @@ async fn diag_dump_auto_watch_fires_on_real_loss() {
     // Poll the dump directory directly rather than the control socket --
     // this is a file the daemon writes to disk on its own, with no wire
     // or command-socket signal accompanying it.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
     let mut found: Option<std::path::PathBuf> = None;
     while tokio::time::Instant::now() < deadline {
         if let Ok(entries) = std::fs::read_dir(&dump_dir) {
@@ -339,11 +339,11 @@ async fn diag_dump_auto_watch_fires_on_real_loss() {
     }
 
     let path = found.expect(
-        "diagnostics_watch_loop never wrote an automatic dump file within 60s of real 60% loss",
+        "diagnostics_watch_loop never wrote an automatic dump file within 120s of real 60% loss",
     );
     let dump = std::fs::read_to_string(&path).expect("read automatic dump file");
     assert!(
-        dump.contains("trigger: automatic: link 'link0' loss"),
+        dump.contains("trigger: automatic: link 'link0' raw probe loss"),
         "missing automatic trigger line, got:\n{dump}"
     );
     assert!(
@@ -542,8 +542,8 @@ async fn diag_dump_auto_watch_submits_report_when_auto_submit_enabled() {
     // submission's POST -- this is the new behavior under test, distinct
     // from the local dump file also covered by the sibling test above.
     let request = mock_rx
-        .recv_timeout(Duration::from_secs(60))
-        .expect("mock software-support server never received a POST within 60s of real 60% loss");
+        .recv_timeout(Duration::from_secs(120))
+        .expect("mock software-support server never received a POST within 120s of real 60% loss");
 
     assert!(
         request.starts_with("POST /api/v1/reports"),

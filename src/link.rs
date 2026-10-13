@@ -173,6 +173,9 @@ pub struct LinkStats {
     last_rtt_ms: Option<f64>,
     pub consecutive_misses: u32,
     pub consecutive_hits: u32,
+    /// Raw probe outcomes for the automatic-report trigger only; never read by the scheduler.
+    pub probe_window: crate::autoreport::ProbeWindow,
+    pub down_transitions: crate::autoreport::DownTransitions,
     pub rx_bytes_since_last_sample: u64,
     pub last_rx_throughput_sample: Instant,
     pub tx_bytes_since_last_sample: u64,
@@ -273,6 +276,8 @@ impl LinkStats {
             last_rtt_ms: None,
             consecutive_misses: 0,
             consecutive_hits: 0,
+            probe_window: Default::default(),
+            down_transitions: Default::default(),
             rx_bytes_since_last_sample: 0,
             last_rx_throughput_sample: Instant::now(),
             tx_bytes_since_last_sample: 0,
@@ -311,6 +316,7 @@ impl LinkStats {
         self.loss_rate.update(0.0);
         self.consecutive_misses = 0;
         self.consecutive_hits += 1;
+        self.probe_window.record(Instant::now(), true);
     }
 
     /// Record a missed probe (no reply within the timeout).
@@ -318,6 +324,7 @@ impl LinkStats {
         self.loss_rate.update(1.0);
         self.consecutive_misses += 1;
         self.consecutive_hits = 0;
+        self.probe_window.record(Instant::now(), false);
     }
 
     /// Lifetime counter (`tx_bytes`/`tx_packets`) *and* the windowed

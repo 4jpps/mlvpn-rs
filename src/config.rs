@@ -727,16 +727,35 @@ pub struct DiagnosticsConfig {
     /// go through the loss watcher. See `diagnostics::install_crash_report_hook`.
     #[serde(default)]
     pub crash_report_enabled: bool,
-    /// A link's `local_loss_pct` (same figure `mlvpn-tui`'s Links tab
-    /// shows) has to exceed this before a dump fires.
+    /// A link's raw probe loss over the last `window_secs` (not the
+    /// scheduler's loss EWMA, which one missed probe pushes past 50%) has
+    /// to exceed this percentage before an event opens.
     #[serde(default = "default_diag_loss_threshold_pct")]
     pub loss_threshold_pct: f64,
-    /// Minimum time between automatic dumps, so a persistently lossy
-    /// link doesn't fill `dump_dir` with near-duplicate captures --
-    /// each dump already captures everything needed for that event,
-    /// repeating it every few seconds adds nothing.
+    /// Minimum time between local dump files while one event continues.
+    /// Tickets are separate: one per event plus `reminder_secs` reminders.
     #[serde(default = "default_diag_cooldown_secs")]
     pub cooldown_secs: u64,
+    /// Sliding window the loss percentage is computed over.
+    #[serde(default = "default_diag_window_secs")]
+    pub window_secs: u64,
+    /// Fewer probes than this in the window means too little data to call
+    /// (also what keeps a just-restarted link's first miss from alarming).
+    #[serde(default = "default_diag_min_probes")]
+    pub min_probes: usize,
+    /// How long a link must stay clear before its event ends.
+    #[serde(default = "default_diag_clear_secs")]
+    pub clear_secs: u64,
+    /// While an event continues, the most often a ticket is re-submitted.
+    #[serde(default = "default_diag_reminder_secs")]
+    pub reminder_secs: u64,
+    /// This many Up->Down transitions within 10 minutes opens an event
+    /// even if loss stays under the threshold. 0 disables.
+    #[serde(default = "default_diag_flap_downs")]
+    pub flap_downs: u32,
+    /// Keep at most this many automatic dump files in `dump_dir`.
+    #[serde(default = "default_diag_max_dump_files")]
+    pub max_dump_files: usize,
     /// Directory dumps are written to. Defaults to `/var/log/mlvpn`,
     /// matching where most other services on the system log to --
     /// already writable under the shipped systemd unit's
@@ -757,6 +776,30 @@ fn default_diag_cooldown_secs() -> u64 {
     300
 }
 
+fn default_diag_window_secs() -> u64 {
+    60
+}
+
+fn default_diag_min_probes() -> usize {
+    20
+}
+
+fn default_diag_clear_secs() -> u64 {
+    60
+}
+
+fn default_diag_reminder_secs() -> u64 {
+    3600
+}
+
+fn default_diag_flap_downs() -> u32 {
+    3
+}
+
+fn default_diag_max_dump_files() -> usize {
+    50
+}
+
 impl Default for DiagnosticsConfig {
     // Hand-written for the same reason as `ControlConfig::default()`
     // above: this is what serde calls when the whole `[diagnostics]`
@@ -770,6 +813,12 @@ impl Default for DiagnosticsConfig {
             crash_report_enabled: false,
             loss_threshold_pct: default_diag_loss_threshold_pct(),
             cooldown_secs: default_diag_cooldown_secs(),
+            window_secs: default_diag_window_secs(),
+            min_probes: default_diag_min_probes(),
+            clear_secs: default_diag_clear_secs(),
+            reminder_secs: default_diag_reminder_secs(),
+            flap_downs: default_diag_flap_downs(),
+            max_dump_files: default_diag_max_dump_files(),
             dump_dir: None,
         }
     }
@@ -1042,6 +1091,12 @@ mod tests {
                 auto_dump_enabled: false,
                 loss_threshold_pct: 10.0,
                 cooldown_secs: 60,
+                window_secs: 60,
+                min_probes: 20,
+                clear_secs: 60,
+                reminder_secs: 3600,
+                flap_downs: 3,
+                max_dump_files: 50,
                 dump_dir: None,
                 auto_submit_enabled: false,
                 crash_report_enabled: false,

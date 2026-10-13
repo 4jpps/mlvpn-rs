@@ -149,8 +149,16 @@ enabled = true           # exposes live stats to `mlvpn-tui`; see README.md "Mon
                            # auto_submit_enabled, and independent of it --
                            # a panic isn't a loss event. With this off, a
                            # panic just prints its backtrace as usual.
-# loss_threshold_pct = 10.0     # default
-# cooldown_secs = 300           # minimum time between auto dumps, default
+# loss_threshold_pct = 10.0     # default; compared against raw probe loss
+                           # over the last window_secs, not the smoothed EWMA
+# window_secs = 60              # default
+# min_probes = 20               # default: fewer probes in the window = no verdict
+# clear_secs = 60               # default: quiet this long ends an event
+# reminder_secs = 3600          # default: at most one ticket per ongoing event per hour
+# flap_downs = 3                # default: Up->Down count in 10 min that opens an
+                           # event even at low loss; 0 disables
+# max_dump_files = 50           # default: oldest automatic dumps are deleted
+# cooldown_secs = 300           # minimum time between local dumps during one event, default
 # dump_dir = "/var/log/mlvpn"   # default -- already writable under the
                            # shipped systemd unit's LogsDirectory=mlvpn.
                            # A different path needs its own

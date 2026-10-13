@@ -9,6 +9,7 @@
 //! this crate is not published, and its `Cargo.toml` has no `[lib]`
 //! consumers outside `src/main.rs` and `src/bin/mlvpn-tui.rs`.
 
+pub mod autoreport;
 pub mod config;
 pub mod congestion;
 pub mod control;

@@ -385,6 +385,12 @@ pub struct TunnelParams {
 pub struct DiagnosticsWatchParams {
     pub loss_threshold_pct: f64,
     pub cooldown: Duration,
+    pub window: Duration,
+    pub min_probes: usize,
+    pub clear: Duration,
+    pub reminder: Duration,
+    pub flap_downs: u32,
+    pub max_dump_files: usize,
     pub dump_dir: PathBuf,
     pub auto_submit: bool,
 }

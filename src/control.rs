@@ -1249,42 +1249,95 @@ pub(crate) async fn mtu_monitor_loop(
     }
 }
 
-/// How often `diagnostics_watch_loop` re-checks every link's loss
-/// against `DiagnosticsWatchParams::loss_threshold_pct`. Frequent enough
-/// to catch a loss event not long after it starts (loss itself is a
-/// windowed EWMA already smoothed over multiple probes, so there is no
-/// benefit to checking faster than that smoothing resolves), infrequent
-/// enough to be negligible overhead on top of the periodic
-/// `procstats`/`sysfs_net` reads `build_snapshot` already does for every
-/// connected monitoring client.
+/// How often `diagnostics_watch_loop` re-evaluates every link. Each pass
+/// reads the per-link probe windows (cheap) and only builds the full
+/// snapshot when something actually has to be dumped.
 const DIAGNOSTICS_WATCH_INTERVAL_SECS: u64 = 5;
 
-/// Watches every link's own locally-measured loss (`LinkSnapshot::local_loss_pct`,
-/// the same figure `mlvpn-tui`'s Links tab shows) and writes a text
-/// diagnostic dump to `watch.dump_dir` the moment one crosses
-/// `watch.loss_threshold_pct` -- the automatic counterpart to
-/// `Command::DiagDump`'s on-demand capture, meant to catch a transient
-/// loss event's evidence even if no one is watching live at the moment
-/// it happens. `watch.cooldown` rate-limits repeat dumps so a
-/// persistently lossy link doesn't fill the directory with near-
-/// duplicate captures -- each dump already reflects that moment fully,
-/// repeating it every few seconds adds nothing. Deliberately does not
-/// shell out to `nstat`/`ss` the way `mlvpnd diag-dump`'s CLI side does
-/// -- see `diag.rs`'s module doc comment for why that split exists.
+/// Links that open an event within this long of another open event ride on
+/// that event's ticket instead of filing their own.
+const DIAGNOSTICS_EVENT_JOIN: Duration = Duration::from_secs(60);
+
+const DIAGNOSTICS_FLAP_WINDOW: Duration = Duration::from_secs(600);
+
+/// Watches every link for a reportable event -- raw probe loss over a
+/// sliding window above `watch.loss_threshold_pct`, or repeated Up->Down
+/// flapping (see `autoreport`) -- and writes a text diagnostic dump to
+/// `watch.dump_dir` while one lasts. One ticket is submitted when an event
+/// opens and at most one reminder per `watch.reminder` while it continues;
+/// local dumps are rate-limited by `watch.cooldown`. Event state is
+/// persisted in `dump_dir` so a daemon restart mid-outage doesn't file a
+/// second ticket. Deliberately does not shell out to `nstat`/`ss` the way
+/// `mlvpnd diag-dump`'s CLI side does -- see `diag.rs`'s module doc comment.
 pub(crate) async fn diagnostics_watch_loop(
     watch: DiagnosticsWatchParams,
     links: Links,
     diag_ctx: DiagContext,
 ) {
+    use crate::autoreport::{DumpKind, EventTracker, Outcome, TrackerCfg, TriggerCfg};
+
+    let trigger_cfg = TriggerCfg {
+        threshold_pct: watch.loss_threshold_pct,
+        window: watch.window,
+        min_probes: watch.min_probes,
+        flap_downs: watch.flap_downs,
+        flap_window: DIAGNOSTICS_FLAP_WINDOW,
+    };
+    let mut tracker = EventTracker::new(TrackerCfg {
+        clear: watch.clear,
+        reminder: watch.reminder,
+        join: DIAGNOSTICS_EVENT_JOIN,
+        dump_cooldown: watch.cooldown,
+    });
+    let state_path = watch
+        .dump_dir
+        .join(format!(".autoreport-state-{}.json", diag_ctx.tunnel_name));
+    if let Ok(raw) = std::fs::read_to_string(&state_path) {
+        match serde_json::from_str(&raw) {
+            Ok(persisted) => tracker.restore(Instant::now(), unix_now_secs(), persisted),
+            Err(e) => tracing::warn!(error = %e, "ignoring unreadable auto-report state file"),
+        }
+    }
+
     let mut tick = interval(Duration::from_secs(DIAGNOSTICS_WATCH_INTERVAL_SECS));
-    let mut last_dump_at: Option<Instant> = None;
     loop {
         tick.tick().await;
+        let now = Instant::now();
 
-        if let Some(last) = last_dump_at {
-            if last.elapsed() < watch.cooldown {
-                continue;
+        let mut dumps: Vec<(String, String, bool, DumpKind)> = Vec::new();
+        for l in links.iter() {
+            let (name, reason) = {
+                let g = l.lock().await;
+                (
+                    g.config.name.clone(),
+                    crate::autoreport::evaluate(
+                        &g.stats.probe_window,
+                        &g.stats.down_transitions,
+                        now,
+                        &trigger_cfg,
+                    ),
+                )
+            };
+            match tracker.observe(now, &name, reason.as_ref()) {
+                Outcome::Dump { submit, kind } => {
+                    let why = reason.map(|r| r.describe(&trigger_cfg)).unwrap_or_default();
+                    dumps.push((name, why, submit, kind));
+                }
+                Outcome::Ended => {
+                    tracing::info!(link = %name, "loss event ended (link clear)");
+                }
+                Outcome::Quiet => {}
             }
+        }
+
+        if let Some(state) = tracker.take_dirty_state(now, unix_now_secs()) {
+            if let Err(e) = write_state_file(&state_path, &state) {
+                tracing::warn!(error = %e, "failed to persist auto-report state");
+            }
+        }
+
+        if dumps.is_empty() {
+            continue;
         }
 
         let (snapshot, _, _) = build_snapshot(
@@ -1309,30 +1362,32 @@ pub(crate) async fn diagnostics_watch_loop(
         )
         .await;
 
-        let Some((link_name, loss_pct)) =
-            diag::worst_loss_link(&snapshot, watch.loss_threshold_pct)
-        else {
-            continue;
+        let submit = dumps.iter().any(|(_, _, s, _)| *s);
+        let kind_label = |k: &DumpKind| match k {
+            DumpKind::Opened => "event opened",
+            DumpKind::Reminder => "reminder",
+            DumpKind::Ongoing => "ongoing",
         };
-
         let trigger = format!(
-            "automatic: link '{link_name}' loss {loss_pct:.1}% exceeded threshold {:.1}%",
-            watch.loss_threshold_pct
+            "automatic: {}",
+            dumps
+                .iter()
+                .map(|(n, why, _, k)| format!("link '{n}' {why} ({})", kind_label(k)))
+                .collect::<Vec<_>>()
+                .join("; ")
         );
         let text = diag::format_dump(&snapshot, &trigger);
         match write_dump_file(&watch.dump_dir, &diag_ctx.tunnel_name, &text) {
             Ok(path) => {
                 tracing::warn!(
-                    link = %link_name,
-                    loss_pct,
-                    threshold_pct = watch.loss_threshold_pct,
+                    trigger = %trigger,
+                    submit,
                     path = %path.display(),
-                    "loss threshold exceeded; wrote automatic diagnostic dump"
+                    "automatic diagnostic dump written"
                 );
-                last_dump_at = Some(Instant::now());
+                prune_dump_files(&watch.dump_dir, &diag_ctx.tunnel_name, watch.max_dump_files);
 
-                if watch.auto_submit {
-                    let text = text.clone();
+                if watch.auto_submit && submit {
                     tokio::spawn(async move {
                         if let Err(e) =
                             crate::diagnostics::submit_report_async(&text, "auto", None).await
@@ -1346,10 +1401,47 @@ pub(crate) async fn diagnostics_watch_loop(
                 tracing::warn!(
                     error = %e,
                     dir = %watch.dump_dir.display(),
-                    "loss threshold exceeded but failed to write diagnostic dump"
+                    "reportable loss event but failed to write diagnostic dump"
                 );
             }
         }
+    }
+}
+
+fn unix_now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn write_state_file(
+    path: &Path,
+    state: &crate::autoreport::PersistedEvents,
+) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(path, serde_json::to_vec(state)?)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+}
+
+/// Deletes the oldest automatic dump files for this tunnel beyond `keep`.
+fn prune_dump_files(dir: &Path, tunnel_name: &str, keep: usize) {
+    let prefix = format!("mlvpn-diag-{tunnel_name}-");
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut files: Vec<String> = rd
+        .filter_map(|e| e.ok()?.file_name().into_string().ok())
+        .filter(|n| n.starts_with(&prefix) && n.ends_with(".txt"))
+        .collect();
+    if files.len() <= keep {
+        return;
+    }
+    files.sort_by_key(|n| (n.len(), n.clone()));
+    for old in &files[..files.len() - keep] {
+        let _ = std::fs::remove_file(dir.join(old));
     }
 }
 

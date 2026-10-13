@@ -71,6 +71,9 @@ pub fn update_link_state(link: &mut Link, cfg: &SchedulerConfig) {
     };
     if was != link.state {
         link.state_since = Instant::now();
+        if was == LinkState::Up && link.state == LinkState::Down {
+            link.stats.down_transitions.record(link.state_since);
+        }
         if was != LinkState::Up && link.state == LinkState::Up {
             // A link coming back Up from Down/Probing may now sit on a
             // genuinely different physical path (e.g. failover) with a

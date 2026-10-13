@@ -217,22 +217,6 @@ pub fn format_dump(snapshot: &Snapshot, trigger: &str) -> String {
     out
 }
 
-/// The link with the highest `local_loss_pct` that exceeds
-/// `threshold_pct`, if any -- `None` when every link is at or below
-/// threshold, or has no loss reading yet (e.g. before that link's first
-/// probe completes). Used by `control::diagnostics_watch_loop` to decide
-/// whether an automatic dump should fire this tick; picking the worst
-/// (not just the first) offender means the dump's `trigger` line always
-/// names the link actually responsible when more than one is degraded.
-pub fn worst_loss_link(snapshot: &Snapshot, threshold_pct: f64) -> Option<(String, f64)> {
-    snapshot
-        .links
-        .iter()
-        .filter_map(|l| l.local_loss_pct.map(|loss| (l.name.clone(), loss)))
-        .filter(|(_, loss)| *loss > threshold_pct)
-        .max_by(|a, b| a.1.total_cmp(&b.1))
-}
-
 fn fmt_opt_ms(v: Option<f64>) -> String {
     v.map(|v| format!("{v:.1}ms"))
         .unwrap_or_else(|| "n/a".to_string())
@@ -389,38 +373,5 @@ mod tests {
         let text = format_dump(&snap, "test");
         assert!(text.contains("Recent log lines (1)"));
         assert!(text.contains("WARN mlvpn::tunnel: link comcast: 5 consecutive probe misses"));
-    }
-
-    #[test]
-    fn worst_loss_link_returns_none_when_every_link_is_under_threshold() {
-        let snap = fixture_snapshot(vec![
-            fixture_link("comcast", Some(2.0)),
-            fixture_link("tmobile", Some(9.9)),
-        ]);
-        assert_eq!(worst_loss_link(&snap, 10.0), None);
-    }
-
-    #[test]
-    fn worst_loss_link_ignores_links_with_no_loss_reading_yet() {
-        let snap = fixture_snapshot(vec![fixture_link("comcast", None)]);
-        assert_eq!(worst_loss_link(&snap, 10.0), None);
-    }
-
-    #[test]
-    fn worst_loss_link_picks_the_highest_offender_not_just_the_first() {
-        let snap = fixture_snapshot(vec![
-            fixture_link("comcast", Some(41.0)),
-            fixture_link("tmobile", Some(73.0)),
-        ]);
-        assert_eq!(
-            worst_loss_link(&snap, 10.0),
-            Some(("tmobile".to_string(), 73.0))
-        );
-    }
-
-    #[test]
-    fn worst_loss_link_boundary_is_strictly_greater_than_threshold() {
-        let snap = fixture_snapshot(vec![fixture_link("comcast", Some(10.0))]);
-        assert_eq!(worst_loss_link(&snap, 10.0), None);
     }
 }

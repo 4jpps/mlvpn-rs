@@ -300,17 +300,28 @@ output if the tool isn't installed or the read fails, rather than
 failing the whole dump.
 
 **Automatic capture on loss.** `[diagnostics] auto_dump_enabled = true`
-has the daemon watch its own locally-measured per-link loss and write
-the same daemon-visible dump section to disk on its own the moment a
-link's loss crosses `loss_threshold_pct` (default 10%) -- catching a
-transient loss event's evidence even if no one is watching
-`mlvpn-tui` at the exact moment it happens:
+has the daemon watch every link's raw probe loss over a sliding
+window (`window_secs`, default 60 s, needing at least `min_probes` =
+20 probes in it) and write the same daemon-visible dump section to disk
+on its own once that loss exceeds `loss_threshold_pct` (default 10%).
+This is deliberately *not* the smoothed loss figure the Links tab shows:
+that one jumps past 50% on a single missed probe, so it would raise an
+alarm on every blip and could drop back under the threshold between
+bursts of real, chronic loss. A link that goes Up -> Down `flap_downs`
+(default 3) times in 10 minutes also opens an event. An event ends after
+the link has been clear for `clear_secs` (default 60 s):
 
 ```toml
 [diagnostics]
 auto_dump_enabled = true
 loss_threshold_pct = 10.0        # default
-cooldown_secs = 300              # minimum time between auto dumps, default
+cooldown_secs = 300              # minimum time between local dumps while one
+                                  # event continues, default
+window_secs = 60                 # default
+min_probes = 20                  # default
+clear_secs = 60                  # default
+flap_downs = 3                   # default, 0 disables the flap trigger
+max_dump_files = 50              # oldest automatic dumps are deleted past this
 dump_dir = "/var/log/mlvpn"      # default -- matches where most other
                                   # services log to, already writable
                                   # under the shipped systemd unit's
@@ -353,9 +364,13 @@ either way.
 **Automatically, on a loss event.** `[diagnostics] auto_submit_enabled
 = true` submits each automatic loss-threshold dump in addition to
 writing it to `dump_dir`. It has no effect unless `auto_dump_enabled`
-is also on, and it reuses that watcher's existing `cooldown_secs`
-rather than adding a second rate limit, so a persistently lossy link
-cannot flood the service with tickets.
+is also on. Tickets are per event, not per dump: one is submitted
+when an event opens, then at most one reminder per `reminder_secs`
+(default 3600) while it continues, so a two-hour outage files two
+tickets instead of one every five minutes. A second link that starts
+losing within 60 s of the first rides on that first ticket (its own
+local dump is still written). Open-event state is kept in a small file in
+`dump_dir`, so restarting the daemon mid-outage doesn't file a duplicate.
 
 **Automatically, on a panic.** `[diagnostics] crash_report_enabled =
 true` installs a panic hook that submits the hostname and the tail of

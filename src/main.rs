@@ -822,6 +822,12 @@ async fn run(cfg: Config, log_ring: Arc<LogRing>) -> anyhow::Result<()> {
         Some(tunnel::DiagnosticsWatchParams {
             loss_threshold_pct: cfg.diagnostics.loss_threshold_pct,
             cooldown: std::time::Duration::from_secs(cfg.diagnostics.cooldown_secs),
+            window: std::time::Duration::from_secs(cfg.diagnostics.window_secs),
+            min_probes: cfg.diagnostics.min_probes,
+            clear: std::time::Duration::from_secs(cfg.diagnostics.clear_secs),
+            reminder: std::time::Duration::from_secs(cfg.diagnostics.reminder_secs),
+            flap_downs: cfg.diagnostics.flap_downs,
+            max_dump_files: cfg.diagnostics.max_dump_files,
             dump_dir: cfg
                 .diagnostics
                 .dump_dir
