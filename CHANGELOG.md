@@ -12,7 +12,7 @@ design, and `ARCHITECTURE.md` covers the system as a whole.
 
 ## [Unreleased]
 
-_Shipping in the 0.7.7-beta3 build: the `tx_send_mode` option below (default `sendto`, so no change unless configured) and doc fixes (stale package names, `outbound_queue_dropped_total` explanation). Packaging this lets a host run `sendmmsg` from the installed package instead of a hand-copied binary._
+_Shipping in the 0.7.7-beta4 build: the event-based automatic loss reports below (replacing the EWMA/cooldown trigger), plus everything from beta3: the `tx_send_mode` option below (default `sendto`, so no change unless configured) and doc fixes (stale package names, `outbound_queue_dropped_total` explanation). Packaging this lets a host run `sendmmsg` from the installed package instead of a hand-copied binary._
 
 ### Changed
 
