@@ -176,10 +176,13 @@ struct Event {
 
 /// Per-link event state machine: one ticket when an event opens, one
 /// reminder per `reminder`, event ends after `clear` of continuous quiet.
+/// A link that re-opens an event within `reminder` of its last ticket (loss
+/// hovering around the threshold) is dumped locally but not ticketed again.
 #[derive(Debug)]
 pub struct EventTracker {
     cfg: TrackerCfg,
     events: HashMap<String, Event>,
+    last_submit: HashMap<String, Instant>,
     dirty: bool,
 }
 
@@ -195,6 +198,7 @@ impl EventTracker {
         Self {
             cfg,
             events: HashMap::new(),
+            last_submit: HashMap::new(),
             dirty: false,
         }
     }
@@ -206,18 +210,27 @@ impl EventTracker {
                     .events
                     .values()
                     .any(|e| now.saturating_duration_since(e.opened_at) < self.cfg.join);
+                let recent = self
+                    .last_submit
+                    .get(link)
+                    .copied()
+                    .filter(|&at| now.saturating_duration_since(at) < self.cfg.reminder);
+                let submit = !rides && recent.is_none();
+                if submit || rides {
+                    self.last_submit.insert(link.to_string(), now);
+                }
                 self.events.insert(
                     link.to_string(),
                     Event {
                         opened_at: now,
                         last_dump: now,
-                        last_submit: now,
+                        last_submit: self.last_submit.get(link).copied().unwrap_or(now),
                         clear_since: None,
                     },
                 );
                 self.dirty = true;
                 Outcome::Dump {
-                    submit: !rides,
+                    submit,
                     kind: DumpKind::Opened,
                 }
             }
@@ -227,6 +240,7 @@ impl EventTracker {
                 if now.saturating_duration_since(ev.last_submit) >= self.cfg.reminder {
                     ev.last_submit = now;
                     ev.last_dump = now;
+                    self.last_submit.insert(link.to_string(), now);
                     self.dirty = true;
                     Outcome::Dump {
                         submit: true,
@@ -263,10 +277,11 @@ impl EventTracker {
             return None;
         }
         let last_submit_unix = self
-            .events
+            .last_submit
             .iter()
-            .map(|(k, e)| {
-                let age = now.saturating_duration_since(e.last_submit).as_secs();
+            .filter(|(_, &at)| now.saturating_duration_since(at) < self.cfg.reminder)
+            .map(|(k, &at)| {
+                let age = now.saturating_duration_since(at).as_secs();
                 (k.clone(), now_unix.saturating_sub(age))
             })
             .collect();
@@ -283,6 +298,7 @@ impl EventTracker {
                 continue;
             }
             let at = now.checked_sub(age).unwrap_or(now);
+            self.last_submit.insert(link.clone(), at);
             self.events.insert(
                 link,
                 Event {
@@ -478,8 +494,35 @@ mod tests {
         assert_eq!(t.observe(at(50), "a", Some(&loss())), Outcome::Quiet);
         assert_eq!(t.observe(at(60), "a", None), Outcome::Quiet);
         assert_eq!(t.observe(at(120), "a", None), Outcome::Ended);
+        // re-opens within the reminder interval of the last ticket: dumped, not ticketed
         assert_eq!(
             t.observe(at(130), "a", Some(&loss())),
+            Outcome::Dump {
+                submit: false,
+                kind: DumpKind::Opened
+            }
+        );
+    }
+
+    #[test]
+    fn reopening_event_files_one_ticket_per_reminder_interval() {
+        let t0 = Instant::now();
+        let mut t = EventTracker::new(trk());
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let mut submits = 0;
+        // loss hovers at the threshold: opens, clears for 2 min, reopens, for 50 min
+        for cycle in 0..10u64 {
+            let base = cycle * 300;
+            if let Outcome::Dump { submit, .. } = t.observe(at(base), "a", Some(&loss())) {
+                submits += usize::from(submit);
+            }
+            t.observe(at(base + 60), "a", None);
+            t.observe(at(base + 130), "a", None);
+        }
+        assert_eq!(submits, 1);
+        // an hour after the ticket a new event files again
+        assert_eq!(
+            t.observe(at(3700), "a", Some(&loss())),
             Outcome::Dump {
                 submit: true,
                 kind: DumpKind::Opened

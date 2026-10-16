@@ -309,7 +309,9 @@ that one jumps past 50% on a single missed probe, so it would raise an
 alarm on every blip and could drop back under the threshold between
 bursts of real, chronic loss. A link that goes Up -> Down `flap_downs`
 (default 3) times in 10 minutes also opens an event. An event ends after
-the link has been clear for `clear_secs` (default 60 s):
+the link has been clear for `clear_secs` (default 60 s). A link that
+re-opens an event within `reminder_secs` (default 1 hour) of its last
+ticket is still dumped locally but does not file another ticket:
 
 ```toml
 [diagnostics]
