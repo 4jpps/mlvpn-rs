@@ -694,7 +694,7 @@ pub struct CommandConfig {
 /// command (always available whenever `[command] enabled = true`,
 /// unaffected by anything here) and an *automatic* capture this section
 /// actually configures: watch every link's own locally-measured loss and
-/// write a text dump to disk the moment one crosses `loss_threshold_pct`,
+/// write a text dump to disk when one is degraded, flapping or down,
 /// so evidence of a transient loss event is captured even if no one is
 /// watching `mlvpn-tui` at the exact moment it happens. Off by default:
 /// this is the one config section that has the daemon write arbitrary
@@ -727,28 +727,44 @@ pub struct DiagnosticsConfig {
     /// go through the loss watcher. See `diagnostics::install_crash_report_hook`.
     #[serde(default)]
     pub crash_report_enabled: bool,
-    /// A link's raw probe loss over the last `window_secs` (not the
-    /// scheduler's loss EWMA, which one missed probe pushes past 50%) has
-    /// to exceed this percentage before an event opens.
-    #[serde(default = "default_diag_loss_threshold_pct")]
-    pub loss_threshold_pct: f64,
+    /// A link is degraded when, over the last `window_secs`, raw probe loss
+    /// (not the scheduler's loss EWMA, which one missed probe pushes past
+    /// 50%) is at least this percentage AND at least `degraded_open_misses`
+    /// probes were lost, and that holds for 30 s.
+    #[serde(default = "default_diag_degraded_open_pct")]
+    pub degraded_open_pct: f64,
+    /// Absolute number of lost probes the window needs before a degraded
+    /// event can open (a percentage alone is noisy on small counts).
+    #[serde(default = "default_diag_degraded_open_misses")]
+    pub degraded_open_misses: usize,
+    /// An open degraded event is calm while window loss is below this.
+    #[serde(default = "default_diag_degraded_close_pct")]
+    pub degraded_close_pct: f64,
     /// Minimum time between local dump files while one event continues.
-    /// Tickets are separate: one per event plus `reminder_secs` reminders.
+    /// Tickets are separate: exactly one per event, no reminders.
     #[serde(default = "default_diag_cooldown_secs")]
     pub cooldown_secs: u64,
     /// Sliding window the loss percentage is computed over.
     #[serde(default = "default_diag_window_secs")]
     pub window_secs: u64,
-    /// Fewer probes than this in the window means too little data to call
-    /// (also what keeps a just-restarted link's first miss from alarming).
+    /// Fewer probes than this in the window means too little data to call.
     #[serde(default = "default_diag_min_probes")]
     pub min_probes: usize,
-    /// How long a link must stay clear before its event ends.
+    /// How long a link must stay calm before its event ends.
     #[serde(default = "default_diag_clear_secs")]
     pub clear_secs: u64,
-    /// While an event continues, the most often a ticket is re-submitted.
-    #[serde(default = "default_diag_reminder_secs")]
-    pub reminder_secs: u64,
+    /// A link that stays not-Up longer than this is an outage.
+    #[serde(default = "default_diag_outage_secs")]
+    pub outage_secs: u64,
+    /// No degradation verdict until a link's probe window is this old, so
+    /// a just-started or just-recovered link can't alarm on its first
+    /// misses. The window is also cleared whenever a link comes Up.
+    #[serde(default = "default_diag_warmup_secs")]
+    pub warmup_secs: u64,
+    /// At most one degraded ticket per link per this long; further
+    /// degraded events are dumped locally and counted in the next ticket.
+    #[serde(default = "default_diag_degraded_ticket_gap_secs")]
+    pub degraded_ticket_gap_secs: u64,
     /// This many Up->Down transitions within 10 minutes opens an event
     /// even if loss stays under the threshold. 0 disables.
     #[serde(default = "default_diag_flap_downs")]
@@ -768,8 +784,16 @@ pub struct DiagnosticsConfig {
     pub dump_dir: Option<String>,
 }
 
-fn default_diag_loss_threshold_pct() -> f64 {
-    10.0
+fn default_diag_degraded_open_pct() -> f64 {
+    12.0
+}
+
+fn default_diag_degraded_open_misses() -> usize {
+    8
+}
+
+fn default_diag_degraded_close_pct() -> f64 {
+    5.0
 }
 
 fn default_diag_cooldown_secs() -> u64 {
@@ -777,19 +801,27 @@ fn default_diag_cooldown_secs() -> u64 {
 }
 
 fn default_diag_window_secs() -> u64 {
-    60
+    300
 }
 
 fn default_diag_min_probes() -> usize {
-    20
+    100
 }
 
 fn default_diag_clear_secs() -> u64 {
+    300
+}
+
+fn default_diag_outage_secs() -> u64 {
     60
 }
 
-fn default_diag_reminder_secs() -> u64 {
-    3600
+fn default_diag_warmup_secs() -> u64 {
+    120
+}
+
+fn default_diag_degraded_ticket_gap_secs() -> u64 {
+    21600
 }
 
 fn default_diag_flap_downs() -> u32 {
@@ -811,12 +843,16 @@ impl Default for DiagnosticsConfig {
             auto_dump_enabled: false,
             auto_submit_enabled: false,
             crash_report_enabled: false,
-            loss_threshold_pct: default_diag_loss_threshold_pct(),
+            degraded_open_pct: default_diag_degraded_open_pct(),
+            degraded_open_misses: default_diag_degraded_open_misses(),
+            degraded_close_pct: default_diag_degraded_close_pct(),
             cooldown_secs: default_diag_cooldown_secs(),
             window_secs: default_diag_window_secs(),
             min_probes: default_diag_min_probes(),
             clear_secs: default_diag_clear_secs(),
-            reminder_secs: default_diag_reminder_secs(),
+            outage_secs: default_diag_outage_secs(),
+            warmup_secs: default_diag_warmup_secs(),
+            degraded_ticket_gap_secs: default_diag_degraded_ticket_gap_secs(),
             flap_downs: default_diag_flap_downs(),
             max_dump_files: default_diag_max_dump_files(),
             dump_dir: None,
@@ -1089,12 +1125,16 @@ mod tests {
             command: CommandConfig::default(),
             diagnostics: DiagnosticsConfig {
                 auto_dump_enabled: false,
-                loss_threshold_pct: 10.0,
+                degraded_open_pct: 12.0,
+                degraded_open_misses: 8,
+                degraded_close_pct: 5.0,
                 cooldown_secs: 60,
-                window_secs: 60,
-                min_probes: 20,
-                clear_secs: 60,
-                reminder_secs: 3600,
+                window_secs: 300,
+                min_probes: 100,
+                clear_secs: 300,
+                outage_secs: 60,
+                warmup_secs: 120,
+                degraded_ticket_gap_secs: 21600,
                 flap_downs: 3,
                 max_dump_files: 50,
                 dump_dir: None,

@@ -72,7 +72,7 @@
 //! - one optional `control::diagnostics_watch_loop` task (`[diagnostics]
 //!   auto_dump_enabled = true` to turn it on, off by default): watches
 //!   every link's locally-measured loss and writes a text diagnostic
-//!   dump to disk the moment one crosses `loss_threshold_pct`, so a
+//!   dump to disk when one is degraded, flapping or down, so a
 //!   transient loss event's evidence gets captured even if no one is
 //!   watching live. See `diag.rs` and `config::DiagnosticsConfig`.
 //!
@@ -383,12 +383,16 @@ pub struct TunnelParams {
 /// each field means and why the feature exists.
 #[derive(Clone)]
 pub struct DiagnosticsWatchParams {
-    pub loss_threshold_pct: f64,
+    pub degraded_open_pct: f64,
+    pub degraded_open_misses: usize,
+    pub degraded_close_pct: f64,
     pub cooldown: Duration,
     pub window: Duration,
     pub min_probes: usize,
     pub clear: Duration,
-    pub reminder: Duration,
+    pub outage: Duration,
+    pub warmup: Duration,
+    pub degraded_ticket_gap: Duration,
     pub flap_downs: u32,
     pub max_dump_files: usize,
     pub dump_dir: PathBuf,

@@ -1260,12 +1260,88 @@ const DIAGNOSTICS_EVENT_JOIN: Duration = Duration::from_secs(60);
 
 const DIAGNOSTICS_FLAP_WINDOW: Duration = Duration::from_secs(600);
 
-/// Watches every link for a reportable event -- raw probe loss over a
-/// sliding window above `watch.loss_threshold_pct`, or repeated Up->Down
-/// flapping (see `autoreport`) -- and writes a text diagnostic dump to
-/// `watch.dump_dir` while one lasts. One ticket is submitted when an event
-/// opens and at most one reminder per `watch.reminder` while it continues;
-/// local dumps are rate-limited by `watch.cooldown`. Event state is
+fn fmt_dur(d: Duration) -> String {
+    let s = d.as_secs();
+    if s >= 3600 {
+        format!("{}h{:02}m", s / 3600, (s % 3600) / 60)
+    } else if s >= 60 {
+        format!("{}m{:02}s", s / 60, s % 60)
+    } else {
+        format!("{s}s")
+    }
+}
+
+/// One link's contribution to a dump's `trigger:` text.
+fn describe_event(
+    link: &str,
+    obs: &crate::autoreport::LinkObs,
+    ev: &crate::autoreport::EventInfo,
+    kind: crate::autoreport::DumpKind,
+    cfg: &crate::autoreport::TriggerCfg,
+) -> String {
+    use crate::autoreport::{Class, DumpKind};
+    let phase = match kind {
+        DumpKind::Opened => "opened",
+        DumpKind::Escalated => "escalated",
+        DumpKind::Ongoing => "ongoing",
+    };
+    let mut out = format!(
+        "[{}] {} link '{link}' {phase} (event {})",
+        ev.class.label(),
+        phase,
+        ev.id
+    );
+    match ev.class {
+        Class::Outage => out.push_str(&format!(
+            "\n  link not Up for {} (threshold {})",
+            fmt_dur(obs.down_for.unwrap_or_default()),
+            fmt_dur(cfg.outage_after)
+        )),
+        Class::Flap => out.push_str(&format!(
+            "\n  {} Up->Down transitions in the last {}",
+            obs.recent_downs,
+            fmt_dur(cfg.flap_window)
+        )),
+        Class::Degraded => out.push_str(&format!(
+            "\n  {}/{} probes lost ({:.1}%) over the last {} (opens at >= {} lost and >= {:.0}%)",
+            obs.missed,
+            obs.total,
+            obs.loss_pct().unwrap_or(0.0),
+            fmt_dur(cfg.window),
+            cfg.open_misses,
+            cfg.open_pct
+        )),
+    }
+    out.push_str(&format!(
+        "\n  peak loss this event: {:.1}%, event age: {}",
+        ev.peak_loss_pct,
+        fmt_dur(ev.age)
+    ));
+    match &ev.previous {
+        Some(p) => out.push_str(&format!(
+            "\n  previous event on this link: {} {} ago, lasted {}, peak loss {:.1}%",
+            p.class.label(),
+            fmt_dur(p.ended_ago),
+            fmt_dur(p.duration),
+            p.peak_loss_pct
+        )),
+        None => out.push_str("\n  previous event on this link: none recorded"),
+    }
+    if ev.suppressed_degraded > 0 {
+        out.push_str(&format!(
+            "\n  {} earlier degraded event(s) on this link were not ticketed (rate limit)",
+            ev.suppressed_degraded
+        ));
+    }
+    out
+}
+
+/// Watches every link for a reportable event -- an outage (link not Up for
+/// `watch.outage`), flapping, or sustained degradation over a long window
+/// of raw probes (see `autoreport`) -- and writes a text diagnostic dump to
+/// `watch.dump_dir` while one lasts. Exactly one ticket is submitted per
+/// event (plus one more if it escalates to a worse class); local dumps are
+/// rate-limited by `watch.cooldown`. Ticket times and previous events are
 /// persisted in `dump_dir` so a daemon restart mid-outage doesn't file a
 /// second ticket. Deliberately does not shell out to `nstat`/`ss` the way
 /// `mlvpnd diag-dump`'s CLI side does -- see `diag.rs`'s module doc comment.
@@ -1274,21 +1350,28 @@ pub(crate) async fn diagnostics_watch_loop(
     links: Links,
     diag_ctx: DiagContext,
 ) {
-    use crate::autoreport::{DumpKind, EventTracker, Outcome, TrackerCfg, TriggerCfg};
+    use crate::autoreport::{EventTracker, LinkObs, Outcome, TrackerCfg, TriggerCfg};
 
     let trigger_cfg = TriggerCfg {
-        threshold_pct: watch.loss_threshold_pct,
         window: watch.window,
         min_probes: watch.min_probes,
+        open_misses: watch.degraded_open_misses,
+        open_pct: watch.degraded_open_pct,
+        close_pct: watch.degraded_close_pct,
+        clear: watch.clear,
+        outage_after: watch.outage,
+        warmup: watch.warmup,
         flap_downs: watch.flap_downs,
         flap_window: DIAGNOSTICS_FLAP_WINDOW,
     };
-    let mut tracker = EventTracker::new(TrackerCfg {
-        clear: watch.clear,
-        reminder: watch.reminder,
-        join: DIAGNOSTICS_EVENT_JOIN,
-        dump_cooldown: watch.cooldown,
-    });
+    let mut tracker = EventTracker::new(
+        trigger_cfg.clone(),
+        TrackerCfg {
+            dump_cooldown: watch.cooldown,
+            join: DIAGNOSTICS_EVENT_JOIN,
+            degraded_ticket_gap: watch.degraded_ticket_gap,
+        },
+    );
     let state_path = watch
         .dump_dir
         .join(format!(".autoreport-state-{}.json", diag_ctx.tunnel_name));
@@ -1303,34 +1386,54 @@ pub(crate) async fn diagnostics_watch_loop(
     loop {
         tick.tick().await;
         let now = Instant::now();
+        let now_unix = unix_now_secs();
 
-        let mut dumps: Vec<(String, String, bool, DumpKind)> = Vec::new();
+        let mut dumps: Vec<(String, bool, String)> = Vec::new();
         for l in links.iter() {
-            let (name, reason) = {
+            let (name, obs) = {
                 let g = l.lock().await;
+                let down_for = (g.state != LinkState::Up)
+                    .then(|| now.saturating_duration_since(g.state_since));
                 (
                     g.config.name.clone(),
-                    crate::autoreport::evaluate(
+                    LinkObs::gather(
                         &g.stats.probe_window,
                         &g.stats.down_transitions,
+                        down_for,
                         now,
                         &trigger_cfg,
                     ),
                 )
             };
-            match tracker.observe(now, &name, reason.as_ref()) {
-                Outcome::Dump { submit, kind } => {
-                    let why = reason.map(|r| r.describe(&trigger_cfg)).unwrap_or_default();
-                    dumps.push((name, why, submit, kind));
+            match tracker.observe(now, now_unix, &name, &obs) {
+                Outcome::Dump {
+                    submit,
+                    kind,
+                    event,
+                } => {
+                    let text = describe_event(&name, &obs, &event, kind, &trigger_cfg);
+                    dumps.push((name, submit, text));
                 }
-                Outcome::Ended => {
-                    tracing::info!(link = %name, "loss event ended (link clear)");
+                Outcome::Ended {
+                    id,
+                    class,
+                    duration,
+                    peak_loss_pct,
+                } => {
+                    tracing::info!(
+                        link = %name,
+                        event = %id,
+                        class = class.label(),
+                        duration = %fmt_dur(duration),
+                        peak_loss_pct,
+                        "auto-report event ended (link calm)"
+                    );
                 }
                 Outcome::Quiet => {}
             }
         }
 
-        if let Some(state) = tracker.take_dirty_state(now, unix_now_secs()) {
+        if let Some(state) = tracker.take_dirty_state(now, now_unix) {
             if let Err(e) = write_state_file(&state_path, &state) {
                 tracing::warn!(error = %e, "failed to persist auto-report state");
             }
@@ -1362,19 +1465,14 @@ pub(crate) async fn diagnostics_watch_loop(
         )
         .await;
 
-        let submit = dumps.iter().any(|(_, _, s, _)| *s);
-        let kind_label = |k: &DumpKind| match k {
-            DumpKind::Opened => "event opened",
-            DumpKind::Reminder => "reminder",
-            DumpKind::Ongoing => "ongoing",
-        };
+        let submit = dumps.iter().any(|(_, s, _)| *s);
         let trigger = format!(
-            "automatic: {}",
+            "automatic\n{}",
             dumps
                 .iter()
-                .map(|(n, why, _, k)| format!("link '{n}' {why} ({})", kind_label(k)))
+                .map(|(_, _, t)| t.as_str())
                 .collect::<Vec<_>>()
-                .join("; ")
+                .join("\n")
         );
         let text = diag::format_dump(&snapshot, &trigger);
         match write_dump_file(&watch.dump_dir, &diag_ctx.tunnel_name, &text) {

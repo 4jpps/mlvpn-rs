@@ -820,12 +820,18 @@ async fn run(cfg: Config, log_ring: Arc<LogRing>) -> anyhow::Result<()> {
     // which matters for evidence of a loss event caught automatically).
     let diagnostics_watch = if cfg.diagnostics.auto_dump_enabled {
         Some(tunnel::DiagnosticsWatchParams {
-            loss_threshold_pct: cfg.diagnostics.loss_threshold_pct,
+            degraded_open_pct: cfg.diagnostics.degraded_open_pct,
+            degraded_open_misses: cfg.diagnostics.degraded_open_misses,
+            degraded_close_pct: cfg.diagnostics.degraded_close_pct,
             cooldown: std::time::Duration::from_secs(cfg.diagnostics.cooldown_secs),
             window: std::time::Duration::from_secs(cfg.diagnostics.window_secs),
             min_probes: cfg.diagnostics.min_probes,
             clear: std::time::Duration::from_secs(cfg.diagnostics.clear_secs),
-            reminder: std::time::Duration::from_secs(cfg.diagnostics.reminder_secs),
+            outage: std::time::Duration::from_secs(cfg.diagnostics.outage_secs),
+            warmup: std::time::Duration::from_secs(cfg.diagnostics.warmup_secs),
+            degraded_ticket_gap: std::time::Duration::from_secs(
+                cfg.diagnostics.degraded_ticket_gap_secs,
+            ),
             flap_downs: cfg.diagnostics.flap_downs,
             max_dump_files: cfg.diagnostics.max_dump_files,
             dump_dir: cfg

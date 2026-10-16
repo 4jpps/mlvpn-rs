@@ -299,36 +299,59 @@ own drop counters. Each of those degrades gracefully to a note in the
 output if the tool isn't installed or the read fails, rather than
 failing the whole dump.
 
-**Automatic capture on loss.** `[diagnostics] auto_dump_enabled = true`
-has the daemon watch every link's raw probe loss over a sliding
-window (`window_secs`, default 60 s, needing at least `min_probes` =
-20 probes in it) and write the same daemon-visible dump section to disk
-on its own once that loss exceeds `loss_threshold_pct` (default 10%).
-This is deliberately *not* the smoothed loss figure the Links tab shows:
-that one jumps past 50% on a single missed probe, so it would raise an
-alarm on every blip and could drop back under the threshold between
-bursts of real, chronic loss. A link that goes Up -> Down `flap_downs`
-(default 3) times in 10 minutes also opens an event. An event ends after
-the link has been clear for `clear_secs` (default 60 s). A link that
-re-opens an event within `reminder_secs` (default 1 hour) of its last
-ticket is still dumped locally but does not file another ticket:
+**Automatic capture on trouble.** `[diagnostics] auto_dump_enabled = true`
+has the daemon watch every link and write the same daemon-visible dump
+section to disk when one is in trouble. There are three event classes,
+strongest first:
+
+- **OUTAGE** -- the link has been not-Up for longer than `outage_secs`
+  (default 60 s).
+- **FLAP** -- `flap_downs` (default 3, 0 disables) Up -> Down transitions
+  within 10 minutes.
+- **DEGRADED** -- over the last `window_secs` (default 300 s, needing at
+  least `min_probes` = 100 probes in it) at least `degraded_open_misses`
+  (default 8) probes were lost *and* the loss is at least
+  `degraded_open_pct` (default 12%), and that holds for 30 s. The
+  percentage is computed from raw probe outcomes, deliberately *not* the
+  smoothed loss figure the Links tab shows: that one jumps past 50% on a
+  single missed probe, so it would raise an alarm on every blip. A link's
+  probe window is cleared whenever it comes Up and a degraded verdict is
+  not given until the window is `warmup_secs` (default 120 s) old, so a
+  restart or recovery can't alarm on its first few misses.
+
+An event ends once the link has been calm (window loss under
+`degraded_close_pct`, default 5%, and neither outage nor flap) for
+`clear_secs` (default 300 s). There is one event per link at a time; an
+event that gets worse (DEGRADED -> OUTAGE) is reported once more as an
+escalation. Each dump's `trigger:` text carries a per-event ID, the
+numbers behind the verdict, the event's peak loss and age, and how long
+ago the previous event on that link ended.
 
 ```toml
 [diagnostics]
 auto_dump_enabled = true
-loss_threshold_pct = 10.0        # default
+degraded_open_pct = 12.0         # default
+degraded_open_misses = 8         # default
+degraded_close_pct = 5.0         # default
+window_secs = 300                # default
+min_probes = 100                 # default
+clear_secs = 300                 # default
+outage_secs = 60                 # default
+warmup_secs = 120                # default
+flap_downs = 3                   # default, 0 disables the flap trigger
 cooldown_secs = 300              # minimum time between local dumps while one
                                   # event continues, default
-window_secs = 60                 # default
-min_probes = 20                  # default
-clear_secs = 60                  # default
-flap_downs = 3                   # default, 0 disables the flap trigger
+degraded_ticket_gap_secs = 21600 # default: at most one DEGRADED ticket per
+                                  # link per 6 hours
 max_dump_files = 50              # oldest automatic dumps are deleted past this
 dump_dir = "/var/log/mlvpn"      # default -- matches where most other
                                   # services log to, already writable
                                   # under the shipped systemd unit's
                                   # LogsDirectory=mlvpn
 ```
+
+(`loss_threshold_pct` and `reminder_secs` from earlier betas no longer
+exist; they are ignored if still present in a config file.)
 
 Off by default -- this is the one setting that has the daemon write
 arbitrary files to disk on its own initiative. A `dump_dir` other than
@@ -366,13 +389,17 @@ either way.
 **Automatically, on a loss event.** `[diagnostics] auto_submit_enabled
 = true` submits each automatic loss-threshold dump in addition to
 writing it to `dump_dir`. It has no effect unless `auto_dump_enabled`
-is also on. Tickets are per event, not per dump: one is submitted
-when an event opens, then at most one reminder per `reminder_secs`
-(default 3600) while it continues, so a two-hour outage files two
-tickets instead of one every five minutes. A second link that starts
-losing within 60 s of the first rides on that first ticket (its own
-local dump is still written). Open-event state is kept in a small file in
-`dump_dir`, so restarting the daemon mid-outage doesn't file a duplicate.
+is also on. Tickets are per event, not per dump: exactly one is
+submitted when an event opens (plus one more if it escalates to a worse
+class) and there are no reminders, so a two-hour outage files one ticket,
+not one every few minutes. A second link that starts losing within 60 s
+of the first rides on that first ticket (its own local dump is still
+written). Re-opened events within 30 minutes of a link's last ticket, and
+DEGRADED events within `degraded_ticket_gap_secs` of its last DEGRADED
+ticket, are still dumped locally but not ticketed; the next ticket that
+does go out says how many were held back. Ticket times and the previous
+event are kept in a small file in `dump_dir`, so restarting the daemon
+mid-outage doesn't file a duplicate.
 
 **Automatically, on a panic.** `[diagnostics] crash_report_enabled =
 true` installs a panic hook that submits the hostname and the tail of

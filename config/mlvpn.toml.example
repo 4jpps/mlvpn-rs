@@ -127,8 +127,8 @@ enabled = true           # exposes live stats to `mlvpn-tui`; see README.md "Mon
 [diagnostics]
 # auto_dump_enabled = false  # off by default: watch every link's own
                            # locally-measured loss and write a text
-                           # diagnostic dump to disk on its own the moment
-                           # one crosses loss_threshold_pct -- catches a
+                           # diagnostic dump to disk on its own when one is
+                           # down, flapping or degraded -- catches a
                            # transient loss event's evidence even if no one
                            # is watching mlvpn-tui at the time. This is the
                            # one setting that has the daemon write arbitrary
@@ -149,12 +149,16 @@ enabled = true           # exposes live stats to `mlvpn-tui`; see README.md "Mon
                            # auto_submit_enabled, and independent of it --
                            # a panic isn't a loss event. With this off, a
                            # panic just prints its backtrace as usual.
-# loss_threshold_pct = 10.0     # default; compared against raw probe loss
-                           # over the last window_secs, not the smoothed EWMA
-# window_secs = 60              # default
-# min_probes = 20               # default: fewer probes in the window = no verdict
-# clear_secs = 60               # default: quiet this long ends an event
-# reminder_secs = 3600          # default: at most one ticket per ongoing event per hour
+# degraded_open_pct = 12.0      # default; raw probe loss over window_secs (not the
+                           # smoothed EWMA) at/above this opens a DEGRADED event...
+# degraded_open_misses = 8      # default: ...if at least this many probes were lost
+# degraded_close_pct = 5.0      # default: window loss under this is "calm"
+# window_secs = 300             # default
+# min_probes = 100              # default: fewer probes in the window = no verdict
+# clear_secs = 300              # default: calm this long ends an event
+# outage_secs = 60              # default: not-Up longer than this is an OUTAGE
+# warmup_secs = 120             # default: no DEGRADED verdict on a window younger than this
+# degraded_ticket_gap_secs = 21600  # default: at most one DEGRADED ticket per link per 6 h
 # flap_downs = 3                # default: Up->Down count in 10 min that opens an
                            # event even at low loss; 0 disables
 # max_dump_files = 50           # default: oldest automatic dumps are deleted

@@ -86,6 +86,9 @@ pub fn update_link_state(link: &mut Link, cfg: &SchedulerConfig) {
             link.stats.confirmed_ceiling_mbps = None;
             link.stats.last_ramp_at = None;
             link.stats.consecutive_verify_misses = 0;
+            // Misses recorded while the link was Down/Probing say nothing
+            // about its health now; the auto-report trigger starts fresh.
+            link.stats.probe_window.clear();
         }
         tracing::info!(
             link = %link.config.name,
