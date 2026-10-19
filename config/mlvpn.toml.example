@@ -36,6 +36,10 @@ address = "10.200.0.2/30"   # client and server must use addresses in the same /
 clamp_mss = true            # rewrite TCP SYN/SYN-ACK MSS options to fit the
                              # effective tunnel MTU instead of relying on PMTUD,
                              # which many networks silently black-hole
+# tx_queue_len = 4000        # default; TUN device transmit queue length in packets
+                             # (valid 100-65536). The Linux default of 500 dropped
+                             # packets on bursts in production; only change it for
+                             # an unusual bandwidth-delay product.
 
 [scheduler]
 down_threshold = 5       # consecutive missed probes before a link is marked Down
@@ -68,6 +72,17 @@ ewma_alpha = 0.2         # smoothing factor for latency/jitter/loss/throughput s
                            # production Comcast + T-Mobile pair 8+1 FEC cost ~30% of
                            # bonded download (~430 vs ~620 Mbps) with no measured
                            # benefit. Both peers must use identical FEC settings.
+# fec_group_size = 8       # default; data frames per FEC group (valid 2-255). Overhead
+                           # is parity/fec_group_size extra traffic. Only used when
+                           # fec_enabled is true.
+# fec_parity = 1           # default; parity frames per group: 1 (plain XOR, recovers
+                           # one loss per group) or 2 (adds a GF(256) share, recovers
+                           # any two). Only used when fec_enabled is true.
+# fec_parity_placement = "scheduler"   # default; which link carries parity frames:
+                           # "scheduler" (wherever the normal scheduler picks),
+                           # "dominant" (the link that carried most of the group), or
+                           # "diverse" (the link that carried the fewest). Only used
+                           # when fec_enabled is true.
 # reorder_window_min_ms = 10    # bounds the auto-tuner above; only consulted
 # reorder_window_max_ms = 500   # when auto_tune_reorder_window is true
 # auto_tune_probe_interval = false   # opt-in: let a link's probe interval
@@ -102,6 +117,10 @@ ewma_alpha = 0.2         # smoothing factor for latency/jitter/loss/throughput s
                            # small packet count would complete a fast link's
                            # burst in well under one round trip, measuring
                            # local overhead more than real sustained capacity.
+# active_bandwidth_reramp_interval_secs = 1800   # default; how often a link's cached
+                           # ceiling is thrown away and fully re-measured. Between
+                           # re-ramps each probe is one cheap verification at the
+                           # cached rate. Keep it well above the probe interval.
 
 [logging]
 level = "info"           # tracing-subscriber EnvFilter directive, e.g. "info" or "mlvpn=debug"
@@ -198,6 +217,10 @@ enabled = true           # exposes live stats to `mlvpn-tui`; see README.md "Mon
 [[links]]
 name = "fiber"
 bind_interface = "eth0"
+# local_addr = "192.0.2.10"   # optional, unset by default; bind the socket to one
+                              # specific local IP (bare IP, no port, no brackets).
+                              # Also what selects IPv6 for a server-side link that
+                              # has no remote_addr (e.g. "::").
 remote_addr = "203.0.113.10:51000"   # server's address:port for this link
                                      # (a hostname like "bgp.example.com:51000"
                                      # works here too -- see note above)
