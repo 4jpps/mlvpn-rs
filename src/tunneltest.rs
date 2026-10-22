@@ -57,8 +57,8 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
@@ -384,11 +384,12 @@ impl TunnelTestContext {
     /// trigger yet another reverse leg) apart from "someone else is
     /// genuinely testing me fresh" (no waiter -- do both).
     fn forward_result(&self, test_id: u32, result: TunnelTestLegResult) -> bool {
-        if let Some(tx) = self.waiters.lock().unwrap().remove(&test_id) {
-            let _ = tx.send(result);
-            true
-        } else {
-            false
+        match self.waiters.lock().unwrap().remove(&test_id) {
+            Some(tx) => {
+                let _ = tx.send(result);
+                true
+            }
+            _ => false,
         }
     }
 }

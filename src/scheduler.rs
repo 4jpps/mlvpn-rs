@@ -25,8 +25,8 @@ use crate::delivery::{DeliverySample, DeliveryTracker};
 use crate::link::{Link, LinkScore, LinkState, TxCounters};
 use crate::monitor;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 /// How far ahead (as a fraction, 0.2 = 20%) a candidate link's score

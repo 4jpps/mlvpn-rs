@@ -160,7 +160,7 @@ impl PacketType {
             other => {
                 return Err(MlvpnError::Protocol(format!(
                     "unknown packet type byte {other}"
-                )))
+                )));
             }
         })
     }

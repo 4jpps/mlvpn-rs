@@ -1,16 +1,16 @@
 //! Overview: the at-a-glance screen -- links, tunnel and reliability
 //! summaries, and the most recent events.
 
-use super::{links, panel, Density};
-use crate::model::{tunnel_rates, SharedState};
+use super::{Density, links, panel};
+use crate::model::{SharedState, tunnel_rates};
 use crate::theme::*;
 use mlvpn::ipc::Snapshot;
 use ratatui::{
+    Frame,
     layout::{Constraint, Direction, Layout, Rect},
     style::Style,
     text::{Line, Span},
     widgets::{List, ListItem, Paragraph},
-    Frame,
 };
 
 pub fn draw(f: &mut Frame, area: Rect, state: &SharedState, snap: &Snapshot, density: Density) {

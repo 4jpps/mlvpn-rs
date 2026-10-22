@@ -1,16 +1,16 @@
 //! Debug: connection details, the structured event list, and a
 //! scrollable tail of the daemon's own log.
 
-use super::{panel, Density};
+use super::{Density, panel};
 use crate::model::{SharedState, Ui};
 use crate::theme::*;
 use mlvpn::ipc::LogEntry;
 use ratatui::{
+    Frame,
     layout::{Constraint, Direction, Layout, Rect},
     style::Style,
     text::{Line, Span},
     widgets::{List, ListItem, Paragraph},
-    Frame,
 };
 
 pub fn draw(f: &mut Frame, area: Rect, state: &SharedState, ui: &Ui, density: Density) {

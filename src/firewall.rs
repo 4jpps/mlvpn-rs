@@ -498,10 +498,11 @@ fn find_rule_handle(
         };
         let has_udp_dport_match = expr.iter().any(|e| is_udp_dport_match(e, port));
         let has_accept = expr.iter().any(|e| e.get("accept").is_some());
-        if has_udp_dport_match && has_accept {
-            if let Some(handle) = rule.get("handle").and_then(Value::as_u64) {
-                return Some(handle as u32);
-            }
+        if has_udp_dport_match
+            && has_accept
+            && let Some(handle) = rule.get("handle").and_then(Value::as_u64)
+        {
+            return Some(handle as u32);
         }
     }
     None
@@ -548,9 +549,11 @@ mod tests {
     #[test]
     fn firewalld_remove_plan_uses_remove_port() {
         let plan = plan_firewalld(&ports(&[51000]), Action::Remove);
-        assert!(plan[0]
-            .args
-            .contains(&"--remove-port=51000/udp".to_string()));
+        assert!(
+            plan[0]
+                .args
+                .contains(&"--remove-port=51000/udp".to_string())
+        );
     }
 
     #[test]

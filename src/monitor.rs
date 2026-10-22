@@ -181,7 +181,7 @@ mod tests {
     /// `active_bandwidth_reramp_interval_secs`.
     #[tokio::test]
     async fn down_to_up_transition_resets_cached_bandwidth_ceiling() {
-        use crate::link::{test_link_for_state_transitions, LinkState, LinkStats};
+        use crate::link::{LinkState, LinkStats, test_link_for_state_transitions};
 
         let cfg = SchedulerConfig {
             up_threshold: 2,
@@ -209,7 +209,7 @@ mod tests {
     /// actual Down/Probing -> Up transition should reset it.
     #[tokio::test]
     async fn up_to_up_no_transition_does_not_reset_cached_bandwidth_ceiling() {
-        use crate::link::{test_link_for_state_transitions, LinkState, LinkStats};
+        use crate::link::{LinkState, LinkStats, test_link_for_state_transitions};
 
         let cfg = SchedulerConfig::default();
 
@@ -235,7 +235,7 @@ mod tests {
     /// otherwise identical idle link (no passive sample at all).
     #[tokio::test]
     async fn lightly_loaded_link_does_not_score_below_an_idle_one() {
-        use crate::link::{test_link_for_state_transitions, LinkState, LinkStats};
+        use crate::link::{LinkState, LinkStats, test_link_for_state_transitions};
 
         let idle = test_link_for_state_transitions(LinkState::Up, LinkStats::new(0.2)).await;
         let mut stats = LinkStats::new(0.2);

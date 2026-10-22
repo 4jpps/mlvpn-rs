@@ -205,10 +205,10 @@ pub fn parse_request(head: &[u8]) -> Result<Request, ParseError> {
 
     // Checked before routing so no data is served to a browser reaching
     // this loopback port by a hostile name (DNS rebinding).
-    if let Some(h) = host {
-        if !host_allowed(h) {
-            return Err(ParseError::BadHost);
-        }
+    if let Some(h) = host
+        && !host_allowed(h)
+    {
+        return Err(ParseError::BadHost);
     }
 
     let (path, query) = target.split_once('?').unwrap_or((target, ""));

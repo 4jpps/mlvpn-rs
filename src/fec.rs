@@ -266,7 +266,7 @@ pub fn choose_parity_link(
         usable
             .iter()
             .enumerate()
-            .filter(|(_, &u)| u)
+            .filter(|&(_, &u)| u)
             .map(|(i, _)| i)
     };
     let best = match placement {
@@ -646,16 +646,15 @@ impl FecRecoveryBuffer {
     }
 
     fn park(&mut self, key: u64, shares: ShareSet, missing: Vec<u64>) {
-        if self.parked.len() >= MAX_PARKED_GROUPS {
-            if let Some(oldest) = self
+        if self.parked.len() >= MAX_PARKED_GROUPS
+            && let Some(oldest) = self
                 .parked
                 .iter()
                 .min_by_key(|(_, g)| g.at)
                 .map(|(k, _)| *k)
-            {
-                self.drop_parked(oldest);
-                self.given_up += 1;
-            }
+        {
+            self.drop_parked(oldest);
+            self.given_up += 1;
         }
         for &seq in &missing {
             self.parked_by_seq.insert(seq, key);

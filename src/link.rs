@@ -35,8 +35,8 @@ use socket2::{Domain, Protocol, Socket, Type};
 use std::net::{IpAddr, SocketAddr, UdpSocket as StdUdpSocket};
 #[cfg(target_os = "linux")]
 use std::os::unix::io::AsRawFd;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::sync::{Mutex as AsyncMutex, RwLock as AsyncRwLock};
@@ -1045,22 +1045,20 @@ impl Link {
                     }
                 }
                 r = primary_socket.recv_from(&mut primary_buf) => {
-                    if let Ok((n, from)) = r {
-                        if from == primary_remote
+                    if let Ok((n, from)) = r
+                        && from == primary_remote
                             && self.answered(&primary_socket, &primary_buf[..n], from, &mut scratch).await
                         {
                             break Some(primary_remote);
                         }
-                    }
                 }
                 r = alt_socket.recv_from(&mut alt_buf) => {
-                    if let Ok((n, from)) = r {
-                        if from == alt_remote
+                    if let Ok((n, from)) = r
+                        && from == alt_remote
                             && self.answered(&alt_socket, &alt_buf[..n], from, &mut scratch).await
                         {
                             break Some(alt_remote);
                         }
-                    }
                 }
                 _ = &mut give_up => break None,
             }

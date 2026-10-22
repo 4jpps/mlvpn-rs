@@ -10,10 +10,10 @@ pub mod traffic;
 use crate::model::{SharedState, Tab, Ui};
 use crate::theme::muted;
 use ratatui::{
+    Frame,
     layout::Rect,
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
-    Frame,
 };
 
 /// Screen-size class. Compact drops borders, secondary columns and

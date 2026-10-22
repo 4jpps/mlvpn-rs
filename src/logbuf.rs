@@ -15,10 +15,10 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tracing::field::{Field, Visit};
 use tracing::Subscriber;
-use tracing_subscriber::layer::Context;
+use tracing::field::{Field, Visit};
 use tracing_subscriber::Layer;
+use tracing_subscriber::layer::Context;
 
 /// How many recent log lines to keep. Generous enough to cover several
 /// `control::SNAPSHOT_INTERVAL_MS` ticks' worth of output even on a

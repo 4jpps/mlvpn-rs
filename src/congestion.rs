@@ -12,7 +12,7 @@
 
 use std::time::{Duration, Instant};
 
-use crate::link::{mono_us, TxCounters};
+use crate::link::{TxCounters, mono_us};
 use std::sync::atomic::Ordering;
 
 /// Weight multiplier floor: a congested link still keeps a trickle of

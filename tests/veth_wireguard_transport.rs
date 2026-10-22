@@ -75,9 +75,9 @@ use std::process::Command;
 use std::time::Duration;
 
 use support::{
+    CLIENT_TUNNEL_ADDR, MlvpnProcess, NetNs, SERVER_TUNNEL_ADDR, SERVER_TUNNEL_HOST, VethPair,
     create_scratch_dir, ensure_mlvpn_system_user, link_is_up, link_state, poll_snapshot_until,
-    require_ip_command, require_root, unique_id, veth_link_addrs, MlvpnProcess, NetNs, VethPair,
-    CLIENT_TUNNEL_ADDR, SERVER_TUNNEL_ADDR, SERVER_TUNNEL_HOST,
+    require_ip_command, require_root, unique_id, veth_link_addrs,
 };
 
 /// One link's worth of config, including its own genuinely distinct

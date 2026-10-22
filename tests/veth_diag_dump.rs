@@ -37,11 +37,10 @@ use std::process::Command;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 use support::{
-    create_scratch_dir, ensure_mlvpn_system_user, generate_test_keypair, link_is_up,
-    poll_snapshot_until, require_ip_command, require_root, require_tc_command,
-    spawn_capturing_mock_server_on, unique_id, veth_link_addrs, write_config, LinkSpec,
-    MlvpnProcess, NetNs, SchedulerOverrides, VethPair, CLIENT_TUNNEL_ADDR, SERVER_TUNNEL_ADDR,
-    SERVER_TUNNEL_HOST,
+    CLIENT_TUNNEL_ADDR, LinkSpec, MlvpnProcess, NetNs, SERVER_TUNNEL_ADDR, SERVER_TUNNEL_HOST,
+    SchedulerOverrides, VethPair, create_scratch_dir, ensure_mlvpn_system_user,
+    generate_test_keypair, link_is_up, poll_snapshot_until, require_ip_command, require_root,
+    require_tc_command, spawn_capturing_mock_server_on, unique_id, veth_link_addrs, write_config,
 };
 
 /// Guards concurrent mutation of the process-global `MLVPN_DIAGNOSTICS_URL`
@@ -67,14 +66,16 @@ struct DiagnosticsUrlGuard {
 impl DiagnosticsUrlGuard {
     fn set(url: &str) -> Self {
         let lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
-        std::env::set_var("MLVPN_DIAGNOSTICS_URL", url);
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("MLVPN_DIAGNOSTICS_URL", url) };
         Self { _lock: lock }
     }
 }
 
 impl Drop for DiagnosticsUrlGuard {
     fn drop(&mut self) {
-        std::env::remove_var("MLVPN_DIAGNOSTICS_URL");
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("MLVPN_DIAGNOSTICS_URL") };
     }
 }
 
@@ -326,14 +327,13 @@ async fn diag_dump_auto_watch_fires_on_real_loss() {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
     let mut found: Option<std::path::PathBuf> = None;
     while tokio::time::Instant::now() < deadline {
-        if let Ok(entries) = std::fs::read_dir(&dump_dir) {
-            if let Some(entry) = entries
+        if let Ok(entries) = std::fs::read_dir(&dump_dir)
+            && let Some(entry) = entries
                 .filter_map(|e| e.ok())
                 .find(|e| e.file_name().to_string_lossy().starts_with("mlvpn-diag-"))
-            {
-                found = Some(entry.path());
-                break;
-            }
+        {
+            found = Some(entry.path());
+            break;
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }

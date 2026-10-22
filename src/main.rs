@@ -9,8 +9,8 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tracing_subscriber::prelude::*;
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::prelude::*;
 
 #[derive(Parser)]
 #[command(name = "mlvpnd", version, about = "Multi-link VPN bonding daemon")]

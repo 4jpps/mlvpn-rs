@@ -99,14 +99,14 @@ fn find_socket() -> Option<PathBuf> {
 /// and feeds every snapshot line into the shared state.
 fn reader_thread(socket: Option<PathBuf>, state: Arc<Mutex<Shared>>) {
     loop {
-        if let Some(path) = socket.clone().or_else(find_socket) {
-            if let Ok(stream) = UnixStream::connect(&path) {
-                state.lock().unwrap().on_connect();
-                for line in BufReader::new(stream).lines() {
-                    let Ok(text) = line else { break };
-                    if let Ok(snapshot) = serde_json::from_str::<Snapshot>(&text) {
-                        state.lock().unwrap().ingest(snapshot);
-                    }
+        if let Some(path) = socket.clone().or_else(find_socket)
+            && let Ok(stream) = UnixStream::connect(&path)
+        {
+            state.lock().unwrap().on_connect();
+            for line in BufReader::new(stream).lines() {
+                let Ok(text) = line else { break };
+                if let Ok(snapshot) = serde_json::from_str::<Snapshot>(&text) {
+                    state.lock().unwrap().ingest(snapshot);
                 }
             }
         }

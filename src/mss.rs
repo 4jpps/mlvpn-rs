@@ -165,11 +165,7 @@ fn tcp_header_len(tcp: &[u8]) -> Option<usize> {
         return None;
     }
     let len = ((tcp[12] >> 4) as usize) * 4;
-    if len < 20 {
-        None
-    } else {
-        Some(len)
-    }
+    if len < 20 { None } else { Some(len) }
 }
 
 /// If `tcp_header` (the full TCP header *including* options, i.e.
@@ -238,11 +234,11 @@ fn rewrite_mss_if_syn(tcp_header: &mut [u8], max_segment: u16) -> bool {
 /// used at different points.
 fn internet_checksum(bytes: &[u8]) -> u16 {
     let mut sum: u32 = 0;
-    let mut chunks = bytes.chunks_exact(2);
-    for chunk in &mut chunks {
-        sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
+    let (words, rest) = bytes.as_chunks::<2>();
+    for word in words {
+        sum += u16::from_be_bytes(*word) as u32;
     }
-    if let [last] = chunks.remainder() {
+    if let [last] = rest {
         sum += (*last as u32) << 8;
     }
     while sum >> 16 != 0 {

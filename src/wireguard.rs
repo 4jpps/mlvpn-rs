@@ -65,8 +65,8 @@
 use crate::error::{MlvpnError, Result};
 use boringtun::noise::{Tunn, TunnResult};
 use boringtun::x25519;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 /// The outcome of feeding one received datagram to `WgTunnel::decapsulate`.

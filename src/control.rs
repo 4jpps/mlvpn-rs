@@ -43,15 +43,15 @@ use crate::procstats;
 use crate::scheduler::Scheduler;
 use crate::sysfs_net;
 use crate::tunnel::{
-    adaptive_bandwidth_ramp, send_throughput_test_reverse_request, send_throughput_test_stream,
     DiagnosticsWatchParams, LiveMtu, OutboundFrame, PeerLiveMtu, PeerMtu, PeerVersion,
-    ThroughputTestContext,
+    ThroughputTestContext, adaptive_bandwidth_ramp, send_throughput_test_reverse_request,
+    send_throughput_test_stream,
 };
 use crate::tunneltest;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -1433,10 +1433,10 @@ pub(crate) async fn diagnostics_watch_loop(
             }
         }
 
-        if let Some(state) = tracker.take_dirty_state(now, now_unix) {
-            if let Err(e) = write_state_file(&state_path, &state) {
-                tracing::warn!(error = %e, "failed to persist auto-report state");
-            }
+        if let Some(state) = tracker.take_dirty_state(now, now_unix)
+            && let Err(e) = write_state_file(&state_path, &state)
+        {
+            tracing::warn!(error = %e, "failed to persist auto-report state");
         }
 
         if dumps.is_empty() {
@@ -1596,10 +1596,10 @@ async fn run_throughput_test_command(
     let mut targets: Vec<(String, u8, crate::link::LinkHandle)> = Vec::new();
     for l in links.iter() {
         let guard = l.lock().await;
-        if let Some(name) = &link {
-            if guard.config.name != *name {
-                continue;
-            }
+        if let Some(name) = &link
+            && guard.config.name != *name
+        {
+            continue;
         }
         if guard.remote.is_none() {
             continue;

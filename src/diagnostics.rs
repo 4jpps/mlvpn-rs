@@ -184,9 +184,11 @@ mod tests {
         let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
 
         let url = spawn_mock_server("HTTP/1.1 201 Created", r#"{"ticket_id":"abc-123"}"#);
-        std::env::set_var("MLVPN_DIAGNOSTICS_URL", &url);
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("MLVPN_DIAGNOSTICS_URL", &url) };
         let result = submit_report_blocking("some logs", "manual", None);
-        std::env::remove_var("MLVPN_DIAGNOSTICS_URL");
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("MLVPN_DIAGNOSTICS_URL") };
         assert_eq!(result.unwrap(), "abc-123");
     }
 
@@ -195,9 +197,11 @@ mod tests {
         let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
 
         let url = spawn_mock_server("HTTP/1.1 422 Unprocessable Entity", r#"{"error":"bad"}"#);
-        std::env::set_var("MLVPN_DIAGNOSTICS_URL", &url);
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("MLVPN_DIAGNOSTICS_URL", &url) };
         let result = submit_report_blocking("some logs", "manual", None);
-        std::env::remove_var("MLVPN_DIAGNOSTICS_URL");
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("MLVPN_DIAGNOSTICS_URL") };
         assert!(result.is_err());
     }
 
@@ -273,10 +277,12 @@ mod tests {
 
         let (url, rx) =
             spawn_mock_server_capturing_body("HTTP/1.1 201 Created", r#"{"ticket_id":"abc-123"}"#);
-        std::env::set_var("MLVPN_DIAGNOSTICS_URL", &url);
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("MLVPN_DIAGNOSTICS_URL", &url) };
         let rt = tokio::runtime::Runtime::new().unwrap();
         let result = rt.block_on(submit_report_async("some logs", "auto", None));
-        std::env::remove_var("MLVPN_DIAGNOSTICS_URL");
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("MLVPN_DIAGNOSTICS_URL") };
         assert!(result.is_ok());
 
         let sent_body = rx

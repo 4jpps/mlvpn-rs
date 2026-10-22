@@ -5,10 +5,10 @@
 //! control-socket snapshot are exposed; the daemon log ring is never
 //! served, and the control socket carries no key material.
 
-use crate::http::{query_param, Method, Request, Response};
+use crate::http::{Method, Request, Response, query_param};
 use mlvpn::ipc::{EventRecord, Snapshot};
 use serde::Serialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::VecDeque;
 use std::time::Instant;
 

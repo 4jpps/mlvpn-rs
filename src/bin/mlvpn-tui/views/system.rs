@@ -1,16 +1,16 @@
 //! System: host load/memory, the daemon process, TUN counters, the
 //! outbound queue, and version/MTU agreement with the peer.
 
-use super::{panel, Density};
+use super::{Density, panel};
 use crate::model::bar;
 use crate::theme::*;
 use mlvpn::ipc::{DaemonSnapshot, Snapshot};
 use ratatui::{
+    Frame,
     layout::{Constraint, Direction, Layout, Rect},
     style::Style,
     text::{Line, Span},
     widgets::Paragraph,
-    Frame,
 };
 
 fn host_lines(d: &DaemonSnapshot) -> Vec<Line<'static>> {

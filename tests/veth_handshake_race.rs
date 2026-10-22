@@ -32,10 +32,10 @@ mod support;
 
 use std::time::Duration;
 use support::{
-    create_scratch_dir, ensure_mlvpn_system_user, generate_test_keypair, link_is_up,
+    CLIENT_TUNNEL_ADDR, LinkSpec, MlvpnProcess, NetNs, SERVER_TUNNEL_ADDR, SchedulerOverrides,
+    VethPair, create_scratch_dir, ensure_mlvpn_system_user, generate_test_keypair, link_is_up,
     poll_snapshot_until, require_ip_command, require_root, unique_id, veth_link_addrs,
-    write_config, LinkSpec, MlvpnProcess, NetNs, SchedulerOverrides, VethPair, CLIENT_TUNNEL_ADDR,
-    SERVER_TUNNEL_ADDR,
+    write_config,
 };
 
 #[tokio::test]

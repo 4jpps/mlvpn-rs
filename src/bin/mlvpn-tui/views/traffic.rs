@@ -1,15 +1,15 @@
 //! Traffic: tunnel and per-link rates as bars plus a rolling sparkline.
 
-use super::{panel, Density};
-use crate::model::{bar, spark, tunnel_rates, SharedState};
+use super::{Density, panel};
+use crate::model::{SharedState, bar, spark, tunnel_rates};
 use crate::theme::*;
 use mlvpn::ipc::Snapshot;
 use ratatui::{
+    Frame,
     layout::{Constraint, Direction, Layout, Rect},
     style::Style,
     text::{Line, Span},
     widgets::Paragraph,
-    Frame,
 };
 
 pub fn draw(f: &mut Frame, area: Rect, state: &SharedState, snap: &Snapshot, density: Density) {
@@ -126,14 +126,12 @@ pub fn draw(f: &mut Frame, area: Rect, state: &SharedState, snap: &Snapshot, den
         spans.push(Span::styled(format!("tx share {share}"), muted()));
         lines.push(Line::from(spans));
 
-        if !compact {
-            if let Some(h) = state.history.link_total.get(&l.name) {
-                let w = inner_w.saturating_sub(name_w + 4).min(60);
-                lines.push(Line::from(vec![
-                    Span::raw(" ".repeat(name_w + 3)),
-                    Span::styled(spark(&h.values(), w, 0.0), muted()),
-                ]));
-            }
+        if !compact && let Some(h) = state.history.link_total.get(&l.name) {
+            let w = inner_w.saturating_sub(name_w + 4).min(60);
+            lines.push(Line::from(vec![
+                Span::raw(" ".repeat(name_w + 3)),
+                Span::styled(spark(&h.values(), w, 0.0), muted()),
+            ]));
         }
     }
     if lines.is_empty() {

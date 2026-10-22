@@ -1,16 +1,16 @@
 //! Links: a compact one-row-per-link table, with an Enter-toggled
 //! drill-down holding every counter for the selected link.
 
-use super::{panel, Density};
+use super::{Density, panel};
 use crate::model::Ui;
 use crate::theme::*;
 use mlvpn::ipc::{LinkSnapshot, Snapshot};
 use ratatui::{
+    Frame,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Cell, Paragraph, Row, Table},
-    Frame,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

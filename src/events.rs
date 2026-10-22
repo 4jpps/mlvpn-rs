@@ -18,8 +18,8 @@
 use crate::ipc::EventRecord;
 use crate::link::LinkState;
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const EVENT_RING_CAPACITY: usize = 1000;
@@ -312,33 +312,34 @@ impl EventDetector {
                 fields: f,
             };
 
-            if let Some(prev) = t.state {
-                if prev != l.state && emit {
-                    let f = fields(&[
-                        ("from", prev.as_str().to_string()),
-                        ("to", l.state.as_str().to_string()),
-                    ]);
-                    match l.state {
-                        LinkState::Up if t.ever_up => out.push(mk(
-                            EventKind::LinkRecovered,
-                            Severity::Info,
-                            format!("link {} is back up", l.name),
-                            f,
-                        )),
-                        LinkState::Up => out.push(mk(
-                            EventKind::LinkUp,
-                            Severity::Info,
-                            format!("link {} is up", l.name),
-                            f,
-                        )),
-                        LinkState::Down => out.push(mk(
-                            EventKind::LinkDown,
-                            Severity::Error,
-                            format!("link {} is down", l.name),
-                            f,
-                        )),
-                        LinkState::Probing => {}
-                    }
+            if let Some(prev) = t.state
+                && prev != l.state
+                && emit
+            {
+                let f = fields(&[
+                    ("from", prev.as_str().to_string()),
+                    ("to", l.state.as_str().to_string()),
+                ]);
+                match l.state {
+                    LinkState::Up if t.ever_up => out.push(mk(
+                        EventKind::LinkRecovered,
+                        Severity::Info,
+                        format!("link {} is back up", l.name),
+                        f,
+                    )),
+                    LinkState::Up => out.push(mk(
+                        EventKind::LinkUp,
+                        Severity::Info,
+                        format!("link {} is up", l.name),
+                        f,
+                    )),
+                    LinkState::Down => out.push(mk(
+                        EventKind::LinkDown,
+                        Severity::Error,
+                        format!("link {} is down", l.name),
+                        f,
+                    )),
+                    LinkState::Probing => {}
                 }
             }
             if l.state == LinkState::Up {
@@ -544,9 +545,10 @@ mod tests {
     #[test]
     fn first_observation_is_only_a_baseline() {
         let mut d = EventDetector::new();
-        assert!(d
-            .observe(&obs(0, vec![link("a", LinkState::Up)]))
-            .is_empty());
+        assert!(
+            d.observe(&obs(0, vec![link("a", LinkState::Up)]))
+                .is_empty()
+        );
     }
 
     #[test]

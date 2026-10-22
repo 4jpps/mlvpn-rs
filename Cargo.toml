@@ -1,8 +1,8 @@
 [package]
 name = "mlvpn"
 version = "0.7.7"
-edition = "2021"
-rust-version = "1.86"
+edition = "2024"
+rust-version = "1.99"
 authors = ["Jeff Parrish PC Services LLC <www.jpps.us>"]
 description = "Multi-link VPN bonding daemon: combines several network uplinks into one resilient, WireGuard-encrypted tunnel with automatic latency/jitter/throughput-aware failover."
 license = "AGPL-3.0-only"

@@ -4,11 +4,11 @@ use crate::model::{Health, SharedState, Tab, Ui};
 use crate::theme::*;
 use crate::views::{self, Density};
 use ratatui::{
+    Frame,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
-    Frame,
 };
 
 pub fn draw(f: &mut Frame, state: &SharedState, ui: &Ui, hostname: &str) {
@@ -136,7 +136,7 @@ mod tests {
     use super::*;
     use crate::model::Health;
     use mlvpn::ipc::{EventRecord, LinkSnapshot, LogEntry, Snapshot};
-    use ratatui::{backend::TestBackend, Terminal};
+    use ratatui::{Terminal, backend::TestBackend};
 
     fn link(name: &str, state: &str, score: f64) -> LinkSnapshot {
         LinkSnapshot {

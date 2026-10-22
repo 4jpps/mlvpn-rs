@@ -26,11 +26,11 @@ use clap::Parser;
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use mlvpn::ipc::Snapshot;
 use model::{SharedState, Tab, Ui};
-use ratatui::{backend::CrosstermBackend, Terminal};
+use ratatui::{Terminal, backend::CrosstermBackend};
 use std::io::{self, BufRead, BufReader, Stdout};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -353,31 +353,31 @@ fn run_app(
             terminal.draw(|f| chrome::draw(f, &s, &ui, hostname))?;
         }
 
-        if event::poll(Duration::from_millis(250))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind != KeyEventKind::Press {
+        if event::poll(Duration::from_millis(250))?
+            && let Event::Key(key) = event::read()?
+        {
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            let ctrl_c =
+                key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
+            if ctrl_c || key.code == KeyCode::Char('q') {
+                return Ok(());
+            }
+            if key.code == KeyCode::Esc {
+                if ui.link_detail {
+                    ui.link_detail = false;
                     continue;
                 }
-                let ctrl_c =
-                    key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
-                if ctrl_c || key.code == KeyCode::Char('q') {
-                    return Ok(());
-                }
-                if key.code == KeyCode::Esc {
-                    if ui.link_detail {
-                        ui.link_detail = false;
-                        continue;
-                    }
-                    return Ok(());
-                }
-                let link_count = state
-                    .lock()
-                    .unwrap()
-                    .snapshot
-                    .as_ref()
-                    .map_or(0, |snap| snap.links.len());
-                handle_key(&mut ui, key.code, link_count);
+                return Ok(());
             }
+            let link_count = state
+                .lock()
+                .unwrap()
+                .snapshot
+                .as_ref()
+                .map_or(0, |snap| snap.links.len());
+            handle_key(&mut ui, key.code, link_count);
         }
     }
 }

@@ -99,11 +99,7 @@ pub struct ProcessStats {
 pub fn clock_ticks_per_sec() -> u64 {
     // SAFETY: sysconf has no preconditions.
     let v = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
-    if v > 0 {
-        v as u64
-    } else {
-        100
-    }
+    if v > 0 { v as u64 } else { 100 }
 }
 
 pub fn read_process_stats() -> ProcessStats {

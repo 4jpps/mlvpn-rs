@@ -221,24 +221,23 @@ use crate::crypto;
 use crate::delivery::{self, DeliverySample};
 use crate::error::{MlvpnError, Result};
 use crate::fec;
-use crate::link::{self, is_interface_gone_error, Link, LinkHandle, LinkScore, LinkState, Links};
+use crate::link::{self, Link, LinkHandle, LinkScore, LinkState, Links, is_interface_gone_error};
 use crate::monitor::{self, ProbeTracker};
 use crate::peerstats::PeerStatsTable;
 use crate::protocol::{
-    Header, PacketType, ProbePayload, StatsPayload, ThroughputTestDataPayload,
+    HEADER_LEN, Header, PacketType, ProbePayload, StatsPayload, ThroughputTestDataPayload,
     ThroughputTestResultPayload, ThroughputTestReverseRequestPayload, VersionInfoPayload,
-    HEADER_LEN,
 };
 use crate::scheduler::{PrimaryFlag, Scheduler};
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::signal::unix::{signal, SignalKind};
-use tokio::sync::mpsc::{self, error::TrySendError};
+use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::mpsc::{self, error::TrySendError};
 use tokio::time::interval;
 use tun_rs::AsyncDevice;
 
@@ -1625,12 +1624,12 @@ impl TxDispatcher {
         frame_len: usize,
     ) -> Option<(usize, mpsc::Permit<'_, TxJob>)> {
         let mut chosen = None;
-        if let Some(f) = forced {
-            if let Some(l) = self.links.get(f) {
-                let g = l.lock().await;
-                if g.state == LinkState::Up && !g.admin_disabled && g.remote.is_some() {
-                    chosen = Some(f);
-                }
+        if let Some(f) = forced
+            && let Some(l) = self.links.get(f)
+        {
+            let g = l.lock().await;
+            if g.state == LinkState::Up && !g.admin_disabled && g.remote.is_some() {
+                chosen = Some(f);
             }
         }
         if chosen.is_none() {
@@ -1846,10 +1845,8 @@ async fn link_tx_worker(idx: usize, mut rx: mpsc::Receiver<TxJob>, d: TxDispatch
                 Ok(carried) => {
                     bytes += (HEADER_LEN + job.plaintext.len()) as u64;
                     pkts += 1;
-                    if carried {
-                        if let Some(m) = job.member.as_mut() {
-                            m.mark_carried();
-                        }
+                    if carried && let Some(m) = job.member.as_mut() {
+                        m.mark_carried();
                     }
                 }
                 Err(e) => {
@@ -1953,10 +1950,8 @@ mod mmsg_tx {
                 Ok(carried) => {
                     bytes += (HEADER_LEN + job.plaintext.len()) as u64;
                     pkts += 1;
-                    if carried {
-                        if let Some(m) = job.member.as_mut() {
-                            m.mark_carried();
-                        }
+                    if carried && let Some(m) = job.member.as_mut() {
+                        m.mark_carried();
                     }
                 }
                 Err(e) => {
@@ -2600,7 +2595,7 @@ fn suggest_ewma_alpha(
     if consecutive_misses > 0 {
         return max_alpha;
     }
-    if consecutive_hits > 0 && consecutive_hits % EWMA_ALPHA_SMOOTHING_STREAK == 0 {
+    if consecutive_hits > 0 && consecutive_hits.is_multiple_of(EWMA_ALPHA_SMOOTHING_STREAK) {
         return (current_alpha - EWMA_ALPHA_STEP).clamp(min_alpha, max_alpha);
     }
     current_alpha.clamp(min_alpha, max_alpha)
@@ -2645,7 +2640,7 @@ fn suggest_probe_interval_ms(
     if consecutive_misses > 0 {
         return floor_ms;
     }
-    if consecutive_hits > 0 && consecutive_hits % PROBE_BACKOFF_STREAK == 0 {
+    if consecutive_hits > 0 && consecutive_hits.is_multiple_of(PROBE_BACKOFF_STREAK) {
         let backed_off = (current_ms as f64 * PROBE_BACKOFF_FACTOR) as u64;
         return backed_off.clamp(floor_ms, max_ms);
     }

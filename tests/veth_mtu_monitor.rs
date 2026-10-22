@@ -44,10 +44,10 @@ mod support;
 use std::process::Command;
 use std::time::Duration;
 use support::{
-    create_scratch_dir, ensure_mlvpn_system_user, generate_test_keypair, link_is_up,
+    CLIENT_TUNNEL_ADDR, LinkSpec, MlvpnProcess, NetNs, SERVER_TUNNEL_ADDR, SchedulerOverrides,
+    VethPair, create_scratch_dir, ensure_mlvpn_system_user, generate_test_keypair, link_is_up,
     poll_snapshot_until, require_ip_command, require_root, unique_id, veth_link_addrs,
-    write_config, LinkSpec, MlvpnProcess, NetNs, SchedulerOverrides, VethPair, CLIENT_TUNNEL_ADDR,
-    SERVER_TUNNEL_ADDR,
+    write_config,
 };
 
 /// Reads a network interface's current kernel-reported MTU inside a given
@@ -198,11 +198,11 @@ async fn tun_device_mtu_converges_after_a_live_link_mtu_change() {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(50);
     let mut converged_mtu = None;
     while tokio::time::Instant::now() < deadline {
-        if let Some(mtu) = read_interface_mtu(&ns_client.name, client_tun_name) {
-            if mtu < initial_mtu {
-                converged_mtu = Some(mtu);
-                break;
-            }
+        if let Some(mtu) = read_interface_mtu(&ns_client.name, client_tun_name)
+            && mtu < initial_mtu
+        {
+            converged_mtu = Some(mtu);
+            break;
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
@@ -358,11 +358,11 @@ async fn tun_device_mtu_converges_after_a_live_link_mtu_increase() {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(50);
     let mut converged_mtu = None;
     while tokio::time::Instant::now() < deadline {
-        if let Some(mtu) = read_interface_mtu(&ns_client.name, client_tun_name) {
-            if mtu > initial_mtu {
-                converged_mtu = Some(mtu);
-                break;
-            }
+        if let Some(mtu) = read_interface_mtu(&ns_client.name, client_tun_name)
+            && mtu > initial_mtu
+        {
+            converged_mtu = Some(mtu);
+            break;
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
     }

@@ -58,10 +58,10 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::time::Duration;
 use support::{
-    create_scratch_dir, ensure_mlvpn_system_user, generate_test_keypair, link_is_up,
-    poll_snapshot_until, require_ip_command, require_root, require_tc_command, unique_id,
-    veth_link_addrs, veth_link_addrs6, write_config, LinkSpec, MlvpnProcess, NetNs,
-    SchedulerOverrides, VethPair, CLIENT_TUNNEL_ADDR, SERVER_TUNNEL_ADDR, SERVER_TUNNEL_HOST,
+    CLIENT_TUNNEL_ADDR, LinkSpec, MlvpnProcess, NetNs, SERVER_TUNNEL_ADDR, SERVER_TUNNEL_HOST,
+    SchedulerOverrides, VethPair, create_scratch_dir, ensure_mlvpn_system_user,
+    generate_test_keypair, link_is_up, poll_snapshot_until, require_ip_command, require_root,
+    require_tc_command, unique_id, veth_link_addrs, veth_link_addrs6, write_config,
 };
 
 /// Appends a temporary `/etc/hosts` entry (two lines: one `A`, one

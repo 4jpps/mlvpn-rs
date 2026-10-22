@@ -916,12 +916,12 @@ impl Config {
             check_permissions(&link.private_key_file)?;
         }
 
-        if let Some(mtu) = self.tunnel.mtu {
-            if mtu < 576 {
-                return Err(MlvpnError::Config(
-                    "tunnel MTU must be at least 576 bytes".into(),
-                ));
-            }
+        if let Some(mtu) = self.tunnel.mtu
+            && mtu < 576
+        {
+            return Err(MlvpnError::Config(
+                "tunnel MTU must be at least 576 bytes".into(),
+            ));
         }
 
         if !(100..=65536).contains(&self.tunnel.tx_queue_len) {

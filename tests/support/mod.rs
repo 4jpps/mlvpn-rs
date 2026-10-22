@@ -165,7 +165,9 @@ pub fn require_tc_command() {
         .map(|o| o.status.success())
         .unwrap_or(false);
     if !ok {
-        panic!("this test needs the `tc` command (iproute2, sometimes packaged separately as iproute2-tc) on PATH");
+        panic!(
+            "this test needs the `tc` command (iproute2, sometimes packaged separately as iproute2-tc) on PATH"
+        );
     }
 }
 

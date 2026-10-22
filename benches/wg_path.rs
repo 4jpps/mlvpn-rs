@@ -23,22 +23,28 @@ static BYTES: AtomicU64 = AtomicU64::new(0);
 
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, l: Layout) -> *mut u8 {
-        ALLOCS.fetch_add(1, Ordering::Relaxed);
-        BYTES.fetch_add(l.size() as u64, Ordering::Relaxed);
-        System.alloc(l)
+        unsafe {
+            ALLOCS.fetch_add(1, Ordering::Relaxed);
+            BYTES.fetch_add(l.size() as u64, Ordering::Relaxed);
+            System.alloc(l)
+        }
     }
     unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
-        ALLOCS.fetch_add(1, Ordering::Relaxed);
-        BYTES.fetch_add(l.size() as u64, Ordering::Relaxed);
-        System.alloc_zeroed(l)
+        unsafe {
+            ALLOCS.fetch_add(1, Ordering::Relaxed);
+            BYTES.fetch_add(l.size() as u64, Ordering::Relaxed);
+            System.alloc_zeroed(l)
+        }
     }
     unsafe fn realloc(&self, p: *mut u8, l: Layout, n: usize) -> *mut u8 {
-        ALLOCS.fetch_add(1, Ordering::Relaxed);
-        BYTES.fetch_add(n as u64, Ordering::Relaxed);
-        System.realloc(p, l, n)
+        unsafe {
+            ALLOCS.fetch_add(1, Ordering::Relaxed);
+            BYTES.fetch_add(n as u64, Ordering::Relaxed);
+            System.realloc(p, l, n)
+        }
     }
     unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
-        System.dealloc(p, l)
+        unsafe { System.dealloc(p, l) }
     }
 }
 

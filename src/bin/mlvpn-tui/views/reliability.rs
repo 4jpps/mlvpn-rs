@@ -1,15 +1,15 @@
 //! Reliability: FEC, reorder buffer, and every drop/error counter, with
 //! nonzero values highlighted so a clean tunnel reads as a quiet screen.
 
-use super::{overview::fec_summary, panel, Density};
+use super::{Density, overview::fec_summary, panel};
 use crate::theme::*;
 use mlvpn::ipc::Snapshot;
 use ratatui::{
+    Frame,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Style},
     text::{Line, Span},
     widgets::Paragraph,
-    Frame,
 };
 
 fn count(label: &str, v: u64, nonzero: Color) -> Line<'static> {

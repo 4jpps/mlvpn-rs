@@ -19,10 +19,10 @@ mod support;
 
 use std::time::Duration;
 use support::{
-    create_scratch_dir, ensure_mlvpn_system_user, generate_test_keypair, link_is_up, link_state,
-    poll_snapshot_until, require_ip_command, require_root, unique_id, veth_link_addrs,
-    write_config, LinkSpec, MlvpnProcess, NetNs, SchedulerOverrides, VethPair, CLIENT_TUNNEL_ADDR,
-    SERVER_TUNNEL_ADDR, SERVER_TUNNEL_HOST,
+    CLIENT_TUNNEL_ADDR, LinkSpec, MlvpnProcess, NetNs, SERVER_TUNNEL_ADDR, SERVER_TUNNEL_HOST,
+    SchedulerOverrides, VethPair, create_scratch_dir, ensure_mlvpn_system_user,
+    generate_test_keypair, link_is_up, link_state, poll_snapshot_until, require_ip_command,
+    require_root, unique_id, veth_link_addrs, write_config,
 };
 
 /// Reads `link0`'s and `link1`'s current `tx_bytes` out of a snapshot,
