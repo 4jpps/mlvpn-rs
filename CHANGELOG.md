@@ -16,7 +16,7 @@ _Shipping in the 0.7.7-beta7 build: the security and handshake fixes directly be
 
 ### Fixed
 
-- **WireGuard handshake retries follow the peer's current address.** The link prober captured its link handle once at start-up and ran every `wg_tick` on that snapshot, so a peer address learned later (server-mode links have none until the peer's first packet) or changed later (NAT rebind, peer re-IP) was never used: handshake retries and keepalives went nowhere or to the old address. It now fetches a fresh handle each tick, as `send_probe` already did. A candidate contributor to the slow handshake recovery seen 2026-09-16, not a confirmed root cause. `tests/veth_recovery_timing.rs` (ignored, root-only) measures recovery after a full outage and after one bonded link dies. Files: `src/control.rs`, `tests/veth_recovery_timing.rs`.
+- **WireGuard handshake retries follow the peer's current address.** The link prober captured its link handle once at start-up and ran every `wg_tick` on that snapshot, so a peer address learned later (server-mode links have none until the peer's first packet) or changed later (NAT rebind, peer re-IP) was never used: handshake retries and keepalives went nowhere or to the old address. It now fetches a fresh handle each tick, as `send_probe` already did. A candidate contributor to the slow handshake recovery seen 2026-09-16, not a confirmed root cause. `tests/veth_recovery_timing.rs` (ignored, root-only) measures recovery after a full outage and after one bonded link dies. Files: `src/tunnel.rs` (`link_prober`), `tests/veth_recovery_timing.rs`.
 
 ### Security
 
