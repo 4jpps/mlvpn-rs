@@ -12,7 +12,15 @@ design, and `ARCHITECTURE.md` covers the system as a whole.
 
 ## [Unreleased]
 
-_Shipping in the 0.7.7-beta6 build: the rebuilt automatic-report trigger below (outage / flap / degraded classes, one ticket per event). Earlier betas: the event-based reports (beta4), `tx_send_mode` (beta3)._
+_Shipping in the 0.7.7-beta7 build: the security and handshake fixes directly below. Beta6: the rebuilt automatic-report trigger (outage / flap / degraded classes, one ticket per event). Earlier betas: the event-based reports (beta4), `tx_send_mode` (beta3)._
+
+### Fixed
+
+- **WireGuard handshake retries follow the peer's current address.** The link prober captured its link handle once at start-up and ran every `wg_tick` on that snapshot, so a peer address learned later (server-mode links have none until the peer's first packet) or changed later (NAT rebind, peer re-IP) was never used: handshake retries and keepalives went nowhere or to the old address. It now fetches a fresh handle each tick, as `send_probe` already did. A candidate contributor to the slow handshake recovery seen 2026-09-16, not a confirmed root cause. `tests/veth_recovery_timing.rs` (ignored, root-only) measures recovery after a full outage and after one bonded link dies. Files: `src/control.rs`, `tests/veth_recovery_timing.rs`.
+
+### Security
+
+- **Dependency updates.** rustls 0.23.46 (RUSTSEC-2026-0346 to 0349), rustls-webpki and webpki-roots (RUSTSEC-2026-0381, 0382), tokio and the other current RustSec fixes in `Cargo.lock`. rustls is only used for the HTTPS client that submits diagnostics reports.
 
 ### Changed
 
