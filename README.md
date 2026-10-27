@@ -1,6 +1,10 @@
+<p align="center">
+  <img src="docs/icon.svg" alt="mlvpn-rs" width="96">
+</p>
+
 # mlvpn-rs
 
-Primary home: https://gitlab.jpps.us/jpps/mlvpn-rs (issues and releases live there). The GitHub copy is read-only.
+Primary home: https://gitlab.jpps.us/jpps/mlvpn-rs (issues, merge requests and releases live there). The GitHub copy at https://github.com/4jpps/mlvpn-rs is a read-only mirror, updated automatically from GitLab.
 
 **In plain terms:** if a site has two or more separate internet
 connections -- a fiber line plus a cellular modem, two different ISPs,

@@ -120,6 +120,14 @@ removed and recreated, `link::LinkHandle::reconnect`, isn't covered yet
 
 ## CI and releases
 
+Releases are built and published by GitLab CI (`.gitlab-ci.yml`): `.deb`
+and `.rpm` for amd64 and arm64, attached to the GitLab Release and
+published to the apt repo. GitHub (https://github.com/4jpps/mlvpn-rs) is a
+read-only push mirror of GitLab, so never push to it directly; a push to
+GitLab reaches it within minutes. GitHub Actions is turned off on the
+mirror, so the `.github/workflows/` files below are kept only as the
+original packaging path and do not run.
+
 `.github/workflows/ci.yml` runs `cargo build`/`test`/`clippy`/`fmt` on
 every push/PR to `main`, on both amd64(`ubuntu-latest`) and arm64
 (`ubuntu-24.04-arm`) runners.
