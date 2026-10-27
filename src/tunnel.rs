@@ -2392,7 +2392,11 @@ async fn link_prober(
                 // separate handshake-retry loop exists anywhere else.
                 // Best-effort: a failure here doesn't affect probe
                 // sending below, which has its own error handling.
-                let _ = handle.wg_tick().await;
+                // Fresh handle each tick: `remote` is a snapshot field, so
+                // the one captured at task start never sees a peer address
+                // learned or changed later (server-mode links, NAT rebind).
+                let tick_handle = links[idx].lock().await.handle();
+                let _ = tick_handle.wg_tick().await;
 
                 let sent = {
                     let mut t = tracker.lock().await;
