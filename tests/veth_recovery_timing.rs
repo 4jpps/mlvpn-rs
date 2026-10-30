@@ -76,6 +76,7 @@ async fn rig(label: &str) -> Rig {
                 bind_interface: &vs0,
                 local_port: 6100,
                 local_addr: None,
+                dual_stack: false,
                 remote_addr: None,
             },
             LinkSpec {
@@ -83,6 +84,7 @@ async fn rig(label: &str) -> Rig {
                 bind_interface: &vs1,
                 local_port: 6101,
                 local_addr: None,
+                dual_stack: false,
                 remote_addr: None,
             },
         ],
@@ -105,6 +107,7 @@ async fn rig(label: &str) -> Rig {
                 bind_interface: &vc0,
                 local_port: 6100,
                 local_addr: None,
+                dual_stack: false,
                 remote_addr: Some(format!("{s0}:6100")),
             },
             LinkSpec {
@@ -112,6 +115,7 @@ async fn rig(label: &str) -> Rig {
                 bind_interface: &vc1,
                 local_port: 6101,
                 local_addr: None,
+                dual_stack: false,
                 remote_addr: Some(format!("{s1}:6101")),
             },
         ],

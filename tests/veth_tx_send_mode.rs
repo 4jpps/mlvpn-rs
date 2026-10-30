@@ -95,6 +95,7 @@ async fn run_mixed_mode(mode: &str, expect_log: &str) {
                 bind_interface: &vs0,
                 local_port: 6940,
                 local_addr: None,
+                dual_stack: false,
                 remote_addr: None,
             },
             LinkSpec {
@@ -102,6 +103,7 @@ async fn run_mixed_mode(mode: &str, expect_log: &str) {
                 bind_interface: &vs1,
                 local_port: 6941,
                 local_addr: None,
+                dual_stack: false,
                 remote_addr: None,
             },
         ],
@@ -125,6 +127,7 @@ async fn run_mixed_mode(mode: &str, expect_log: &str) {
                 bind_interface: &vc0,
                 local_port: 6940,
                 local_addr: None,
+                dual_stack: false,
                 remote_addr: Some(format!("{server_addr_0}:6940")),
             },
             LinkSpec {
@@ -132,6 +135,7 @@ async fn run_mixed_mode(mode: &str, expect_log: &str) {
                 bind_interface: &vc1,
                 local_port: 6941,
                 local_addr: None,
+                dual_stack: false,
                 remote_addr: Some(format!("{server_addr_1}:6941")),
             },
         ],

@@ -129,6 +129,7 @@ async fn auto_tune_reorder_window_reacts_to_real_rtt_spread() {
                 bind_interface: &vs0,
                 local_port: 6600,
                 local_addr: None,
+                dual_stack: false,
                 remote_addr: None,
             },
             LinkSpec {
@@ -136,6 +137,7 @@ async fn auto_tune_reorder_window_reacts_to_real_rtt_spread() {
                 bind_interface: &vs1,
                 local_port: 6601,
                 local_addr: None,
+                dual_stack: false,
                 remote_addr: None,
             },
         ],
@@ -162,6 +164,7 @@ async fn auto_tune_reorder_window_reacts_to_real_rtt_spread() {
                 bind_interface: &vc0,
                 local_port: 6600,
                 local_addr: None,
+                dual_stack: false,
                 remote_addr: Some(format!("{server_addr_0}:6600")),
             },
             LinkSpec {
@@ -169,6 +172,7 @@ async fn auto_tune_reorder_window_reacts_to_real_rtt_spread() {
                 bind_interface: &vc1,
                 local_port: 6601,
                 local_addr: None,
+                dual_stack: false,
                 remote_addr: Some(format!("{server_addr_1}:6601")),
             },
         ],
@@ -303,6 +307,7 @@ async fn real_data_traffic_is_not_delayed_by_a_widened_reorder_window() {
                 bind_interface: &vs0,
                 local_port: 6600,
                 local_addr: None,
+                dual_stack: false,
                 remote_addr: None,
             },
             LinkSpec {
@@ -310,6 +315,7 @@ async fn real_data_traffic_is_not_delayed_by_a_widened_reorder_window() {
                 bind_interface: &vs1,
                 local_port: 6601,
                 local_addr: None,
+                dual_stack: false,
                 remote_addr: None,
             },
         ],
@@ -336,6 +342,7 @@ async fn real_data_traffic_is_not_delayed_by_a_widened_reorder_window() {
                 bind_interface: &vc0,
                 local_port: 6600,
                 local_addr: None,
+                dual_stack: false,
                 remote_addr: Some(format!("{server_addr_0}:6600")),
             },
             LinkSpec {
@@ -343,6 +350,7 @@ async fn real_data_traffic_is_not_delayed_by_a_widened_reorder_window() {
                 bind_interface: &vc1,
                 local_port: 6601,
                 local_addr: None,
+                dual_stack: false,
                 remote_addr: Some(format!("{server_addr_1}:6601")),
             },
         ],

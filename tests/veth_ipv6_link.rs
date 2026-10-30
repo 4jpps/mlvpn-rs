@@ -86,6 +86,7 @@ async fn bonded_tunnel_carries_traffic_over_a_mixed_ipv4_ipv6_link_set() {
                 bind_interface: &vs0,
                 local_port: 6700,
                 local_addr: None,
+                dual_stack: false,
                 remote_addr: None,
             },
             LinkSpec {
@@ -98,6 +99,7 @@ async fn bonded_tunnel_carries_traffic_over_a_mixed_ipv4_ipv6_link_set() {
                 // from. "::" (any local IPv6 address), same as
                 // link0 implicitly relies on "0.0.0.0" for IPv4.
                 local_addr: Some("::"),
+                dual_stack: false,
                 remote_addr: None,
             },
         ],
@@ -121,6 +123,7 @@ async fn bonded_tunnel_carries_traffic_over_a_mixed_ipv4_ipv6_link_set() {
                 bind_interface: &vc0,
                 local_port: 6700,
                 local_addr: None,
+                dual_stack: false,
                 remote_addr: Some(format!("{server_addr_0}:6700")),
             },
             LinkSpec {
@@ -128,6 +131,7 @@ async fn bonded_tunnel_carries_traffic_over_a_mixed_ipv4_ipv6_link_set() {
                 bind_interface: &vc1,
                 local_port: 6701,
                 local_addr: None,
+                dual_stack: false,
                 // Bracketed, the standard SocketAddr string form for
                 // IPv6 -- this alone is enough for socket_domain to
                 // infer IPv6 on the client side.

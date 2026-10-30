@@ -187,6 +187,7 @@ async fn run_scenario(redundant: bool, fec: bool) {
                 bind_interface: &vs0,
                 local_port: 6200,
                 local_addr: None,
+                dual_stack: false,
                 remote_addr: None,
             },
             LinkSpec {
@@ -194,6 +195,7 @@ async fn run_scenario(redundant: bool, fec: bool) {
                 bind_interface: &vs1,
                 local_port: 6201,
                 local_addr: None,
+                dual_stack: false,
                 remote_addr: None,
             },
         ],
@@ -216,6 +218,7 @@ async fn run_scenario(redundant: bool, fec: bool) {
                 bind_interface: &vc0,
                 local_port: 6200,
                 local_addr: None,
+                dual_stack: false,
                 remote_addr: Some(format!("{server_addr_0}:6200")),
             },
             LinkSpec {
@@ -223,6 +226,7 @@ async fn run_scenario(redundant: bool, fec: bool) {
                 bind_interface: &vc1,
                 local_port: 6201,
                 local_addr: None,
+                dual_stack: false,
                 remote_addr: Some(format!("{server_addr_1}:6201")),
             },
         ],

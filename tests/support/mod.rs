@@ -353,6 +353,8 @@ pub struct LinkSpec<'a> {
     pub bind_interface: &'a str,
     pub local_port: u16,
     pub local_addr: Option<&'a str>,
+    /// Server-side `dual_stack` (one `[::]` socket taking IPv4 and IPv6).
+    pub dual_stack: bool,
     pub remote_addr: Option<String>,
 }
 
@@ -553,6 +555,9 @@ pub fn write_config(
         toml.push_str(&format!("local_port = {}\n", link.local_port));
         if let Some(local) = link.local_addr {
             toml.push_str(&format!("local_addr = \"{local}\"\n"));
+        }
+        if link.dual_stack {
+            toml.push_str("dual_stack = true\n");
         }
         if let Some(remote) = &link.remote_addr {
             toml.push_str(&format!("remote_addr = \"{remote}\"\n"));

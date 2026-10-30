@@ -88,6 +88,7 @@ async fn set_link_enabled_pins_scheduling_without_changing_real_link_state() {
                 bind_interface: &vs0,
                 local_port: 6500,
                 local_addr: None,
+                dual_stack: false,
                 remote_addr: None,
             },
             LinkSpec {
@@ -95,6 +96,7 @@ async fn set_link_enabled_pins_scheduling_without_changing_real_link_state() {
                 bind_interface: &vs1,
                 local_port: 6501,
                 local_addr: None,
+                dual_stack: false,
                 remote_addr: None,
             },
         ],
@@ -123,6 +125,7 @@ async fn set_link_enabled_pins_scheduling_without_changing_real_link_state() {
                 bind_interface: &vc0,
                 local_port: 6500,
                 local_addr: None,
+                dual_stack: false,
                 remote_addr: Some(format!("{server_addr_0}:6500")),
             },
             LinkSpec {
@@ -130,6 +133,7 @@ async fn set_link_enabled_pins_scheduling_without_changing_real_link_state() {
                 bind_interface: &vc1,
                 local_port: 6501,
                 local_addr: None,
+                dual_stack: false,
                 remote_addr: Some(format!("{server_addr_1}:6501")),
             },
         ],

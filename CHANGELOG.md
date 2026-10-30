@@ -12,10 +12,11 @@ design, and `ARCHITECTURE.md` covers the system as a whole.
 
 ## [Unreleased]
 
-_Beta8/9: `[control] group_access` (below); beta9 also serializes the umask-around-bind sections so the stats and command sockets can't race. Shipping in the 0.7.7-beta7 build: the security and handshake fixes directly below. Beta6: the rebuilt automatic-report trigger (outage / flap / degraded classes, one ticket per event). Earlier betas: the event-based reports (beta4), `tx_send_mode` (beta3)._
+_Beta10: per-link `dual_stack` for server links (below). Beta8/9: `[control] group_access` (below); beta9 also serializes the umask-around-bind sections so the stats and command sockets can't race. Shipping in the 0.7.7-beta7 build: the security and handshake fixes directly below. Beta6: the rebuilt automatic-report trigger (outage / flap / degraded classes, one ticket per event). Earlier betas: the event-based reports (beta4), `tx_send_mode` (beta3)._
 
 ### Added
 
+- **`dual_stack` server links: the client can use IPv4 or IPv6 per link.** A server-side link with `dual_stack = true` binds one socket on `[::]` with `IPV6_V6ONLY` off, so the same link accepts its peer over either family (IPv4 peers show as `::ffff:a.b.c.d`). The client then chooses per link: a dual-stack `remote_addr` hostname races IPv6 against IPv4 as before, and `local_addr = "0.0.0.0"` pins a link to IPv4. Useful where one uplink is CGNAT'd on IPv4 but native on IPv6 (mobile) and another is the reverse. Replies leave from the routing table's source address, so a multi-address server should set its default routes' `src`. Rejected on client links, with `remote_addr`, or with a specific `local_addr`. Files: `src/config.rs`, `src/link.rs`, `tests/support/mod.rs`, `config/mlvpn.toml.example`.
 - **`[control] group_access`: run `mlvpn-tui` without sudo.** When true, the stats socket is created mode 0660 instead of 0600, so members of the daemon's group (`mlvpn` under the shipped unit) can read it; add an operator with `usermod -aG mlvpn <user>`. Off by default. The `[command]` socket, which can change link state, always stays 0600. Files: `src/config.rs`, `src/control.rs`, `src/tunnel.rs`, `src/main.rs`, `config/mlvpn.toml.example`.
 
 ### Fixed

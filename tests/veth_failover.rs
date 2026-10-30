@@ -87,6 +87,7 @@ async fn link_down_and_up_transitions_reflect_in_control_socket_and_data_still_f
                 bind_interface: &vs0,
                 local_port: 6100,
                 local_addr: None,
+                dual_stack: false,
                 remote_addr: None,
             },
             LinkSpec {
@@ -94,6 +95,7 @@ async fn link_down_and_up_transitions_reflect_in_control_socket_and_data_still_f
                 bind_interface: &vs1,
                 local_port: 6101,
                 local_addr: None,
+                dual_stack: false,
                 remote_addr: None,
             },
         ],
@@ -117,6 +119,7 @@ async fn link_down_and_up_transitions_reflect_in_control_socket_and_data_still_f
                 bind_interface: &vc0,
                 local_port: 6100,
                 local_addr: None,
+                dual_stack: false,
                 remote_addr: Some(format!("{server_addr_0}:6100")),
             },
             LinkSpec {
@@ -124,6 +127,7 @@ async fn link_down_and_up_transitions_reflect_in_control_socket_and_data_still_f
                 bind_interface: &vc1,
                 local_port: 6101,
                 local_addr: None,
+                dual_stack: false,
                 remote_addr: Some(format!("{server_addr_1}:6101")),
             },
         ],

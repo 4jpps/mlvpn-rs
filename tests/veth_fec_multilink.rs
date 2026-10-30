@@ -152,6 +152,7 @@ async fn setup(label: &str, base_port: u16, fec: SchedulerOverrides) -> Rig {
                 bind_interface: &vs[0],
                 local_port: p0,
                 local_addr: None,
+                dual_stack: false,
                 remote_addr: None,
             },
             LinkSpec {
@@ -159,6 +160,7 @@ async fn setup(label: &str, base_port: u16, fec: SchedulerOverrides) -> Rig {
                 bind_interface: &vs[1],
                 local_port: p1,
                 local_addr: None,
+                dual_stack: false,
                 remote_addr: None,
             },
         ],
@@ -181,6 +183,7 @@ async fn setup(label: &str, base_port: u16, fec: SchedulerOverrides) -> Rig {
                 bind_interface: &vc[0],
                 local_port: p0,
                 local_addr: None,
+                dual_stack: false,
                 remote_addr: Some(format!("{s0}:{p0}")),
             },
             LinkSpec {
@@ -188,6 +191,7 @@ async fn setup(label: &str, base_port: u16, fec: SchedulerOverrides) -> Rig {
                 bind_interface: &vc[1],
                 local_port: p1,
                 local_addr: None,
+                dual_stack: false,
                 remote_addr: Some(format!("{s1}:{p1}")),
             },
         ],

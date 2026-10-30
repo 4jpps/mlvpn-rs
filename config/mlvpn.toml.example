@@ -225,6 +225,12 @@ bind_interface = "eth0"
                               # specific local IP (bare IP, no port, no brackets).
                               # Also what selects IPv6 for a server-side link that
                               # has no remote_addr (e.g. "::").
+# dual_stack = false        # server-side links only: one socket on [::] that
+                           # accepts the peer over IPv4 OR IPv6 (leave
+                           # local_addr and remote_addr unset). Replies use
+                           # the routing table's source address, so on a
+                           # multi-address host set the default routes'
+                           # `src` to the address clients connect to.
 remote_addr = "203.0.113.10:51000"   # server's address:port for this link
                                      # (a hostname like "bgp.example.com:51000"
                                      # works here too -- see note above)

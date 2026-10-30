@@ -1267,6 +1267,9 @@ async fn resolve_remote_addr(
 /// an IPv6 address (`"::"` for "any"). Defaults to IPv4 if neither is
 /// set, matching every config written before this existed.
 fn socket_domain(config: &LinkConfig, remote: Option<SocketAddr>) -> Result<Domain> {
+    if config.dual_stack {
+        return Ok(Domain::IPV6);
+    }
     if let Some(remote) = remote {
         return Ok(if remote.is_ipv6() {
             Domain::IPV6
@@ -1424,7 +1427,10 @@ fn bind_socket(
         // Keeping each link's socket strictly single-family makes "one
         // link, one address family" an invariant enforced by the
         // kernel, not just a convention.
-        socket.set_only_v6(true).map_err(MlvpnError::Io)?;
+        // `dual_stack` is the deliberate exception: one server-side
+        // socket on `[::]` that takes IPv4 peers too (see its doc
+        // comment on `LinkConfig`).
+        socket.set_only_v6(!config.dual_stack).map_err(MlvpnError::Io)?;
     }
 
     #[cfg(target_os = "linux")]
@@ -1973,6 +1979,7 @@ pub(crate) async fn test_link_for_state_transitions(state: LinkState, stats: Lin
             name: "test".to_string(),
             bind_interface: "lo".to_string(),
             local_addr: None,
+            dual_stack: false,
             remote_addr: None,
             local_port: 0,
             weight: 1.0,
@@ -2068,6 +2075,7 @@ mod tests {
             name: "test".to_string(),
             bind_interface: "lo".to_string(),
             local_addr: local_addr.map(str::to_string),
+            dual_stack: false,
             remote_addr: remote_addr.map(str::to_string),
             local_port: 0,
             weight: 1.0,
@@ -2587,5 +2595,44 @@ mod tests {
         assert!(out[0].is_ok());
         assert!(out[1].is_err());
         assert!(out[2].is_ok());
+    }
+
+    #[tokio::test]
+    async fn dual_stack_socket_takes_ipv4_and_ipv6_peers() {
+        let mut cfg = test_link_config(None, None);
+        cfg.dual_stack = true;
+        assert_eq!(socket_domain(&cfg, None).unwrap(), Domain::IPV6);
+        // bind_interface "lo" needs CAP_NET_RAW on some kernels; skip rather than fail
+        // where an unprivileged test run can't bind to a device.
+        let (sock, _) = match bind_socket(&cfg, None) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("skipping: can't bind to lo here: {e}");
+                return;
+            }
+        };
+        let port = sock.local_addr().unwrap().port();
+        let v4 = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let v6 = std::net::UdpSocket::bind("[::1]:0").unwrap();
+        v4.send_to(b"four", ("127.0.0.1", port)).unwrap();
+        v6.send_to(b"six", ("::1", port)).unwrap();
+        let mut got = Vec::new();
+        let mut buf = [0u8; 16];
+        for _ in 0..2 {
+            let (n, from) = tokio::time::timeout(Duration::from_secs(2), sock.recv_from(&mut buf))
+                .await
+                .expect("datagram")
+                .unwrap();
+            got.push((buf[..n].to_vec(), from));
+        }
+        got.sort();
+        assert_eq!(got[0].0, b"four");
+        assert!(got[0].1.to_string().starts_with("[::ffff:127.0.0.1]"), "{:?}", got[0].1);
+        assert_eq!(got[1].0, b"six");
+        // Replies go back the same way, IPv4-mapped included.
+        sock.send_to(b"ok", got[0].1).await.unwrap();
+        v4.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let (n, _) = v4.recv_from(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"ok");
     }
 }

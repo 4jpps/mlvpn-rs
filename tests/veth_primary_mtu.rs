@@ -113,6 +113,7 @@ async fn primary_mtu_tracks_the_active_link_and_converges_across_the_peer() {
                 bind_interface: &vs0,
                 local_port: 6300,
                 local_addr: None,
+                dual_stack: false,
                 remote_addr: None,
             },
             LinkSpec {
@@ -120,6 +121,7 @@ async fn primary_mtu_tracks_the_active_link_and_converges_across_the_peer() {
                 bind_interface: &vs1,
                 local_port: 6301,
                 local_addr: None,
+                dual_stack: false,
                 remote_addr: None,
             },
         ],
@@ -146,6 +148,7 @@ async fn primary_mtu_tracks_the_active_link_and_converges_across_the_peer() {
                 bind_interface: &vc0,
                 local_port: 6300,
                 local_addr: None,
+                dual_stack: false,
                 remote_addr: Some(format!("{server_addr_0}:6300")),
             },
             LinkSpec {
@@ -153,6 +156,7 @@ async fn primary_mtu_tracks_the_active_link_and_converges_across_the_peer() {
                 bind_interface: &vc1,
                 local_port: 6301,
                 local_addr: None,
+                dual_stack: false,
                 remote_addr: Some(format!("{server_addr_1}:6301")),
             },
         ],

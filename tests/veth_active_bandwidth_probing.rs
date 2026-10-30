@@ -159,6 +159,7 @@ async fn active_bandwidth_probing_discovers_a_real_rate_cap() {
                 bind_interface: &vs0,
                 local_port: 6600,
                 local_addr: None,
+                dual_stack: false,
                 remote_addr: None,
             },
             LinkSpec {
@@ -166,6 +167,7 @@ async fn active_bandwidth_probing_discovers_a_real_rate_cap() {
                 bind_interface: &vs1,
                 local_port: 6601,
                 local_addr: None,
+                dual_stack: false,
                 remote_addr: None,
             },
         ],
@@ -193,6 +195,7 @@ async fn active_bandwidth_probing_discovers_a_real_rate_cap() {
                 bind_interface: &vc0,
                 local_port: 6600,
                 local_addr: None,
+                dual_stack: false,
                 remote_addr: Some(format!("{server_addr_0}:6600")),
             },
             LinkSpec {
@@ -200,6 +203,7 @@ async fn active_bandwidth_probing_discovers_a_real_rate_cap() {
                 bind_interface: &vc1,
                 local_port: 6601,
                 local_addr: None,
+                dual_stack: false,
                 remote_addr: Some(format!("{server_addr_1}:6601")),
             },
         ],

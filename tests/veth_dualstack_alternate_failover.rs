@@ -200,6 +200,7 @@ async fn losing_link_still_fails_over_to_its_working_alternate_family() {
                 bind_interface: &vs0,
                 local_port: 6920,
                 local_addr: None,
+                dual_stack: false,
                 remote_addr: None,
             },
             LinkSpec {
@@ -214,6 +215,7 @@ async fn losing_link_still_fails_over_to_its_working_alternate_family() {
                 // routable path to a peer that simply never listens on
                 // it for this link.
                 local_addr: None,
+                dual_stack: false,
                 remote_addr: None,
             },
         ],
@@ -237,6 +239,7 @@ async fn losing_link_still_fails_over_to_its_working_alternate_family() {
                 bind_interface: &vc0,
                 local_port: 6920,
                 local_addr: None,
+                dual_stack: false,
                 remote_addr: Some(format!("{server_addr_0}:6920")),
             },
             LinkSpec {
@@ -244,6 +247,7 @@ async fn losing_link_still_fails_over_to_its_working_alternate_family() {
                 bind_interface: &vc1,
                 local_port: 6921,
                 local_addr: None,
+                dual_stack: false,
                 // The hostname, not a literal address -- this is what
                 // makes `link::resolve_remote_addr` actually go through
                 // DNS resolution and `pick_remote_addr`'s dual-stack

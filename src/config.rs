@@ -539,6 +539,18 @@ pub struct LinkConfig {
     /// IP, no port and no brackets even for IPv6 (unlike `remote_addr`
     /// below).
     pub local_addr: Option<String>,
+    /// Server-side links only: accept the peer over IPv4 *or* IPv6 on one
+    /// socket, bound to `[::]:local_port` with `IPV6_V6ONLY` off (IPv4
+    /// peers appear as IPv4-mapped `::ffff:a.b.c.d` addresses). Lets the
+    /// client pick either family per link (e.g. IPv6 over a CGNAT'd
+    /// mobile link, IPv4 over a cable link) without separate links.
+    /// Replies leave from whatever source address the kernel's routing
+    /// picks, so on a host with several addresses set the default
+    /// routes' preferred source (`ip route ... src`) to the address
+    /// clients connect to. Off by default; `local_addr` must be unset or
+    /// `"::"`, and `remote_addr` must be unset.
+    #[serde(default)]
+    pub dual_stack: bool,
     /// Remote host:port of the peer for this link (client mode: where we
     /// connect; server mode: not used for binding, only for source
     /// validation once the peer's address is learned). Accepts a literal
@@ -900,6 +912,20 @@ impl Config {
                     link.name
                 )));
             }
+            if link.dual_stack {
+                if self.mode != Mode::Server || link.remote_addr.is_some() {
+                    return Err(MlvpnError::Config(format!(
+                        "link '{}': dual_stack is for server-side links without remote_addr",
+                        link.name
+                    )));
+                }
+                if link.local_addr.as_deref().is_some_and(|a| a != "::") {
+                    return Err(MlvpnError::Config(format!(
+                        "link '{}': dual_stack binds [::]; leave local_addr unset (or \"::\")",
+                        link.name
+                    )));
+                }
+            }
             if link.weight <= 0.0 {
                 return Err(MlvpnError::Config(format!(
                     "link '{}' weight must be > 0",
@@ -1119,6 +1145,7 @@ mod tests {
                 name: "link0".to_string(),
                 bind_interface: "eth0".to_string(),
                 local_addr: None,
+                dual_stack: false,
                 remote_addr: Some("198.51.100.1:51000".to_string()),
                 local_port: 51000,
                 weight: 1.0,
@@ -1416,5 +1443,21 @@ mod tests {
             cfg.links[0].peer_public_key,
             "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
         );
+    }
+
+    #[test]
+    fn dual_stack_is_server_side_only() {
+        let mut cfg = minimal_valid_config();
+        cfg.links[0].dual_stack = true;
+        // Client mode (the fixture's default), with a remote_addr: rejected.
+        assert!(cfg.validate().unwrap_err().to_string().contains("dual_stack"));
+        cfg.mode = Mode::Server;
+        assert!(cfg.validate().is_err(), "remote_addr set: still rejected");
+        cfg.links[0].remote_addr = None;
+        cfg.validate().expect("server link without remote_addr");
+        cfg.links[0].local_addr = Some("::".into());
+        cfg.validate().expect("\"::\" is what dual_stack binds anyway");
+        cfg.links[0].local_addr = Some("204.52.221.1".into());
+        assert!(cfg.validate().is_err(), "a specific local_addr can't be dual-stack");
     }
 }

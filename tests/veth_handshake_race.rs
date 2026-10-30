@@ -94,6 +94,7 @@ async fn client_establishes_via_second_link_when_first_is_unreachable() {
                 bind_interface: &vs0,
                 local_port: 6000,
                 local_addr: None,
+                dual_stack: false,
                 remote_addr: None,
             },
             LinkSpec {
@@ -101,6 +102,7 @@ async fn client_establishes_via_second_link_when_first_is_unreachable() {
                 bind_interface: &vs1,
                 local_port: 6001,
                 local_addr: None,
+                dual_stack: false,
                 remote_addr: None,
             },
         ],
@@ -128,6 +130,7 @@ async fn client_establishes_via_second_link_when_first_is_unreachable() {
                 bind_interface: &vc0,
                 local_port: 6000,
                 local_addr: None,
+                dual_stack: false,
                 remote_addr: Some(format!("{server_addr_0}:9999")),
             },
             // link1, configured second, is fully reachable.
@@ -136,6 +139,7 @@ async fn client_establishes_via_second_link_when_first_is_unreachable() {
                 bind_interface: &vc1,
                 local_port: 6001,
                 local_addr: None,
+                dual_stack: false,
                 remote_addr: Some(format!("{server_addr_1}:6001")),
             },
         ],
