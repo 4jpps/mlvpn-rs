@@ -864,6 +864,7 @@ async fn run(cfg: Config, log_ring: Arc<LogRing>) -> anyhow::Result<()> {
         scheduler_cfg: cfg.scheduler.clone(),
         tunnel_name: cfg.tunnel.name.clone(),
         control_socket,
+        control_group_access: cfg.control.group_access,
         command_socket,
         diagnostics_watch,
         tunnel_local_addr,

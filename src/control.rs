@@ -69,6 +69,7 @@ const SNAPSHOT_INTERVAL_MS: u64 = 500;
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn serve(
     path: PathBuf,
+    group_access: bool,
     links: Links,
     peer_stats: Arc<PeerStatsTable>,
     tunnel_name: String,
@@ -128,7 +129,7 @@ pub(crate) async fn serve(
         // being unchanged for the duration" -- there is no such
         // concurrent dependency here, and we restore the prior value
         // immediately after `bind()` returns.
-        let previous_umask = unsafe { libc::umask(0o177) };
+        let previous_umask = unsafe { libc::umask(if group_access { 0o117 } else { 0o177 }) };
         let result = UnixListener::bind(&path);
         unsafe {
             libc::umask(previous_umask);
@@ -146,12 +147,14 @@ pub(crate) async fn serve(
         }
     };
 
-    // Belt and suspenders: explicitly (re-)assert 0600 even though the
+    // Belt and suspenders: explicitly (re-)assert the mode even though the
     // umask above should already have produced exactly that, in case
     // some platform/backend doesn't fully honor umask for AF_UNIX socket
-    // creation.
-    if let Err(e) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)) {
-        tracing::warn!(error = %e, "failed to restrict control socket permissions to 0600");
+    // creation. 0660 only with `[control] group_access`, so the daemon's
+    // group can run mlvpn-tui without sudo.
+    let socket_mode = if group_access { 0o660 } else { 0o600 };
+    if let Err(e) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(socket_mode)) {
+        tracing::warn!(error = %e, mode = format!("{socket_mode:o}"), "failed to set control socket permissions");
     }
 
     tracing::info!(path = %path.display(), "control socket listening (for mlvpn-tui)");

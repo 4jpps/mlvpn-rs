@@ -12,7 +12,11 @@ design, and `ARCHITECTURE.md` covers the system as a whole.
 
 ## [Unreleased]
 
-_Shipping in the 0.7.7-beta7 build: the security and handshake fixes directly below. Beta6: the rebuilt automatic-report trigger (outage / flap / degraded classes, one ticket per event). Earlier betas: the event-based reports (beta4), `tx_send_mode` (beta3)._
+_Beta8: `[control] group_access` (below). Shipping in the 0.7.7-beta7 build: the security and handshake fixes directly below. Beta6: the rebuilt automatic-report trigger (outage / flap / degraded classes, one ticket per event). Earlier betas: the event-based reports (beta4), `tx_send_mode` (beta3)._
+
+### Added
+
+- **`[control] group_access`: run `mlvpn-tui` without sudo.** When true, the stats socket is created mode 0660 instead of 0600, so members of the daemon's group (`mlvpn` under the shipped unit) can read it; add an operator with `usermod -aG mlvpn <user>`. Off by default. The `[command]` socket, which can change link state, always stays 0600. Files: `src/config.rs`, `src/control.rs`, `src/tunnel.rs`, `src/main.rs`, `config/mlvpn.toml.example`.
 
 ### Fixed
 

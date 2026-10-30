@@ -641,6 +641,13 @@ pub struct ControlConfig {
     /// service's unprivileged runtime user, before mlvpnd ever starts --
     /// see systemd/mlvpn.service).
     pub socket_path: Option<String>,
+    /// Let members of the daemon's group (the `mlvpn` group under the
+    /// shipped systemd unit) read the stats socket, so `mlvpn-tui` runs
+    /// without sudo: the socket is created mode 0660 instead of 0600.
+    /// Off by default. Only the read-only stats socket is affected; the
+    /// `[command]` socket, which can change link state, always stays 0600.
+    #[serde(default)]
+    pub group_access: bool,
 }
 
 fn default_control_enabled() -> bool {
@@ -655,6 +662,7 @@ impl Default for ControlConfig {
         Self {
             enabled: default_control_enabled(),
             socket_path: None,
+            group_access: false,
         }
     }
 }

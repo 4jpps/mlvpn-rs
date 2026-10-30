@@ -343,6 +343,8 @@ pub struct TunnelParams {
     pub tunnel_name: String,
     /// `None` disables the monitoring control socket entirely.
     pub control_socket: Option<PathBuf>,
+    /// `[control] group_access`: create the stats socket 0660 instead of 0600.
+    pub control_group_access: bool,
     /// `None` disables the runtime command socket entirely (the default
     /// -- see `config::CommandConfig::enabled`'s doc comment for why
     /// this one, unlike `control_socket`, is opt-in).
@@ -836,9 +838,11 @@ pub async fn run(
         let fec_unrecoverable_total = fec_unrecoverable_total.clone();
         let fec_send_stats = fec_send_stats.clone();
         let telemetry = telemetry.clone();
+        let group_access = params.control_group_access;
         handles.push(tokio::spawn(async move {
             control::serve(
                 path,
+                group_access,
                 links,
                 peer_stats,
                 tunnel_name,
