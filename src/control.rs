@@ -60,6 +60,13 @@ use tokio::time::interval;
 
 const SNAPSHOT_INTERVAL_MS: u64 = 500;
 
+/// Serializes the umask-around-bind sections below. `umask(2)` is
+/// process-wide, and the stats and command sockets are bound from
+/// separate tasks: without this, the stats socket's 0o117 (with
+/// `[control] group_access`) could be in effect while the command socket
+/// binds, leaving it group-connectable until its chmod.
+static UMASK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Bind the control socket and serve snapshots to whoever connects until
 /// the process exits. Any setup failure (can't create the runtime
 /// directory, can't bind, path already in use by something else) is
@@ -129,6 +136,7 @@ pub(crate) async fn serve(
         // being unchanged for the duration" -- there is no such
         // concurrent dependency here, and we restore the prior value
         // immediately after `bind()` returns.
+        let _umask_guard = UMASK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let previous_umask = unsafe { libc::umask(if group_access { 0o117 } else { 0o177 }) };
         let result = UnixListener::bind(&path);
         unsafe {
@@ -517,6 +525,7 @@ pub(crate) async fn serve_commands(
 
     let listener = {
         // SAFETY: same reasoning as the umask block in `serve` above.
+        let _umask_guard = UMASK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let previous_umask = unsafe { libc::umask(0o177) };
         let result = UnixListener::bind(&path);
         unsafe {

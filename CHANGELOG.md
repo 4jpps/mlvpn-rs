@@ -12,7 +12,7 @@ design, and `ARCHITECTURE.md` covers the system as a whole.
 
 ## [Unreleased]
 
-_Beta8: `[control] group_access` (below). Shipping in the 0.7.7-beta7 build: the security and handshake fixes directly below. Beta6: the rebuilt automatic-report trigger (outage / flap / degraded classes, one ticket per event). Earlier betas: the event-based reports (beta4), `tx_send_mode` (beta3)._
+_Beta8/9: `[control] group_access` (below); beta9 also serializes the umask-around-bind sections so the stats and command sockets can't race. Shipping in the 0.7.7-beta7 build: the security and handshake fixes directly below. Beta6: the rebuilt automatic-report trigger (outage / flap / degraded classes, one ticket per event). Earlier betas: the event-based reports (beta4), `tx_send_mode` (beta3)._
 
 ### Added
 
