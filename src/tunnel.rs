@@ -554,6 +554,61 @@ fn resolve_peer_primary_index(snap: &[Link], peer_primary_link: &PeerPrimaryLink
 /// How long startup waits for a dual-stack link's address-family race.
 const ALTERNATE_RACE_DEADLINE: Duration = Duration::from_secs(10);
 
+/// How long a dual-stack link must stay out of `Up` before
+/// `family_fallback_watch` tries the other address family.
+const FAMILY_FALLBACK_AFTER: Duration = Duration::from_secs(30);
+/// How long one runtime family probe waits for the peer to answer.
+const FAMILY_PROBE_DEADLINE: Duration = Duration::from_secs(10);
+/// Minimum gap between runtime family probes on one link.
+const FAMILY_RETRY_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Runtime address-family fallback for one dual-stack link (see
+/// `Link::family_fallback_eligible`). The startup race picks a family
+/// once; if that family later stops working (IPv6 dropped by a carrier,
+/// a v4 CGNAT path dying) while the other still works, this moves the
+/// link over instead of leaving it down until `mlvpnd` restarts. It only
+/// acts after the link has been out of `Up` for `FAMILY_FALLBACK_AFTER`,
+/// tries at most once per `FAMILY_RETRY_INTERVAL`, and never touches a
+/// link that is up or administratively disabled.
+async fn family_fallback_watch(idx: usize, links: Links) {
+    if !links[idx].lock().await.family_fallback_eligible() {
+        return;
+    }
+    let mut down_since: Option<Instant> = None;
+    let mut last_try: Option<Instant> = None;
+    let mut tick = interval(Duration::from_secs(5));
+    loop {
+        tick.tick().await;
+        let (handle, current) = {
+            let g = links[idx].lock().await;
+            if g.state == LinkState::Up || g.admin_disabled {
+                down_since = None;
+                continue;
+            }
+            let Some(current) = g.remote else { continue };
+            (g.handle(), current)
+        };
+        let since = *down_since.get_or_insert_with(Instant::now);
+        if since.elapsed() < FAMILY_FALLBACK_AFTER
+            || last_try.is_some_and(|t| t.elapsed() < FAMILY_RETRY_INTERVAL)
+        {
+            continue;
+        }
+        last_try = Some(Instant::now());
+        if let Some((alt, socket)) =
+            crate::link::probe_other_family(&handle, current, FAMILY_PROBE_DEADLINE).await
+        {
+            let mut g = links[idx].lock().await;
+            // Re-checked under the lock: the link may have recovered on
+            // its own while the probe ran.
+            if g.state != LinkState::Up && g.remote == Some(current) {
+                g.switch_family(alt, socket).await;
+                down_since = None;
+            }
+        }
+    }
+}
+
 pub async fn run(
     tun: AsyncDevice,
     links: Vec<Link>,
@@ -788,6 +843,10 @@ pub async fn run(
                 )
                 .await;
             }));
+        }
+        {
+            let links = links.clone();
+            handles.push(tokio::spawn(family_fallback_watch(idx, links)));
         }
         {
             let links = links.clone();
@@ -1893,6 +1952,9 @@ mod mmsg_tx {
         pkts: u64,
         batches: u64,
         last_log: Option<Instant>,
+        /// Reused every batch so the send path allocates nothing per packet.
+        headers: Vec<[u8; HEADER_LEN]>,
+        scratch: crate::link::TxBatchScratch,
     }
 
     impl State {
@@ -1907,6 +1969,8 @@ mod mmsg_tx {
                 pkts: 0,
                 batches: 0,
                 last_log: None,
+                headers: Vec::new(),
+                scratch: Default::default(),
             }
         }
     }
@@ -1927,29 +1991,33 @@ mod mmsg_tx {
         let Some((link_id, handle, name)) = target else {
             return (0, 0);
         };
-        let headers: Vec<_> = batch
-            .iter()
-            .map(|job| {
-                Header {
-                    ptype: job.ptype,
-                    link_id: *link_id,
-                    seq: job.seq,
-                }
-                .to_bytes()
-            })
-            .collect();
-        let (results, stats) = {
-            let frames: Vec<[&[u8]; 2]> = batch
-                .iter()
-                .zip(headers.iter())
-                .map(|(job, h)| [&h[..], job.plaintext.as_slice()])
-                .collect();
-            handle.wg_send_batch(&frames, st.gso).await
+        st.headers.clear();
+        st.headers.extend(batch.iter().map(|job| {
+            Header {
+                ptype: job.ptype,
+                link_id: *link_id,
+                seq: job.seq,
+            }
+            .to_bytes()
+        }));
+        let stats = {
+            let headers = &st.headers;
+            let jobs = &batch[..];
+            handle
+                .wg_send_batch(
+                    jobs.len(),
+                    |i| [&headers[i][..], jobs[i].plaintext.as_slice()],
+                    st.gso,
+                    &mut st.scratch,
+                )
+                .await
         };
+        let results = std::mem::take(&mut st.scratch.results);
         let counters = &d.queues[idx].counters;
         let (mut bytes, mut pkts) = (0u64, 0u64);
         let mut unsupported = false;
-        for (mut job, res) in batch.drain(..).zip(results) {
+        let mut results = results;
+        for (mut job, res) in batch.drain(..).zip(results.drain(..)) {
             match res {
                 Ok(carried) => {
                     bytes += (HEADER_LEN + job.plaintext.len()) as u64;
@@ -1969,6 +2037,7 @@ mod mmsg_tx {
                 }
             }
         }
+        st.scratch.results = results; // hand the (now empty) buffer back for reuse
         if unsupported {
             tracing::warn!(link = %name, "sendmmsg(2) not supported here; falling back to per-packet sendto");
             st.active = false;
@@ -2255,94 +2324,99 @@ async fn link_receiver(
 
     let mut consecutive_failures = 0u32;
     let mut backoff_ms = RECONNECT_BACKOFF_INITIAL_MS;
-    // Owned once for this task's lifetime: the raw-datagram scratch and the
-    // decrypted-frame buffer `wg_recv_into` fills on every packet. Sized to
-    // hold any legitimate UDP datagram (see `wg_recv_into`).
-    let mut recv_buf = vec![0u8; u16::MAX as usize + 64];
-    let mut frame: Vec<u8> = Vec::with_capacity(2048);
+    // Owned once for this task's lifetime: the raw-datagram slots and the
+    // decrypted-frame buffers `wg_recv_batch` fills (see `RxBatch`).
+    let mut batch = crate::link::RxBatch::default();
     loop {
-        // `wg_recv_into` loops internally past any handshake/keepalive
-        // traffic on this link's socket -- what comes back here is
-        // always either a genuine decrypted mlvpn frame plus the
-        // datagram's source address, or a real error (a socket I/O
-        // failure, or a malformed/oversized datagram that
-        // `wireguard::WgTunnel::decapsulate` rejected outright).
-        match handle.wg_recv_into(&mut recv_buf, &mut frame).await {
-            Ok(from) => {
-                consecutive_failures = 0;
-                handle_incoming(
-                    idx,
-                    link_id,
-                    &frame,
-                    from,
-                    &links,
-                    &scheduler,
-                    &rx_pipeline,
-                    &cfg,
-                    &tracker,
-                    &peer_stats,
-                    &mtu,
-                    &throughput_test_state,
-                    &throughput_test_ctx,
-                    &peer_version,
-                    &peer_mtu,
-                    &peer_live_mtu,
-                    &peer_primary_link,
-                )
-                .await;
-            }
-            Err(MlvpnError::Io(e)) if is_interface_gone_error(&e) => {
-                consecutive_failures += 1;
-                tracing::debug!(
-                    link = %link_name,
-                    error = %e,
-                    consecutive_failures,
-                    "link receive error (interface appears gone)"
-                );
-                if consecutive_failures >= RECONNECT_FAILURE_THRESHOLD {
-                    attempt_reconnect(&handle, &link_name, &mut backoff_ms).await;
+        // `wg_recv_batch` reads up to a batch of datagrams in one syscall
+        // and loops internally past handshake/keepalive traffic; each event
+        // is either a genuine decrypted mlvpn frame plus that datagram's
+        // source address, or a per-datagram error. A socket error with
+        // nothing received comes back as the outer `Err`.
+        let mut events = match handle.wg_recv_batch(&mut batch).await {
+            Ok(()) => std::mem::take(&mut batch.events),
+            Err(e) => vec![Err(e)],
+        };
+        for event in events.drain(..) {
+            match event {
+                Ok((slot, from)) => {
                     consecutive_failures = 0;
-                } else {
-                    // Brief pause so a socket that's failing every call
-                    // (rather than just occasionally) doesn't spin the
-                    // task in a tight CPU-burning loop while it waits
-                    // to cross the reconnect threshold.
+                    handle_incoming(
+                        idx,
+                        link_id,
+                        batch.frame(slot),
+                        from,
+                        &links,
+                        &scheduler,
+                        &rx_pipeline,
+                        &cfg,
+                        &tracker,
+                        &peer_stats,
+                        &mtu,
+                        &throughput_test_state,
+                        &throughput_test_ctx,
+                        &peer_version,
+                        &peer_mtu,
+                        &peer_live_mtu,
+                        &peer_primary_link,
+                    )
+                    .await;
+                }
+                Err(MlvpnError::Io(e)) if is_interface_gone_error(&e) => {
+                    consecutive_failures += 1;
+                    tracing::debug!(
+                        link = %link_name,
+                        error = %e,
+                        consecutive_failures,
+                        "link receive error (interface appears gone)"
+                    );
+                    if consecutive_failures >= RECONNECT_FAILURE_THRESHOLD {
+                        attempt_reconnect(&handle, &link_name, &mut backoff_ms).await;
+                        consecutive_failures = 0;
+                    } else {
+                        // Brief pause so a socket that's failing every call
+                        // (rather than just occasionally) doesn't spin the
+                        // task in a tight CPU-burning loop while it waits
+                        // to cross the reconnect threshold.
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                }
+                Err(MlvpnError::Io(e)) => {
+                    // Not classified as "interface gone" -- e.g. ENETDOWN
+                    // from an interface that's merely administratively down,
+                    // or a momentary route lookup failure. Deliberately not
+                    // counted toward the reconnect threshold at all: this
+                    // socket is expected to start working again on its own
+                    // the moment the underlying route returns (see
+                    // link.rs's module doc comment and
+                    // is_interface_gone_error's doc comment), so reconnecting
+                    // here would just rebind to the same still-unusable
+                    // interface for no benefit.
+                    tracing::debug!(
+                        link = %link_name,
+                        error = %e,
+                        "link receive error (transient, not reconnecting)"
+                    );
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
-            }
-            Err(MlvpnError::Io(e)) => {
-                // Not classified as "interface gone" -- e.g. ENETDOWN
-                // from an interface that's merely administratively down,
-                // or a momentary route lookup failure. Deliberately not
-                // counted toward the reconnect threshold at all: this
-                // socket is expected to start working again on its own
-                // the moment the underlying route returns (see
-                // link.rs's module doc comment and
-                // is_interface_gone_error's doc comment), so reconnecting
-                // here would just rebind to the same still-unusable
-                // interface for no benefit.
-                tracing::debug!(
-                    link = %link_name,
-                    error = %e,
-                    "link receive error (transient, not reconnecting)"
-                );
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-            Err(e) => {
-                // A malformed/oversized/garbled datagram rejected by
-                // `WgTunnel::decapsulate` before it ever became a real
-                // frame -- not a socket problem, so it neither resets
-                // nor increments the reconnect-failure counter, and
-                // there's nothing to hand to `handle_incoming`. Anyone
-                // can send arbitrary garbage at this socket; rejecting
-                // it here and continuing is the correct response.
-                tracing::debug!(
-                    link = %link_name,
-                    error = %e,
-                    "link receive error (malformed datagram, ignoring)"
-                );
+                Err(e) => {
+                    // A malformed/oversized/garbled datagram rejected by
+                    // `WgTunnel::decapsulate` before it ever became a real
+                    // frame -- not a socket problem, so it neither resets
+                    // nor increments the reconnect-failure counter, and
+                    // there's nothing to hand to `handle_incoming`. Anyone
+                    // can send arbitrary garbage at this socket; rejecting
+                    // it here and continuing is the correct response.
+                    tracing::debug!(
+                        link = %link_name,
+                        error = %e,
+                        "link receive error (malformed datagram, ignoring)"
+                    );
+                }
             }
         }
+        // Hand the (now empty) events buffer back so its capacity is reused.
+        batch.events = events;
     }
 }
 

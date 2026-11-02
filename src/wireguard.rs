@@ -332,6 +332,16 @@ impl WgTunnel {
     /// array) and the payload separately instead of first copying both into
     /// a freshly allocated frame `Vec`.
     pub fn encapsulate_parts(&self, parts: &[&[u8]]) -> Result<(Vec<u8>, bool)> {
+        let mut out = Vec::new();
+        let carried = self.encapsulate_parts_into(parts, &mut out)?;
+        Ok((out, carried))
+    }
+
+    /// Same as `encapsulate_parts`, but the datagram is written into the
+    /// caller's `out` (cleared first, capacity kept), so a batch sender that
+    /// reuses its buffers allocates nothing per packet. Returns the same
+    /// carries-the-frame bool.
+    pub fn encapsulate_parts_into(&self, parts: &[&[u8]], out: &mut Vec<u8>) -> Result<bool> {
         let payload_len: usize = parts.iter().map(|p| p.len()).sum();
         let mut guard = self.inner.lock().unwrap();
         let Inner {
@@ -375,7 +385,9 @@ impl WgTunnel {
                 // above and the caller-visible bool -- deliberately one
                 // shared computation, never two parallel ones that could
                 // drift apart.
-                Ok((bytes.to_vec(), is_data))
+                out.clear();
+                out.extend_from_slice(bytes);
+                Ok(is_data)
             }
             TunnResult::Err(e) => Err(MlvpnError::Protocol(format!("wg encapsulate: {e:?}"))),
             TunnResult::Done => Err(MlvpnError::Protocol(
@@ -428,9 +440,46 @@ impl WgTunnel {
             )));
         }
         let mut guard = self.inner.lock().unwrap();
+        self.decapsulate_locked(&mut guard, datagram, frame_out)
+    }
+
+    /// Feeds a whole batch of received datagrams to boringtun under ONE
+    /// lock acquisition, in order (boringtun's replay window is stateful,
+    /// so arrival order must be kept). Datagram `i`'s outcome lands in
+    /// `out[i]` (cleared first) and, for `DecapsulateKind::Frame`, its
+    /// decrypted frame in `frames[i]`; `frames` must have at least one
+    /// buffer per datagram. Same per-datagram contract as
+    /// `decapsulate_into`.
+    pub fn decapsulate_batch<'a>(
+        &self,
+        datagrams: impl IntoIterator<Item = &'a [u8]>,
+        frames: &mut [Vec<u8>],
+        out: &mut Vec<Result<DecapsulateKind>>,
+    ) {
+        out.clear();
+        let mut guard = self.inner.lock().unwrap();
+        for (datagram, frame_out) in datagrams.into_iter().zip(frames.iter_mut()) {
+            out.push(self.decapsulate_locked(&mut guard, datagram, frame_out));
+        }
+    }
+
+    fn decapsulate_locked(
+        &self,
+        inner: &mut Inner,
+        datagram: &[u8],
+        frame_out: &mut Vec<u8>,
+    ) -> Result<DecapsulateKind> {
+        if datagram.len() > MAX_WG_PACKET {
+            self.rejected_total.fetch_add(1, Ordering::Relaxed);
+            return Err(MlvpnError::Protocol(format!(
+                "wg decapsulate: datagram too large ({} bytes, max {})",
+                datagram.len(),
+                MAX_WG_PACKET
+            )));
+        }
         let Inner {
             tunn, dec_scratch, ..
-        } = &mut *guard;
+        } = inner;
         match tunn.decapsulate(None, datagram, dec_scratch) {
             TunnResult::Done => Ok(DecapsulateKind::Consumed),
             TunnResult::Err(e) => {
@@ -735,6 +784,55 @@ mod tests {
                 DecapsulateKind::Frame
             ));
             assert_eq!(out, plaintext);
+        }
+    }
+
+    /// A batch decrypts in arrival order under one lock, a rejected datagram
+    /// in the middle only fails its own slot, and `encapsulate_parts_into`
+    /// produces the same datagrams as the allocating form.
+    #[test]
+    fn decapsulate_batch_keeps_order_and_isolates_a_bad_datagram() {
+        let (client_priv, client_pub) = generate_test_keypair();
+        let (server_priv, server_pub) = generate_test_keypair();
+        let client = WgTunnel::new(client_priv, server_pub, true).unwrap();
+        let server = WgTunnel::new(server_priv, client_pub, false).unwrap();
+        let (init, _) = client.encapsulate(b"x").unwrap();
+        let reply = match server.decapsulate(&init).unwrap() {
+            DecapsulateOutcome::SendReply(b) => b,
+            other => panic!("expected SendReply, got {other:?}"),
+        };
+        let ka = match client.decapsulate(&reply).unwrap() {
+            DecapsulateOutcome::SendReply(b) => b,
+            other => panic!("expected SendReply, got {other:?}"),
+        };
+        server.decapsulate(&ka).unwrap();
+
+        let plaintexts: Vec<Vec<u8>> = (0u8..6).map(|i| vec![i; 50 + i as usize * 100]).collect();
+        let mut dg = Vec::new();
+        let mut dgs: Vec<Vec<u8>> = Vec::new();
+        for (i, p) in plaintexts.iter().enumerate() {
+            assert!(
+                client
+                    .encapsulate_parts_into(&[&p[..1], &p[1..]], &mut dg)
+                    .unwrap()
+            );
+            dgs.push(dg.clone());
+            if i == 2 {
+                dgs.push(vec![0xFF; 64]); // garbage between real datagrams
+            }
+        }
+        let mut frames = vec![Vec::new(); dgs.len()];
+        let mut out = Vec::new();
+        server.decapsulate_batch(dgs.iter().map(|d| &d[..]), &mut frames, &mut out);
+        assert_eq!(out.len(), dgs.len());
+        let mut expected = plaintexts.iter();
+        for (i, kind) in out.iter().enumerate() {
+            if i == 3 {
+                assert!(kind.is_err(), "garbage datagram must be rejected");
+                continue;
+            }
+            assert!(matches!(kind, Ok(DecapsulateKind::Frame)));
+            assert_eq!(&frames[i], expected.next().unwrap());
         }
     }
 

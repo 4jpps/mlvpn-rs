@@ -39,7 +39,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
-use tokio::sync::{Mutex as AsyncMutex, RwLock as AsyncRwLock};
+use tokio::sync::{Mutex as AsyncMutex, Notify, RwLock as AsyncRwLock};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinkState {
@@ -397,6 +397,10 @@ pub struct LinkHandle {
     remote: Option<SocketAddr>,
     socket: SharedSocket,
     reconnect_lock: Arc<AsyncMutex<()>>,
+    /// Fired whenever this link's socket is replaced (`reconnect`,
+    /// `switch_family`) so a receive already parked on the old socket
+    /// wakes and picks up the new one.
+    socket_swapped: Arc<Notify>,
     /// This link's own independent WireGuard tunnel (own keypair,
     /// handshake, rekey, replay window) -- see `wireguard::WgTunnel`.
     /// Shared (via `Arc`) with the `Link` this handle was built from
@@ -472,52 +476,68 @@ impl LinkHandle {
     /// Every frame is encapsulated in order exactly as the
     /// per-packet path would, then all resulting datagrams go out through
     /// `sendmmsg(2)` (one syscall per kernel-accepted run instead of one
-    /// `sendto` each). Returns one result per input frame, same contract
-    /// as `wg_send_parts` (`Ok(carries_frame)` / `Err`), so the caller's
-    /// per-packet failure handling is unchanged.
+    /// `sendto` each). `frame(i)` gives frame `i`'s header and payload for
+    /// `i in 0..n`. Leaves one result per input frame in
+    /// `scratch.results`, same contract as `wg_send_parts`
+    /// (`Ok(carries_frame)` / `Err`), so the caller's per-packet failure
+    /// handling is unchanged. Reuses `scratch`'s buffers: no per-packet
+    /// allocation once they have grown to the batch size.
     /// `gso` additionally coalesces equal-size runs via `UDP_SEGMENT`.
-    pub async fn wg_send_batch(
+    pub async fn wg_send_batch<'a>(
         &self,
-        frames: &[[&[u8]; 2]],
+        n: usize,
+        frame: impl Fn(usize) -> [&'a [u8]; 2],
         gso: bool,
-    ) -> (Vec<Result<bool>>, SendmmsgStats) {
+        scratch: &mut TxBatchScratch,
+    ) -> SendmmsgStats {
+        let TxBatchScratch {
+            results,
+            datagrams,
+            slot,
+        } = scratch;
+        results.clear();
+        slot.clear();
         let Some(remote) = self.remote else {
-            let errs = frames
-                .iter()
-                .map(|_| {
-                    Err(MlvpnError::Protocol(format!(
-                        "wg_send: link '{}' has no remote address to send to yet",
-                        self.config.name
-                    )))
-                })
-                .collect();
-            return (errs, SendmmsgStats::default());
+            for _ in 0..n {
+                results.push(Err(MlvpnError::Protocol(format!(
+                    "wg_send: link '{}' has no remote address to send to yet",
+                    self.config.name
+                ))));
+            }
+            return SendmmsgStats::default();
         };
-        let mut results: Vec<Result<bool>> = Vec::with_capacity(frames.len());
-        let mut datagrams: Vec<Vec<u8>> = Vec::with_capacity(frames.len());
-        let mut slot: Vec<usize> = Vec::with_capacity(frames.len());
-        for (i, parts) in frames.iter().enumerate() {
-            match self.wg.encapsulate_parts(&parts[..]) {
-                Ok((datagram, carries)) => {
+        // `datagrams` keeps every buffer (and its capacity) from earlier
+        // batches; only the first `used` hold this batch's output.
+        let mut used = 0;
+        for i in 0..n {
+            if used == datagrams.len() {
+                datagrams.push(Vec::with_capacity(2048));
+            }
+            debug_assert!(used < datagrams.len());
+            match self
+                .wg
+                .encapsulate_parts_into(&frame(i), &mut datagrams[used])
+            {
+                Ok(carries) => {
                     results.push(Ok(carries));
-                    datagrams.push(datagram);
                     slot.push(i);
+                    used += 1;
                 }
                 Err(e) => results.push(Err(e)),
             }
         }
         let socket = self.current_socket().await;
         let (outcomes, stats) = if gso {
-            sendmmsg_gso_all(&socket, remote, &datagrams).await
+            sendmmsg_gso_all(&socket, remote, &datagrams[..used]).await
         } else {
-            sendmmsg_all(&socket, remote, &datagrams).await
+            sendmmsg_all(&socket, remote, &datagrams[..used]).await
         };
         for (k, outcome) in outcomes.into_iter().enumerate() {
             if let Err(e) = outcome {
                 results[slot[k]] = Err(MlvpnError::Io(e));
             }
         }
-        (results, stats)
+        stats
     }
 
     /// Receive one raw datagram off this link's *current* socket and
@@ -551,6 +571,89 @@ impl LinkHandle {
         let mut frame = Vec::new();
         let from = self.wg_recv_into(&mut buf, &mut frame).await?;
         Ok((frame, from))
+    }
+
+    /// Batched form of `wg_recv_into` for `tunnel::link_receiver`: waits
+    /// for at least one datagram, then takes up to `RECV_BATCH_MAX` with one
+    /// `recvmmsg(2)` and decrypts them all under one tunnel lock, in arrival
+    /// order. Handshake/keepalive replies go back to each datagram's own
+    /// sender, as in `wg_recv_into`. Returns once `batch.events` holds at
+    /// least one decrypted frame or per-datagram error; a socket error with
+    /// nothing received yet is returned as `Err`. Falls back to one
+    /// `recv_from` per call for good if the kernel lacks `recvmmsg`.
+    pub async fn wg_recv_batch(&self, batch: &mut RxBatch) -> Result<()> {
+        batch.events.clear();
+        loop {
+            // Created before reading the socket so a swap in between still
+            // wakes us (a `Notified` sees `notify_waiters` from creation on).
+            let swapped = self.socket_swapped.notified();
+            tokio::pin!(swapped);
+            let socket = self.current_socket().await;
+            let n = if batch.mmsg {
+                let fd = socket.as_raw_fd();
+                let RxBatch {
+                    bufs, lens, addrs, ..
+                } = &mut *batch;
+                let r = tokio::select! {
+                    r = socket.async_io(tokio::io::Interest::READABLE, || {
+                        raw_recvmmsg(fd, bufs, lens, addrs)
+                    }) => r,
+                    _ = &mut swapped => continue,
+                };
+                match r {
+                    Ok(n) => n,
+                    Err(e) if e.raw_os_error() == Some(libc::ENOSYS) => {
+                        tracing::warn!(
+                            link = %self.config.name,
+                            "recvmmsg(2) not supported here; falling back to per-packet recv_from"
+                        );
+                        batch.mmsg = false;
+                        continue;
+                    }
+                    Err(e) => return Err(MlvpnError::Io(e)),
+                }
+            } else {
+                let (n, from) = tokio::select! {
+                    r = socket.recv_from(&mut batch.bufs[0]) => r.map_err(MlvpnError::Io)?,
+                    _ = &mut swapped => continue,
+                };
+                batch.lens[0] = n;
+                batch.addrs[0] = Some(from);
+                1
+            };
+            let RxBatch {
+                bufs,
+                lens,
+                frames,
+                kinds,
+                ..
+            } = &mut *batch;
+            self.wg.decapsulate_batch(
+                bufs[..n].iter().zip(&lens[..n]).map(|(b, &len)| &b[..len]),
+                frames,
+                kinds,
+            );
+            for (i, kind) in batch.kinds.drain(..).enumerate() {
+                let Some(from) = batch.addrs[i] else {
+                    // Not an IPv4/IPv6 source: nothing a WireGuard peer
+                    // could have sent; nothing to reply to either.
+                    continue;
+                };
+                match kind {
+                    Ok(wireguard::DecapsulateKind::Frame) => batch.events.push(Ok((i, from))),
+                    Ok(wireguard::DecapsulateKind::SendReply(reply)) => {
+                        if let Err(e) = socket.send_to(&reply, from).await {
+                            batch.events.push(Err(MlvpnError::Io(e)));
+                        }
+                    }
+                    Ok(wireguard::DecapsulateKind::Consumed) => {}
+                    Err(e) => batch.events.push(Err(e)),
+                }
+            }
+            if !batch.events.is_empty() {
+                return Ok(());
+            }
+        }
     }
 
     /// Hot-path form of `wg_recv`: the receive loop owns `buf` (raw
@@ -658,6 +761,7 @@ impl LinkHandle {
                 .await
                 .map_err(|e| MlvpnError::Config(format!("reconnect task panicked: {e}")))??;
         *self.socket.write().await = new_socket;
+        self.socket_swapped.notify_waiters();
         Ok(())
     }
 }
@@ -782,6 +886,10 @@ pub struct Link {
     pub config: LinkConfig,
     socket: SharedSocket,
     reconnect_lock: Arc<AsyncMutex<()>>,
+    /// Fired whenever this link's socket is replaced (`reconnect`,
+    /// `switch_family`) so a receive already parked on the old socket
+    /// wakes and picks up the new one.
+    socket_swapped: Arc<Notify>,
     pub remote: Option<SocketAddr>,
     pub state: LinkState,
     /// When `state` last changed, per `monitor::update_link_state` --
@@ -910,6 +1018,7 @@ impl Link {
             config,
             socket: Arc::new(AsyncRwLock::new(socket)),
             reconnect_lock: Arc::new(AsyncMutex::new(())),
+            socket_swapped: Arc::new(Notify::new()),
             remote,
             state: LinkState::Probing,
             state_since: Instant::now(),
@@ -954,6 +1063,7 @@ impl Link {
             remote: self.remote,
             socket: self.socket.clone(),
             reconnect_lock: self.reconnect_lock.clone(),
+            socket_swapped: self.socket_swapped.clone(),
             wg: self.wg.clone(),
         }
     }
@@ -975,6 +1085,7 @@ impl Link {
             remote: Some(*remote),
             socket: socket.clone(),
             reconnect_lock: Arc::new(AsyncMutex::new(())),
+            socket_swapped: Arc::new(Notify::new()),
             // Same underlying WireGuard session as `handle()` above --
             // the alternate is only a not-yet-confirmed *address*/socket
             // for this same link, not a second independent tunnel/peer.
@@ -1075,6 +1186,35 @@ impl Link {
         self.commit_remote(winner);
     }
 
+    /// Whether this link can ever switch address family at runtime: a
+    /// client-mode link whose `remote_addr` is a hostname (a literal
+    /// address has only one family) and whose family is not pinned by
+    /// `local_addr`.
+    pub fn family_fallback_eligible(&self) -> bool {
+        self.config.local_addr.is_none()
+            && self
+                .config
+                .remote_addr
+                .as_deref()
+                .is_some_and(|r| r.parse::<SocketAddr>().is_err())
+    }
+
+    /// Swaps this link onto `remote` and `socket` (from a successful
+    /// `probe_other_family`): every existing handle sees the new socket on
+    /// its next send, the receive task is woken off the old one, and new
+    /// handles carry the new `remote`.
+    pub async fn switch_family(&mut self, remote: SocketAddr, socket: Arc<UdpSocket>) {
+        tracing::info!(
+            link = %self.config.name,
+            previous = ?self.remote,
+            now = %remote,
+            "link was down on its current address family and the other one answered; switching"
+        );
+        self.remote = Some(remote);
+        *self.socket.write().await = socket;
+        self.socket_swapped.notify_waiters();
+    }
+
     /// Feeds one received datagram through this link's `WgTunnel` and
     /// reports whether it was an authenticated answer (handshake
     /// response or data), sending any reply boringtun produced.
@@ -1123,6 +1263,86 @@ impl Link {
             );
             self.remote = Some(alt_remote);
             self.socket = alt_socket;
+        }
+    }
+}
+
+/// Runtime half of the dual-stack race (`Link::resolve_alternate` is the
+/// startup half). Re-resolves `handle`'s `remote_addr` and, if it has an
+/// address in the family `current` is not in, binds a socket for it and
+/// sends this link's WireGuard traffic there until the peer answers or
+/// `deadline` passes. Returns that address and socket if the peer
+/// answered, for `Link::switch_family`. A successful answer means the peer
+/// has also learned the new address (`handle_incoming` follows an
+/// authenticated packet's source), so both ends move together.
+pub async fn probe_other_family(
+    handle: &LinkHandle,
+    current: SocketAddr,
+    deadline: Duration,
+) -> Option<(SocketAddr, Arc<UdpSocket>)> {
+    let config = &handle.config;
+    let remote_addr = config.remote_addr.as_deref()?;
+    let candidates: Vec<SocketAddr> =
+        tokio::time::timeout(DNS_RESOLVE_TIMEOUT, tokio::net::lookup_host(remote_addr))
+            .await
+            .ok()?
+            .ok()?
+            .collect();
+    let alt = candidates
+        .into_iter()
+        .find(|a| a.is_ipv6() != current.is_ipv6())?;
+    let bind_config = config.clone();
+    let socket = match tokio::task::spawn_blocking(move || bind_socket(&bind_config, Some(alt)))
+        .await
+    {
+        Ok(Ok((socket, _))) => socket,
+        Ok(Err(e)) => {
+            tracing::debug!(link = %config.name, %alt, error = %e, "cannot bind for the other address family");
+            return None;
+        }
+        Err(_) => return None,
+    };
+
+    let mut frame = Vec::with_capacity(crate::protocol::HEADER_LEN);
+    crate::protocol::Header {
+        ptype: crate::protocol::PacketType::Keepalive,
+        link_id: handle.link_id,
+        seq: 0,
+    }
+    .encode(&mut frame);
+    let mut buf = vec![0u8; u16::MAX as usize + 64];
+    let mut scratch = Vec::with_capacity(2048);
+    let mut retry = tokio::time::interval(Duration::from_millis(500));
+    let give_up = tokio::time::sleep(deadline);
+    tokio::pin!(give_up);
+    loop {
+        tokio::select! {
+            _ = retry.tick() => {
+                // A fresh keepalive each round (new nonce), plus whatever
+                // handshake retry boringtun wants, so this works whether
+                // the session is still valid or needs re-establishing.
+                if let Ok((d, _)) = handle.wg.encapsulate(&frame) {
+                    let _ = socket.send_to(&d, alt).await;
+                }
+                if let Some(d) = handle.wg.tick() {
+                    let _ = socket.send_to(&d, alt).await;
+                }
+            }
+            r = socket.recv_from(&mut buf) => {
+                let Ok((n, from)) = r else { continue };
+                if from != alt {
+                    continue;
+                }
+                match handle.wg.decapsulate_into(&buf[..n], &mut scratch) {
+                    Ok(wireguard::DecapsulateKind::SendReply(reply)) => {
+                        let _ = socket.send_to(&reply, from).await;
+                        return Some((alt, socket));
+                    }
+                    Ok(wireguard::DecapsulateKind::Frame) => return Some((alt, socket)),
+                    _ => {}
+                }
+            }
+            _ = &mut give_up => return None,
         }
     }
 }
@@ -1800,6 +2020,109 @@ fn raw_sendmmsg(
     }
 }
 
+/// Most datagrams one `recvmmsg(2)` call takes (`LinkHandle::wg_recv_batch`),
+/// the same as the TX worker's batch (`TX_WORKER_BATCH`).
+pub const RECV_BATCH_MAX: usize = 32;
+
+/// Every buffer `LinkHandle::wg_recv_batch` needs, owned by the link's
+/// receive task and reused for its whole lifetime. Each raw slot holds any
+/// legitimate UDP datagram (65 535 bytes plus slack), so nothing is ever
+/// truncated: about 2 MiB per link, allocated once.
+pub struct RxBatch {
+    bufs: Vec<Vec<u8>>,
+    lens: [usize; RECV_BATCH_MAX],
+    addrs: [Option<SocketAddr>; RECV_BATCH_MAX],
+    /// Decrypted frame per datagram slot; read through `RxBatch::frame`.
+    frames: Vec<Vec<u8>>,
+    kinds: Vec<Result<wireguard::DecapsulateKind>>,
+    /// After `wg_recv_batch`: in arrival order, `Ok((slot, from))` for each
+    /// decrypted frame (`frame(slot)`) or the error for a rejected datagram.
+    pub events: Vec<Result<(usize, SocketAddr)>>,
+    mmsg: bool,
+}
+
+impl Default for RxBatch {
+    fn default() -> Self {
+        Self {
+            bufs: (0..RECV_BATCH_MAX)
+                .map(|_| vec![0u8; u16::MAX as usize + 64])
+                .collect(),
+            lens: [0; RECV_BATCH_MAX],
+            addrs: [None; RECV_BATCH_MAX],
+            frames: (0..RECV_BATCH_MAX)
+                .map(|_| Vec::with_capacity(2048))
+                .collect(),
+            kinds: Vec::with_capacity(RECV_BATCH_MAX),
+            events: Vec::with_capacity(RECV_BATCH_MAX),
+            mmsg: true,
+        }
+    }
+}
+
+impl RxBatch {
+    pub fn frame(&self, slot: usize) -> &[u8] {
+        &self.frames[slot]
+    }
+}
+
+/// One non-blocking `recvmmsg(2)` into `bufs`: returns how many datagrams
+/// arrived (at least one), with each one's length in `lens` and source in
+/// `addrs` (`None` for a non-IP source family). `WouldBlock` when none.
+fn raw_recvmmsg(
+    fd: std::os::unix::io::RawFd,
+    bufs: &mut [Vec<u8>],
+    lens: &mut [usize; RECV_BATCH_MAX],
+    addrs: &mut [Option<SocketAddr>; RECV_BATCH_MAX],
+) -> std::io::Result<usize> {
+    let n = bufs.len().min(RECV_BATCH_MAX);
+    // SAFETY: all-zero is a valid value for these plain C structs.
+    let mut iovs: [libc::iovec; RECV_BATCH_MAX] = unsafe { std::mem::zeroed() };
+    let mut msgs: [libc::mmsghdr; RECV_BATCH_MAX] = unsafe { std::mem::zeroed() };
+    let mut names: [libc::sockaddr_storage; RECV_BATCH_MAX] = unsafe { std::mem::zeroed() };
+    for k in 0..n {
+        iovs[k].iov_base = bufs[k].as_mut_ptr() as *mut libc::c_void;
+        iovs[k].iov_len = bufs[k].len();
+        let hdr = &mut msgs[k].msg_hdr;
+        hdr.msg_name = &mut names[k] as *mut _ as *mut libc::c_void;
+        hdr.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+        hdr.msg_iov = &mut iovs[k];
+        hdr.msg_iovlen = 1;
+    }
+    // SAFETY: `msgs[..n]` point at live buffers that outlive the call;
+    // `fd` is open for the call's duration.
+    let rc = unsafe {
+        libc::recvmmsg(
+            fd,
+            msgs.as_mut_ptr(),
+            n as libc::c_uint,
+            libc::MSG_DONTWAIT,
+            std::ptr::null_mut(),
+        )
+    };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let got = rc as usize;
+    for k in 0..got {
+        lens[k] = msgs[k].msg_len as usize;
+        // SAFETY: the kernel filled `names[k]` and its length.
+        let addr = unsafe { socket2::SockAddr::new(names[k], msgs[k].msg_hdr.msg_namelen) };
+        addrs[k] = addr.as_socket();
+    }
+    Ok(got)
+}
+
+/// Buffers `LinkHandle::wg_send_batch` reuses from one batch to the next,
+/// owned by the link's TX worker, so a steady stream of batches allocates
+/// nothing per packet. After a call, `results` holds one outcome per frame
+/// in the batch (`Ok(carries_frame)` / `Err`), in order.
+#[derive(Default)]
+pub struct TxBatchScratch {
+    pub results: Vec<Result<bool>>,
+    datagrams: Vec<Vec<u8>>,
+    slot: Vec<usize>,
+}
+
 /// Send every datagram in `dgs` to `remote` through `sendmmsg(2)`,
 /// waiting for socket writability like `send_to` does. One outcome per
 /// datagram, in order: a datagram the kernel rejected gets that error and
@@ -1993,6 +2316,7 @@ pub(crate) async fn test_link_for_state_transitions(state: LinkState, stats: Lin
         },
         socket: Arc::new(AsyncRwLock::new(Arc::new(socket))),
         reconnect_lock: Arc::new(AsyncMutex::new(())),
+        socket_swapped: Arc::new(Notify::new()),
         remote: None,
         state,
         state_since: Instant::now(),
@@ -2243,6 +2567,7 @@ mod tests {
             config: test_link_config(None, None),
             socket: Arc::new(AsyncRwLock::new(Arc::new(primary_socket))),
             reconnect_lock: Arc::new(AsyncMutex::new(())),
+            socket_swapped: Arc::new(Notify::new()),
             remote: Some(primary_remote),
             state: LinkState::Probing,
             state_since: Instant::now(),
@@ -2344,6 +2669,7 @@ mod tests {
             config: test_link_config(None, None),
             socket: Arc::new(AsyncRwLock::new(Arc::new(socket))),
             reconnect_lock: Arc::new(AsyncMutex::new(())),
+            socket_swapped: Arc::new(Notify::new()),
             remote: None,
             state: LinkState::Probing,
             state_since: Instant::now(),
@@ -2482,6 +2808,51 @@ mod tests {
                 .unwrap();
             assert_eq!(&buf[..n], &want[..]);
         }
+    }
+
+    #[tokio::test]
+    async fn raw_recvmmsg_returns_a_batch_in_order_with_each_source() {
+        let rx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let to = rx.local_addr().unwrap();
+        // 40 > RECV_BATCH_MAX: the first call must stop at the batch size.
+        let mut sent = Vec::new();
+        for i in 0u32..40 {
+            let src = if i % 2 == 0 { &a } else { &b };
+            let mut v = i.to_be_bytes().to_vec();
+            v.extend(std::iter::repeat_n(i as u8, i as usize * 7));
+            src.send_to(&v, to).await.unwrap();
+            sent.push((v, src.local_addr().unwrap()));
+        }
+        let mut batch = RxBatch::default();
+        let mut got = Vec::new();
+        while got.len() < sent.len() {
+            tokio::time::timeout(Duration::from_secs(2), rx.readable())
+                .await
+                .expect("nothing readable")
+                .unwrap();
+            let fd = rx.as_raw_fd();
+            let RxBatch {
+                bufs, lens, addrs, ..
+            } = &mut batch;
+            match rx.try_io(tokio::io::Interest::READABLE, || {
+                raw_recvmmsg(fd, bufs, lens, addrs)
+            }) {
+                Ok(n) => {
+                    assert!(n <= RECV_BATCH_MAX);
+                    for k in 0..n {
+                        got.push((
+                            batch.bufs[k][..batch.lens[k]].to_vec(),
+                            batch.addrs[k].unwrap(),
+                        ));
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => panic!("recvmmsg: {e}"),
+            }
+        }
+        assert_eq!(got, sent);
     }
 
     #[tokio::test]

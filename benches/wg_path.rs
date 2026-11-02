@@ -103,9 +103,11 @@ fn main() {
         println!("--- payload {payload_len} B (inner IP packet) ---");
         let payload = vec![0xA5u8; payload_len];
 
-        // TX as send_scheduled does it: tun_reader's to_vec, frame build, encapsulate.
+        // TX as the sendmmsg worker does it: tun_reader's to_vec, header,
+        // encapsulate into a reused datagram buffer (`TxBatchScratch`).
         let (client, server) = pair();
-        measure("tx: to_vec+encapsulate_parts", iters, |seq| {
+        let mut dg = Vec::with_capacity(2048);
+        measure("tx: to_vec+encapsulate_into", iters, |seq| {
             let plaintext = payload.to_vec();
             let header = Header {
                 ptype: PacketType::Data,
@@ -113,8 +115,32 @@ fn main() {
                 seq,
             }
             .to_bytes();
-            let (dg, carried) = client.encapsulate_parts(&[&header, &plaintext]).unwrap();
-            black_box((dg, carried));
+            let carried = client
+                .encapsulate_parts_into(&[&header, &plaintext], &mut dg)
+                .unwrap();
+            black_box((dg.len(), carried));
+        });
+
+        // Same, with the plaintext copy drawn from a mutex free list instead
+        // of the allocator: the pool tun_reader would need to reach 0
+        // allocs/pkt. Kept as a yardstick for whether that pool pays off.
+        let (client, _server) = pair();
+        let pool = std::sync::Mutex::new(Vec::<Vec<u8>>::new());
+        measure("tx: pooled+encapsulate_into", iters, |seq| {
+            let mut plaintext = pool.lock().unwrap().pop().unwrap_or_default();
+            plaintext.clear();
+            plaintext.extend_from_slice(&payload);
+            let header = Header {
+                ptype: PacketType::Data,
+                link_id: 0,
+                seq,
+            }
+            .to_bytes();
+            let carried = client
+                .encapsulate_parts_into(&[&header, &plaintext], &mut dg)
+                .unwrap();
+            black_box((dg.len(), carried));
+            pool.lock().unwrap().push(plaintext);
         });
 
         // RX as link_receiver/handle_incoming do it: wg_recv's scratch buffer,
