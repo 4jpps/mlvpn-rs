@@ -161,7 +161,12 @@ pub struct SchedulerConfig {
     #[serde(default = "default_up_threshold")]
     pub up_threshold: u32,
     /// Max time the receive-side reorder buffer will hold a gap open before
-    /// giving up and delivering what it has, in milliseconds.
+    /// giving up and delivering what it has, in milliseconds. This is also
+    /// the worst-case latency one lost packet adds: everything behind the
+    /// gap waits up to this long before `reorder_flush` releases it. The
+    /// default 50 ms covers ordinary cross-link skew; lower it for
+    /// latency-sensitive traffic over links with similar RTTs, raise it
+    /// only if links differ a lot in RTT and reordering shows in the stats.
     #[serde(default = "default_reorder_ms")]
     pub reorder_window_ms: u64,
     /// EWMA smoothing factor (0..1) for latency/jitter/loss stats. Higher =

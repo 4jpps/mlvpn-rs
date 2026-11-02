@@ -173,3 +173,10 @@ interpreting results:
   first few seconds; turning on active bandwidth probing gets the
   scheduler a real measurement much sooner instead of waiting on
   passive traffic to reveal it.
+- **`bandwidth_cap_mbps` is not enforced on the primary link.** With
+  `scheduler.primary_link_mode` or `scheduler.follow_peer_primary` on,
+  whichever link is primary sends unmetered: the cap only applies where
+  traffic is split across links. A cap still lowers that link's score,
+  so it is less likely to be picked as primary, but if it is picked the
+  cap does not protect it. If a metered link must never exceed its cap,
+  leave both primary modes off.

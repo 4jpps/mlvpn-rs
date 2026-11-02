@@ -102,8 +102,8 @@ fn clamp_ipv4(packet: &mut [u8], mtu: u16) {
         return;
     }
 
-    let src = packet[12..16].to_vec();
-    let dst = packet[16..20].to_vec();
+    let src: [u8; 4] = packet[12..16].try_into().unwrap();
+    let dst: [u8; 4] = packet[16..20].try_into().unwrap();
     let checksum = tcp_checksum_v4(&src, &dst, &packet[tcp_start..]);
     packet[tcp_start + 16..tcp_start + 18].copy_from_slice(&checksum.to_be_bytes());
 }
@@ -149,8 +149,8 @@ fn clamp_ipv6(packet: &mut [u8], mtu: u16) {
         return;
     }
 
-    let src = packet[8..24].to_vec();
-    let dst = packet[24..40].to_vec();
+    let src: [u8; 16] = packet[8..24].try_into().unwrap();
+    let dst: [u8; 16] = packet[24..40].try_into().unwrap();
     let checksum = tcp_checksum_v6(&src, &dst, &packet[tcp_start..]);
     packet[tcp_start + 16..tcp_start + 18].copy_from_slice(&checksum.to_be_bytes());
 }

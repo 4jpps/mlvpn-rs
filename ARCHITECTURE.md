@@ -331,7 +331,7 @@ preferred (`link::pick_remote_addr`). This is distinct from
 `tunnel.address6` (§12), which is about the TUN interface's own
 address, not the transport sockets between the two `mlvpnd` instances.
 
-**Dual-stack ambiguity: resolved at startup, not at runtime.** An
+**Dual-stack ambiguity: resolved at startup, re-checked at runtime.** An
 `AAAA` record existing doesn't mean that IPv6 path actually works
 end-to-end -- residential/consumer ISPs with a broken or absent IPv6
 route are common enough that blindly committing to "IPv6 if present"
@@ -347,12 +347,23 @@ whose IPv6 guess is wrong comes up on IPv4 regardless of what the other
 links do. Verified by `tests/veth_dualstack_alternate_failover.rs`
 (root-only, so `#[ignore]`d; passed 2026-11-02).
 
-**Known gap:** the choice is made once. If the committed family stops
-working later (for example an ISP's IPv6 breaks while IPv4 still works)
-the link does not switch back to the other family on its own; it stays
-down until `mlvpnd` restarts and races again. Pin the family with
-`local_addr` (`"0.0.0.0"` or `"::"`) where that matters more than
-automatic selection.
+**Runtime fallback.** If the committed family stops working later (an
+ISP's IPv6 breaks while IPv4 still works, or the reverse),
+`tunnel::family_fallback_watch` notices the link has been out of `Up`
+for `FAMILY_FALLBACK_AFTER` (30 s), re-resolves `remote_addr`, and
+`link::probe_other_family` sends this link's WireGuard traffic to the
+other family's address from a freshly bound socket for up to 10 s. If
+the peer answers, `Link::switch_family` swaps the socket and `remote` in
+place (every handle sees the new socket on its next send, and the
+receive task is woken off the old one through `socket_swapped`). The
+peer follows on its own: it learns the new source address from the
+first authenticated packet, so this needs a peer whose link socket
+takes both families (`dual_stack = true` on the server). Probes run at
+most once a minute per link, only for a hostname `remote_addr` with no
+`local_addr`; a link that is up or admin-disabled is never touched.
+Verified by `tests/veth_dualstack_runtime_fallback.rs` (root-only,
+`#[ignore]`d). Pin the family with `local_addr` (`"0.0.0.0"` or
+`"::"`) to opt out.
 
 ## 7. Receive-side reordering
 
@@ -601,17 +612,19 @@ retained `CAP_NET_ADMIN` and performs every `SIOCSIFMTU` on the
 daemon's behalf. That indirection is unnecessary under model 2 and
 harmless there. See §6 and §8.
 
-**Peer MTU is not negotiated.** Each end computes its MTU from its own
-local links, independently. Bonding genuinely asymmetric hardware (an
-LTE modem at ~1428 on one end, plain Ethernet at 1500 on the other) can
-therefore leave the two ends on different tunnel MTUs. MSS clamping
-keeps TCP correct in both directions, but UDP and ICMP large enough to
-fit the bigger side and not the smaller are silently discarded on
-arrival. Real negotiation -- each side learning the peer's MTU over the
-existing periodic peer version exchange and using `min(local, peer)`
-only where it actually needs to -- is the correct fix and is planned;
-it is deliberately not addressed by capping both ends down by hand,
-which would throw away capacity the faster link really has.
+**Peer MTU is negotiated.** Each end computes what its own links can
+carry (`local_capability_mtu`) and advertises it in the periodic,
+authenticated `VersionInfo` exchange; `control::mtu_monitor_loop` then
+applies `negotiate_tunnel_mtu(local, peer, floor)` = `min(local, peer)`,
+never below this side's own address-family floor. Both ends therefore
+converge on the lower of the two, so asymmetric hardware (an LTE modem
+at ~1428 on one end, Ethernet at 1500 on the other) no longer leaves
+large UDP/ICMP that fits one side silently dropped by the other. A peer
+too old to send the field (wire value `0`) counts as "no opinion" and
+the local value is used. The local value is primary-link-aware in
+`primary_link_mode`. `mlvpn-tui`'s Session panel shows the peer's
+advertised capability and its applied MTU separately. Verified by
+`tests/veth_primary_mtu.rs` and `tests/veth_mtu_monitor.rs`.
 
 **TCP MSS clamping** (on by default). Adaptive MTU alone only bounds
 the tunnel's own outer packet size; individual TCP connections
