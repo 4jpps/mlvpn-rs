@@ -12,7 +12,11 @@ design, and `ARCHITECTURE.md` covers the system as a whole.
 
 ## [Unreleased]
 
-_Beta10/11: per-link `dual_stack` for server links (below; beta10 failed CI on formatting only). Beta8/9: `[control] group_access` (below); beta9 also serializes the umask-around-bind sections so the stats and command sockets can't race. Shipping in the 0.7.7-beta7 build: the security and handshake fixes directly below. Beta6: the rebuilt automatic-report trigger (outage / flap / degraded classes, one ticket per event). Earlier betas: the event-based reports (beta4), `tx_send_mode` (beta3)._
+_Beta12: `tx_send_mode` defaults to `sendmmsg` (review MLV-3); dual-stack docs corrected (MLV-4). Beta10/11: per-link `dual_stack` for server links (below; beta10 failed CI on formatting only). Beta8/9: `[control] group_access` (below); beta9 also serializes the umask-around-bind sections so the stats and command sockets can't race. Shipping in the 0.7.7-beta7 build: the security and handshake fixes directly below. Beta6: the rebuilt automatic-report trigger (outage / flap / degraded classes, one ticket per event). Earlier betas: the event-based reports (beta4), `tx_send_mode` (beta3)._
+
+### Changed
+
+- **`tx_send_mode` now defaults to `sendmmsg`.** The measured +37% packet rate (53k -> 73k pps on the production host) ships by default; set `tx_send_mode = "sendto"` to opt out. A kernel without `sendmmsg` still falls back to `sendto` automatically, and `sendmmsg_gso` stays opt-in. File: `src/config.rs`.
 
 ### Added
 
