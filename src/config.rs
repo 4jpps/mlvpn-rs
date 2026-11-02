@@ -1450,14 +1450,23 @@ mod tests {
         let mut cfg = minimal_valid_config();
         cfg.links[0].dual_stack = true;
         // Client mode (the fixture's default), with a remote_addr: rejected.
-        assert!(cfg.validate().unwrap_err().to_string().contains("dual_stack"));
+        assert!(
+            cfg.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("dual_stack")
+        );
         cfg.mode = Mode::Server;
         assert!(cfg.validate().is_err(), "remote_addr set: still rejected");
         cfg.links[0].remote_addr = None;
         cfg.validate().expect("server link without remote_addr");
         cfg.links[0].local_addr = Some("::".into());
-        cfg.validate().expect("\"::\" is what dual_stack binds anyway");
+        cfg.validate()
+            .expect("\"::\" is what dual_stack binds anyway");
         cfg.links[0].local_addr = Some("204.52.221.1".into());
-        assert!(cfg.validate().is_err(), "a specific local_addr can't be dual-stack");
+        assert!(
+            cfg.validate().is_err(),
+            "a specific local_addr can't be dual-stack"
+        );
     }
 }

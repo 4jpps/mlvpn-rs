@@ -1430,7 +1430,9 @@ fn bind_socket(
         // `dual_stack` is the deliberate exception: one server-side
         // socket on `[::]` that takes IPv4 peers too (see its doc
         // comment on `LinkConfig`).
-        socket.set_only_v6(!config.dual_stack).map_err(MlvpnError::Io)?;
+        socket
+            .set_only_v6(!config.dual_stack)
+            .map_err(MlvpnError::Io)?;
     }
 
     #[cfg(target_os = "linux")]
@@ -2627,7 +2629,11 @@ mod tests {
         }
         got.sort();
         assert_eq!(got[0].0, b"four");
-        assert!(got[0].1.to_string().starts_with("[::ffff:127.0.0.1]"), "{:?}", got[0].1);
+        assert!(
+            got[0].1.to_string().starts_with("[::ffff:127.0.0.1]"),
+            "{:?}",
+            got[0].1
+        );
         assert_eq!(got[1].0, b"six");
         // Replies go back the same way, IPv4-mapped included.
         sock.send_to(b"ok", got[0].1).await.unwrap();
