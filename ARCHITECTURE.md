@@ -331,29 +331,28 @@ preferred (`link::pick_remote_addr`). This is distinct from
 `tunnel.address6` (§12), which is about the TUN interface's own
 address, not the transport sockets between the two `mlvpnd` instances.
 
-**Dual-stack ambiguity, a known gap since the WireGuard rewrite.** An
+**Dual-stack ambiguity: resolved at startup, not at runtime.** An
 `AAAA` record existing doesn't mean that IPv6 path actually works
 end-to-end -- residential/consumer ISPs with a broken or absent IPv6
 route are common enough that blindly committing to "IPv6 if present"
-can strand a link. `link::Link::alternate` still holds the untried
-other family alongside the chosen primary (`link::pick_remote_addr`),
-but the active mechanism that used to recover from a wrong guess --
-the old shared-session design's `tunnel::perform_client_handshake`
-racing both families during the tunnel-wide initial handshake, with
-`tunnel::resolve_remaining_alternates` following up for every link that
-didn't win that race -- depended entirely on there being one shared,
-tunnel-wide handshake moment to race during. That moment no longer
-exists: each link now handshakes lazily and independently, on its own
-schedule, via its own `WgTunnel` (see §2, §4), so there is nothing left
-to hang a "race both families once, right after the handshake" step
-off of. This has deliberately **not** been reimplemented as part of the
-WireGuard rewrite -- `Link::alternate`/`alternate_handle`/`commit_remote`
-still exist in `link.rs` but nothing in `tunnel.rs` calls them anymore
-(see that module's own doc comment for the full accounting). A link
-configured with a dual-stack `remote_addr` now simply uses whichever
-family `pick_remote_addr` guessed at bind time, with no runtime
-fallback if that guess is wrong -- worth reconsidering in a later task
-if this turns out to matter in practice.
+can strand a link. So when `remote_addr` resolves to both families and
+`local_addr` doesn't pin one, `link::pick_remote_addr` keeps the other
+family as `Link::alternate`, and `tunnel::run` calls
+`Link::resolve_alternate` for every link (in parallel, before any
+per-link task takes a `handle()`): the link sends its first WireGuard
+handshake initiation to both addresses and commits (`commit_remote`) to
+whichever answers first, keeping the primary if neither answers within
+`ALTERNATE_RACE_DEADLINE` (10 s). Each link races on its own, so a link
+whose IPv6 guess is wrong comes up on IPv4 regardless of what the other
+links do. Verified by `tests/veth_dualstack_alternate_failover.rs`
+(root-only, so `#[ignore]`d; passed 2026-11-02).
+
+**Known gap:** the choice is made once. If the committed family stops
+working later (for example an ISP's IPv6 breaks while IPv4 still works)
+the link does not switch back to the other family on its own; it stays
+down until `mlvpnd` restarts and races again. Pin the family with
+`local_addr` (`"0.0.0.0"` or `"::"`) where that matters more than
+automatic selection.
 
 ## 7. Receive-side reordering
 

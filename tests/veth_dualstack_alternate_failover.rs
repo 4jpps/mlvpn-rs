@@ -1,18 +1,14 @@
-//! End-to-end test of `tunnel::resolve_remaining_alternates`, the fix
-//! for a real bug: a client-mode link whose `remote_addr` hostname
-//! resolves to both an `A` and `AAAA` record used to only get its own
-//! primary-vs-alternate family ambiguity resolved if it happened to be
-//! the *one* link whose reply won the tunnel's overall initial-handshake
-//! race across every configured link (see `perform_client_handshake`'s
-//! doc comment: the peer deduplicates every copy of that broadcast by
-//! `session_id`, so only the very first arrival, across *all* targets,
-//! ever gets a real reply -- every other link, and every other family on
-//! whichever link did win, gets nothing). Every *other* link used to
-//! just keep `pick_remote_addr`'s IPv6-preferred guess and silently
-//! drop its untested alternate -- if that guess happened to be wrong, in
-//! practice reported as "IPv6 is disabled on this interface, but the
-//! link is stuck trying to use it anyway," the link would sit in
-//! `Probing` forever, having never gotten a real chance to fail over.
+//! End-to-end test of the per-link address-family race at startup
+//! (`link::Link::resolve_alternate`, called for every link by
+//! `tunnel::run`): a client-mode link whose `remote_addr` hostname
+//! resolves to both an `A` and `AAAA` record must come up on whichever
+//! family actually answers, even when its IPv6-preferred first guess
+//! (`link::pick_remote_addr`) can never work and another link wins the
+//! race to bring the tunnel up first. The original bug (before the
+//! WireGuard rewrite, the race only ran for the link that won a
+//! tunnel-wide handshake) left such a link stuck in `Probing` forever,
+//! reported as "IPv6 is disabled on this interface, but the link is stuck
+//! trying to use it anyway."
 //!
 //! Reproduces exactly that shape without needing to actually disable
 //! IPv6 anywhere: link0 is a plain, fast, always-reachable IPv4 link
@@ -37,9 +33,8 @@
 //! manipulation of the veth interface itself.
 //!
 //! Asserts link1 still reaches "up" (via its IPv4 alternate, promoted by
-//! `resolve_remaining_alternates` after losing the initial race to
-//! link0) and that the client logged the alternate-promotion line for
-//! it.
+//! `Link::resolve_alternate`) and that the client logged the
+//! alternate-promotion line for it.
 //!
 //! See `tests/support/mod.rs`'s module doc comment for what this needs
 //! (root, `iproute2` incl. `tc`, the `mlvpn` system user). Run with:
@@ -141,7 +136,7 @@ async fn losing_link_still_fails_over_to_its_working_alternate_family() {
 
     // Bias the initial handshake race so link0 -- not link1's own IPv4
     // alternate -- reliably wins it, so this test deterministically
-    // exercises `resolve_remaining_alternates`'s *post*-handshake path
+    // exercises the per-link family race (`Link::resolve_alternate`)
     // rather than depending on which one happens to answer first.
     // link0 has no delay at all; even the 100ms round trip this adds is
     // trivially within `perform_client_handshake`'s 500ms per-attempt
@@ -273,14 +268,14 @@ async fn losing_link_still_fails_over_to_its_working_alternate_family() {
 
     // The real assertion: link1, which lost the initial handshake race
     // (per the netem delay bias above) and whose IPv6 primary can never
-    // work, should still reach 'up' -- via `resolve_remaining_alternates`
+    // work, should still reach 'up' -- via `Link::resolve_alternate`
     // promoting its IPv4 alternate after the fact, not by luck.
     poll_snapshot_until(&client_ctl, Duration::from_secs(30), |s| {
         link_is_up(s, "link1")
     })
     .await
     .expect(
-        "link1 never reached 'up' -- resolve_remaining_alternates should have promoted its \
+        "link1 never reached 'up' -- Link::resolve_alternate should have promoted its \
          IPv4 alternate after losing the initial handshake race to link0",
     );
 
