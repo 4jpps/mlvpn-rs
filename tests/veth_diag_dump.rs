@@ -346,13 +346,22 @@ async fn diag_dump_auto_watch_fires_on_real_loss() {
         "diagnostics_watch_loop never wrote an automatic dump file within 120s of real 60% loss",
     );
     let dump = std::fs::read_to_string(&path).expect("read automatic dump file");
+    // Trigger text as the v2 auto-report writes it (`control::describe_event`):
+    // "trigger: automatic" followed by one classified event line per link,
+    // e.g. "[FLAP] opened link 'link0' opened (event ...)" and its loss.
     assert!(
-        dump.contains("trigger: automatic: link 'link0' raw probe loss"),
+        dump.contains("trigger: automatic"),
         "missing automatic trigger line, got:\n{dump}"
     );
     assert!(
-        dump.contains("exceeded threshold 5.0%"),
-        "missing threshold detail in trigger line, got:\n{dump}"
+        ["[DEGRADED]", "[FLAP]", "[OUTAGE]"]
+            .iter()
+            .any(|class| dump.contains(&format!("{class} opened link 'link0'"))),
+        "missing a classified event line for link0, got:\n{dump}"
+    );
+    assert!(
+        dump.contains("peak loss this event:"),
+        "missing the event's loss detail, got:\n{dump}"
     );
 }
 
