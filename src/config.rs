@@ -502,15 +502,16 @@ impl Default for SchedulerConfig {
 /// Measured on the production cloud host (3-vCPU KVM guest, Comcast link,
 /// iperf3 -P16 -R BBR, 6 runs each): `sendmmsg` moved the link from ~53k to
 /// ~73k pps (+37%) with ~31% less send time per packet and no change in
-/// total CPU. It stays opt-in until it has soaked in production.
+/// total CPU. Default since 0.7.7-beta12 (review item MLV-3); `sendto` stays
+/// available, and an `ENOSYS` kernel falls back to it automatically.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TxSendMode {
-    /// One `sendto(2)` per packet (default).
-    #[default]
+    /// One `sendto(2)` per packet.
     Sendto,
     /// One `sendmmsg(2)` per TX-worker batch (up to 32 packets). Encryption
-    /// and per-packet failure handling are identical to `sendto`.
+    /// and per-packet failure handling are identical to `sendto` (default).
+    #[default]
     Sendmmsg,
     /// EXPERIMENTAL. `sendmmsg(2)` as above, but runs of equal-size
     /// datagrams are additionally coalesced into one message with a
@@ -588,7 +589,7 @@ pub struct LinkConfig {
     pub bandwidth_cap_mbps: Option<f64>,
     #[serde(default = "default_probe_interval_ms")]
     pub probe_interval_ms: u64,
-    /// How this link's TX worker sends: `"sendto"` (default, one syscall per
+    /// How this link's TX worker sends: `"sendto"` (one syscall per
     /// packet) or `"sendmmsg"` (one syscall per worker batch). Per link, so
     /// it can be trialled on one link while the others stay on the default.
     /// Changing it needs a restart.
@@ -1361,9 +1362,9 @@ mod tests {
     }
 
     #[test]
-    fn tx_send_mode_defaults_to_sendto() {
+    fn tx_send_mode_defaults_to_sendmmsg() {
         let cfg: Config = toml::from_str(&link_toml("")).expect("parse");
-        assert_eq!(cfg.links[0].tx_send_mode, TxSendMode::Sendto);
+        assert_eq!(cfg.links[0].tx_send_mode, TxSendMode::Sendmmsg);
     }
 
     #[test]
