@@ -1275,6 +1275,13 @@ impl Link {
 /// answered, for `Link::switch_family`. A successful answer means the peer
 /// has also learned the new address (`handle_incoming` follows an
 /// authenticated packet's source), so both ends move together.
+///
+/// The switch is not lossless, by design: if the confirming datagram is a
+/// data frame rather than a handshake reply, it is decrypted here (so the
+/// replay window has advanced past it) and then dropped, not handed to the
+/// receive pipeline. That is at most one frame per switchover, on a link
+/// that was already down and losing everything; routing it back into the
+/// reorder buffer from this task would add more risk than it removes.
 pub async fn probe_other_family(
     handle: &LinkHandle,
     current: SocketAddr,
@@ -2027,7 +2034,18 @@ pub const RECV_BATCH_MAX: usize = 32;
 /// Every buffer `LinkHandle::wg_recv_batch` needs, owned by the link's
 /// receive task and reused for its whole lifetime. Each raw slot holds any
 /// legitimate UDP datagram (65 535 bytes plus slack), so nothing is ever
-/// truncated: about 2 MiB per link, allocated once.
+/// truncated.
+///
+/// Memory cost, chosen deliberately: 32 slots x 65 599 bytes is about
+/// 2.06 MiB of raw buffers per link, plus 32 x 2 KiB frame buffers --
+/// roughly 2.1 MiB per link, allocated once (two links: ~4 MiB; a 30-link
+/// server: ~62 MiB). Sizing slots from the tunnel MTU instead would save
+/// most of that, but the live MTU can grow at runtime
+/// (`control::mtu_monitor_loop` resizes upward, up to `u16::MAX`), so it
+/// would need resizing the slots, `MSG_TRUNC` detection and a
+/// truncated-datagram counter to stay correct. Not worth it at the link
+/// counts this runs at; revisit (and make the batch depth a config key)
+/// if a many-link deployment ever needs the memory back.
 pub struct RxBatch {
     bufs: Vec<Vec<u8>>,
     lens: [usize; RECV_BATCH_MAX],

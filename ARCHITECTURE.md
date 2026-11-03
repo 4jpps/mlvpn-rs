@@ -75,6 +75,10 @@ buffer on each, well past the stock ~208KB Linux default that would
 otherwise silently drop packets under a fast link's real
 bandwidth-delay product -- see `docs/performance-tuning.md`), load each
 link's own keypair, drop privileges, then spawn the steady-state tasks.
+Memory to plan for: each link's receive task keeps about 2.1 MiB of
+batch buffers for its lifetime (32 datagram slots big enough for any
+UDP datagram; see `link::RxBatch` for why they are not sized from the
+MTU), so ~4 MiB for two links and ~62 MiB for thirty.
 Each link's `WgTunnel` handshakes lazily and independently the moment
 it has something to send or receives a peer's handshake attempt --
 there is no daemon-wide "wait for the handshake to complete" step, the
@@ -359,8 +363,14 @@ receive task is woken off the old one through `socket_swapped`). The
 peer follows on its own: it learns the new source address from the
 first authenticated packet, so this needs a peer whose link socket
 takes both families (`dual_stack = true` on the server). Probes run at
-most once a minute per link, only for a hostname `remote_addr` with no
-`local_addr`; a link that is up or admin-disabled is never touched.
+the first probe 30 s into an outage, then back off after each failure
+(1, 2, 5, 10, then every 30 minutes), resetting when the link comes up,
+is disabled, or a probe succeeds. After three failures in a row the link
+logs one warning naming the likely cause (the server link lacks
+`dual_stack = true`). Probes run only for a hostname `remote_addr` with
+no `local_addr`; a link that is up or admin-disabled is never touched.
+A switch drops at most one data frame (the one that confirmed the other
+family), by design.
 Verified by `tests/veth_dualstack_runtime_fallback.rs` (root-only,
 `#[ignore]`d). Pin the family with `local_addr` (`"0.0.0.0"` or
 `"::"`) to opt out.
