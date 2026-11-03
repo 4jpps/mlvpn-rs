@@ -559,51 +559,96 @@ const ALTERNATE_RACE_DEADLINE: Duration = Duration::from_secs(10);
 const FAMILY_FALLBACK_AFTER: Duration = Duration::from_secs(30);
 /// How long one runtime family probe waits for the peer to answer.
 const FAMILY_PROBE_DEADLINE: Duration = Duration::from_secs(10);
-/// Minimum gap between runtime family probes on one link.
-const FAMILY_RETRY_INTERVAL: Duration = Duration::from_secs(60);
+/// Consecutive failed probes after which `family_fallback_watch` warns
+/// (once per link) that the other family is probably not usable.
+const FAMILY_PROBE_WARN_AFTER: u32 = 3;
+
+/// Wait before the next runtime family probe after `failures` consecutive
+/// failed ones: none before the first, then 1, 2, 5, 10 and 30 minutes,
+/// staying at 30. Against a peer that can never answer on the other family
+/// (no `dual_stack` on the server) this settles at one probe every half
+/// hour instead of one a minute forever.
+fn family_probe_backoff(failures: u32) -> Duration {
+    const LADDER_MINS: [u64; 5] = [1, 2, 5, 10, 30];
+    match failures {
+        0 => Duration::ZERO,
+        n => Duration::from_secs(60 * LADDER_MINS[(n as usize - 1).min(LADDER_MINS.len() - 1)]),
+    }
+}
 
 /// Runtime address-family fallback for one dual-stack link (see
 /// `Link::family_fallback_eligible`). The startup race picks a family
 /// once; if that family later stops working (IPv6 dropped by a carrier,
 /// a v4 CGNAT path dying) while the other still works, this moves the
-/// link over instead of leaving it down until `mlvpnd` restarts. It only
-/// acts after the link has been out of `Up` for `FAMILY_FALLBACK_AFTER`,
-/// tries at most once per `FAMILY_RETRY_INTERVAL`, and never touches a
-/// link that is up or administratively disabled.
+/// link over instead of leaving it down until `mlvpnd` restarts.
+///
+/// It only acts after the link has been out of `Up` for
+/// `FAMILY_FALLBACK_AFTER`, backs off between failed probes
+/// (`family_probe_backoff`), and warns once per link after
+/// `FAMILY_PROBE_WARN_AFTER` failures in a row. The backoff resets when the
+/// link is up, administratively disabled (so re-enabling starts fresh), or
+/// a probe succeeds. Never touches a link that is up or disabled; probes run
+/// one at a time on this task, so at most one is in flight per link.
 async fn family_fallback_watch(idx: usize, links: Links) {
     if !links[idx].lock().await.family_fallback_eligible() {
         return;
     }
     let mut down_since: Option<Instant> = None;
     let mut last_try: Option<Instant> = None;
+    let mut failures = 0u32;
+    let mut warned = false;
     let mut tick = interval(Duration::from_secs(5));
     loop {
         tick.tick().await;
-        let (handle, current) = {
+        let (handle, current, name) = {
             let g = links[idx].lock().await;
             if g.state == LinkState::Up || g.admin_disabled {
                 down_since = None;
+                last_try = None;
+                failures = 0;
                 continue;
             }
             let Some(current) = g.remote else { continue };
-            (g.handle(), current)
+            (g.handle(), current, g.config.name.clone())
         };
         let since = *down_since.get_or_insert_with(Instant::now);
         if since.elapsed() < FAMILY_FALLBACK_AFTER
-            || last_try.is_some_and(|t| t.elapsed() < FAMILY_RETRY_INTERVAL)
+            || last_try.is_some_and(|t| t.elapsed() < family_probe_backoff(failures))
         {
             continue;
         }
         last_try = Some(Instant::now());
-        if let Some((alt, socket)) =
-            crate::link::probe_other_family(&handle, current, FAMILY_PROBE_DEADLINE).await
-        {
-            let mut g = links[idx].lock().await;
-            // Re-checked under the lock: the link may have recovered on
-            // its own while the probe ran.
-            if g.state != LinkState::Up && g.remote == Some(current) {
-                g.switch_family(alt, socket).await;
-                down_since = None;
+        match crate::link::probe_other_family(&handle, current, FAMILY_PROBE_DEADLINE).await {
+            Some((alt, socket)) => {
+                failures = 0;
+                let mut g = links[idx].lock().await;
+                // Re-checked under the lock: the link may have recovered on
+                // its own while the probe ran.
+                if g.state != LinkState::Up && g.remote == Some(current) {
+                    g.switch_family(alt, socket).await;
+                    down_since = None;
+                }
+            }
+            None => {
+                failures = failures.saturating_add(1);
+                tracing::debug!(
+                    link = %name,
+                    failures,
+                    next_try_in = ?family_probe_backoff(failures),
+                    "runtime address-family probe got no answer"
+                );
+                if failures >= FAMILY_PROBE_WARN_AFTER && !warned {
+                    warned = true;
+                    tracing::warn!(
+                        link = %name,
+                        current = %current,
+                        failures,
+                        "link is down and the other address family has not answered either; \
+                         if the peer should be reachable on it, its server link needs \
+                         dual_stack = true (setting local_addr here pins the family and stops \
+                         these probes). Retrying with backoff up to every 30 minutes."
+                    );
+                }
             }
         }
     }
@@ -5402,5 +5447,20 @@ mod rx_pipeline_tests {
             });
         }
         assert_eq!(dropped.load(Ordering::Relaxed), 3);
+    }
+}
+
+#[cfg(test)]
+mod family_fallback_tests {
+    use super::*;
+
+    #[test]
+    fn family_probe_backoff_climbs_the_ladder_and_caps() {
+        let mins = |n| family_probe_backoff(n).as_secs() / 60;
+        assert_eq!(family_probe_backoff(0), Duration::ZERO);
+        assert_eq!(
+            [1, 2, 3, 4, 5, 6, 50, u32::MAX].map(mins),
+            [1, 2, 5, 10, 30, 30, 30, 30]
+        );
     }
 }
