@@ -143,10 +143,13 @@ otherwise. Then:
   connection is closed unanswered. Make sure the proxy's address reaches
   this host unchanged: behind a router that NATs it, every device behind
   that router would share the address.
-- Every request without the header (or with a name not in
-  `allowed_subjects`) gets 403, loopback included, so a local user can't
-  skip the check. Repeated copies of the header, `Host`, `Origin`,
-  `Content-Type` or `X-MLVPN-Action` get 400.
+- The header is believed only from `trusted_proxies`; a request from
+  there without it (or with a name not in `allowed_subjects`) gets 403.
+  Connections from this machine that aren't a trusted proxy can look but
+  never act, and any header they send is ignored (a local process could
+  write one itself). If the proxy runs on the same host, list
+  `127.0.0.1` in `trusted_proxies`. Repeated copies of the header,
+  `Host`, `Origin`, `Content-Type` or `X-MLVPN-Action` get 400.
 - Have the proxy keep the original `Host` and add that name to
   `allowed_hosts`.
 

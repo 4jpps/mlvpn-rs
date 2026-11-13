@@ -315,40 +315,59 @@ fn canonical(ip: IpAddr) -> IpAddr {
     }
 }
 
-/// Who is asking. With `client_cert_header` set, every request (loopback
-/// included, so a local user can't skip the check) must carry an allowed
-/// certificate name. Without it (loopback-only setups), it's "local".
-fn identify(
-    settings: &Settings,
-    peer: IpAddr,
-    req: &http::Request,
-) -> Result<String, http::Response> {
-    let Some(header) = settings
+/// Who is asking.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Who {
+    /// A connection from this machine that isn't a trusted proxy: may look,
+    /// may not act. Any certificate header it sends is ignored (a local
+    /// process could write one itself).
+    Local,
+    /// A certificate name, as vouched for by a trusted proxy.
+    Verified(String),
+}
+
+impl Who {
+    pub fn label(&self) -> &str {
+        match self {
+            Who::Local => "local",
+            Who::Verified(name) => name,
+        }
+    }
+}
+
+/// The certificate header is believed only from `trusted_proxies`; there it
+/// is required (and must be an allowed name). Loopback peers that aren't a
+/// trusted proxy are `Local`. Anyone else never got this far (`peer_allowed`).
+fn identify(settings: &Settings, peer: IpAddr, req: &http::Request) -> Result<Who, http::Response> {
+    let peer = canonical(peer);
+    let from_proxy = settings
+        .web
+        .trusted_proxies
+        .iter()
+        .any(|t| canonical(*t) == peer);
+    let header = settings
         .web
         .client_cert_header
         .as_deref()
-        .filter(|h| !h.trim().is_empty())
-    else {
-        // `check` refuses a non-loopback listener without a header, so only
-        // loopback peers get here.
-        return if canonical(peer).is_loopback() {
-            Ok("local".into())
-        } else {
-            Err(http::Response::error(403, "client certificate required"))
-        };
-    };
-    let Some(subject) = req.header(header).map(str::trim).filter(|s| !s.is_empty()) else {
-        return Err(http::Response::error(403, "client certificate required"));
-    };
-    if !settings.web.allowed_subjects.is_empty()
-        && !settings.web.allowed_subjects.iter().any(|a| a == subject)
-    {
-        return Err(http::Response::error(
-            403,
-            "this certificate is not allowed here",
-        ));
+        .filter(|h| !h.trim().is_empty());
+    match (from_proxy, header) {
+        (true, Some(header)) => {
+            let Some(subject) = req.header(header).map(str::trim).filter(|s| !s.is_empty()) else {
+                return Err(http::Response::error(403, "client certificate required"));
+            };
+            if !settings.web.allowed_subjects.is_empty()
+                && !settings.web.allowed_subjects.iter().any(|a| a == subject)
+            {
+                return Err(http::Response::error(
+                    403,
+                    "this certificate is not allowed here",
+                ));
+            }
+            Ok(Who::Verified(subject.to_string()))
+        }
+        _ if peer.is_loopback() => Ok(Who::Local),
+        _ => Err(http::Response::error(403, "client certificate required")),
     }
-    Ok(subject.to_string())
 }
 
 fn serve_connection(mut stream: TcpStream, state: &Mutex<Shared>, settings: &Settings) {
@@ -393,8 +412,8 @@ fn respond(
     let title = settings.title();
     let ui = UiInfo {
         title: &title,
-        actions: settings.web.allow_actions,
-        who: &who,
+        actions: settings.web.allow_actions && matches!(who, Who::Verified(_)),
+        who: who.label(),
     };
     api::handle(&state.lock().unwrap(), req, &ui)
 }
@@ -525,28 +544,24 @@ mod tests {
         assert!(!peer_allowed(&s, None));
 
         let proxy: IpAddr = "10.0.0.9".parse().unwrap();
-        // With a certificate header configured, loopback needs it too.
+        // Loopback is never taken at its word: any header it sends is ignored.
+        let lo: IpAddr = "127.0.0.1".parse().unwrap();
+        assert_eq!(identify(&s, lo, &req(&[])).unwrap(), Who::Local);
         assert_eq!(
-            identify(&s, "127.0.0.1".parse().unwrap(), &req(&[]))
-                .unwrap_err()
-                .status,
-            403
+            identify(&s, lo, &req(&[("X-Client-Cert-Subject", "Jeff")])).unwrap(),
+            Who::Local
         );
-        assert_eq!(
-            identify(
-                &s,
-                "127.0.0.1".parse().unwrap(),
-                &req(&[("X-Client-Cert-Subject", "Jeff")])
-            )
-            .unwrap(),
-            "Jeff"
-        );
-        // Without one (loopback-only setup), loopback is "local".
         let plain = Settings::for_tests();
+        assert_eq!(identify(&plain, lo, &req(&[])).unwrap(), Who::Local);
+        // ...unless loopback is listed as the proxy (proxy on the same host).
+        let mut same_host = web(&["127.0.0.1"], Some("X-Client-Cert-Subject"));
+        same_host.allowed_subjects = vec!["Jeff".into()];
+        let same_host = proxied(same_host);
         assert_eq!(
-            identify(&plain, "127.0.0.1".parse().unwrap(), &req(&[])).unwrap(),
-            "local"
+            identify(&same_host, lo, &req(&[("X-Client-Cert-Subject", "Jeff")])).unwrap(),
+            Who::Verified("Jeff".into())
         );
+        assert_eq!(identify(&same_host, lo, &req(&[])).unwrap_err().status, 403);
         assert_eq!(identify(&s, proxy, &req(&[])).unwrap_err().status, 403);
         assert_eq!(
             identify(&s, proxy, &req(&[("X-Client-Cert-Subject", " ")]))
@@ -556,14 +571,14 @@ mod tests {
         );
         assert_eq!(
             identify(&s, proxy, &req(&[("X-Client-Cert-Subject", "Jeff")])).unwrap(),
-            "Jeff"
+            Who::Verified("Jeff".into())
         );
 
         w.allowed_subjects = vec!["Jeff".into()];
         let s = proxied(w);
         assert_eq!(
             identify(&s, proxy, &req(&[("X-Client-Cert-Subject", "Jeff")])).unwrap(),
-            "Jeff"
+            Who::Verified("Jeff".into())
         );
         assert_eq!(
             identify(&s, proxy, &req(&[("X-Client-Cert-Subject", "Mallory")]))

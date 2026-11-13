@@ -9,9 +9,9 @@
 //! that header without a CORS preflight, which this server never grants.
 //! Only one action runs at a time.
 
-use crate::Settings;
 use crate::api::Shared;
 use crate::http::{Request, Response};
+use crate::{Settings, Who};
 use mlvpn::ipc::{Command, CommandResult};
 use serde::Deserialize;
 use serde_json::json;
@@ -97,10 +97,18 @@ pub fn guard(settings: &Settings, req: &Request) -> Result<(), Response> {
     Ok(())
 }
 
-pub fn handle(settings: &Settings, state: &Mutex<Shared>, req: &Request, who: &str) -> Response {
+pub fn handle(settings: &Settings, state: &Mutex<Shared>, req: &Request, who: &Who) -> Response {
     if let Err(r) = guard(settings, req) {
         return r;
     }
+    // Only a certificate name vouched for by a trusted proxy may act.
+    let Who::Verified(who) = who else {
+        return Response::error(
+            403,
+            "actions need a client certificate through the proxy; local connections are view-only",
+        );
+    };
+    let who = who.as_str();
     if BUSY
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_err()
@@ -264,6 +272,17 @@ mod tests {
         s.web.allow_actions = actions;
         s.web.client_cert_header = Some("X-Client-Cert-Subject".into());
         s
+    }
+
+    #[test]
+    fn local_connections_cannot_act() {
+        let state = Mutex::new(Shared::default());
+        let req = post(&[
+            ("X-MLVPN-Action", "1"),
+            ("Content-Type", "application/json"),
+        ]);
+        let r = handle(&settings(true), &state, &req, &Who::Local);
+        assert_eq!(r.status, 403);
     }
 
     #[test]
