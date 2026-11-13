@@ -48,6 +48,14 @@ impl Request {
             .find(|(n, _)| *n == name)
             .map(|(_, v)| v.as_str())
     }
+
+    /// True if `name` appears more than once. Callers refuse such requests
+    /// for headers that decide access, so a proxy and this server can't
+    /// read different copies.
+    pub fn repeated(&self, name: &str) -> bool {
+        let name = name.to_ascii_lowercase();
+        self.headers.iter().filter(|(n, _)| *n == name).count() > 1
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]

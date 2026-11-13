@@ -273,7 +273,8 @@ peer_public_key = "REPLACE_WITH_PEER_PUBLIC_KEY_BASE64"
 # title = "home router"       # shown at the top; default the tunnel name
 # allow_actions = false       # true: turn links off/on, throughput tests and
                               # diagnostic dumps from the dashboard (needs
-                              # [command] enabled = true)
+                              # [command] enabled = true and client_cert_header
+                              # below; a loopback-only dashboard is view-only)
 #
 # Behind a reverse proxy that checks a client certificate (all three of
 # listen, trusted_proxies and client_cert_header are needed for a

@@ -96,10 +96,13 @@ memory, and serves:
   round trip and loss), a card per link and the event feed. It updates
   every second.
 - **The JSON API** under `/api/v1/` (below).
-- **Actions**, only with `allow_actions = true`: turn a link off or on
+- **Actions**, only with `allow_actions = true` behind a certificate-
+  checking proxy (`client_cert_header` set): turn a link off or on
   (`mlvpnd set-link`), run a throughput test (`mlvpnd self-test`, 1-15 s
   per link) and take a diagnostic dump (`mlvpnd diag-dump`). These need
-  `[command] enabled = true`.
+  `[command] enabled = true`. A loopback-only dashboard is view-only:
+  anyone on the machine who can reach the port would otherwise act with
+  the `mlvpn` user's command socket (root has the `mlvpnd` CLI).
 
 It is off by default: nothing listens until you run
 
@@ -121,7 +124,7 @@ and `[command] socket_path`).
 |---|---|---|
 | `listen` | `127.0.0.1:8765` | Address and port to listen on |
 | `title` | the tunnel name | Name shown at the top of the dashboard |
-| `allow_actions` | `false` | Allow turning links off/on, throughput tests and diagnostic dumps |
+| `allow_actions` | `false` | Allow turning links off/on, throughput tests and diagnostic dumps (needs `client_cert_header`) |
 | `trusted_proxies` | `[]` | The reverse proxy's address(es); every other non-loopback peer is refused |
 | `allowed_hosts` | `[]` | `Host` names accepted besides `localhost`/`127.0.0.1`/`[::1]` and the listen address |
 | `client_cert_header` | none | Header the proxy sets to the verified client-certificate name |
@@ -140,8 +143,10 @@ otherwise. Then:
   connection is closed unanswered. Make sure the proxy's address reaches
   this host unchanged: behind a router that NATs it, every device behind
   that router would share the address.
-- A request through the proxy without the header (or with a name not in
-  `allowed_subjects`) gets 403. Requests from loopback need no header.
+- Every request without the header (or with a name not in
+  `allowed_subjects`) gets 403, loopback included, so a local user can't
+  skip the check. Repeated copies of the header, `Host`, `Origin`,
+  `Content-Type` or `X-MLVPN-Action` get 400.
 - Have the proxy keep the original `Host` and add that name to
   `allowed_hosts`.
 

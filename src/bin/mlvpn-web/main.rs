@@ -315,17 +315,28 @@ fn canonical(ip: IpAddr) -> IpAddr {
     }
 }
 
-/// Who is asking: "local" for loopback, else the verified certificate
-/// name from the proxy. Err when a proxied request is not authenticated.
+/// Who is asking. With `client_cert_header` set, every request (loopback
+/// included, so a local user can't skip the check) must carry an allowed
+/// certificate name. Without it (loopback-only setups), it's "local".
 fn identify(
     settings: &Settings,
     peer: IpAddr,
     req: &http::Request,
 ) -> Result<String, http::Response> {
-    if canonical(peer).is_loopback() {
-        return Ok("local".into());
-    }
-    let header = settings.web.client_cert_header.as_deref().unwrap_or("");
+    let Some(header) = settings
+        .web
+        .client_cert_header
+        .as_deref()
+        .filter(|h| !h.trim().is_empty())
+    else {
+        // `check` refuses a non-loopback listener without a header, so only
+        // loopback peers get here.
+        return if canonical(peer).is_loopback() {
+            Ok("local".into())
+        } else {
+            Err(http::Response::error(403, "client certificate required"))
+        };
+    };
     let Some(subject) = req.header(header).map(str::trim).filter(|s| !s.is_empty()) else {
         return Err(http::Response::error(403, "client certificate required"));
     };
@@ -362,6 +373,13 @@ fn respond(
 ) -> http::Response {
     // Checked before routing so no data is served to a browser reaching
     // this port by a hostile name (DNS rebinding).
+    let mut sensitive = vec!["host", "origin", "content-type", "x-mlvpn-action"];
+    if let Some(h) = settings.web.client_cert_header.as_deref() {
+        sensitive.push(h);
+    }
+    if sensitive.iter().any(|h| req.repeated(h)) {
+        return http::Response::error(400, "repeated header");
+    }
     if !http::host_allowed(req.header("host"), &settings.hosts) {
         return http::Response::error(421, "unexpected Host header");
     }
@@ -476,6 +494,27 @@ mod tests {
     }
 
     #[test]
+    fn repeated_access_headers_are_refused() {
+        let state = Mutex::new(Shared::default());
+        let s = proxied(web(&["10.0.0.9"], Some("X-Client-Cert-Subject")));
+        let proxy: IpAddr = "10.0.0.9".parse().unwrap();
+        let two_certs = req(&[
+            ("Host", "192.168.1.1"),
+            ("X-Client-Cert-Subject", "Jeff"),
+            ("X-Client-Cert-Subject", "Mallory"),
+        ]);
+        assert_eq!(respond(&state, &s, proxy, &two_certs).status, 400);
+        let two_hosts = req(&[
+            ("Host", "192.168.1.1"),
+            ("Host", "evil.example"),
+            ("X-Client-Cert-Subject", "Jeff"),
+        ]);
+        assert_eq!(respond(&state, &s, proxy, &two_hosts).status, 400);
+        let one_each = req(&[("Host", "192.168.1.1"), ("X-Client-Cert-Subject", "Jeff")]);
+        assert_eq!(respond(&state, &s, proxy, &one_each).status, 200);
+    }
+
+    #[test]
     fn peers_and_identity() {
         let mut w = web(&["10.0.0.9"], Some("X-Client-Cert-Subject"));
         let s = proxied(w.clone());
@@ -486,8 +525,26 @@ mod tests {
         assert!(!peer_allowed(&s, None));
 
         let proxy: IpAddr = "10.0.0.9".parse().unwrap();
+        // With a certificate header configured, loopback needs it too.
         assert_eq!(
-            identify(&s, "127.0.0.1".parse().unwrap(), &req(&[])).unwrap(),
+            identify(&s, "127.0.0.1".parse().unwrap(), &req(&[]))
+                .unwrap_err()
+                .status,
+            403
+        );
+        assert_eq!(
+            identify(
+                &s,
+                "127.0.0.1".parse().unwrap(),
+                &req(&[("X-Client-Cert-Subject", "Jeff")])
+            )
+            .unwrap(),
+            "Jeff"
+        );
+        // Without one (loopback-only setup), loopback is "local".
+        let plain = Settings::for_tests();
+        assert_eq!(
+            identify(&plain, "127.0.0.1".parse().unwrap(), &req(&[])).unwrap(),
             "local"
         );
         assert_eq!(identify(&s, proxy, &req(&[])).unwrap_err().status, 403);

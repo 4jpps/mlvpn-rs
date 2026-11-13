@@ -56,6 +56,21 @@ pub fn guard(settings: &Settings, req: &Request) -> Result<(), Response> {
             "actions are turned off ([web] allow_actions in mlvpn.toml)",
         ));
     }
+    // Without a certificate check, anyone on this machine who can reach the
+    // port would act with the mlvpn user's command socket, so actions need
+    // `client_cert_header`; a loopback-only dashboard is view-only (root
+    // has the mlvpnd CLI).
+    if settings
+        .web
+        .client_cert_header
+        .as_deref()
+        .is_none_or(|h| h.trim().is_empty())
+    {
+        return Err(Response::error(
+            403,
+            "actions need [web] client_cert_header (a proxy that checks a client certificate)",
+        ));
+    }
     if req.header("x-mlvpn-action") != Some("1") {
         return Err(Response::error(403, "missing X-MLVPN-Action header"));
     }
@@ -247,7 +262,19 @@ mod tests {
     fn settings(actions: bool) -> Settings {
         let mut s = Settings::for_tests();
         s.web.allow_actions = actions;
+        s.web.client_cert_header = Some("X-Client-Cert-Subject".into());
         s
+    }
+
+    #[test]
+    fn actions_need_a_certificate_header_setting() {
+        let mut s = Settings::for_tests();
+        s.web.allow_actions = true;
+        let req = post(&[
+            ("X-MLVPN-Action", "1"),
+            ("Content-Type", "application/json"),
+        ]);
+        assert_eq!(guard(&s, &req).unwrap_err().status, 403);
     }
 
     fn post(headers: &[(&str, &str)]) -> Request {
