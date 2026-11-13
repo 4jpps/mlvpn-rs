@@ -326,6 +326,7 @@ async fn build_snapshot(
                 remote_addr: link.remote.map(|a| a.to_string()),
                 state: link.state.as_str().to_string(),
                 is_primary: primary_idx == Some(idx),
+                admin_disabled: link.admin_disabled,
                 score: crate::monitor::score(link),
                 state_duration_ms: link.state_since.elapsed().as_millis() as u64,
                 tx_bytes: link.stats.tx_bytes,

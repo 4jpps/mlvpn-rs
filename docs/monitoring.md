@@ -82,14 +82,26 @@ Auto-detecting (no `--socket` given) with nothing found under
   other way): falls back to the original plain error asking you to pass
   `--socket` explicitly or check `mlvpnd` yourself.
 
-## Web telemetry API
+## Web dashboard
 
-`mlvpn-web` is an optional, read-only HTTP API for the same data the TUI
-shows. It is a separate process, so `mlvpnd` itself gains no listening
-socket and no HTTP code. It connects to the daemon's control socket,
-keeps the latest snapshot, the last 600 samples (about five minutes) of
-throughput/RTT/loss history and the last 500 events in memory, and
-serves them as JSON. It is off by default: nothing listens until you run
+`mlvpn-web` is an optional dashboard and HTTP API for the same data the
+TUI shows. It is a separate process, so `mlvpnd` itself gains no
+listening socket and no HTTP code. It connects to the daemon's control
+socket, keeps the latest snapshot, the last 600 samples (about five
+minutes) of throughput/RTT/loss history and the last 500 events in
+memory, and serves:
+
+- **A dashboard** at `/`: health, the other end's version, charts of the
+  last five minutes (tunnel throughput, and per link: received, sent,
+  round trip and loss), a card per link and the event feed. It updates
+  every second.
+- **The JSON API** under `/api/v1/` (below).
+- **Actions**, only with `allow_actions = true`: turn a link off or on
+  (`mlvpnd set-link`), run a throughput test (`mlvpnd self-test`, 1-15 s
+  per link) and take a diagnostic dump (`mlvpnd diag-dump`). These need
+  `[command] enabled = true`.
+
+It is off by default: nothing listens until you run
 
 ```
 sudo systemctl enable --now mlvpn-web.service
@@ -97,44 +109,99 @@ sudo systemctl enable --now mlvpn-web.service
 
 (`systemd/mlvpn-web.service`; the unit runs as the `mlvpn` user with no
 capabilities.) Or run it by hand as a user that can read the control
-socket: `mlvpn-web [--socket PATH] [--listen 127.0.0.1:8765]`.
+sockets: `mlvpn-web [--config /etc/mlvpn/mlvpn.toml] [--socket PATH]
+[--listen ADDR]` (`--listen` overrides the config).
+
+### Settings: `[web]` in mlvpn.toml
+
+`mlvpnd` ignores this table; `mlvpn-web` reads it (plus `[tunnel] name`
+and `[command] socket_path`).
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `listen` | `127.0.0.1:8765` | Address and port to listen on |
+| `title` | the tunnel name | Name shown at the top of the dashboard |
+| `allow_actions` | `false` | Allow turning links off/on, throughput tests and diagnostic dumps |
+| `trusted_proxies` | `[]` | The reverse proxy's address(es); every other non-loopback peer is refused |
+| `allowed_hosts` | `[]` | `Host` names accepted besides `localhost`/`127.0.0.1`/`[::1]` and the listen address |
+| `client_cert_header` | none | Header the proxy sets to the verified client-certificate name |
+| `allowed_subjects` | `[]` (any) | Certificate names allowed in, matched exactly |
+
+On loopback (the default), reach it with `ssh -L 8765:127.0.0.1:8765
+host` and open `http://localhost:8765/`.
+
+To serve it to a browser elsewhere, put it behind a reverse proxy that
+verifies a client certificate and passes its name in a header (stripping
+any copy the client sends). A non-loopback `listen` needs both
+`trusted_proxies` and `client_cert_header`; `mlvpn-web` refuses to start
+otherwise. Then:
+
+- Only loopback and `trusted_proxies` may connect; anyone else's
+  connection is closed unanswered. Make sure the proxy's address reaches
+  this host unchanged: behind a router that NATs it, every device behind
+  that router would share the address.
+- A request through the proxy without the header (or with a name not in
+  `allowed_subjects`) gets 403. Requests from loopback need no header.
+- Have the proxy keep the original `Host` and add that name to
+  `allowed_hosts`.
+
+```toml
+[web]
+listen = "192.168.1.1:8765"
+title = "home router"
+trusted_proxies = ["192.168.1.20"]
+allowed_hosts = ["mlvpn.example.net"]
+client_cert_header = "X-Client-Cert-Subject"
+allowed_subjects = ["Jane Admin"]
+allow_actions = true
+```
+
+### API
 
 | Endpoint | Returns |
 |---|---|
+| `/api/v1/ui` | Dashboard settings: title, whether actions are on, who is signed in |
 | `/api/v1/version` | API version, `mlvpn-web` version, local and peer daemon versions |
 | `/api/v1/snapshot` | The full snapshot (health, links, daemon, FEC, reorder, system) |
 | `/api/v1/links` | Per-link state and counters only |
 | `/api/v1/events?since=<seq>&limit=<n>` | Structured events newer than `since` (default 100, max 500), oldest first; poll with the returned `next_since` |
 | `/api/v1/history?limit=<n>` | Up to 600 samples at 500 ms: tunnel tx/rx Mbps plus per-link tx/rx Mbps, RTT and loss (default 120) |
+| `POST /api/v1/actions/link` | `{"link": "...", "enabled": false}` |
+| `POST /api/v1/actions/selftest` | `{"link": null, "duration_secs": 5, "bidirectional": false}` (`link` null = every link) |
+| `POST /api/v1/actions/diag` | `{}`; returns `{"text": "..."}` |
 
-Every response is `{"api": 1, "connected": bool, "age_ms": ms-or-null,
-"data": ...}`. `connected` is false while the daemon is unreachable and
-`age_ms` is how old the data is, so a client can tell stale from live.
-Before the first snapshot arrives, `snapshot` and `links` return 503.
-Errors are `{"api": 1, "error": "..."}`.
+Every GET response is `{"api": 1, "connected": bool, "age_ms":
+ms-or-null, "data": ...}`. `connected` is false while the daemon is
+unreachable and `age_ms` is how old the data is, so a client can tell
+stale from live. Before the first snapshot arrives, `snapshot` and
+`links` return 503. Errors are `{"api": 1, "error": "..."}`.
 
-What it will and won't do:
+Actions must be `POST`s with `Content-Type: application/json`, the header
+`X-MLVPN-Action: 1` and, if the browser sends an `Origin`, one matching
+the `Host`. A page on another site cannot add that header without a CORS
+preflight, which is never granted. One action runs at a time (409
+otherwise); each is logged with who ran it (`journalctl -u mlvpn-web`).
 
-- **Read-only.** Only `GET` and `HEAD`; anything else is a 405, and a
-  request with a body is a 400.
-- **Loopback only.** Any `--listen` address that isn't loopback is
-  refused at startup, because exposing it beyond the host would need
-  authentication, which doesn't exist yet. To read it remotely, forward
-  the port over SSH. The `Host` header must also be `localhost`,
-  `127.0.0.1` or `[::1]` (otherwise 421), which blocks DNS-rebinding
-  from a browser on the same machine. No CORS headers are sent.
-- **No logs, no secrets.** The daemon's log ring is never served and the
-  control socket carries no key material. The snapshot does include each
+What else it will and won't do:
+
+- **`Host` checked.** It must be a loopback name, the listen address or
+  one of `allowed_hosts` (otherwise 421), which blocks DNS rebinding. No
+  CORS headers are sent.
+- **Strict page policy.** The dashboard's own script and style only
+  (`Content-Security-Policy`), no inline code, nothing from other sites,
+  and it cannot be framed.
+- **No secrets.** The daemon's log ring is never served by the API, and
+  the control socket carries no key material. A diagnostic dump (an
+  action) does include recent log lines. The snapshot includes each
   link's `remote_addr` and `bind_interface`, which describe your network
-  topology, so treat access to the port as access to that.
-- **Bounded.** Requests are capped at 8 KiB and 64 headers, must
-  complete within 10 s, and at most 32 connections are served at once
-  (further ones get an immediate 503). Each connection serves one
-  request and closes.
+  topology, so treat access to the dashboard as access to that.
+- **Bounded.** Requests are capped at 8 KiB of headers, 64 headers and a
+  4 KiB body, must arrive within 10 s, and at most 32 connections are
+  served at once (further ones get an immediate 503). Each connection
+  serves one request and closes.
 
 Reconnecting to a restarted daemon clears the buffered events and
-history, as in the TUI. There is no dashboard yet; this is the data
-layer for one.
+history, as in the TUI.
 
 ## Runtime link control
 

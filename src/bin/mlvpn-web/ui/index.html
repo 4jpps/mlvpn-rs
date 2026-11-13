@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>mlvpn</title>
+<link rel="icon" type="image/svg+xml" href="favicon.svg">
+<link rel="stylesheet" href="app.css">
+<script src="app.js" defer></script>
+</head>
+<body>
+<main>
+  <header class="top">
+    <div>
+      <h1 id="title">mlvpn</h1>
+      <p class="note" id="subtitle">Connecting…</p>
+    </div>
+    <div class="top__right">
+      <span class="pill" id="health">—</span>
+      <p class="note" id="who"></p>
+    </div>
+  </header>
+
+  <p class="banner" id="stale" hidden></p>
+
+  <section class="grid">
+    <article class="card">
+      <h3>Tunnel throughput</h3>
+      <div id="chart-tunnel"></div>
+    </article>
+    <article class="card">
+      <h3>Round-trip time by link</h3>
+      <div id="chart-rtt"></div>
+    </article>
+    <article class="card">
+      <h3>Received by link</h3>
+      <div id="chart-rx"></div>
+    </article>
+    <article class="card">
+      <h3>Sent by link</h3>
+      <div id="chart-tx"></div>
+    </article>
+    <article class="card">
+      <h3>Packet loss by link</h3>
+      <div id="chart-loss"></div>
+    </article>
+    <article class="card">
+      <h3>This end</h3>
+      <dl class="facts" id="facts"></dl>
+    </article>
+  </section>
+
+  <h2>Links</h2>
+  <section class="links" id="links"></section>
+
+  <section class="card tools" id="tools" hidden>
+    <h3>Tools</h3>
+    <div class="tools__row">
+      <label>Test
+        <select id="test-link"><option value="">every link</option></select>
+      </label>
+      <label>for
+        <select id="test-secs">
+          <option value="3">3 s</option>
+          <option value="5" selected>5 s</option>
+          <option value="10">10 s</option>
+        </select>
+      </label>
+      <label class="check"><input type="checkbox" id="test-both"> both directions</label>
+      <button id="test-run">Run throughput test</button>
+      <button id="diag-run" class="secondary">Diagnostic dump</button>
+    </div>
+    <p class="note" id="tool-status"></p>
+    <table class="results" id="test-results" hidden>
+      <thead><tr><th>Link</th><th>Upload</th><th>Download</th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <div id="diag" hidden>
+      <div class="tools__row">
+        <button id="diag-save" class="secondary">Save as file</button>
+        <button id="diag-copy" class="secondary">Copy</button>
+      </div>
+      <pre id="diag-text"></pre>
+    </div>
+  </section>
+
+  <section class="card">
+    <h3>Events</h3>
+    <ol class="events" id="events"><li class="note">None yet.</li></ol>
+  </section>
+
+  <footer class="note" id="footer"></footer>
+</main>
+</body>
+</html>

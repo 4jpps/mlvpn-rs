@@ -62,7 +62,9 @@ cargo build --release --locked --offline || cargo build --release --locked
 %install
 install -Dm0755 target/release/mlvpnd %{buildroot}%{_bindir}/mlvpnd
 install -Dm0755 target/release/mlvpn-tui %{buildroot}%{_bindir}/mlvpn-tui
+install -Dm0755 target/release/mlvpn-web %{buildroot}%{_bindir}/mlvpn-web
 install -Dm0644 systemd/mlvpn.service %{buildroot}%{_unitdir}/mlvpn.service
+install -Dm0644 systemd/mlvpn-web.service %{buildroot}%{_unitdir}/mlvpn-web.service
 install -Dm0644 config/mlvpn.toml.example %{buildroot}%{_pkgdocdir}/mlvpn.toml.example
 install -Dm0644 config/mlvpn-server.toml.example %{buildroot}%{_pkgdocdir}/mlvpn-server.toml.example
 install -dm0750 %{buildroot}%{_sysconfdir}/mlvpn
@@ -99,7 +101,9 @@ chmod 0750 %{_sysconfdir}/mlvpn
 %files
 %{_bindir}/mlvpnd
 %{_bindir}/mlvpn-tui
+%{_bindir}/mlvpn-web
 %{_unitdir}/mlvpn.service
+%{_unitdir}/mlvpn-web.service
 %license LICENSE
 %doc %{_pkgdocdir}/mlvpn.toml.example
 %doc %{_pkgdocdir}/mlvpn-server.toml.example

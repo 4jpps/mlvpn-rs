@@ -1,24 +1,33 @@
-//! A deliberately tiny, read-only HTTP/1.1 layer: GET and HEAD only, one
-//! request per connection, hard limits on everything an unauthenticated
-//! client controls. There is no HTTP server crate in this project, and
-//! the surface here is small enough that hand-rolling it is safer than a
-//! dependency tree of features this never uses.
+//! A deliberately tiny HTTP/1.1 layer: GET, HEAD and (for dashboard actions)
+//! POST with a small body, one request per connection, hard limits on
+//! everything a client controls. There is no HTTP server crate in this
+//! project, and the surface here is small enough that hand-rolling it is
+//! safer than a dependency tree of features this never uses.
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
 pub const MAX_REQUEST_BYTES: usize = 8 * 1024;
+pub const MAX_BODY_BYTES: usize = 4 * 1024;
 pub const MAX_HEADERS: usize = 64;
 /// Total time allowed to receive a complete request, so a client that
 /// trickles bytes cannot hold a connection slot open.
 pub const REQUEST_DEADLINE: Duration = Duration::from_secs(10);
 pub const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// For JSON and text: nothing may load or run.
+pub const CSP_API: &str = "default-src 'none'; frame-ancestors 'none'";
+/// For the dashboard page: its own script, style and API, nothing else.
+pub const CSP_PAGE: &str = "default-src 'none'; script-src 'self'; style-src 'self'; \
+     connect-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'; \
+     frame-ancestors 'none'";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Method {
     Get,
     Head,
+    Post,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -26,6 +35,19 @@ pub struct Request {
     pub method: Method,
     pub path: String,
     pub query: String,
+    /// Header names lower-cased, in order.
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+impl Request {
+    pub fn header(&self, name: &str) -> Option<&str> {
+        let name = name.to_ascii_lowercase();
+        self.headers
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, v)| v.as_str())
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -34,7 +56,7 @@ pub enum ParseError {
     Malformed,
     MethodNotAllowed,
     BodyNotAllowed,
-    BadHost,
+    LengthRequired,
     Io,
 }
 
@@ -44,22 +66,24 @@ impl ParseError {
             ParseError::TooLarge => Response::error(431, "request too large"),
             ParseError::Malformed => Response::error(400, "malformed request"),
             ParseError::MethodNotAllowed => {
-                let mut r = Response::error(405, "this API is read-only: GET and HEAD only");
-                r.allow = Some("GET, HEAD");
+                let mut r = Response::error(405, "GET, HEAD and POST only");
+                r.allow = Some("GET, HEAD, POST");
                 r
             }
-            ParseError::BodyNotAllowed => Response::error(400, "request bodies are not accepted"),
-            ParseError::BadHost => Response::error(421, "unexpected Host header"),
+            ParseError::BodyNotAllowed => Response::error(400, "this request may not have a body"),
+            ParseError::LengthRequired => Response::error(411, "Content-Length required"),
             ParseError::Io => Response::error(408, "request timeout"),
         }
     }
 }
 
+#[derive(Debug)]
 pub struct Response {
     pub status: u16,
     pub content_type: &'static str,
     pub body: Vec<u8>,
     pub allow: Option<&'static str>,
+    pub csp: &'static str,
 }
 
 impl Response {
@@ -69,11 +93,23 @@ impl Response {
             content_type: "application/json",
             body: serde_json::to_vec(value).unwrap_or_else(|_| b"{}".to_vec()),
             allow: None,
+            csp: CSP_API,
         }
     }
 
     pub fn error(status: u16, message: &str) -> Response {
         Response::json(status, &serde_json::json!({ "api": 1, "error": message }))
+    }
+
+    /// A static dashboard file.
+    pub fn asset(content_type: &'static str, body: &'static str) -> Response {
+        Response {
+            status: 200,
+            content_type,
+            body: body.as_bytes().to_vec(),
+            allow: None,
+            csp: CSP_PAGE,
+        }
     }
 }
 
@@ -81,11 +117,17 @@ fn reason(status: u16) -> &'static str {
     match status {
         200 => "OK",
         400 => "Bad Request",
+        403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
         408 => "Request Timeout",
+        409 => "Conflict",
+        411 => "Length Required",
+        413 => "Content Too Large",
+        415 => "Unsupported Media Type",
         421 => "Misdirected Request",
         431 => "Request Header Fields Too Large",
+        502 => "Bad Gateway",
         503 => "Service Unavailable",
         _ => "Error",
     }
@@ -98,13 +140,15 @@ pub fn write_response<W: Write>(w: &mut W, r: &Response, head_only: bool) -> std
          Content-Length: {}\r\n\
          Cache-Control: no-store\r\n\
          X-Content-Type-Options: nosniff\r\n\
-         Content-Security-Policy: default-src 'none'; frame-ancestors 'none'\r\n\
+         X-Frame-Options: DENY\r\n\
+         Content-Security-Policy: {}\r\n\
          Referrer-Policy: no-referrer\r\n\
          Connection: close\r\n",
         r.status,
         reason(r.status),
         r.content_type,
         r.body.len(),
+        r.csp,
     );
     if let Some(allow) = r.allow {
         head.push_str(&format!("Allow: {allow}\r\n"));
@@ -117,18 +161,29 @@ pub fn write_response<W: Write>(w: &mut W, r: &Response, head_only: bool) -> std
     w.flush()
 }
 
-/// Reads until the blank line that ends the headers, within the byte and
-/// time limits. Anything after the blank line is ignored: no request
-/// body is ever read.
+/// Reads the headers (and a POST's body) within the byte and time limits.
 pub fn read_request(stream: &mut TcpStream) -> Result<Request, ParseError> {
     let start = Instant::now();
     let mut buf = Vec::with_capacity(1024);
     let mut chunk = [0u8; 1024];
+    let mut parsed: Option<(Request, usize, usize)> = None; // (request, header end, body length)
     loop {
-        if let Some(end) = find_header_end(&buf) {
-            return parse_request(&buf[..end]);
+        if parsed.is_none()
+            && let Some(end) = find_header_end(&buf)
+        {
+            let (req, body_len) = parse_head(&buf[..end])?;
+            parsed = Some((req, end, body_len));
         }
-        if buf.len() >= MAX_REQUEST_BYTES {
+        if let Some((_, end, body_len)) = &parsed
+            && buf.len() >= end + body_len
+        {
+            let (mut req, end, body_len) = parsed.take().unwrap();
+            req.body = buf[end..end + body_len].to_vec();
+            return Ok(req);
+        }
+        if buf.len() >= MAX_REQUEST_BYTES + MAX_BODY_BYTES
+            || (parsed.is_none() && buf.len() >= MAX_REQUEST_BYTES)
+        {
             return Err(ParseError::TooLarge);
         }
         let remaining = REQUEST_DEADLINE
@@ -150,7 +205,22 @@ fn find_header_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4)
 }
 
-pub fn parse_request(head: &[u8]) -> Result<Request, ParseError> {
+/// Parses a request with any body after the headers (tests and callers
+/// that already hold the whole request).
+#[cfg(test)]
+pub fn parse_request(raw: &[u8]) -> Result<Request, ParseError> {
+    let end = find_header_end(raw).ok_or(ParseError::Malformed)?;
+    let (mut req, body_len) = parse_head(&raw[..end])?;
+    if raw.len() < end + body_len {
+        return Err(ParseError::Malformed);
+    }
+    req.body = raw[end..end + body_len].to_vec();
+    Ok(req)
+}
+
+/// The request line and headers; returns the request and how many body
+/// bytes follow.
+fn parse_head(head: &[u8]) -> Result<(Request, usize), ParseError> {
     if head.len() > MAX_REQUEST_BYTES {
         return Err(ParseError::TooLarge);
     }
@@ -177,68 +247,86 @@ pub fn parse_request(head: &[u8]) -> Result<Request, ParseError> {
     let method = match method {
         "GET" => Method::Get,
         "HEAD" => Method::Head,
+        "POST" => Method::Post,
         _ => return Err(ParseError::MethodNotAllowed),
     };
 
-    let mut host: Option<&str> = None;
-    let mut count = 0;
+    let mut headers = Vec::new();
+    let mut content_length: Option<usize> = None;
     for line in lines {
         if line.is_empty() {
             break;
         }
-        count += 1;
-        if count > MAX_HEADERS {
+        if headers.len() >= MAX_HEADERS {
             return Err(ParseError::TooLarge);
         }
         let (name, value) = line.split_once(':').ok_or(ParseError::Malformed)?;
         if name.is_empty() || name.contains(' ') || name.contains('\t') {
             return Err(ParseError::Malformed);
         }
-        let value = value.trim();
-        match name.to_ascii_lowercase().as_str() {
-            "host" => host = Some(value),
-            "content-length" if value != "0" => return Err(ParseError::BodyNotAllowed),
+        let name = name.to_ascii_lowercase();
+        let value = value.trim().to_string();
+        match name.as_str() {
+            "content-length" => {
+                if content_length.is_some() {
+                    return Err(ParseError::Malformed);
+                }
+                content_length = Some(value.parse().map_err(|_| ParseError::Malformed)?);
+            }
             "transfer-encoding" => return Err(ParseError::BodyNotAllowed),
             _ => {}
         }
+        headers.push((name, value));
     }
 
-    // Checked before routing so no data is served to a browser reaching
-    // this loopback port by a hostile name (DNS rebinding).
-    if let Some(h) = host
-        && !host_allowed(h)
-    {
-        return Err(ParseError::BadHost);
-    }
+    let body_len = match (method, content_length) {
+        (Method::Post, None) => return Err(ParseError::LengthRequired),
+        (Method::Post, Some(n)) if n > MAX_BODY_BYTES => return Err(ParseError::TooLarge),
+        (Method::Post, Some(n)) => n,
+        (_, None | Some(0)) => 0,
+        (_, Some(_)) => return Err(ParseError::BodyNotAllowed),
+    };
 
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
-    Ok(Request {
-        method,
-        path: path.to_string(),
-        query: query.to_string(),
-    })
+    Ok((
+        Request {
+            method,
+            path: path.to_string(),
+            query: query.to_string(),
+            headers,
+            body: Vec::new(),
+        },
+        body_len,
+    ))
 }
 
-/// Only literal loopback names are accepted, with an optional port.
-pub fn host_allowed(host: &str) -> bool {
+/// The name part of a `Host` header (without the port), lower-cased; None
+/// if it isn't a well-formed host.
+pub fn host_name(host: &str) -> Option<String> {
     let name = if let Some(rest) = host.strip_prefix('[') {
         match rest.split_once(']') {
             Some((addr, tail)) if tail.is_empty() || tail.starts_with(':') => addr,
-            _ => return false,
+            _ => return None,
         }
     } else {
-        host.rsplit_once(':').map_or(host, |(n, port)| {
-            if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) {
-                n
-            } else {
-                host
-            }
-        })
+        match host.rsplit_once(':') {
+            Some((n, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => n,
+            Some(_) => return None,
+            None => host,
+        }
     };
-    matches!(
-        name.to_ascii_lowercase().as_str(),
-        "localhost" | "127.0.0.1" | "::1"
-    )
+    (!name.is_empty()).then(|| name.to_ascii_lowercase())
+}
+
+/// Loopback names always; `extra` (configured names and the listen
+/// address) besides. A missing Host (HTTP/1.0) is allowed.
+pub fn host_allowed(host: Option<&str>, extra: &[String]) -> bool {
+    let Some(host) = host else { return true };
+    let Some(name) = host_name(host) else {
+        return false;
+    };
+    matches!(name.as_str(), "localhost" | "127.0.0.1" | "::1")
+        || extra.iter().any(|e| e.eq_ignore_ascii_case(&name))
 }
 
 pub fn query_param<'a>(query: &'a str, key: &str) -> Option<&'a str> {
@@ -264,37 +352,52 @@ mod tests {
                 .unwrap();
         assert_eq!(r.method, Method::Get);
         assert_eq!(r.path, "/api/v1/events");
+        assert_eq!(r.header("HOST"), Some("127.0.0.1:8765"));
         assert_eq!(query_param(&r.query, "since"), Some("5"));
         assert_eq!(query_param(&r.query, "limit"), Some("10"));
         assert_eq!(query_param(&r.query, "nope"), None);
     }
 
     #[test]
-    fn head_is_accepted_and_everything_else_is_405() {
+    fn get_head_post_accepted_everything_else_is_405() {
         assert_eq!(
             parse("HEAD / HTTP/1.1\r\n\r\n").unwrap().method,
             Method::Head
         );
-        for m in [
-            "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "CONNECT", "get",
-        ] {
+        let post = parse("POST /x HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}").unwrap();
+        assert_eq!(post.method, Method::Post);
+        assert_eq!(post.body, b"{}");
+        for m in ["PUT", "DELETE", "PATCH", "OPTIONS", "CONNECT", "get"] {
             let req = format!("{m} /api/v1/snapshot HTTP/1.1\r\n\r\n");
             assert_eq!(parse(&req), Err(ParseError::MethodNotAllowed), "{m}");
         }
-        let resp = ParseError::MethodNotAllowed.response();
-        assert_eq!(resp.status, 405);
-        assert_eq!(resp.allow, Some("GET, HEAD"));
+        assert_eq!(ParseError::MethodNotAllowed.response().status, 405);
     }
 
     #[test]
-    fn bodies_are_rejected() {
+    fn bodies_only_on_post_and_small() {
         assert_eq!(
-            parse("GET / HTTP/1.1\r\nContent-Length: 5\r\n\r\n"),
+            parse("GET / HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello"),
             Err(ParseError::BodyNotAllowed)
         );
         assert_eq!(
-            parse("GET / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"),
+            parse("POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"),
             Err(ParseError::BodyNotAllowed)
+        );
+        assert_eq!(
+            parse("POST / HTTP/1.1\r\n\r\n"),
+            Err(ParseError::LengthRequired)
+        );
+        assert_eq!(
+            parse(&format!(
+                "POST / HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+                MAX_BODY_BYTES + 1
+            )),
+            Err(ParseError::TooLarge)
+        );
+        assert_eq!(
+            parse("POST / HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\nx"),
+            Err(ParseError::Malformed)
         );
         assert!(parse("GET / HTTP/1.1\r\nContent-Length: 0\r\n\r\n").is_ok());
     }
@@ -328,7 +431,8 @@ mod tests {
     }
 
     #[test]
-    fn host_header_must_be_loopback() {
+    fn host_rules() {
+        let none: Vec<String> = Vec::new();
         for ok in [
             "localhost",
             "LOCALHOST:8765",
@@ -337,7 +441,7 @@ mod tests {
             "[::1]",
             "[::1]:8765",
         ] {
-            assert!(host_allowed(ok), "{ok}");
+            assert!(host_allowed(Some(ok), &none), "{ok}");
         }
         for bad in [
             "example.com",
@@ -349,13 +453,13 @@ mod tests {
             "",
             "localhost:abc",
         ] {
-            assert!(!host_allowed(bad), "{bad}");
+            assert!(!host_allowed(Some(bad), &none), "{bad}");
         }
-        assert_eq!(
-            parse("GET / HTTP/1.1\r\nHost: evil.example\r\n\r\n"),
-            Err(ParseError::BadHost)
-        );
-        assert!(parse("GET / HTTP/1.0\r\n\r\n").is_ok());
+        assert!(host_allowed(None, &none));
+        let extra = vec!["mlvpn.example.net".to_string(), "192.168.1.1".to_string()];
+        assert!(host_allowed(Some("MLVPN.example.net"), &extra));
+        assert!(host_allowed(Some("192.168.1.1:8765"), &extra));
+        assert!(!host_allowed(Some("mlvpn.example.net.evil"), &extra));
     }
 
     #[test]

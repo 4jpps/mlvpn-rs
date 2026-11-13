@@ -1,31 +1,35 @@
 # Install to /etc/systemd/system/mlvpn-web.service
 #
-# Optional read-only HTTP telemetry API for mlvpnd (see docs/monitoring.md,
-# "Web telemetry API"). Not enabled by default: nothing listens on any TCP
-# port unless you run `systemctl enable --now mlvpn-web.service`.
+# Optional dashboard and HTTP API for mlvpnd (see docs/monitoring.md,
+# "Web dashboard"). Not enabled by default: nothing listens on any TCP port
+# unless you run `systemctl enable --now mlvpn-web.service`.
+#
+# Settings are the [web] table of /etc/mlvpn/mlvpn.toml. By default it
+# listens on 127.0.0.1:8765 and is read-only. To reach it from another
+# machine, either forward the port over SSH (`ssh -L 8765:127.0.0.1:8765
+# host`) or put it behind a reverse proxy that verifies a client
+# certificate: set [web] listen, trusted_proxies and client_cert_header
+# (mlvpn-web refuses a non-loopback address without them), and optionally
+# allowed_subjects and allow_actions.
 #
 # Runs as the same unprivileged `mlvpn` user as mlvpn.service because the
-# daemon's control socket is mode 0600 owned by that user. It has no
-# capabilities, makes no outbound connections, and only reads the control
-# socket under /run/mlvpn. mlvpn-web refuses to bind anything other than a
-# loopback address, so the default 127.0.0.1:8765 is also the only place
-# it can listen.
-#
-# To read it from another machine, forward the port over SSH
-# (`ssh -L 8765:127.0.0.1:8765 host`); do not put it behind a reverse proxy
-# without authentication in front.
+# daemon's control sockets are mode 0600 owned by that user. It has no
+# capabilities and makes no outbound connections.
 
 [Unit]
-Description=mlvpn read-only web telemetry API
+Description=mlvpn web dashboard
 Documentation=https://github.com/4jpps/mlvpn-rs/blob/main/docs/monitoring.md
 After=mlvpn.service
 Requires=mlvpn.service
+# Keep retrying: a listen address on the tunnel interface only exists once
+# mlvpnd has brought it up.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/mlvpn-web --listen 127.0.0.1:8765
+ExecStart=/usr/bin/mlvpn-web --config /etc/mlvpn/mlvpn.toml
 Restart=on-failure
-RestartSec=2
+RestartSec=5
 
 User=mlvpn
 Group=mlvpn
@@ -60,7 +64,7 @@ SystemCallErrorNumber=EPERM
 TasksMax=128
 MemoryMax=64M
 InaccessiblePaths=-/root -/home
-ReadOnlyPaths=/run/mlvpn
+ReadOnlyPaths=/run/mlvpn /etc/mlvpn
 
 [Install]
 WantedBy=multi-user.target

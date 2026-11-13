@@ -255,6 +255,7 @@ mod tests {
             remote_addr: Some("203.0.113.5:6900".to_string()),
             state: "up".to_string(),
             is_primary: false,
+            admin_disabled: false,
             score: 0.75,
             state_duration_ms: 12_345,
             tx_bytes: 1_000,

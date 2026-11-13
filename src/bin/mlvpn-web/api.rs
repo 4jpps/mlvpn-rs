@@ -9,7 +9,7 @@ use crate::http::{Method, Request, Response, query_param};
 use mlvpn::ipc::{EventRecord, Snapshot};
 use serde::Serialize;
 use serde_json::{Value, json};
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::time::Instant;
 
 pub const EVENT_CAPACITY: usize = 500;
@@ -42,6 +42,9 @@ pub struct Shared {
     pub last_update: Option<Instant>,
     pub events: VecDeque<EventRecord>,
     pub history: VecDeque<HistorySample>,
+    /// Links turned off from the dashboard since the daemon connected, for
+    /// a daemon too old to report `admin_disabled` itself.
+    pub disabled_by_web: BTreeSet<String>,
 }
 
 impl Shared {
@@ -51,6 +54,20 @@ impl Shared {
         self.connected = true;
         self.events.clear();
         self.history.clear();
+        // A restarted daemon starts with every link turned on.
+        self.disabled_by_web.clear();
+    }
+
+    pub fn note_admin(&mut self, link: &str, disabled: bool) {
+        if disabled {
+            self.disabled_by_web.insert(link.to_string());
+        } else {
+            self.disabled_by_web.remove(link);
+        }
+    }
+
+    pub fn link_count(&self) -> usize {
+        self.snapshot.as_ref().map_or(0, |s| s.links.len())
     }
 
     pub fn ingest(&mut self, mut snapshot: Snapshot) {
@@ -97,10 +114,37 @@ impl Shared {
     }
 }
 
-pub fn handle(state: &Shared, req: &Request) -> Response {
+const PAGE: &str = include_str!("ui/index.html");
+const SCRIPT: &str = include_str!("ui/app.js");
+const STYLE: &str = include_str!("ui/app.css");
+const ICON: &str = include_str!("../../../docs/icon.svg");
+
+/// What the dashboard needs to know about this server.
+pub struct UiInfo<'a> {
+    pub title: &'a str,
+    pub actions: bool,
+    pub who: &'a str,
+}
+
+pub fn handle(state: &Shared, req: &Request, ui: &UiInfo) -> Response {
     debug_assert!(matches!(req.method, Method::Get | Method::Head));
     match req.path.as_str() {
-        "/" | "/api" | "/api/v1" => Response::json(200, &index()),
+        "/" | "/index.html" => Response::asset("text/html; charset=utf-8", PAGE),
+        "/app.js" => Response::asset("text/javascript; charset=utf-8", SCRIPT),
+        "/app.css" => Response::asset("text/css; charset=utf-8", STYLE),
+        "/favicon.svg" | "/favicon.ico" => Response::asset("image/svg+xml", ICON),
+        "/api" | "/api/v1" => Response::json(200, &index()),
+        "/api/v1/ui" => Response::json(
+            200,
+            &state.envelope(json!({
+                "title": ui.title,
+                "tunnel": state.snapshot.as_ref().map(|s| s.tunnel_name.clone()),
+                "actions": ui.actions,
+                "who": ui.who,
+                "disabled_by_web": state.disabled_by_web,
+                "max_test_secs": crate::actions::MAX_TEST_SECS,
+            })),
+        ),
         "/api/v1/version" => version(state),
         "/api/v1/snapshot" => snapshot(state),
         "/api/v1/links" => links(state),
@@ -114,8 +158,8 @@ fn index() -> Value {
     json!({
         "api": 1,
         "name": "mlvpn-web",
-        "read_only": true,
         "endpoints": [
+            "/api/v1/ui",
             "/api/v1/version",
             "/api/v1/snapshot",
             "/api/v1/links",
@@ -232,7 +276,36 @@ mod tests {
             method: Method::Get,
             path: path.into(),
             query: query.into(),
+            headers: Vec::new(),
+            body: Vec::new(),
         }
+    }
+
+    fn ui() -> UiInfo<'static> {
+        UiInfo {
+            title: "test",
+            actions: false,
+            who: "",
+        }
+    }
+
+    #[test]
+    fn serves_the_dashboard_with_a_strict_csp() {
+        let state = Shared::default();
+        for (p, ct) in [
+            ("/", "text/html"),
+            ("/app.js", "text/javascript"),
+            ("/app.css", "text/css"),
+        ] {
+            let r = handle(&state, &req(p, ""), &ui());
+            assert_eq!(r.status, 200, "{p}");
+            assert!(r.content_type.starts_with(ct), "{p}");
+            assert!(r.csp.contains("script-src 'self'"), "{p}");
+            assert!(!r.csp.contains("unsafe"), "{p}");
+        }
+        let info = body(&handle(&state, &req("/api/v1/ui", ""), &ui()));
+        assert_eq!(info["data"]["title"], json!("test"));
+        assert_eq!(info["data"]["actions"], json!(false));
     }
 
     fn event(seq: u64) -> EventRecord {
@@ -281,14 +354,23 @@ mod tests {
     fn no_data_is_503_with_envelope() {
         let state = Shared::default();
         for p in ["/api/v1/snapshot", "/api/v1/links"] {
-            let r = handle(&state, &req(p, ""));
+            let r = handle(&state, &req(p, ""), &ui());
             assert_eq!(r.status, 503, "{p}");
             assert_eq!(body(&r)["connected"], json!(false));
             assert!(body(&r)["age_ms"].is_null());
         }
-        assert_eq!(handle(&state, &req("/api/v1/version", "")).status, 200);
-        assert_eq!(handle(&state, &req("/api/v1/events", "")).status, 200);
-        assert_eq!(handle(&state, &req("/api/v1/history", "")).status, 200);
+        assert_eq!(
+            handle(&state, &req("/api/v1/version", ""), &ui()).status,
+            200
+        );
+        assert_eq!(
+            handle(&state, &req("/api/v1/events", ""), &ui()).status,
+            200
+        );
+        assert_eq!(
+            handle(&state, &req("/api/v1/history", ""), &ui()).status,
+            200
+        );
     }
 
     #[test]
@@ -296,7 +378,7 @@ mod tests {
         let mut state = Shared::default();
         state.on_connect();
         state.ingest(snap(vec![event(1)]));
-        let r = handle(&state, &req("/api/v1/snapshot", ""));
+        let r = handle(&state, &req("/api/v1/snapshot", ""), &ui());
         assert_eq!(r.status, 200);
         let text = String::from_utf8(r.body.clone()).unwrap();
         assert!(!text.contains("secret-ish"));
@@ -314,9 +396,9 @@ mod tests {
         let mut state = Shared::default();
         state.on_connect();
         state.ingest(snap(vec![]));
-        let l = body(&handle(&state, &req("/api/v1/links", "")));
+        let l = body(&handle(&state, &req("/api/v1/links", ""), &ui()));
         assert_eq!(l["data"].as_array().unwrap().len(), 1);
-        let v = body(&handle(&state, &req("/api/v1/version", "")));
+        let v = body(&handle(&state, &req("/api/v1/version", ""), &ui()));
         assert_eq!(v["data"]["daemon"], json!("9.9.9"));
         assert_eq!(v["data"]["tunnel"], json!("t0"));
         assert_eq!(v["data"]["api_version"], json!(1));
@@ -327,7 +409,7 @@ mod tests {
         let mut state = Shared::default();
         state.on_connect();
         state.ingest(snap((1..=5).map(event).collect()));
-        let v = body(&handle(&state, &req("/api/v1/events", "since=2")));
+        let v = body(&handle(&state, &req("/api/v1/events", "since=2"), &ui()));
         let seqs: Vec<u64> = v["data"]["events"]
             .as_array()
             .unwrap()
@@ -337,7 +419,7 @@ mod tests {
         assert_eq!(seqs, vec![3, 4, 5]);
         assert_eq!(v["data"]["next_since"], json!(5));
 
-        let v = body(&handle(&state, &req("/api/v1/events", "limit=2")));
+        let v = body(&handle(&state, &req("/api/v1/events", "limit=2"), &ui()));
         let seqs: Vec<u64> = v["data"]["events"]
             .as_array()
             .unwrap()
@@ -346,7 +428,7 @@ mod tests {
             .collect();
         assert_eq!(seqs, vec![4, 5]);
 
-        let v = body(&handle(&state, &req("/api/v1/events", "since=5")));
+        let v = body(&handle(&state, &req("/api/v1/events", "since=5"), &ui()));
         assert!(v["data"]["events"].as_array().unwrap().is_empty());
         assert_eq!(v["data"]["next_since"], json!(5));
     }
@@ -355,10 +437,14 @@ mod tests {
     fn bad_query_values_are_400() {
         let state = Shared::default();
         for q in ["since=abc", "since=-1", "limit=x", "limit=-3"] {
-            assert_eq!(handle(&state, &req("/api/v1/events", q)).status, 400, "{q}");
+            assert_eq!(
+                handle(&state, &req("/api/v1/events", q), &ui()).status,
+                400,
+                "{q}"
+            );
         }
         assert_eq!(
-            handle(&state, &req("/api/v1/history", "limit=zz")).status,
+            handle(&state, &req("/api/v1/history", "limit=zz"), &ui()).status,
             400
         );
     }
@@ -371,12 +457,16 @@ mod tests {
             state.ingest(snap(vec![]));
         }
         assert_eq!(state.history.len(), HISTORY_CAPACITY);
-        let v = body(&handle(&state, &req("/api/v1/history", "limit=999999")));
+        let v = body(&handle(
+            &state,
+            &req("/api/v1/history", "limit=999999"),
+            &ui(),
+        ));
         assert_eq!(
             v["data"]["samples"].as_array().unwrap().len(),
             MAX_HISTORY_PER_REQUEST
         );
-        let v = body(&handle(&state, &req("/api/v1/history", "limit=0")));
+        let v = body(&handle(&state, &req("/api/v1/history", "limit=0"), &ui()));
         assert_eq!(v["data"]["samples"].as_array().unwrap().len(), 1);
         assert_eq!(v["data"]["samples"][0]["tx_mbps"], json!(12.5));
     }
@@ -404,8 +494,8 @@ mod tests {
             "/etc/passwd",
             "/api/v1/stream",
         ] {
-            assert_eq!(handle(&state, &req(p, "")).status, 404, "{p}");
+            assert_eq!(handle(&state, &req(p, ""), &ui()).status, 404, "{p}");
         }
-        assert_eq!(handle(&state, &req("/", "")).status, 200);
+        assert_eq!(handle(&state, &req("/", ""), &ui()).status, 200);
     }
 }

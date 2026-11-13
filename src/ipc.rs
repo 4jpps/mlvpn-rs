@@ -357,6 +357,11 @@ pub struct LinkSnapshot {
     /// traffic without cross-referencing byte counters by hand.
     #[serde(default)]
     pub is_primary: bool,
+    /// Turned off by hand (`mlvpnd link disable`, or the web UI), as
+    /// opposed to `state` "down" from the probes. `false` from a daemon
+    /// that predates this field.
+    #[serde(default)]
+    pub admin_disabled: bool,
     /// This process's own SWRR weight for the link right now (0 when not
     /// Up); mirrors what the scheduler is actually doing with traffic.
     pub score: f64,
@@ -666,6 +671,7 @@ mod tests {
             remote_addr: Some("198.51.100.1:51000".to_string()),
             state: "up".to_string(),
             is_primary: true,
+            admin_disabled: false,
             score: 1.5,
             state_duration_ms: 12_345,
             tx_bytes: 1_000_000,

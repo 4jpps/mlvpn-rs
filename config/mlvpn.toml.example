@@ -263,3 +263,25 @@ probe_interval_ms = 200
 private_key_file = "/etc/mlvpn/lte.key"   # must be mode 0600; generate with
                                           # `mlvpnd genkey --link lte`
 peer_public_key = "REPLACE_WITH_PEER_PUBLIC_KEY_BASE64"
+
+[web]
+# Settings for mlvpn-web, the optional dashboard (`systemctl enable --now
+# mlvpn-web`). mlvpnd itself ignores this table. See docs/monitoring.md,
+# "Web dashboard".
+# listen = "127.0.0.1:8765"   # loopback by default; reach it with
+                              # `ssh -L 8765:127.0.0.1:8765 <host>`
+# title = "home router"       # shown at the top; default the tunnel name
+# allow_actions = false       # true: turn links off/on, throughput tests and
+                              # diagnostic dumps from the dashboard (needs
+                              # [command] enabled = true)
+#
+# Behind a reverse proxy that checks a client certificate (all three of
+# listen, trusted_proxies and client_cert_header are needed for a
+# non-loopback address; mlvpn-web refuses to start otherwise):
+# listen = "192.168.1.1:8765"
+# trusted_proxies = ["192.168.1.20"]          # the proxy's address(es)
+# allowed_hosts = ["mlvpn.example.net"]       # the name the proxy serves
+# client_cert_header = "X-Client-Cert-Subject" # set by the proxy to the
+                              # verified certificate's name; the proxy must
+                              # strip any copy sent by the client
+# allowed_subjects = ["Jane Admin"]           # only these certificates

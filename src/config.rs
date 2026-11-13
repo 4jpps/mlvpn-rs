@@ -38,6 +38,71 @@ pub struct Config {
 
     #[serde(default)]
     pub diagnostics: DiagnosticsConfig,
+
+    /// The optional `mlvpn-web` dashboard (a separate process; `mlvpnd`
+    /// itself ignores this table). See [`WebConfig`].
+    #[serde(default)]
+    pub web: WebConfig,
+}
+
+/// `[web]`: settings for `mlvpn-web`, the optional dashboard and API.
+///
+/// By default it listens on loopback only and is read-only. Serving it to
+/// other machines is meant to go through an authenticating reverse proxy
+/// (one that verifies a client certificate, say) and needs all of
+/// `trusted_proxies` and `client_cert_header`: `mlvpn-web` refuses to start
+/// on a non-loopback address without them.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebConfig {
+    /// Address to listen on. Default `127.0.0.1:8765`.
+    #[serde(default = "default_web_listen")]
+    pub listen: String,
+    /// Name shown at the top of the dashboard (e.g. the host name).
+    /// Defaults to the tunnel name.
+    #[serde(default)]
+    pub title: Option<String>,
+    /// Peers allowed to connect when `listen` is not loopback: the reverse
+    /// proxy's address(es). Every other address is refused.
+    #[serde(default)]
+    pub trusted_proxies: Vec<std::net::IpAddr>,
+    /// `Host` names accepted besides the loopback names and the listen
+    /// address itself (the name the proxy serves it under).
+    #[serde(default)]
+    pub allowed_hosts: Vec<String>,
+    /// Header the proxy sets to the verified client-certificate name (for
+    /// example `X-Client-Cert-Subject`). Requests arriving through a
+    /// trusted proxy without it are refused. The proxy must strip any
+    /// copy of this header sent by the client.
+    #[serde(default)]
+    pub client_cert_header: Option<String>,
+    /// If not empty, only these certificate names (the header's value,
+    /// matched exactly) are let in.
+    #[serde(default)]
+    pub allowed_subjects: Vec<String>,
+    /// Allow actions from the dashboard: turning a link off and on,
+    /// throughput tests and diagnostic dumps. Needs `[command] enabled`.
+    /// Off by default: the dashboard is read-only.
+    #[serde(default)]
+    pub allow_actions: bool,
+}
+
+fn default_web_listen() -> String {
+    "127.0.0.1:8765".to_string()
+}
+
+impl Default for WebConfig {
+    fn default() -> Self {
+        WebConfig {
+            listen: default_web_listen(),
+            title: None,
+            trusted_proxies: Vec::new(),
+            allowed_hosts: Vec::new(),
+            client_cert_header: None,
+            allowed_subjects: Vec::new(),
+            allow_actions: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -1182,6 +1247,7 @@ mod tests {
                 auto_submit_enabled: false,
                 crash_report_enabled: false,
             },
+            web: WebConfig::default(),
         }
     }
 
