@@ -75,6 +75,15 @@ enum Command {
         #[arg(value_enum)]
         state: LinkEnableState,
     },
+    /// Rebind one link's socket from scratch on a *running* mlvpnd (what the daemon does by itself
+    /// after repeated failures), leaving every other link alone. Talks to the command socket, same
+    /// as `set-link`.
+    ReconnectLink {
+        #[arg(short, long, default_value = "/etc/mlvpn/mlvpn.toml")]
+        config: PathBuf,
+        /// Link name, matching a [[links]] `name` in the config.
+        link: String,
+    },
     /// Run an on-demand throughput self-test against a running mlvpnd's
     /// peer, without needing a separate tool like iperf3. Talks to the
     /// command socket, same as `set-link` (`[command] enabled = true`
@@ -197,6 +206,7 @@ fn main() -> anyhow::Result<()> {
             link,
             state,
         } => set_link(&config, &link, matches!(state, LinkEnableState::Enable)),
+        Command::ReconnectLink { config, link } => reconnect_link(&config, &link),
         Command::SelfTest {
             config,
             link,
@@ -274,6 +284,27 @@ fn send_command(config_path: &Path, cmd: &SocketCommand) -> anyhow::Result<Comma
     let mut reply = String::new();
     BufReader::new(&stream).read_line(&mut reply)?;
     Ok(serde_json::from_str(reply.trim_end())?)
+}
+
+/// Send a `ReconnectLink` command to a running daemon's command socket and print the result.
+fn reconnect_link(config_path: &Path, link: &str) -> anyhow::Result<()> {
+    let result = send_command(
+        config_path,
+        &SocketCommand::ReconnectLink {
+            link: link.to_string(),
+        },
+    )?;
+    if result.ok {
+        println!("ok: link '{link}' reconnected");
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "mlvpnd rejected the command: {}",
+            result
+                .error
+                .unwrap_or_else(|| "(no error detail)".to_string())
+        );
+    }
 }
 
 /// Send a `SetLinkEnabled` command to a running daemon's command socket

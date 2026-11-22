@@ -689,6 +689,36 @@ async fn apply_command(
                 }
             }
         }
+        Command::ReconnectLink { link } => {
+            // Find the link by name, take its handle, and let go of the link's lock before the
+            // reconnect (which awaits the rebind and must not hold the per-link mutex).
+            let mut handle = None;
+            for l in links.iter() {
+                let guard = l.lock().await;
+                if guard.config.name == link {
+                    handle = Some(guard.handle());
+                    break;
+                }
+            }
+            let error = match handle {
+                None => Some(format!("no such link '{link}'")),
+                Some(h) => match h.reconnect().await {
+                    Ok(()) => {
+                        tracing::warn!(link = %link, "link reconnected via command socket");
+                        None
+                    }
+                    Err(e) => Some(format!("reconnect of '{link}' failed: {e}")),
+                },
+            };
+            CommandResult {
+                ok: error.is_none(),
+                error,
+                throughput_results: Vec::new(),
+                diag_dump: None,
+                tunnel_test_result: None,
+                peer_version: diag_ctx.peer_version.lock().unwrap().clone(),
+            }
+        }
         Command::RunThroughputTest {
             link,
             duration_secs,

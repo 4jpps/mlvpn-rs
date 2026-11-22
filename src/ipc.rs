@@ -521,6 +521,11 @@ pub enum Command {
     /// for scheduling, independent of its real probe-measured state --
     /// see `Link::admin_disabled`'s doc comment.
     SetLinkEnabled { link: String, enabled: bool },
+    /// Rebinds `link`'s socket from scratch right now (`LinkHandle::reconnect`, the same thing the
+    /// daemon does on its own after `RECONNECT_FAILURE_THRESHOLD` failures), without touching any
+    /// other link. For an outside watcher that knows the WAN under a link came back (e.g. the
+    /// router's dead-gateway watchdog) while the link itself still shows down.
+    ReconnectLink { link: String },
     /// Runs an on-demand throughput self-test (`mlvpnd selftest` on the
     /// CLI) -- see `tunnel::send_throughput_test_stream`,
     /// `control::apply_command`'s handling of this variant. `link`
@@ -875,6 +880,22 @@ mod tests {
         };
         assert_eq!(link, "lte0");
         assert!(!enabled);
+    }
+
+    /// `wan-failover-watchdog.sh` on the router sends this one as raw JSON (socat), so its exact
+    /// shape is a contract, not just a serde detail.
+    #[test]
+    fn reconnect_link_command_json_round_trips() {
+        let cmd = Command::ReconnectLink {
+            link: "comcast".to_string(),
+        };
+        let json = serde_json::to_string(&cmd).expect("serialize");
+        assert_eq!(json, r#"{"command":"reconnect_link","link":"comcast"}"#);
+        let back: Command = serde_json::from_str(&json).expect("deserialize");
+        let Command::ReconnectLink { link } = back else {
+            panic!("expected ReconnectLink, got {back:?}");
+        };
+        assert_eq!(link, "comcast");
     }
 
     #[test]
