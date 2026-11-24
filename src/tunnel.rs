@@ -3977,7 +3977,7 @@ async fn send_version_info(
     };
 
     let payload = VersionInfoPayload {
-        version: VersionInfoPayload::encode_version(&crate::version()),
+        version: VersionInfoPayload::encode_version(&crate::wire_version()),
         tunnel_mtu: local_capability_mtu.load(std::sync::atomic::Ordering::Relaxed),
         live_tunnel_mtu: live_mtu.load(std::sync::atomic::Ordering::Relaxed),
         primary_link_name: VersionInfoPayload::encode_link_name(&primary_link_name),

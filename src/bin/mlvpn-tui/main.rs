@@ -41,7 +41,7 @@ use std::time::Duration;
 #[derive(Parser)]
 #[command(
     name = "mlvpn-tui",
-    version,
+    version = env!("APP_VERSION"),
     about = "Live monitoring view for an mlvpnd tunnel"
 )]
 struct Cli {

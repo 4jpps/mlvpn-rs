@@ -37,11 +37,12 @@ pub mod tunnel;
 pub mod tunneltest;
 pub mod wireguard;
 
-/// `Cargo.toml`'s own semver-only version (e.g. "0.7.3") -- the same
+/// The date version people see (YY.MM.DD.hhmm, Jeff 2026-11-22; Cargo.toml holds YY.MMDD.hhmm, build.rs
+/// turns it into `APP_VERSION`) -- the same
 /// for every build regardless of release channel. Prefer [`version()`]
 /// for anything user-facing; this exists mainly as the input it's
 /// built from.
-pub const CARGO_VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const CARGO_VERSION: &str = env!("APP_VERSION");
 
 /// Set by CI for a Beta build (e.g. "beta7") via the `MLVPN_BUILD_SUFFIX`
 /// env var at `cargo build` time -- see `.beta_build_suffix` in
@@ -73,6 +74,20 @@ pub fn version() -> String {
 /// an `option_env!` read at compile time, so a real `cargo test` run
 /// (with `MLVPN_BUILD_SUFFIX` unset) can never observe the `Some(...)`
 /// branch through `version()` itself.
+/// What goes in a `VersionInfo` frame (and what the peer-version check compares): [`version()`] when it
+/// fits the 16-byte field, else the date version without its Beta suffix (each date version is already one
+/// release), never a string cut mid-suffix.
+pub fn wire_version() -> String {
+    wire_form(&version())
+}
+
+fn wire_form(full: &str) -> String {
+    if full.len() <= protocol::VersionInfoPayload::VERSION_LEN {
+        return full.to_string();
+    }
+    full.split('-').next().unwrap_or(full).to_string()
+}
+
 fn format_version(cargo_version: &str, suffix: Option<&str>) -> String {
     match suffix {
         Some(s) if !s.is_empty() => format!("{cargo_version}-{s}"),
@@ -99,5 +114,19 @@ mod version_tests {
         // Defensive: `MLVPN_BUILD_SUFFIX=""` (set but empty) shouldn't
         // produce a trailing bare hyphen like "0.7.3-".
         assert_eq!(format_version("0.7.3", Some("")), "0.7.3");
+    }
+
+    #[test]
+    fn the_wire_version_fits_version_info_and_drops_a_suffix_that_doesnt() {
+        // Date versions (Jeff 2026-11-22): a Stable one fits the 16-byte field.
+        assert_eq!(wire_form("26.11.23.1900"), "26.11.23.1900");
+        assert_eq!(wire_form("0.7.3-beta7"), "0.7.3-beta7");
+        // A dated Beta doesn't (19 bytes): the date alone already names the build, and cutting it
+        // mid-suffix would make the mismatch check flag two equal builds as different.
+        assert_eq!(wire_form("26.11.23.1900-beta3"), "26.11.23.1900");
+        assert!(
+            wire_form("26.11.23.1900-beta3").len()
+                <= crate::protocol::VersionInfoPayload::VERSION_LEN
+        );
     }
 }

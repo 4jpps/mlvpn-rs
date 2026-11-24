@@ -43,7 +43,7 @@ fn hostname() -> Option<String> {
 fn build_report_body(bundle: &str, trigger: &str, message: Option<&str>) -> serde_json::Value {
     json!({
         "product": "mlvpn-rs",
-        "version": env!("CARGO_PKG_VERSION"),
+        "version": env!("APP_VERSION"),
         "os_info": os_info(),
         "hostname": hostname(),
         "trigger": trigger,
@@ -126,7 +126,7 @@ mod tests {
     fn build_report_body_includes_expected_fields_and_omits_identity() {
         let body = build_report_body("some log text", "manual", Some("it broke"));
         assert_eq!(body["product"], "mlvpn-rs");
-        assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(body["version"], env!("APP_VERSION"));
         assert_eq!(body["trigger"], "manual");
         assert_eq!(body["logs"], "some log text");
         assert_eq!(body["message"], "it broke");

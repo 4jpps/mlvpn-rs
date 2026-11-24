@@ -50,7 +50,7 @@ const MAX_CONNECTIONS: usize = 32;
 #[derive(Parser)]
 #[command(
     name = "mlvpn-web",
-    version,
+    version = env!("APP_VERSION"),
     about = "Dashboard and HTTP API for an mlvpnd tunnel (settings: [web] in mlvpn.toml)"
 )]
 struct Cli {

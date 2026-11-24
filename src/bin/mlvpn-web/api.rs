@@ -191,7 +191,7 @@ fn version(state: &Shared) -> Response {
         200,
         &state.envelope(json!({
             "api_version": 1,
-            "mlvpn_web": env!("CARGO_PKG_VERSION"),
+            "mlvpn_web": env!("APP_VERSION"),
             "daemon": daemon,
             "peer": peer,
             "tunnel": tunnel,

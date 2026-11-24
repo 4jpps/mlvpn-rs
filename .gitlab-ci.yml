@@ -120,7 +120,7 @@ test:
 .beta_build_suffix:
   script:
     - |
-      if echo "${CI_COMMIT_TAG:-}" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+      if echo "${CI_COMMIT_TAG:-}" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?$'; then
         DEB_REVISION_ARG=""
         RPM_RELEASE_OVERRIDE=""
         PKG_DISTRIBUTION="stable"

@@ -360,7 +360,7 @@ impl StatsPayload {
 }
 
 /// Payload of a `VersionInfo` frame: the sender's own `mlvpnd` version
-/// (`env!("CARGO_PKG_VERSION")`), e.g. `"0.4.5"`. Fixed-size and
+/// (`crate::wire_version()`), e.g. `"26.11.23.1900"`. Fixed-size and
 /// zero-padded exactly like `StatsPayload::name` above -- same
 /// truncate-on-a-UTF-8-boundary encoding, same null-terminated
 /// decoding -- there's no realistic version string anywhere close to

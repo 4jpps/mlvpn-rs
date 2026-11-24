@@ -13,7 +13,7 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::prelude::*;
 
 #[derive(Parser)]
-#[command(name = "mlvpnd", version, about = "Multi-link VPN bonding daemon")]
+#[command(name = "mlvpnd", version = env!("APP_VERSION"), about = "Multi-link VPN bonding daemon")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -398,7 +398,7 @@ fn run_throughput_selftest(
 }
 
 /// Prints the peer's last-known `mlvpnd` version and flags a mismatch
-/// against this build's own `mlvpn::version()`. Shared by both self-test
+/// against this build's own `mlvpn::wire_version()`. Shared by both self-test
 /// CLI paths (link-level and tunnel-level): the version comes from the
 /// periodic wire `VersionInfo` exchange (`CommandResult::peer_version`),
 /// not from the self-test's own round trip, so it's still available to
@@ -406,7 +406,8 @@ fn run_throughput_selftest(
 /// exactly the case where knowing whether a version skew might explain
 /// the failure is most useful.
 fn print_peer_version_report(peer_version: &Option<String>) {
-    let local_version = mlvpn::version();
+    // The peer sends its wire form (a dated Beta without its suffix): compare like with like.
+    let local_version = mlvpn::wire_version();
     match peer_version {
         Some(v) if *v == local_version => {
             println!("peer version: {v} (matches this host)");

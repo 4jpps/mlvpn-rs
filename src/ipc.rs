@@ -204,7 +204,7 @@ pub struct DaemonSnapshot {
     pub tun: TunSnapshot,
     /// Machine-wide health -- see `procstats::read_system_stats`.
     pub system: SystemSnapshot,
-    /// This daemon's own `mlvpnd` version (`env!("CARGO_PKG_VERSION")`).
+    /// This daemon's own `mlvpnd` version (`env!("APP_VERSION")`).
     pub local_version: String,
     /// The peer's own last-reported version, learned from the
     /// periodic authenticated `PacketType::VersionInfo` wire exchange
